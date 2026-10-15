@@ -89,13 +89,16 @@ Nuxt UI 语义色映射在 `app.config.ts`：`primary → brand`、`secondary �
 
 ## 浅色、深色及商家主题边界
 
-- 当前默认方案为浅色。Nuxt UI 的语义表面和边框随 `.dark` 适配，`main.css` 也为主色和状态色提供深色阶。
-- **本阶段没有实现模式切换，也没有完成深色模式浏览器验收。** 后续须同时检查文本对比、输入控件、浮层、焦点和图表状态，不能把颜色反转当作深色设计。
-- 将来商家设置只提供店铺名称、Logo 和品牌色；品牌色映射到主色语义，成功/警告/错误/信息色保持固定。
-- 每个商家使用同一套语义变量，不复制 CSS。服务端根据当前店铺配置解析主题并在 SSR 响应中提供初始值，避免首屏闪烁和 hydration 差异。
-- 主题变量应落在文档根元素（例如 `<html>` 的主题属性/变量）或等价的应用级主题边界；这样 Teleport 到 `body` 的弹窗、抽屉和菜单也能继承。不要只把商家变量放在局部页面容器上。
-- 管理后台继续使用 AiKayun 稳定的品牌和中性色。若 SSR 同一请求需要区分前台/后台，服务端按页面区域应用对应语义映射，状态色仍共享。
-- ②-1 只设置静态默认主题；没有主题数据库、后台主题编辑器、运行时主题引擎、模板系统或客户配置 API。
+- 浅色、深色和跟随系统由 Nuxt Color Mode 管理，默认 `preference` 是 `system`。明确选择的浅色或深色优先于系统设置；跟随系统时，系统偏好变化会立即更新 `value`。
+- 模式偏好由 Nuxt Color Mode 写入 `localStorage` 的 `aikayun-color-mode`。这是长期应用存储键；历史 `nuxt-color-mode` 与阶段②-1临时键 `aikayun-color-mode-r1` 不参与初始化，避免旧值覆盖新的系统默认。没有额外的主题状态或同步存储。
+- 模式切换使用 Nuxt UI `USelectMenu` 和 Nuxt Color Mode 的 `preference`；实际显示主题读取只读 `value`。选择器在客户端初始化后启用，SSR 提供稳定回退项。
+- 店铺品牌配置位于 `runtimeConfig.public`：`storeName`、`storeLogoUrl`、`storeBrandColor`。独立部署通过 `NUXT_PUBLIC_STORE_NAME`、`NUXT_PUBLIC_STORE_LOGO_URL`、`NUXT_PUBLIC_STORE_BRAND_COLOR` 设置，无需修改源码或重新构建应用。
+- Logo 仅接受站内根路径或 HTTPS URL；无 Logo 时统一显示店铺名称首字。品牌色仅接受 `#RGB` 或 `#RRGGBB`；非法颜色回退为 AiKayun 默认蓝 `#2563EB`。Culori 将主色转换为 OKLCH 并裁切到 sRGB，生成 Nuxt UI 主色阶；主色阶对浅色白色文字、深色深色文字保留 WCAG AA 对比度。成功、信息、警告、错误色保持独立。
+- 商城前台将生成的 `--ui-color-primary-*` 变量放在 `<html>` 根节点，页面导航切换时由 SSR/应用路由设置 `data-aikayun-area` 并更新根变量。管理后台及登录页不写入客户主色，沿用 AiKayun 蓝和中性色。
+- 根节点作用域使 UApp 中 Teleport 到 `body` 的菜单、弹窗和抽屉继承当前区域主题；不依赖可能被 Teleport 脱离的局部容器，也不在服务端模块间共享可变主题状态。
+- Color Mode 的早期 head 脚本在绘制前读取用户偏好并设置 `.light` / `.dark`；应用 SSR 不按未知系统状态分支渲染主题文案。品牌根变量由本次请求的 public runtimeConfig 计算并随首屏 HTML 输出。
+- Compose 默认值可直接运行 AiKayun 蓝色配置；`docs/deployment.md` 也提供紫色配置示例。新增品牌只需在目标部署设置三项环境变量并重建 web 容器，无需创建一套组件样式。
+- 当前没有后台可视化主题编辑器、主题数据库、配置 API、拖拽装修、主题市场或多租户/按域名主题解析。品牌配置仅在部署层维护。
 
 ## 新页面使用规范
 
@@ -107,4 +110,4 @@ Nuxt UI 语义色映射在 `app.config.ts`：`primary → brand`、`secondary �
 
 ## 当前迁移范围
 
-②-1 建立默认变量、Nuxt UI 组件基础主题和少量布局/组件验证点。全站仍有旧的 indigo、slate、white 页面类名；它们尚未全部迁移，不代表全站主题化已完成。完整页面迁移与视觉统一留到②-4。
+②-1 建立默认变量、Nuxt UI 组件基础主题和少量布局/组件验证点；②-2 为当前正式页面接通色彩模式与前后台品牌边界。新增页面仍须使用语义类，其他旧页面的全面迁移及完整视觉统一留到②-4。

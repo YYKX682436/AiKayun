@@ -17,16 +17,16 @@ const capabilities = [
       <div class="max-w-2xl">
         <div class="mb-7 inline-flex items-center gap-2 rounded-full border border-primary/20 bg-elevated px-3 py-1.5 text-sm font-medium text-primary shadow-sm">
           <span
-            class="size-2 rounded-full bg-emerald-500"
+            class="size-2 rounded-full bg-success"
             aria-hidden="true"
           />
           独立部署 · 数字商品专注
         </div>
-        <h1 class="text-5xl font-semibold leading-[1.08] tracking-[-0.045em] text-slate-950 sm:text-6xl lg:text-7xl">
+        <h1 class="text-5xl font-semibold leading-[1.08] tracking-[-0.045em] text-highlighted sm:text-6xl lg:text-7xl">
           让数字商品，<br>
           <span class="text-primary">轻松开始销售。</span>
         </h1>
-        <p class="mt-7 max-w-xl text-lg leading-8 text-slate-600">
+        <p class="mt-7 max-w-xl text-lg leading-8 text-muted">
           AiKayun 为卡密、软件授权与虚拟商品提供清晰的商城基础。用自己的部署环境经营业务，从可靠的商品展示与交付开始。
         </p>
         <div class="mt-9 flex flex-wrap gap-3">
@@ -44,7 +44,7 @@ const capabilities = [
             查看 API 文档
           </a>
         </div>
-        <div class="mt-12 flex flex-wrap gap-x-8 gap-y-3 border-t border-slate-200 pt-6 text-sm text-slate-500">
+        <div class="mt-12 flex flex-wrap gap-x-8 gap-y-3 border-t border-default pt-6 text-sm text-muted">
           <span>TypeScript 严格模式</span>
           <span>PostgreSQL 数据持久化</span>
           <span>前后端共享 API 契约</span>
@@ -56,10 +56,10 @@ const capabilities = [
           <template #header>
             <div class="flex items-center justify-between">
               <div>
-                <p class="text-sm font-semibold text-slate-900">
+                <p class="text-sm font-semibold text-highlighted">
                   工程基础
                 </p>
-                <p class="mt-1 text-xs text-slate-500">
+                <p class="mt-1 text-xs text-muted">
                   为数字商品业务准备
                 </p>
               </div>
@@ -71,7 +71,7 @@ const capabilities = [
               <p class="text-xs font-medium text-primary">
                 页面渲染
               </p>
-              <p class="mt-2 text-xl font-semibold tracking-tight text-slate-950">
+              <p class="mt-2 text-xl font-semibold tracking-tight text-highlighted">
                 SSR
               </p>
             </div>
@@ -79,23 +79,23 @@ const capabilities = [
               <p class="text-xs font-medium text-toned">
                 应用架构
               </p>
-              <p class="mt-2 text-xl font-semibold tracking-tight text-slate-950">
+              <p class="mt-2 text-xl font-semibold tracking-tight text-highlighted">
                 模块化单体
               </p>
             </div>
           </div>
-          <div class="mt-4 rounded-2xl border border-slate-200 p-4">
+          <div class="mt-4 rounded-2xl border border-default p-4">
             <div class="mb-4 flex items-center justify-between">
-              <p class="text-sm font-medium text-slate-800">
+              <p class="text-sm font-medium text-default">
                 基础能力
               </p>
-              <span class="text-xs text-slate-400">首个版本</span>
+              <span class="text-xs text-dimmed">首个版本</span>
             </div>
             <div class="grid gap-3">
               <div
                 v-for="item in ['共享 OpenAPI 契约', '管理员会话验证', 'PG18 + Kysely 迁移']"
                 :key="item"
-                class="flex items-center gap-3 text-sm text-slate-600"
+                class="flex items-center gap-3 text-sm text-muted"
               >
                 <span
                   class="grid size-6 place-items-center rounded-full bg-success/10 text-success"
@@ -106,7 +106,7 @@ const capabilities = [
             </div>
           </div>
           <template #footer>
-            <div class="flex items-center justify-between text-xs text-slate-500">
+            <div class="flex items-center justify-between text-xs text-muted">
               <span>当前阶段：工程基础搭建</span>
               <span>v0.1</span>
             </div>
@@ -116,13 +116,13 @@ const capabilities = [
     </UContainer>
   </section>
 
-  <section class="border-y border-slate-200 bg-white py-16 sm:py-20">
+  <section class="border-y border-default bg-elevated py-16 sm:py-20">
     <UContainer>
       <div class="mb-10 max-w-2xl">
-        <p class="text-sm font-semibold uppercase tracking-[0.15em] text-indigo-600">
+        <p class="text-sm font-semibold uppercase tracking-[0.15em] text-primary">
           为实际经营打基础
         </p>
-        <h2 class="mt-3 text-3xl font-semibold tracking-tight text-slate-950">
+        <h2 class="mt-3 text-3xl font-semibold tracking-tight text-highlighted">
           从清晰、可靠的商城核心开始。
         </h2>
       </div>
@@ -130,15 +130,15 @@ const capabilities = [
         <article
           v-for="capability in capabilities"
           :key="capability.number"
-          class="rounded-2xl border border-slate-200 bg-slate-50/70 p-6"
+          class="rounded-2xl border border-default bg-muted p-6"
         >
-          <p class="text-sm font-semibold text-indigo-600">
+          <p class="text-sm font-semibold text-primary">
             {{ capability.number }}
           </p>
-          <h3 class="mt-6 text-lg font-semibold text-slate-950">
+          <h3 class="mt-6 text-lg font-semibold text-highlighted">
             {{ capability.title }}
           </h3>
-          <p class="mt-3 text-sm leading-6 text-slate-600">
+          <p class="mt-3 text-sm leading-6 text-muted">
             {{ capability.description }}
           </p>
         </article>

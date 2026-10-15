@@ -1,20 +1,23 @@
 <template>
   <div class="min-h-screen bg-default">
     <header class="border-b border-default bg-elevated">
-      <UContainer class="flex h-16 items-center justify-between gap-4">
+      <UContainer class="flex min-h-16 flex-wrap items-center justify-between gap-2 py-2">
         <NuxtLink
           to="/admin"
           class="flex items-center gap-3 font-semibold text-highlighted"
         >
           <span class="grid size-9 place-items-center rounded-xl bg-primary text-sm font-bold text-inverted">A</span>
-          <span>AiKayun <span class="font-normal text-dimmed">/ 管理后台</span></span>
+          <span>AiKayun <span class="hidden font-normal text-dimmed sm:inline">/ 管理后台</span></span>
         </NuxtLink>
-        <NuxtLink
-          to="/"
-          class="text-sm font-medium text-muted hover:text-highlighted"
-        >
-          返回商城
-        </NuxtLink>
+        <nav class="flex items-center gap-2">
+          <ThemeModeSelect />
+          <NuxtLink
+            to="/"
+            class="text-sm font-medium text-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+          >
+            返回商城
+          </NuxtLink>
+        </nav>
       </UContainer>
     </header>
     <div class="mx-auto grid min-h-[calc(100vh-4rem)] max-w-7xl lg:grid-cols-[220px_1fr]">
