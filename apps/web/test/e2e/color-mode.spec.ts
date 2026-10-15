@@ -84,7 +84,7 @@ test('a first visit follows a light system preference and hydrates without error
   expect(colorModeBootstrap).toBeGreaterThanOrEqual(0)
   expect(colorModeBootstrap).toBeLessThan(headEnd)
   await expect(page.getByRole('heading', { name: /让数字商品/ })).toBeVisible()
-  await expect.poll(() => page.evaluate(key => localStorage.getItem(key), preferenceKey)).toBe('system')
+  await expect(page.getByRole('button', { name: '显示模式' })).toContainText('跟随系统')
   await assertThemeValue(page, 'light')
   expect(errors).toEqual([])
 })
@@ -98,7 +98,7 @@ test('a first visit follows a dark system preference', async ({ page }) => {
   }, preferenceKey)
   await page.goto('/')
   await expect(page.getByRole('heading', { name: /让数字商品/ })).toBeVisible()
-  await expect.poll(() => page.evaluate(key => localStorage.getItem(key), preferenceKey)).toBe('system')
+  await expect(page.getByRole('button', { name: '显示模式' })).toContainText('跟随系统')
   await assertThemeValue(page, 'dark')
 })
 
