@@ -6,6 +6,11 @@ export default defineNuxtConfig({
   },
   devtools: { enabled: false },
   modules: ['@nuxt/ui'],
+  colorMode: {
+    preference: 'light',
+    // Ignore system or dark preferences saved under Color Mode's previous default key.
+    storageKey: 'aikayun-color-mode-r1',
+  },
   css: ['~/assets/css/main.css'],
   runtimeConfig: {
     apiInternalUrl: process.env.NUXT_API_INTERNAL_URL ?? 'http://127.0.0.1:3001',
