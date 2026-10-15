@@ -78,7 +78,7 @@ test('a first visit follows a light system preference and hydrates without error
   expect(response?.status()).toBe(200)
   const serverHtml = await response?.text()
   expect(serverHtml).toContain('data-aikayun-area="storefront"')
-  expect(serverHtml).toContain('--ui-color-primary-600:#2563EB')
+  expect(serverHtml).toMatch(/--ui-color-primary-600:#[\da-f]{6}/i)
   const headEnd = serverHtml?.indexOf('</head>') ?? -1
   const colorModeBootstrap = serverHtml?.indexOf('__NUXT_COLOR_MODE__') ?? -1
   expect(colorModeBootstrap).toBeGreaterThanOrEqual(0)
@@ -212,6 +212,7 @@ test('front and admin routes share the display preference and apply separate roo
   const admin = await readTheme(page)
   expect(admin.preference).toBe('dark')
   expect(admin.value).toBe('dark')
-  expect(admin.primaryShade600.toLowerCase()).toBe(storefront.primaryShade600.toLowerCase())
+  expect(admin.primaryShade600.toLowerCase()).toBe('#2563eb')
+  expect(admin.primaryShade600.toLowerCase()).not.toBe(storefront.primaryShade600.toLowerCase())
   expect(admin.buttonBackground).not.toBe(storefront.buttonBackground)
 })

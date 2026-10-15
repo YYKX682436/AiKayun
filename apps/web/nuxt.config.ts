@@ -25,7 +25,6 @@ export default defineNuxtConfig({
   typescript: { strict: true, typeCheck: true },
   app: {
     head: {
-      titleTemplate: '%s · AiKayun',
       htmlAttrs: { lang: 'zh-CN' },
       meta: [
         { name: 'description', content: '独立部署的数字商品商城系统' },

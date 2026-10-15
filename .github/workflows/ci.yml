@@ -61,6 +61,8 @@ jobs:
         run: pnpm e2e
       - name: Production build
         run: pnpm build
+      - name: Verify production runtime branding
+        run: pnpm --filter @aikayun/web test:e2e:production-brand
       - name: Build and start full Compose stack
         run: docker compose up -d --build
       - name: Check Compose web, API and admin flow

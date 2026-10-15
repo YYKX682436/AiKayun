@@ -7,7 +7,7 @@
 1. 在目标 Linux 主机安装 Docker Engine 与 Compose 插件。
 2. 从受控渠道获取代码和锁文件。
 3. 复制 `.env.example` 为 `.env`，为 PostgreSQL 设置唯一高强度密码。
-4. 在 `.env` 中按需设置 `NUXT_PUBLIC_STORE_NAME`、`NUXT_PUBLIC_STORE_LOGO_URL` 和 `NUXT_PUBLIC_STORE_BRAND_COLOR`。它们通过 Nuxt public runtimeConfig 在容器启动时读取，修改后重建 web 容器即可生效，无需重新构建镜像。
+4. 在 `.env` 中按需设置 `NUXT_PUBLIC_STORE_NAME`、`NUXT_PUBLIC_STORE_LOGO_URL` 和 `NUXT_PUBLIC_STORE_BRAND_COLOR`。它们通过 Nuxt public runtimeConfig 在容器启动时读取。修改后仅需重新创建 web 容器，例如 `docker compose up -d --no-deps --force-recreate web`，无需重新构建镜像。
 5. 配置 DNS，将独立商城域名指向主机；放通 TCP 80 和 443。
 6. 将 `HTTP_BIND_ADDRESS=0.0.0.0` 明确设为公开入口，`SITE_ADDRESS` 设为域名，`PUBLIC_ORIGIN` 设为 `https://域名`，`COOKIE_SECURE=true`，并将 `HTTP_PORT=80`、`HTTPS_PORT=443`。Caddy 负责 TLS 终止；生产管理员会话必须使用 Secure Cookie。
 

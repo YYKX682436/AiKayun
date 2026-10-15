@@ -16,7 +16,7 @@
     "test:api": "pnpm --filter @aikayun/api test",
     "test": "pnpm test:unit && pnpm test:api",
     "e2e": "pnpm --filter @aikayun/web test:e2e",
-    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm e2e && pnpm build",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm e2e && pnpm build && pnpm --filter @aikayun/web test:e2e:production-brand",
     "db:migrate": "pnpm --filter @aikayun/api db:migrate",
     "admin:init": "pnpm --filter @aikayun/api admin:init"
   },

@@ -1,4 +1,4 @@
-import { clampChroma, converter, formatHex, parse, wcagContrast } from 'culori'
+import { clampChroma, converter, formatHex, interpolate, parse, wcagContrast } from 'culori'
 
 export interface StoreBrandConfig {
   storeName: string
@@ -21,6 +21,10 @@ export const defaultStoreBrand: StoreBrandConfig = {
 const hexColor = /^#(?:[\da-f]{3}|[\da-f]{6})$/i
 const toOklch = converter('oklch')
 const shades = [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 950] as const
+const minimumBrandContrast = 4.75
+const tintedBackgroundOpacity = 0.1
+const lightBrandSurfaces = ['#FFFFFF', '#F8FAFC', '#F1F5F9']
+const darkBrandSurfaces = ['#020617', '#0F172A', '#1E293B']
 
 export function resolveStoreBrand(input: StoreBrandInput): StoreBrandConfig {
   const storeName = typeof input.storeName === 'string'
@@ -60,13 +64,13 @@ export function createStorefrontThemeStyle(brandColor: string): string {
   }, 'oklch', 'rgb')).toUpperCase()
 
   let lightModeLightness = seed.l
-  while (lightModeLightness > 0 && wcagContrast(makeHex(lightModeLightness, 1), '#FFFFFF') < 4.5) {
-    lightModeLightness = Math.max(0, lightModeLightness - 0.01)
+  while (lightModeLightness > 0 && !hasBrandContrast(makeHex(lightModeLightness, 1), lightBrandSurfaces, '#FFFFFF')) {
+    lightModeLightness = Math.max(0, lightModeLightness - 0.005)
   }
 
-  let darkModeLightness = Math.min(1, Math.max(seed.l + 0.12, 0.72))
-  while (darkModeLightness < 1 && wcagContrast(makeHex(darkModeLightness, 0.95), '#020617') < 4.5) {
-    darkModeLightness = Math.min(1, darkModeLightness + 0.01)
+  let darkModeLightness = Math.min(0.98, Math.max(seed.l + 0.03, 0.72))
+  while (darkModeLightness < 1 && !hasBrandContrast(makeHex(darkModeLightness, 0.95), darkBrandSurfaces, '#0F172A')) {
+    darkModeLightness = Math.min(1, darkModeLightness + 0.005)
   }
 
   const values: Record<typeof shades[number], string> = {
@@ -84,6 +88,16 @@ export function createStorefrontThemeStyle(brandColor: string): string {
   }
 
   return shades.map(shade => `--ui-color-primary-${shade}:${values[shade]}`).join(';')
+}
+
+function hasBrandContrast(color: string, surfaces: string[], invertedButtonText: string): boolean {
+  if (wcagContrast(color, invertedButtonText) < minimumBrandContrast) return false
+
+  return surfaces.every((surface) => {
+    const tintedSurface = interpolate([surface, color], 'rgb')(tintedBackgroundOpacity)
+    return wcagContrast(color, surface) >= minimumBrandContrast
+      && wcagContrast(color, tintedSurface) >= minimumBrandContrast
+  })
 }
 
 function resolveLogoUrl(value: unknown): string {

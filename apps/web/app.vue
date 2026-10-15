@@ -7,12 +7,16 @@ const route = useRoute()
 const storeBrand = useStoreBrand()
 const isAdminArea = computed(() => route.path.startsWith('/admin'))
 const storeThemeStyle = computed(() => createStorefrontThemeStyle(storeBrand.value.storeBrandColor))
-useHead({
+useHead(() => ({
+  titleTemplate: (titleChunk) => {
+    if (isAdminArea.value) return titleChunk ? `${titleChunk} · AiKayun` : 'AiKayun 管理后台'
+    return titleChunk ? `${titleChunk} · ${storeBrand.value.storeName}` : storeBrand.value.storeName
+  },
   htmlAttrs: {
     'data-aikayun-area': computed(() => isAdminArea.value ? 'admin' : 'storefront'),
     style: computed(() => isAdminArea.value ? undefined : storeThemeStyle.value),
   },
-})
+}))
 </script>
 
 <template>
