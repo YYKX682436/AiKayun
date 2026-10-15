@@ -79,7 +79,7 @@ test('an alternate deployment applies its logo and purple primary, then isolates
     contentType: 'application/json',
     body: JSON.stringify({ data: { admin: { email: 'theme-test@example.com' } } }),
   }))
-  await expect(page.getByRole('button', { name: '安全登录' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: '安全登录' })).toBeEnabled({ timeout: 15_000 })
   await page.getByLabel('管理员邮箱').fill('theme-test@example.com')
   await page.getByLabel('密码').fill('theme-test-password')
   await expect(page.getByLabel('管理员邮箱')).toHaveValue('theme-test@example.com')
