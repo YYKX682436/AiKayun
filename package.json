@@ -1,0 +1,34 @@
+{
+  "name": "aikayun",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.29.3",
+  "engines": {
+    "node": ">=24.15.0 <25"
+  },
+  "scripts": {
+    "dev": "pnpm build:packages && concurrently -n api,web -c blue,green \"pnpm --filter @aikayun/api dev\" \"pnpm --filter @aikayun/web dev\"",
+    "build:packages": "pnpm --filter @aikayun/contracts build && pnpm --filter @aikayun/money build",
+    "build": "pnpm build:packages && pnpm --filter @aikayun/api build && pnpm --filter @aikayun/web build",
+    "typecheck": "pnpm build:packages && pnpm --filter @aikayun/api typecheck && pnpm --filter @aikayun/web typecheck",
+    "lint": "eslint .",
+    "test:unit": "pnpm --filter @aikayun/money test",
+    "test:api": "pnpm --filter @aikayun/api test",
+    "test": "pnpm test:unit && pnpm test:api",
+    "e2e": "pnpm --filter @aikayun/web test:e2e",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm e2e && pnpm build",
+    "db:migrate": "pnpm --filter @aikayun/api db:migrate",
+    "admin:init": "pnpm --filter @aikayun/api admin:init"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.19.2",
+    "concurrently": "9.2.1",
+    "eslint": "10.12.0",
+    "eslint-plugin-vue": "10.11.1",
+    "globals": "16.5.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.71.2",
+    "vue-eslint-parser": "10.4.1"
+  }
+}

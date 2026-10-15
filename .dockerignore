@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+!.env.example
+**/node_modules
+**/.nuxt
+**/.output
+**/dist
+**/coverage
+**/playwright-report
+**/test-results
+**/.DS_Store

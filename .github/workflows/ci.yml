@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+        env:
+          POSTGRES_USER: aikayun
+          POSTGRES_PASSWORD: ci-test-password
+          POSTGRES_DB: aikayun_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aikayun -d aikayun_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql://aikayun:ci-test-password@127.0.0.1:5432/aikayun_test
+      POSTGRES_USER: aikayun
+      POSTGRES_PASSWORD: ci-only-compose-password
+      POSTGRES_DB: aikayun
+      PUBLIC_ORIGIN: http://localhost:8080
+      COOKIE_SECURE: "false"
+      TRUST_PROXY: "true"
+      PG_PORT: "55432"
+      HTTP_PORT: "8080"
+      HTTPS_PORT: "8443"
+      SITE_ADDRESS: :80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Enable pinned pnpm
+        run: corepack enable && corepack prepare pnpm@10.29.3 --activate
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        run: pnpm lint
+      - name: Type check
+        run: pnpm typecheck
+      - name: Unit and PostgreSQL integration tests
+        run: pnpm test
+      - name: Install Chromium
+        run: pnpm --filter @aikayun/web exec playwright install --with-deps chromium
+      - name: Browser E2E against real PostgreSQL
+        run: pnpm e2e
+      - name: Production build
+        run: pnpm build
+      - name: Build and start full Compose stack
+        run: docker compose up -d --build
+      - name: Check Compose web, API and admin flow
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://localhost:8080/api/v1/health/ready >/dev/null; then break; fi
+            sleep 2
+          done
+          curl --fail --silent http://localhost:8080/api/v1/health/ready
+          curl --fail --silent http://localhost:8080/ | grep -q '让数字商品'
+          docker compose exec -T -e ADMIN_INITIAL_EMAIL=browser-test@example.com -e 'ADMIN_INITIAL_PASSWORD=Only-For-E2E-Tests-2026!!' api node dist/admin-init.js
+          PLAYWRIGHT_BASE_URL=http://localhost:8080 PLAYWRIGHT_EXTERNAL_SERVER=true pnpm e2e
+      - name: Verify PostgreSQL data survives Compose rebuild
+        run: |
+          docker compose exec -T db psql -U aikayun -d aikayun -v ON_ERROR_STOP=1 -c "CREATE TABLE compose_persistence_check (marker text PRIMARY KEY); INSERT INTO compose_persistence_check VALUES ('persisted');"
+          docker compose up -d --build --force-recreate
+          for attempt in $(seq 1 60); do
+            if docker compose exec -T db pg_isready -U aikayun -d aikayun >/dev/null; then break; fi
+            sleep 2
+          done
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://localhost:8080/api/v1/health/ready >/dev/null; then break; fi
+            sleep 2
+          done
+          docker compose exec -T db psql -U aikayun -d aikayun -Atc 'SELECT marker FROM compose_persistence_check' | grep -qx persisted
+          curl --fail --silent http://localhost:8080/api/v1/health/ready
+          curl --fail --silent http://localhost:8080/ | grep -q '让数字商品'
+      - name: Remove CI containers and volumes
+        if: always()
+        run: docker compose down -v --remove-orphans

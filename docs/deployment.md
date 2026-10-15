@@ -1,0 +1,37 @@
+# 部署
+
+当前 Compose 是本地和测试环境的完整运行边界。它不连接、不修改 MyShop 生产环境，也不含正式客户安装器、自动更新器或商业授权中心。
+
+## 准备
+
+1. 在目标 Linux 主机安装 Docker Engine 与 Compose 插件。
+2. 从受控渠道获取代码和锁文件。
+3. 复制 `.env.example` 为 `.env`，为 PostgreSQL 设置唯一高强度密码。
+4. 配置 DNS，将独立商城域名指向主机；放通 TCP 80 和 443。
+5. 将 `SITE_ADDRESS` 设为域名，`PUBLIC_ORIGIN` 设为 `https://域名`，`COOKIE_SECURE=true`，并将 `HTTP_PORT=80`、`HTTPS_PORT=443`。
+
+所有真实密钥仅从 `.env` 或部署平台密钥注入，不能提交到仓库。不要将数据库端口暴露到公网；Compose 默认只绑定到 `127.0.0.1`。
+
+## 启动与管理员初始化
+
+```sh
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 migrate api web caddy
+```
+
+`migrate` 服务必须成功完成后，API 才会启动；API readiness 检查同时验证 PostgreSQL 连接。随后通过 API 容器运行一次性管理员初始化：
+
+```sh
+docker compose exec -e ADMIN_INITIAL_EMAIL=owner@example.com -e ADMIN_INITIAL_PASSWORD='注入的唯一强密码' api node dist/admin-init.js
+```
+
+在生产主机上优先用容器平台的 secret 注入功能，避免把密码写入终端历史。确认登录后清除临时环境变量。
+
+## 数据、升级和回滚
+
+PostgreSQL 18 使用命名卷 `postgres_data` 并挂载至 `/var/lib/postgresql`，覆盖 PG18 的实际版本化 PGDATA 路径。更新镜像前先通过 PostgreSQL 工具和存储快照完成备份，并验证恢复流程；单纯重建容器不应删除命名卷。
+
+升级时拉取目标提交，检查迁移说明，然后 `docker compose up -d --build`。数据库迁移按版本前进并由部署前的一次性服务执行。当前未承诺自动 schema 回滚或在线零停机升级；如应用回滚依赖不可逆迁移，应恢复经过验证的备份并部署兼容版本。
+
+`docker compose down` 保留数据。只有明确要销毁本地/测试环境数据时才使用 `docker compose down -v`。不要在生产环境使用该命令。
