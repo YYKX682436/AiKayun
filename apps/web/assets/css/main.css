@@ -1,19 +1,67 @@
 @import "tailwindcss";
 @import "@nuxt/ui";
 
+@theme static {
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+
+  --color-brand-50: #eff6ff;
+  --color-brand-100: #dbeafe;
+  --color-brand-200: #bfdbfe;
+  --color-brand-300: #93c5fd;
+  --color-brand-400: #60a5fa;
+  --color-brand-500: #3b82f6;
+  --color-brand-600: #2563eb;
+  --color-brand-700: #1d4ed8;
+  --color-brand-800: #1e40af;
+  --color-brand-900: #1e3a8a;
+  --color-brand-950: #172554;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
 :root {
   color-scheme: light;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
+  --ui-bg: var(--ui-color-neutral-50);
+  --ui-bg-elevated: #fff;
+  --ui-primary: var(--ui-color-primary-600);
+  --ui-secondary: var(--ui-color-secondary-700);
+  --ui-success: var(--ui-color-success-700);
+  --ui-info: var(--ui-color-info-700);
+  --ui-warning: var(--ui-color-warning-700);
+  --ui-error: var(--ui-color-error-700);
+  --ui-radius: 0.25rem;
+  --ui-container: 80rem;
+  --ui-header-height: 4rem;
+}
+
+.dark {
+  color-scheme: dark;
+  --ui-bg: var(--ui-color-neutral-950);
+  --ui-bg-elevated: var(--ui-color-neutral-900);
+  --ui-primary: var(--ui-color-primary-400);
+  --ui-secondary: var(--ui-color-secondary-300);
+  --ui-success: var(--ui-color-success-300);
+  --ui-info: var(--ui-color-info-300);
+  --ui-warning: var(--ui-color-warning-300);
+  --ui-error: var(--ui-color-error-300);
+}
+
+html {
+  min-width: 320px;
+  background-color: var(--ui-bg);
 }
 
 body {
-  min-width: 320px;
   min-height: 100vh;
+  min-height: 100dvh;
   margin: 0;
-  background: #f7f8fc;
-  color: #151b32;
+  background-color: var(--ui-bg);
+  color: var(--ui-text);
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.6;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
 }
 
 button,
@@ -22,7 +70,28 @@ input {
   -webkit-tap-highlight-color: transparent;
 }
 
+:focus-visible {
+  outline: 2px solid var(--ui-primary);
+  outline-offset: 2px;
+}
+
 ::selection {
-  background: #d8ddff;
-  color: #202b68;
+  background: var(--ui-color-primary-100);
+  color: var(--ui-color-primary-900);
+}
+
+.dark ::selection {
+  background: var(--ui-color-primary-900);
+  color: var(--ui-color-primary-100);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

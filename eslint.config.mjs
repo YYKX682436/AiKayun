@@ -14,6 +14,7 @@ export default [
       '**/coverage/**',
       '**/playwright-report/**',
       '**/test-results/**',
+      '**/.agents/skills/**',
     ],
   },
   js.configs.recommended,

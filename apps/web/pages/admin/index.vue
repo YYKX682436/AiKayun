@@ -26,13 +26,13 @@ async function logout() {
   <div class="mx-auto max-w-4xl">
     <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
       <div>
-        <p class="text-sm font-medium text-indigo-600">
+        <p class="text-sm font-medium text-primary">
           工作区
         </p>
-        <h1 class="mt-2 text-3xl font-semibold tracking-tight text-slate-950">
+        <h1 class="mt-2 text-3xl font-semibold tracking-tight text-highlighted">
           管理概览
         </h1>
-        <p class="mt-2 text-sm text-slate-600">
+        <p class="mt-2 text-sm text-muted">
           商城基础已就绪，可以从这里开始配置。
         </p>
       </div>
@@ -47,21 +47,21 @@ async function logout() {
     </div>
 
     <section class="mt-8 grid gap-4 sm:grid-cols-2">
-      <UCard class="rounded-2xl bg-white">
-        <p class="text-sm text-slate-500">
+      <UCard>
+        <p class="text-sm text-muted">
           当前管理员
         </p>
-        <p class="mt-2 break-all text-lg font-semibold text-slate-950">
+        <p class="mt-2 break-all text-lg font-semibold text-highlighted">
           {{ session?.data.admin.email }}
         </p>
       </UCard>
-      <UCard class="rounded-2xl bg-white">
-        <p class="text-sm text-slate-500">
+      <UCard>
+        <p class="text-sm text-muted">
           服务状态
         </p>
-        <p class="mt-2 inline-flex items-center gap-2 text-lg font-semibold text-slate-950">
+        <p class="mt-2 inline-flex items-center gap-2 text-lg font-semibold text-highlighted">
           <span
-            class="size-2 rounded-full bg-emerald-500"
+            class="size-2 rounded-full bg-success"
             aria-hidden="true"
           />
           已安全登录
@@ -69,18 +69,18 @@ async function logout() {
       </UCard>
     </section>
 
-    <UCard class="mt-6 rounded-2xl bg-white">
-      <h2 class="text-base font-semibold text-slate-950">
+    <UCard class="mt-6">
+      <h2 class="text-base font-semibold text-highlighted">
         首版工程状态
       </h2>
-      <p class="mt-2 text-sm leading-6 text-slate-600">
+      <p class="mt-2 text-sm leading-6 text-muted">
         这套工程已接通共享 API 契约、PostgreSQL 迁移和管理员会话。商品、订单、支付和履约数据模型将在后续阶段按实际业务建立。
       </p>
       <div class="mt-5 flex flex-wrap gap-2">
         <span
           v-for="tag in ['管理员会话', 'PostgreSQL', 'OpenAPI']"
           :key="tag"
-          class="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-medium text-slate-600"
+          class="rounded-full bg-muted px-3 py-1.5 text-xs font-medium text-muted"
         >{{ tag }}</span>
       </div>
     </UCard>

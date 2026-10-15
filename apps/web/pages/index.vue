@@ -15,7 +15,7 @@ const capabilities = [
   <section class="overflow-hidden">
     <UContainer class="grid min-h-[620px] items-center gap-14 py-16 lg:grid-cols-[1.15fr_0.85fr] lg:py-24">
       <div class="max-w-2xl">
-        <div class="mb-7 inline-flex items-center gap-2 rounded-full border border-indigo-100 bg-white px-3 py-1.5 text-sm font-medium text-indigo-700 shadow-sm">
+        <div class="mb-7 inline-flex items-center gap-2 rounded-full border border-primary/20 bg-elevated px-3 py-1.5 text-sm font-medium text-primary shadow-sm">
           <span
             class="size-2 rounded-full bg-emerald-500"
             aria-hidden="true"
@@ -24,7 +24,7 @@ const capabilities = [
         </div>
         <h1 class="text-5xl font-semibold leading-[1.08] tracking-[-0.045em] text-slate-950 sm:text-6xl lg:text-7xl">
           让数字商品，<br>
-          <span class="text-indigo-600">轻松开始销售。</span>
+          <span class="text-primary">轻松开始销售。</span>
         </h1>
         <p class="mt-7 max-w-xl text-lg leading-8 text-slate-600">
           AiKayun 为卡密、软件授权与虚拟商品提供清晰的商城基础。用自己的部署环境经营业务，从可靠的商品展示与交付开始。
@@ -39,7 +39,7 @@ const capabilities = [
           </UButton>
           <a
             href="/api/docs"
-            class="inline-flex h-11 items-center rounded-lg border border-slate-300 bg-white px-5 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
+            class="inline-flex h-11 items-center rounded-lg border border-default bg-elevated px-5 text-sm font-medium text-toned transition-colors hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
           >
             查看 API 文档
           </a>
@@ -52,15 +52,7 @@ const capabilities = [
       </div>
 
       <div class="relative mx-auto w-full max-w-md">
-        <div
-          class="absolute -right-12 -top-12 size-56 rounded-full bg-indigo-200/60 blur-3xl"
-          aria-hidden="true"
-        />
-        <div
-          class="absolute -bottom-14 -left-10 size-48 rounded-full bg-cyan-200/50 blur-3xl"
-          aria-hidden="true"
-        />
-        <UCard class="relative overflow-hidden rounded-3xl border border-white/80 bg-white/90 shadow-[0_28px_80px_-36px_rgba(49,64,145,0.38)] ring-1 ring-slate-200/70">
+        <UCard class="relative overflow-hidden border border-default">
           <template #header>
             <div class="flex items-center justify-between">
               <div>
@@ -71,20 +63,20 @@ const capabilities = [
                   为数字商品业务准备
                 </p>
               </div>
-              <span class="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700">阶段 01</span>
+              <span class="rounded-full bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary">阶段 01</span>
             </div>
           </template>
           <div class="grid grid-cols-2 gap-3">
-            <div class="rounded-2xl bg-indigo-50 p-4">
-              <p class="text-xs font-medium text-indigo-700">
+            <div class="rounded-2xl bg-primary/10 p-4">
+              <p class="text-xs font-medium text-primary">
                 页面渲染
               </p>
               <p class="mt-2 text-xl font-semibold tracking-tight text-slate-950">
                 SSR
               </p>
             </div>
-            <div class="rounded-2xl bg-cyan-50 p-4">
-              <p class="text-xs font-medium text-cyan-800">
+            <div class="rounded-2xl bg-muted p-4">
+              <p class="text-xs font-medium text-toned">
                 应用架构
               </p>
               <p class="mt-2 text-xl font-semibold tracking-tight text-slate-950">
@@ -106,7 +98,7 @@ const capabilities = [
                 class="flex items-center gap-3 text-sm text-slate-600"
               >
                 <span
-                  class="grid size-6 place-items-center rounded-full bg-emerald-50 text-emerald-700"
+                  class="grid size-6 place-items-center rounded-full bg-success/10 text-success"
                   aria-hidden="true"
                 >✓</span>
                 {{ item }}

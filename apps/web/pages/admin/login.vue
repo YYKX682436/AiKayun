@@ -48,7 +48,7 @@ async function submitLogin() {
           to="/"
           class="mb-10 inline-flex items-center gap-3 font-semibold tracking-tight text-slate-950"
         >
-          <span class="grid size-9 place-items-center rounded-xl bg-indigo-600 text-sm font-bold text-white">A</span>
+          <span class="grid size-9 place-items-center rounded-xl bg-primary text-sm font-bold text-inverted">A</span>
           AiKayun
         </NuxtLink>
         <h1 class="text-3xl font-semibold tracking-tight text-slate-950">

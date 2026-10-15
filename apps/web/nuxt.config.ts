@@ -15,9 +15,10 @@ export default defineNuxtConfig({
   app: {
     head: {
       titleTemplate: '%s · AiKayun',
+      htmlAttrs: { lang: 'zh-CN' },
       meta: [
         { name: 'description', content: '独立部署的数字商品商城系统' },
-        { name: 'theme-color', content: '#f7f8fc' },
+        { name: 'theme-color', content: '#f8fafc' },
       ],
     },
   },
