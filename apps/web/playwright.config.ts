@@ -8,7 +8,7 @@ const useExternalServer = process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true'
 export default defineConfig({
   testDir: './test/e2e',
   fullyParallel: true,
-  workers: process.env.CI ? 2 : undefined,
+  workers: process.env.CI ? 1 : undefined,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? 'github' : 'list',
