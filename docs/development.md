@@ -56,4 +56,4 @@ API 集成测试会连接真实 PostgreSQL、清理测试库 schema、重跑迁�
 
 ## Compose 全栈
 
-`docker compose up -d --build` 启动 PostgreSQL、迁移、Fastify、Nuxt SSR 和 Caddy。默认 HTTP 入口是 <http://localhost:8080>，HTTPS 入口预留为 8443；开发默认站点只监听 HTTP。`docker compose down` 保留数据卷，`docker compose down -v` 会删除 PostgreSQL 和 Caddy 数据卷。
+`docker compose up -d --build` 启动 PostgreSQL、迁移、Fastify、Nuxt SSR 和 Caddy。默认 HTTP 入口是 <http://localhost:8080>，HTTPS 入口预留为 8443；宿主机端口只绑定 `127.0.0.1`，开发默认站点只监听 HTTP。`docker compose down` 保留数据卷，`docker compose down -v` 会删除 PostgreSQL 和 Caddy 数据卷。

@@ -55,7 +55,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
   return {
     nodeEnv,
-    host: env.API_HOST ?? '0.0.0.0',
+    host: env.API_HOST ?? '127.0.0.1',
     port: env.API_PORT ? Number(env.API_PORT) : 3001,
     publicOrigin: origin,
     cookieSecure,

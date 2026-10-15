@@ -1,5 +1,9 @@
 export default defineNuxtConfig({
   compatibilityDate: '2026-10-15',
+  nitro: {
+    preset: 'node_server',
+    esbuild: { options: { target: 'node24' } },
+  },
   devtools: { enabled: false },
   modules: ['@nuxt/ui'],
   css: ['~/assets/css/main.css'],

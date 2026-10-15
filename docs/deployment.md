@@ -8,9 +8,9 @@
 2. 从受控渠道获取代码和锁文件。
 3. 复制 `.env.example` 为 `.env`，为 PostgreSQL 设置唯一高强度密码。
 4. 配置 DNS，将独立商城域名指向主机；放通 TCP 80 和 443。
-5. 将 `SITE_ADDRESS` 设为域名，`PUBLIC_ORIGIN` 设为 `https://域名`，`COOKIE_SECURE=true`，并将 `HTTP_PORT=80`、`HTTPS_PORT=443`。
+5. 将 `HTTP_BIND_ADDRESS=0.0.0.0` 明确设为公开入口，`SITE_ADDRESS` 设为域名，`PUBLIC_ORIGIN` 设为 `https://域名`，`COOKIE_SECURE=true`，并将 `HTTP_PORT=80`、`HTTPS_PORT=443`。Caddy 负责 TLS 终止；生产管理员会话必须使用 Secure Cookie。
 
-所有真实密钥仅从 `.env` 或部署平台密钥注入，不能提交到仓库。不要将数据库端口暴露到公网；Compose 默认只绑定到 `127.0.0.1`。
+所有真实密钥仅从 `.env` 或部署平台密钥注入，不能提交到仓库。不要将数据库端口暴露到公网；Compose 默认只绑定到 `127.0.0.1`。正式部署必须显式设置公开绑定地址、HTTPS 域名与 Secure Cookie。
 
 ## 启动与管理员初始化
 
