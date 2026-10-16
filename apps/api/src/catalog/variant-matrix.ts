@@ -22,6 +22,7 @@ interface ExistingVariant {
   combination_key: string
   sale_price: string
   enabled: boolean
+  retired_at: Date | null
   revision: number
   created_at: Date
   updated_at: Date
@@ -74,6 +75,7 @@ interface MatrixPlan {
   values: NormalizedValue[]
   combinations: PlannedVariant[]
   retired: ExistingVariant[]
+  retireNow: ExistingVariant[]
   removed: ExistingVariant[]
   existingOptions: Map<string, ExistingOption[]>
 }
@@ -134,7 +136,7 @@ async function planMatrix(
   const [currentValues, currentVariants, linkRows] = await Promise.all([
     trx.selectFrom('product_option_values').selectAll().where('product_id', '=', productId).execute(),
     trx.selectFrom('product_variants')
-      .select(['id', 'product_id', 'sku_code', 'combination_key', 'sale_price', 'enabled', 'revision', 'created_at', 'updated_at'])
+      .select(['id', 'product_id', 'sku_code', 'combination_key', 'sale_price', 'enabled', 'retired_at', 'revision', 'created_at', 'updated_at'])
       .where('product_id', '=', productId).execute(),
     trx.selectFrom('product_variant_option_values as selected')
       .innerJoin('product_option_groups as option_group', (join) => join
@@ -225,8 +227,8 @@ async function planMatrix(
     ? cartesian(normalizedGroups).map((values) => ({
       values,
       skuId: undefined,
-      salePrice: body.newSkuDefaults.salePrice,
-      enabled: body.newSkuDefaults.enabled,
+      salePrice: undefined,
+      enabled: undefined,
     }))
     : body.combinations.map((combination: MatrixCombinationInput) => {
       const selectedIds = combination.optionValueIds.map((id) => id.toLowerCase())
@@ -277,15 +279,17 @@ async function planMatrix(
     if (requested.skuId) {
       current = existingById.get(requested.skuId)
       if (!current) throw new CatalogError(409, 'SKU_ID_CONFLICT', 'A selected SKU does not belong to this product')
-      if (!current.enabled) throw new CatalogError(409, 'SKU_RETIRED', 'A disabled SKU cannot be reactivated or reused')
+      if (current.retired_at !== null) {
+        throw new CatalogError(409, 'SKU_RETIRED', 'A permanently retired SKU cannot be reactivated or reused')
+      }
       if (usedSkuIds.has(current.id)) throw new CatalogError(400, 'DUPLICATE_SKU_ID', 'A SKU ID may appear only once')
       if (current.combination_key === '' && combinationKey !== '') {
         throw new CatalogError(409, 'LEGACY_SKU_REMAP_PROHIBITED', 'The default SKU cannot be reassigned to a different option combination; retire or remove it and create a new SKU')
       }
     } else {
       current = existingByKey.get(combinationKey)
-      if (current && !current.enabled) {
-        throw new CatalogError(409, 'SKU_RETIRED', 'A disabled SKU combination cannot be reused; remove the retired SKU in a separate valid edit first')
+      if (current && current.retired_at !== null) {
+        throw new CatalogError(409, 'SKU_RETIRED_COMBINATION', 'A permanently retired SKU reserves its option combination')
       }
     }
 
@@ -308,7 +312,9 @@ async function planMatrix(
       }
     }
 
-    if (requested.salePrice === undefined || requested.enabled === undefined) {
+    const newSalePrice = requested.salePrice ?? (body.mode === 'all' ? body.newSkuDefaults.salePrice : undefined)
+    const newEnabled = requested.enabled ?? (body.mode === 'all' ? body.newSkuDefaults.enabled : undefined)
+    if (newSalePrice === undefined || newEnabled === undefined) {
       throw new CatalogError(400, 'NEW_SKU_DEFAULTS_REQUIRED', 'Each new SKU requires an explicit sale price and enabled state')
     }
     return {
@@ -317,8 +323,8 @@ async function planMatrix(
       current: undefined,
       combinationKey,
       options,
-      salePrice: normalizePrice(requested.salePrice),
-      enabled: requested.enabled,
+      salePrice: normalizePrice(newSalePrice),
+      enabled: newEnabled,
       change: 'added',
     }
   })
@@ -327,22 +333,25 @@ async function planMatrix(
   if (new Set(retireIds).size !== retireIds.length) {
     throw new CatalogError(400, 'DUPLICATE_RETIRED_SKU_ID', 'A retired SKU ID may appear only once')
   }
-  const retired = retireIds.map((id) => {
+  const requestedRetirements = retireIds.map((id) => {
     const variant = existingById.get(id)
     if (!variant) throw new CatalogError(409, 'SKU_ID_CONFLICT', 'A retired SKU does not belong to this product')
     if (usedSkuIds.has(id)) throw new CatalogError(400, 'SKU_SELECTED_AND_RETIRED', 'A SKU cannot be selected and retired in the same edit')
     return variant
   })
+  const retireNow = requestedRetirements.filter((variant) => variant.retired_at === null)
+  const retired = currentVariants.filter((variant) => variant.retired_at !== null)
+  const allRetired = [...retired, ...retireNow]
   const desiredIds = new Set(combinations.flatMap((variant) => variant.skuId ? [variant.skuId] : []))
-  const retiredIds = new Set(retired.map((variant) => variant.id))
+  const retiredIds = new Set(allRetired.map((variant) => variant.id))
   const removed = currentVariants.filter((variant) => !desiredIds.has(variant.id) && !retiredIds.has(variant.id))
-  const remainingCount = combinations.length + retired.length
+  const remainingCount = combinations.length + allRetired.length
   if (remainingCount > 1000) {
     throw new CatalogError(400, 'SKU_LIMIT_EXCEEDED', 'A product cannot have more than 1000 retained and requested SKUs')
   }
 
   const desiredKeySet = new Set(combinations.map((variant) => variant.combinationKey))
-  for (const variant of retired) {
+  for (const variant of allRetired) {
     if (desiredKeySet.has(variant.combination_key)) {
       throw new CatalogError(409, 'SKU_RETIRED_COMBINATION', 'A retained historical SKU reserves its option combination')
     }
@@ -363,6 +372,7 @@ async function planMatrix(
     values: normalizedGroups.flatMap((group) => group.values),
     combinations,
     retired,
+    retireNow,
     removed,
     existingOptions,
   }
@@ -386,7 +396,7 @@ function matrixChanges(plan: MatrixPlan): ProductVariantMatrixPreview['changes']
     enabled: variant.enabled,
     options: variant.options,
   }))
-  for (const variant of plan.retired) {
+  for (const variant of plan.retireNow) {
     changes.push({
       change: 'retired',
       skuId: variant.id,
@@ -421,7 +431,7 @@ export async function previewVariantMatrix(
       productId,
       currentRevision: product.revision,
       possibleCombinationCount: plan.possibleCombinationCount,
-      requestedSkuCount: plan.combinations.length + plan.retired.length,
+      requestedSkuCount: plan.combinations.length + plan.retired.length + plan.retireNow.length,
       changes: matrixChanges(plan),
     }
   })
@@ -499,9 +509,9 @@ async function applyMatrixPlan(
     await trx.deleteFrom('product_variants').where('product_id', '=', plan.productId)
       .where('id', 'in', removalIds).execute()
   }
-  const retiringIds = plan.retired.filter((variant) => variant.enabled).map((variant) => variant.id)
+  const retiringIds = plan.retireNow.map((variant) => variant.id)
   if (retiringIds.length > 0) {
-    await trx.updateTable('product_variants').set({ enabled: false })
+    await trx.updateTable('product_variants').set({ enabled: false, retired_at: new Date() })
       .where('product_id', '=', plan.productId).where('id', 'in', retiringIds).execute()
   }
 

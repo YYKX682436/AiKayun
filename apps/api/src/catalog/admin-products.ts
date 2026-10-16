@@ -154,6 +154,7 @@ export async function loadProduct(db: Kysely<Database>, id: string): Promise<Pro
         salePrice: amount.toFixed(2),
         currency: 'CNY' as const,
         enabled: variant.enabled,
+        retiredAt: variant.retired_at?.toISOString() ?? null,
         isDefault: variant.combination_key === '',
         options: optionsByVariant.get(variant.id) ?? [],
         revision: variant.revision,

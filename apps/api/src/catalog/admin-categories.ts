@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
-import { sql, type Kysely } from 'kysely'
+import { sql, type Kysely, type Transaction } from 'kysely'
 import {
   AdminProductCategoriesSchema,
   AdminProductCategorySchema,
@@ -53,6 +53,16 @@ function normalizedCategoryName(name: string): string {
   return normalized
 }
 
+async function lockCategoryTree(trx: Transaction<Database>): Promise<void> {
+  const guard = await sql<{ singleton: boolean }>`
+    UPDATE product_category_tree_guard
+    SET revision = revision + 1
+    WHERE singleton
+    RETURNING singleton
+  `.execute(trx)
+  if (guard.rows.length !== 1) throw new Error('The category tree guard row is missing')
+}
+
 export function registerAdminCategoryRoutes(app: FastifyInstance, db: Kysely<Database>, config: AppConfig): void {
   const authenticate = requireAdmin(db, config)
   const csrfCheck = verifyCsrf(config)
@@ -84,13 +94,16 @@ export function registerAdminCategoryRoutes(app: FastifyInstance, db: Kysely<Dat
   }, async (request, reply) => {
     try {
       const body = request.body as CreateProductCategoryBody
-      const row = await db.insertInto('product_categories').values({
-        id: randomUUID(),
-        parent_id: body.parentId ?? null,
-        name: normalizedCategoryName(body.name),
-        sort_order: body.sortOrder ?? 0,
-        is_visible: body.isVisible ?? true,
-      }).returningAll().executeTakeFirstOrThrow()
+      const row = await db.transaction().execute(async (trx) => {
+        await lockCategoryTree(trx)
+        return trx.insertInto('product_categories').values({
+          id: randomUUID(),
+          parent_id: body.parentId ?? null,
+          name: normalizedCategoryName(body.name),
+          sort_order: body.sortOrder ?? 0,
+          is_visible: body.isVisible ?? true,
+        }).returningAll().executeTakeFirstOrThrow()
+      })
       return reply.code(201).send(success(asCategory(row), request.id))
     } catch (error) {
       return sendCatalogError(reply, error, request.id)
@@ -114,7 +127,7 @@ export function registerAdminCategoryRoutes(app: FastifyInstance, db: Kysely<Dat
       const body = request.body as UpdateProductCategoryBody
       const { id } = request.params as { id: string }
       const row = await db.transaction().execute(async (trx) => {
-        await sql`SELECT pg_advisory_xact_lock(41024, 1)`.execute(trx)
+        await lockCategoryTree(trx)
         const current = await trx.selectFrom('product_categories').select(['id', 'revision'])
           .where('id', '=', id).forUpdate().executeTakeFirst()
         if (!current) throw new CatalogError(404, 'CATEGORY_NOT_FOUND', 'The category does not exist')
@@ -152,7 +165,7 @@ export function registerAdminCategoryRoutes(app: FastifyInstance, db: Kysely<Dat
       const { id } = request.params as { id: string }
       const body = request.body as DeleteProductCategoryBody
       await db.transaction().execute(async (trx) => {
-        await sql`SELECT pg_advisory_xact_lock(41024, 1)`.execute(trx)
+        await lockCategoryTree(trx)
         const current = await trx.selectFrom('product_categories').select(['id', 'revision'])
           .where('id', '=', id).forUpdate().executeTakeFirst()
         if (!current) throw new CatalogError(404, 'CATEGORY_NOT_FOUND', 'The category does not exist')

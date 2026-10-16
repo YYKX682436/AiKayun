@@ -41,6 +41,7 @@ export interface ProductVariantsTable {
   /** PostgreSQL NUMERIC is returned as a string by node-postgres. */
   sale_price: ColumnType<string, string, string>
   enabled: Generated<boolean>
+  retired_at: Generated<Date | null>
   revision: Generated<number>
   created_at: Generated<Date>
   updated_at: Generated<Date>

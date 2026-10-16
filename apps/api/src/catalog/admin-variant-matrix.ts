@@ -75,7 +75,7 @@ export function registerAdminVariantMatrixRoutes(
           return sendCatalogError(reply, new CatalogError(
             409,
             'SKU_HAS_REFERENCES',
-            'A SKU is referenced by catalog history or resources and cannot be removed; retain it as disabled instead',
+            'A SKU is referenced by catalog history or resources and cannot be removed; retain it as permanently retired instead',
           ), request.id)
         }
       }

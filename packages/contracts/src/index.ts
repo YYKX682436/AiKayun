@@ -86,6 +86,7 @@ export const ProductVariantSchema = Type.Object({
   salePrice: ProductSalePriceSchema,
   currency: Type.Literal('CNY'),
   enabled: Type.Boolean(),
+  retiredAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
   isDefault: Type.Boolean(),
   options: Type.Array(Type.Object({
     groupId: Type.String({ format: 'uuid' }),

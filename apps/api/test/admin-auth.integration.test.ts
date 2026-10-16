@@ -584,7 +584,7 @@ describe('Fastify API with PostgreSQL 18', () => {
     `.execute(db)
     expect(result.rows.map((row) => row.table_name)).toEqual([
       'admin_sessions', 'admin_users', 'product_attributes', 'product_categories',
-      'product_category_assignments', 'product_option_groups', 'product_option_values',
+      'product_category_assignments', 'product_category_tree_guard', 'product_option_groups', 'product_option_values',
       'product_variant_option_values', 'product_variants', 'products',
     ])
     const admin = await db.selectFrom('admin_users').select('email').where('email', '=', testEmail).executeTakeFirst()
@@ -685,6 +685,42 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(savedKeys.every((row) => row.combination_key === `v1:${row.id === blueSku.id ? redId : blueId}`)).toBe(true)
   })
 
+  it('allows a temporarily disabled SKU to be re-enabled with the same identity', async () => {
+    const auth = await loginAdmin()
+    const draft = await createTestProduct(auth, '临时停用 SKU')
+    const groupId = randomUUID()
+    const valueId = randomUUID()
+    const options = [optionGroup('期限', groupId, [{ id: valueId, name: '月卡' }])]
+    const created = await saveMatrix(auth, draft.id, {
+      expectedRevision: draft.revision,
+      mode: 'selected',
+      groups: options,
+      combinations: [{ optionValueIds: [valueId], salePrice: '9.90', enabled: true }],
+    })
+    const first = created.json<{ data: { product: ProductDetail } }>().data.product
+    const sku = first.variants[0]!
+
+    const paused = await saveMatrix(auth, draft.id, {
+      expectedRevision: first.revision,
+      mode: 'selected',
+      groups: options,
+      combinations: [{ skuId: sku.id, optionValueIds: [valueId], enabled: false }],
+    })
+    expect(paused.statusCode).toBe(200)
+    const pausedProduct = paused.json<{ data: { product: ProductDetail } }>().data.product
+    expect(pausedProduct.variants[0]).toMatchObject({ id: sku.id, skuCode: sku.skuCode, salePrice: '9.90', enabled: false, retiredAt: null })
+
+    const resumed = await saveMatrix(auth, draft.id, {
+      expectedRevision: pausedProduct.revision,
+      mode: 'selected',
+      groups: options,
+      combinations: [{ skuId: sku.id, optionValueIds: [valueId], enabled: true }],
+    })
+    expect(resumed.statusCode).toBe(200)
+    expect(resumed.json<{ data: { product: ProductDetail } }>().data.product.variants[0])
+      .toMatchObject({ id: sku.id, skuCode: sku.skuCode, salePrice: '9.90', enabled: true, retiredAt: null })
+  })
+
   it('rejects deleting the last SKU and leaves its data and identity unchanged', async () => {
     const created = await app.inject({
       method: 'POST',
@@ -764,6 +800,15 @@ describe('Fastify API with PostgreSQL 18', () => {
     const level2 = await createCategory('子', level1.id)
     const level3 = await createCategory('孙', level2.id)
     const level4 = await createCategory('曾孙', level3.id)
+    const selfParentId = randomUUID()
+    await expect(db.insertInto('product_categories').values({
+      id: selfParentId,
+      parent_id: selfParentId,
+      name: '数据库自引用拒绝',
+      sort_order: 0,
+      is_visible: true,
+    }).execute()).rejects.toMatchObject({ code: '23514', constraint: 'product_categories_no_cycle' })
+    expect(await db.selectFrom('product_categories').select('id').where('id', '=', selfParentId).execute()).toHaveLength(0)
     const tooDeep = await app.inject({
       method: 'POST', url: '/api/v1/admin/categories', headers: productHeaders(auth),
       payload: { name: '第五级', parentId: level4.id },
@@ -808,7 +853,10 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(list.json<{ data: { categories: Array<{ id: string }> } }>().data.categories).toHaveLength(10)
   })
 
-  it('serializes opposite category moves so concurrent edits cannot form a cycle', async () => {
+  it.each([
+    ['read committed', 'read committed', '23514'],
+    ['repeatable read', 'repeatable read', '40001'],
+  ] as const)('protects opposite category moves at %s isolation, including stale snapshots', async (_label, isolation, expectedCode) => {
     const auth = await loginAdmin()
     const create = async (name: string) => {
       const response = await app.inject({
@@ -818,23 +866,56 @@ describe('Fastify API with PostgreSQL 18', () => {
     }
     const left = await create('并发左')
     const right = await create('并发右')
-    const results = await Promise.all([
-      app.inject({
-        method: 'PATCH', url: `/api/v1/admin/categories/${left.id}`, headers: productHeaders(auth),
-        payload: { expectedRevision: left.revision, parentId: right.id },
-      }),
-      app.inject({
-        method: 'PATCH', url: `/api/v1/admin/categories/${right.id}`, headers: productHeaders(auth),
-        payload: { expectedRevision: right.revision, parentId: left.id },
-      }),
-    ])
-    expect(results.map((result) => result.statusCode).sort()).toEqual([200, 400])
-    expect(results.find((result) => result.statusCode === 400)?.json().error.code).toBe('CATEGORY_CYCLE')
+
+    let releaseFirst!: () => void
+    let firstHasMoved!: () => void
+    let secondIsWaiting!: () => void
+    const release = new Promise<void>((resolve) => { releaseFirst = resolve })
+    const moved = new Promise<void>((resolve) => { firstHasMoved = resolve })
+    const waiting = new Promise<void>((resolve) => { secondIsWaiting = resolve })
+    const first = db.transaction().setIsolationLevel(isolation).execute(async (trx) => {
+      await sql`UPDATE product_category_tree_guard SET revision = revision + 1 WHERE singleton`.execute(trx)
+      await trx.updateTable('product_categories').set({ parent_id: right.id }).where('id', '=', left.id).execute()
+      firstHasMoved()
+      await release
+    })
+    await moved
+
+    let secondPid = 0
+    const second = db.transaction().setIsolationLevel(isolation).execute(async (trx) => {
+      // Establish a snapshot before waiting for the first transaction's shared guard row.
+      await trx.selectFrom('product_categories').select('id').execute()
+      const pid = await sql<{ pid: number }>`SELECT pg_backend_pid()::integer AS pid`.execute(trx)
+      secondPid = pid.rows[0]!.pid
+      secondIsWaiting()
+      await sql`UPDATE product_category_tree_guard SET revision = revision + 1 WHERE singleton`.execute(trx)
+      await trx.updateTable('product_categories').set({ parent_id: left.id }).where('id', '=', right.id).execute()
+    })
+    await waiting
+
+    const deadline = Date.now() + 5_000
+    let blocked = false
+    while (Date.now() < deadline) {
+      const activity = await sql<{ wait_event_type: string | null }>`
+        SELECT wait_event_type FROM pg_stat_activity WHERE pid = ${secondPid}
+      `.execute(db)
+      if (activity.rows[0]?.wait_event_type === 'Lock') {
+        blocked = true
+        break
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    expect(blocked).toBe(true)
+    releaseFirst()
+    await first
+    const secondResult = await Promise.allSettled([second])
+    expect(secondResult[0]?.status).toBe('rejected')
+    if (secondResult[0]?.status === 'rejected') expect(secondResult[0].reason).toMatchObject({ code: expectedCode })
     const rows = await db.selectFrom('product_categories').select(['id', 'parent_id'])
       .where('id', 'in', [left.id, right.id]).execute()
     expect(rows.filter((row) => row.parent_id === null)).toHaveLength(1)
     expect(rows.filter((row) => row.parent_id !== null)).toHaveLength(1)
-  })
+  }, 30_000)
 
   it('keeps multi-category relations explicit, ordered per product, and safe to delete', async () => {
     const auth = await loginAdmin()
@@ -1131,6 +1212,94 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(new Set(result.variants.map((variant) => variant.skuCode)).size).toBe(6)
   })
 
+  it('uses automatic matrix defaults only for new SKUs and keeps preview aligned with saved existing SKUs', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '保留自动矩阵现有价格')
+    const groupId = randomUUID()
+    const values = [
+      { id: randomUUID(), name: '月卡' },
+      { id: randomUUID(), name: '季卡' },
+      { id: randomUUID(), name: '年卡' },
+    ]
+    const initial = await saveMatrix(auth, product.id, {
+      expectedRevision: product.revision,
+      mode: 'selected',
+      groups: [optionGroup('期限', groupId, values)],
+      combinations: [
+        { optionValueIds: [values[0]!.id], salePrice: '9.90', enabled: true },
+        { optionValueIds: [values[1]!.id], salePrice: '25.00', enabled: false },
+        { optionValueIds: [values[2]!.id], salePrice: '88.00', enabled: true },
+      ],
+    })
+    expect(initial.statusCode).toBe(200)
+    const populated = initial.json<{ data: { product: ProductDetail } }>().data.product
+    const addedValue = { id: randomUUID(), name: '两年卡' }
+    const groups = [optionGroup('期限', groupId, [...values, addedValue])]
+    const body = {
+      expectedRevision: populated.revision,
+      mode: 'all',
+      groups,
+      newSkuDefaults: { salePrice: '1.00', enabled: false },
+    }
+    const preview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/variant-matrix/preview`,
+      headers: productHeaders(auth), payload: body,
+    })
+    expect(preview.statusCode).toBe(200)
+    const previewData = preview.json<{ data: { requestedSkuCount: number; changes: Array<{
+      change: string; skuId: string | null; skuCode: string | null; salePrice: string | null; enabled: boolean | null;
+      options: Array<{ valueId: string }>
+    }> } }>().data
+    expect(previewData.requestedSkuCount).toBe(4)
+    const retainedPreview = previewData.changes.filter((change) => change.change === 'retained')
+    expect(retainedPreview).toHaveLength(3)
+    const expected = new Map([
+      [values[0]!.id, { salePrice: '9.90', enabled: true }],
+      [values[1]!.id, { salePrice: '25.00', enabled: false }],
+      [values[2]!.id, { salePrice: '88.00', enabled: true }],
+    ])
+    for (const change of retainedPreview) {
+      const valueId = change.options[0]!.valueId
+      expect(change).toMatchObject({ ...expected.get(valueId), skuId: expect.any(String), skuCode: expect.any(String) })
+    }
+    const newPreview = previewData.changes.find((change) => change.change === 'added')
+    expect(newPreview).toMatchObject({ skuId: null, skuCode: null, salePrice: '1.00', enabled: false })
+
+    const saved = await saveMatrix(auth, product.id, body)
+    expect(saved.statusCode).toBe(200)
+    const savedData = saved.json<{ data: { product: ProductDetail; changes: Array<{
+      change: string; skuId: string | null; skuCode: string | null; salePrice: string | null; enabled: boolean | null;
+      options: Array<{ valueId: string }>
+    }> } }>().data
+    expect(savedData.product.variants).toHaveLength(4)
+    for (const variant of populated.variants) {
+      const result = savedData.product.variants.find((candidate) => candidate.id === variant.id)!
+      expect(result).toMatchObject({
+        id: variant.id,
+        skuCode: variant.skuCode,
+        salePrice: variant.salePrice,
+        enabled: variant.enabled,
+        retiredAt: null,
+      })
+      expect(savedData.changes.find((change) => change.skuId === variant.id))
+        .toMatchObject({ change: 'retained', skuCode: variant.skuCode, salePrice: variant.salePrice, enabled: variant.enabled })
+    }
+    expect(savedData.product.variants.find((variant) => variant.options[0]?.valueId === addedValue.id))
+      .toMatchObject({ salePrice: '1.00', enabled: false })
+
+    await expect(sql`TRUNCATE TABLE product_variant_option_values`.execute(db))
+      .rejects.toMatchObject({ code: '23514', constraint: 'product_variant_option_values_truncate_forbidden' })
+    await expect(sql`TRUNCATE TABLE product_option_values CASCADE`.execute(db))
+      .rejects.toMatchObject({ code: '23514', constraint: 'product_variant_option_values_truncate_forbidden' })
+    const associations = await db.selectFrom('product_variant_option_values').selectAll()
+      .where('product_id', '=', product.id).execute()
+    expect(associations).toHaveLength(4)
+    for (const variant of savedData.product.variants) {
+      const stored = await db.selectFrom('product_variants').select('combination_key').where('id', '=', variant.id).executeTakeFirstOrThrow()
+      expect(stored.combination_key).toBe(`v1:${variant.options[0]!.valueId}`)
+    }
+  })
+
   it('rejects oversized, duplicate, cross-product, and incomplete option combinations before saving', async () => {
     const auth = await loginAdmin()
     const product = await createTestProduct(auth, '非法规格检查')
@@ -1229,7 +1398,7 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(await db.selectFrom('product_option_groups').select('id').where('product_id', '=', product.id).execute()).toHaveLength(0)
   })
 
-  it('rolls back a matrix that would leave only disabled SKUs', async () => {
+  it('allows every SKU to be temporarily disabled while retaining the SKU minimum', async () => {
     const auth = await loginAdmin()
     const product = await createTestProduct(auth, '非法批量回滚商品')
     const defaultSku = product.variants[0]!
@@ -1241,15 +1410,16 @@ describe('Fastify API with PostgreSQL 18', () => {
       groups: [optionGroup('期限', groupId, [{ id: valueId, name: '月卡' }])],
       combinations: [{ optionValueIds: [valueId], salePrice: '10.00', enabled: false }],
     })
-    expect(response.statusCode).toBe(409)
-    expect(response.json().error.code).toBe('PRODUCT_VALID_SKU_REQUIRED')
+    expect(response.statusCode).toBe(200)
     const after = await app.inject({
       method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie },
     })
-    const unchanged = after.json<{ data: ProductDetail }>().data
-    expect(unchanged.revision).toBe(product.revision)
-    expect(unchanged.optionGroups).toEqual([])
-    expect(unchanged.variants).toEqual([defaultSku])
+    const saved = after.json<{ data: ProductDetail }>().data
+    expect(saved.revision).toBeGreaterThan(product.revision)
+    expect(saved.optionGroups).toHaveLength(1)
+    expect(saved.variants).toHaveLength(1)
+    expect(saved.variants[0]).toMatchObject({ enabled: false, retiredAt: null, salePrice: '10.00' })
+    expect(saved.variants[0]?.id).not.toBe(defaultSku.id)
   })
 
   it('protects D2 management routes with administrator auth, CSRF, and strict TypeBox payloads', async () => {
@@ -1321,11 +1491,99 @@ describe('Fastify API with PostgreSQL 18', () => {
       const preserved = variants.find((variant) => variant.id === legacySku.id)!
       expect(preserved.skuCode).toBe(legacySku.skuCode)
       expect(preserved.enabled).toBe(false)
+      expect(preserved.retiredAt).toBeTruthy()
       expect(preserved.isDefault).toBe(true)
       expect(variants.some((variant) => variant.id !== legacySku.id && variant.enabled)).toBe(true)
+
+      const reenable = await saveMatrix(auth, product.id, {
+        expectedRevision: retained.json<{ data: { product: ProductDetail } }>().data.product.revision,
+        mode: 'selected',
+        groups: [optionGroup('期限', groupId, [{ id: valueId, name: '年卡' }])],
+        combinations: [{ skuId: legacySku.id, optionValueIds: [valueId], salePrice: '30.00', enabled: true }],
+      })
+      expect(reenable.statusCode).toBe(409)
+      expect(reenable.json().error.code).toBe('SKU_RETIRED')
+      await expect(db.updateTable('product_variants').set({ enabled: true }).where('id', '=', legacySku.id).execute())
+        .rejects.toMatchObject({ code: '23514', constraint: 'product_variant_retired_immutable' })
+      const stillRetired = await db.selectFrom('product_variants').select(['enabled', 'retired_at', 'sku_code', 'combination_key'])
+        .where('id', '=', legacySku.id).executeTakeFirstOrThrow()
+      expect(stillRetired).toMatchObject({ enabled: false, sku_code: legacySku.skuCode, combination_key: '' })
+      expect(stillRetired.retired_at).toBeTruthy()
     } finally {
       await sql`DROP TABLE IF EXISTS d2_sku_history_probe`.execute(db)
     }
+  })
+
+  it('keeps permanently retired option SKUs and their specification references in later matrix edits', async () => {
+    const auth = await loginAdmin()
+    const draft = await createTestProduct(auth, '规格退役历史保留')
+    const groupId = randomUUID()
+    const values = [
+      { id: randomUUID(), name: '月卡' },
+      { id: randomUUID(), name: '季卡' },
+      { id: randomUUID(), name: '年卡' },
+    ]
+    const initial = await saveMatrix(auth, draft.id, {
+      expectedRevision: draft.revision,
+      mode: 'selected',
+      groups: [optionGroup('期限', groupId, values)],
+      combinations: values.map((value, index) => ({
+        optionValueIds: [value.id], salePrice: ['9.90', '25.00', '88.00'][index]!, enabled: true,
+      })),
+    })
+    const populated = initial.json<{ data: { product: ProductDetail } }>().data.product
+    const retiredSku = populated.variants.find((variant) => variant.options[0]?.valueId === values[0]!.id)!
+    const activeSkus = populated.variants.filter((variant) => variant.id !== retiredSku.id)
+    const retire = await saveMatrix(auth, draft.id, {
+      expectedRevision: populated.revision,
+      mode: 'selected',
+      groups: [optionGroup('期限', groupId, values)],
+      combinations: activeSkus.map((variant) => ({
+        skuId: variant.id,
+        optionValueIds: [variant.options[0]!.valueId],
+      })),
+      retireSkuIds: [retiredSku.id],
+    })
+    expect(retire.statusCode).toBe(200)
+    const retiredProduct = retire.json<{ data: { product: ProductDetail } }>().data.product
+    const retainedHistory = retiredProduct.variants.find((variant) => variant.id === retiredSku.id)!
+    expect(retainedHistory).toMatchObject({
+      id: retiredSku.id, skuCode: retiredSku.skuCode, enabled: false, isDefault: false,
+      retiredAt: expect.any(String),
+      options: [{ groupId, valueId: values[0]!.id }],
+    })
+
+    const renamed = await saveMatrix(auth, draft.id, {
+      expectedRevision: retiredProduct.revision,
+      mode: 'selected',
+      groups: [optionGroup('销售期限', groupId, [
+        { ...values[0]!, name: '已停月卡', sortOrder: 2 },
+        { ...values[1]!, name: '季卡 2026', sortOrder: 0 },
+        { ...values[2]!, name: '年卡 2026', sortOrder: 1 },
+      ], 4)],
+      combinations: [{ skuId: activeSkus[0]!.id, optionValueIds: [values[1]!.id] }],
+    })
+    expect(renamed.statusCode).toBe(200)
+    const afterRename = renamed.json<{ data: { product: ProductDetail } }>().data.product
+    const preservedAfterRename = afterRename.variants.find((variant) => variant.id === retiredSku.id)!
+    expect(preservedAfterRename).toMatchObject({
+      id: retiredSku.id, skuCode: retiredSku.skuCode, enabled: false,
+      options: [{ groupId, valueId: values[0]!.id, groupName: '销售期限', valueName: '已停月卡' }],
+    })
+
+    const unsafeRemoval = await saveMatrix(auth, draft.id, {
+      expectedRevision: afterRename.revision,
+      mode: 'selected',
+      groups: [optionGroup('销售期限', groupId, [{ ...values[1]!, name: '季卡 2026' }], 4)],
+      combinations: [{ skuId: activeSkus[0]!.id, optionValueIds: [values[1]!.id] }],
+    })
+    expect(unsafeRemoval.statusCode).toBe(409)
+    expect(unsafeRemoval.json().error.code).toBe('SPECIFICATION_VALUE_IN_USE')
+    await expect(db.deleteFrom('product_variant_option_values').where('product_variant_id', '=', retiredSku.id).execute())
+      .rejects.toMatchObject({ code: '23514', constraint: 'product_variant_retired_options_immutable' })
+    const unchanged = await db.selectFrom('product_variant_option_values').select(['option_group_id', 'option_value_id'])
+      .where('product_variant_id', '=', retiredSku.id).executeTakeFirstOrThrow()
+    expect(unchanged).toEqual({ option_group_id: groupId, option_value_id: values[0]!.id })
   })
 
   it('serializes concurrent matrix saves by product revision', async () => {

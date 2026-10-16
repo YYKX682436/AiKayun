@@ -18,15 +18,15 @@ AiKayun 是可独立部署、可通过商业授权销售的数字商品商城。
 
 ## 数据与迁移
 
-PostgreSQL 18 为唯一业务数据库。Kysely Migrator 以版本化 TypeScript 迁移管理 schema；API 不在进程启动时隐式改表。业务表包括管理员与会话、`products`、`product_variants`、分类、规格和属性关系表，另有 Kysely 自己的迁移元数据。商品、分类、规格组、规格值、商品属性和 SKU 均有独立 UUID 身份；商品名称与分类名称都不作为身份。商品创建时会生成真实默认 SKU，但默认 SKU 不是永久要求；数据库在事务提交时要求每个商品至少有一个 SKU 和一个有效启用 SKU，并阻止在仍有商品时对 SKU 表执行 `TRUNCATE`。
+PostgreSQL 18 为唯一业务数据库。Kysely Migrator 以版本化 TypeScript 迁移管理 schema；API 不在进程启动时隐式改表。业务表包括管理员与会话、`products`、`product_variants`、分类、规格和属性关系表，另有 Kysely 自己的迁移元数据。商品、分类、规格组、规格值、商品属性和 SKU 均有独立 UUID 身份；商品名称与分类名称都不作为身份。商品创建时会生成真实默认 SKU，但默认 SKU 不是永久要求；数据库在事务提交时要求每个商品至少有一个 SKU，允许全部 SKU 暂停或退役。仍有商品时，数据库禁止对 SKU 表执行 `TRUNCATE`。
 
-`product_categories` 使用自关联 `parent_id`，数据库递归触发器验证循环和四级深度；分类树写入在事务级 advisory lock 下串行检查。`product_category_assignments` 以 `(product_id, category_id)` 去重，部分唯一索引限制每商品一个主分类，延迟约束在事务提交时保证“有关联就必须恰有一个主分类”。关联行按商品保存分类内排序；分类和商品外键均避免删除分类时级联删除商品或关联。
+`product_categories` 使用自关联 `parent_id`，数据库递归触发器验证循环和四级深度。分类树写事务先更新共享的 `product_category_tree_guard` 行；共同元组写冲突使 READ COMMITTED 等待后读取最新树状态，并使持有旧快照的 REPEATABLE READ 事务以序列化冲突失败。触发器也为直接数据库写入更新该行；单独的 advisory lock 不承担快照正确性。`product_category_assignments` 以 `(product_id, category_id)` 去重，部分唯一索引限制每商品一个主分类，延迟约束在事务提交时保证“有关联就必须恰有一个主分类”。关联行按商品保存分类内排序；分类和商品外键均避免删除分类时级联删除商品或关联。
 
-`product_option_groups`、`product_option_values` 和 `product_variant_option_values` 是商品私有规格模型。关系表以复合外键保证 SKU、规格组、规格值属于同一商品，主键保证同一 SKU 每组最多选一个值。服务端限制每商品最多 5 组、每组最多 50 个值、每商品最多 1000 个 SKU；延迟数据库检查要求所有启用 SKU 都有完整且有效的当前组合，并且每商品至少有一个有效启用 SKU。`product_attributes` 是轻量关系表，限制每商品最多 30 项；属性只保存名称、值和顺序，不参与 SKU 组合。
+`product_option_groups`、`product_option_values` 和 `product_variant_option_values` 是商品私有规格模型。关系表以复合外键保证 SKU、规格组、规格值属于同一商品，主键保证同一 SKU 每组最多选一个值。服务端限制每商品最多 5 组、每组最多 50 个值、每商品最多 1000 个 SKU；延迟数据库检查要求每个启用 SKU 都有完整且有效的当前组合，但不要求任何 SKU 处于启用状态。`product_variants.retired_at` 区分永久退役与可恢复的临时停用；退役 SKU 的 ID、编码和规格引用不可改写或删除。关联表及其规格父表在有数据时拒绝 `TRUNCATE`，避免绕过行级约束而留下不一致组合。`product_attributes` 是轻量关系表，限制每商品最多 30 项；属性只保存名称、值和顺序，不参与 SKU 组合。
 
 `product_variants.combination_key` 仅为数据库内部身份校验字段，不由 API 接收或返回。无规格 SKU 使用空字符串；有规格时按规格值 UUID 的规范小写文本排序，生成为 `v1:<uuid>.<uuid>`。因此显示名称和排序变化不会改变组合身份。现存 `(product_id, combination_key)` 是 `DEFERRABLE INITIALLY IMMEDIATE` 唯一约束，服务在组合保存事务中显式延迟该约束以支持组合交换；保存使用普通 INSERT/UPDATE/DELETE，不把该约束错误地当作 `ON CONFLICT` 仲裁器。产品修订行的 `FOR UPDATE` 锁与 `expectedRevision` 校验串行化每次商品级编辑；数据库触发器为 SKU/规格/分类/属性关系改动递增商品修订，延迟检查键与实际规格关联一致。
 
-新增 SKU 必须明确提交价格和启用状态，规格自动生成会先计算笛卡尔积上限；服务不会默认生成零元可售 SKU。旧无规格 SKU 不会被映射成新规格：商家可在同一事务中安全移除无引用 SKU，或显式将它列为停用历史 SKU。SKU 被未来业务表外键引用时，`RESTRICT` 会阻止身份删除；已停用 SKU 不能再次作为可售组合选取。测试库重置命令在连接后检查数据库名以 `_test` 结尾，随后才允许清空其 schema。
+新增 SKU 必须明确提交价格和启用状态，规格自动生成会先计算笛卡尔积上限；服务不会默认生成零元可售 SKU。`mode: "all"` 的默认值只用于新组合，已存在组合保留价格、启用状态、SKU ID 和编码；预览与保存共用同一事务计划。旧无规格 SKU 不会被映射成新规格：无历史引用时可在同一事务中安全移除；有历史引用时可明确永久退役并保留其原身份和规格关系。临时停用 SKU 可按原身份重新启用，永久退役 SKU 不能重新销售，且保留的历史组合占用其唯一组合键。测试库重置命令在连接后检查数据库名以 `_test` 结尾，随后才允许清空其 schema。
 
 金额的基础精度约定：`product_variants.sale_price` 保留 `NUMERIC(18,5)`，数据库约束和 API/服务校验共同限定非负、最多两位小数，首版固定 CNY。更广义的单价运算仍可使用最多 13 位整数、5 位小数的 `packages/money` 精确十进制基础；实付、结算等未来已结算金额最多 16 位整数、2 位小数，对应 `NUMERIC(18,2)`。API 金额始终用十进制字符串，数据库金额由 PostgreSQL 驱动以字符串返回；商品售价输出统一格式化为两位小数，不转换为 JavaScript `number`。结算舍入采用四舍五入（half up），规则由 `packages/money` 明确实现和测试。TypeScript `number` 只用于数量等整数，不用于资金运算。
 

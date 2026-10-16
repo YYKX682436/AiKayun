@@ -71,6 +71,7 @@ export function catalogDatabaseFailure(error: unknown): { status: number; code: 
     const known: Record<string, { status: number; code: string; message: string }> = {
       product_categories_no_cycle: { status: 400, code: 'CATEGORY_CYCLE', message: 'A category cannot be moved below itself or one of its descendants' },
       product_categories_max_depth: { status: 400, code: 'CATEGORY_DEPTH_LIMIT', message: 'The category tree cannot exceed four levels' },
+      product_category_tree_guard_required: conflict('CATALOG_CONCURRENT_MODIFICATION', 'The category tree changed concurrently; reload it and retry'),
       product_categories_primary_required: { status: 400, code: 'PRIMARY_CATEGORY_REQUIRED', message: 'Choose one primary category or remove all category assignments' },
       product_catalog_identity_immutable: { status: 400, code: 'CATALOG_IDENTITY_IMMUTABLE', message: 'Catalog records cannot be moved to another product' },
       product_variants_max_count: { status: 400, code: 'SKU_LIMIT_EXCEEDED', message: 'A product cannot have more than 1000 SKUs' },
@@ -79,8 +80,10 @@ export function catalogDatabaseFailure(error: unknown): { status: number; code: 
       product_attributes_max_count: { status: 400, code: 'PRODUCT_ATTRIBUTE_LIMIT_EXCEEDED', message: 'A product cannot have more than 30 attributes' },
       product_variant_combination_key_consistent: conflict('SKU_COMBINATION_INCONSISTENT', 'The SKU option references do not match its saved combination'),
       product_variant_active_combination_required: conflict('INVALID_SKU_MATRIX', 'Every enabled SKU must have one valid value for each active option group'),
-      product_requires_valid_sku: conflict('PRODUCT_VALID_SKU_REQUIRED', 'A product must retain at least one valid enabled SKU'),
       product_requires_sku: conflict('PRODUCT_SKU_REQUIRED', 'A product must retain at least one SKU'),
+      product_variant_retired_immutable: conflict('SKU_PERMANENTLY_RETIRED', 'A permanently retired SKU cannot be reactivated, rewritten, or deleted'),
+      product_variant_retired_options_immutable: conflict('SKU_PERMANENTLY_RETIRED', 'A permanently retired SKU must retain its specification references'),
+      product_variant_option_values_truncate_forbidden: conflict('SKU_OPTION_TRUNCATE_FORBIDDEN', 'Use catalog operations to preserve SKU combinations and product revisions'),
     }
     return known[constraint] ?? { status: 400, code: 'CATALOG_CONSTRAINT_VIOLATION', message: 'The catalog change violates a business rule' }
   }
