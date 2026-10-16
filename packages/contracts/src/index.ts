@@ -46,6 +46,62 @@ export const AdminOverviewSchema = Type.Object({
   administrator: Type.String({ format: 'email' }),
   status: Type.Literal('ready'),
 })
+
+export const ProductTypeSchema = Type.Union([
+  Type.Literal('physical'),
+  Type.Literal('digital'),
+  Type.Literal('service'),
+])
+
+export const ProductStatusSchema = Type.Union([
+  Type.Literal('draft'),
+  Type.Literal('active'),
+  Type.Literal('paused'),
+  Type.Literal('archived'),
+])
+
+export const ProductSalePriceSchema = Type.String({
+  pattern: '^(?:0|[1-9]\\d{0,12})(?:\\.\\d{1,2})?(?![\\s\\S])',
+  description: 'Non-negative CNY amount with at most 13 integer and 2 fractional digits',
+})
+
+export const CreateProductBodySchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 200 }),
+  description: Type.Optional(Type.String({ maxLength: 20_000 })),
+  productType: ProductTypeSchema,
+  defaultSku: Type.Object({
+    salePrice: ProductSalePriceSchema,
+  }, { additionalProperties: false }),
+}, { additionalProperties: false })
+
+export const ProductIdParamsSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+
+export const ProductVariantSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  productId: Type.String({ format: 'uuid' }),
+  skuCode: Type.String({ minLength: 1, maxLength: 64 }),
+  salePrice: ProductSalePriceSchema,
+  currency: Type.Literal('CNY'),
+  enabled: Type.Boolean(),
+  isDefault: Type.Boolean(),
+  revision: Type.Integer({ minimum: 1 }),
+  createdAt: Type.String({ format: 'date-time' }),
+  updatedAt: Type.String({ format: 'date-time' }),
+})
+
+export const ProductDetailSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 200 }),
+  description: Type.String({ maxLength: 20_000 }),
+  productType: ProductTypeSchema,
+  status: ProductStatusSchema,
+  revision: Type.Integer({ minimum: 1 }),
+  createdAt: Type.String({ format: 'date-time' }),
+  updatedAt: Type.String({ format: 'date-time' }),
+  variants: Type.Array(ProductVariantSchema, { minItems: 1 }),
+})
 export const ReadySchema = Type.Object({
   status: Type.Literal('ok'),
   service: Type.Literal('aikayun-api'),
@@ -68,6 +124,13 @@ export type Admin = Static<typeof AdminSchema>
 export type AdminSession = Static<typeof AdminSessionSchema>
 export type AdminLogout = Static<typeof AdminLogoutSchema>
 export type AdminOverview = Static<typeof AdminOverviewSchema>
+export type ProductType = Static<typeof ProductTypeSchema>
+export type ProductStatus = Static<typeof ProductStatusSchema>
+export type ProductSalePrice = Static<typeof ProductSalePriceSchema>
+export type CreateProductBody = Static<typeof CreateProductBodySchema>
+export type ProductIdParams = Static<typeof ProductIdParamsSchema>
+export type ProductVariant = Static<typeof ProductVariantSchema>
+export type ProductDetail = Static<typeof ProductDetailSchema>
 export type Ready = Static<typeof ReadySchema>
 export type UnitAmount = Static<typeof UnitAmountSchema>
 export type SettlementAmount = Static<typeof SettlementAmountSchema>

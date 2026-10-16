@@ -4,7 +4,7 @@
 
 AiKayun 是可独立部署、可通过商业授权销售的数字商品商城。系统采用 TypeScript 模块化单体：一个 Nuxt 前端工程通过同源 BFF 路由调用单一 Fastify API，API 与前端共用 TypeBox 契约。当前目录按可运行的技术边界拆分，不预先创建空业务模块。
 
-首版允许实现商城前台基础、后台基础和管理员安全入口。实体商品、消费者账户、商品/SKU、订单、支付、库存和履约业务均不在当前数据库迁移范围内。后续设计按商品、SKU、订单、支付尝试、库存和履约组织，避免以插件名义引入没有明确边界的万能扩展框架。
+当前已实现商城基础、后台基础、管理员安全入口，以及阶段③-D1 的商品与 SKU 核心数据和最小管理接口。消费者账户、订单、支付、库存和履约业务仍不在数据库范围内。后续按商品规格、库存、生命周期、媒体、管理页面和公开展示逐步扩展，避免以插件名义引入没有明确边界的万能扩展框架。
 
 旧 MyShop 仓库只允许在后续需要时只读核对业务经验；本工程不复制其代码，不继承其数据库、API、配置或部署依赖，也不接入闲鱼系统。
 
@@ -18,9 +18,11 @@ AiKayun 是可独立部署、可通过商业授权销售的数字商品商城。
 
 ## 数据与迁移
 
-PostgreSQL 18 为唯一业务数据库。Kysely Migrator 以版本化 TypeScript 迁移管理 schema；API 不在进程启动时隐式改表。当前仅有 `admin_users` 与 `admin_sessions`，外加 Kysely 自己的迁移元数据。测试库重置命令在连接后检查数据库名以 `_test` 结尾，随后才允许清空其 schema。
+PostgreSQL 18 为唯一业务数据库。Kysely Migrator 以版本化 TypeScript 迁移管理 schema；API 不在进程启动时隐式改表。当前业务表为 `admin_users`、`admin_sessions`、`products` 与 `product_variants`，另有 Kysely 自己的迁移元数据。商品和 SKU 使用独立 UUID 身份；商品名称不唯一。每个商品必须在事务提交时拥有一个内部组合键为空的默认 SKU，`(product_id, combination_key)` 唯一约束同时为 D2 多 SKU 扩展保留空间。SKU 编码全局唯一，商品和 SKU 的更新触发器递增修订版本并更新 `updated_at`。测试库重置命令在连接后检查数据库名以 `_test` 结尾，随后才允许清空其 schema。
 
-金额的基础精度约定：商品单价和成本最多 13 位整数、5 位小数，对应 `NUMERIC(18,5)`；实付、结算等已结算金额最多 16 位整数、2 位小数，对应 `NUMERIC(18,2)`。API 金额始终用字符串。结算舍入采用四舍五入（half up），规则由 `packages/money` 明确实现和测试。TypeScript `number` 只用于数量等整数，不用于资金运算。
+金额的基础精度约定：`product_variants.sale_price` 保留 `NUMERIC(18,5)`，数据库约束和 API/服务校验共同限定非负、最多两位小数，首版固定 CNY。更广义的单价运算仍可使用最多 13 位整数、5 位小数的 `packages/money` 精确十进制基础；实付、结算等未来已结算金额最多 16 位整数、2 位小数，对应 `NUMERIC(18,2)`。API 金额始终用十进制字符串，数据库金额由 PostgreSQL 驱动以字符串返回；商品售价输出统一格式化为两位小数，不转换为 JavaScript `number`。结算舍入采用四舍五入（half up），规则由 `packages/money` 明确实现和测试。TypeScript `number` 只用于数量等整数，不用于资金运算。
+
+阶段③-D1 提供 `POST /api/v1/admin/products` 创建草稿商品及默认 SKU，并提供 `GET /api/v1/admin/products/:id` 按稳定商品 ID 读取商品和 SKU。写请求复用管理员会话、同源 Origin 与 CSRF 校验；共享 TypeBox 契约拒绝未知字段。D1 不提供商品状态流转、规格组、库存、图片、管理页面或公开商品接口。`combination_key` 仅由服务端维护；默认 SKU 使用空字符串，D2 应在验证真实规格组合后为每个组合生成稳定规范键。
 
 ## 管理员认证
 

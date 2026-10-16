@@ -50,7 +50,7 @@ pnpm e2e
 pnpm build
 ```
 
-API 集成测试会连接真实 PostgreSQL、清理测试库 schema、重跑迁移并验证健康检查、管理员登录/退出、会话保护和 OpenAPI。为了避免误删，测试只接受名字以 `_test` 结尾的数据库。Playwright E2E 会重置同一测试库、创建一次性测试管理员，启动 API 和 Nuxt dev server，再在 Chromium 中检查 SSR 页面及管理端认证流程。
+API 集成测试会连接真实 PostgreSQL、清理测试库 schema，先建立仅含管理员表的历史基线，再升级到最新迁移并重复执行迁移。测试覆盖健康检查、管理员登录/退出、会话保护、商品与默认 SKU 事务、数据库约束、精确金额、CSRF、严格请求校验和 OpenAPI。为了避免误删，测试只接受名字以 `_test` 结尾的数据库。Playwright E2E 会重置同一测试库、创建一次性测试管理员，启动 API 和 Nuxt dev server，再在 Chromium 中检查 SSR 页面及管理端认证流程。
 
 `pnpm verify` 会按顺序运行 lint、类型检查、单元/数据库测试、浏览器 E2E 和生产构建。
 

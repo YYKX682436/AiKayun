@@ -20,11 +20,14 @@ import type { AppConfig } from './config.js'
 import type { Database } from './db/types.js'
 import { registerAdminAuthRoutes } from './auth/admin.js'
 import { hashPassword } from './auth/password.js'
+import { registerAdminProductRoutes } from './catalog/admin-products.js'
+import type { ProductIdentityFactory } from './catalog/admin-products.js'
 
 export async function createApp(options: {
   db: Kysely<Database>
   config: AppConfig
   logger?: boolean
+  productIdentityFactory?: ProductIdentityFactory
 }) {
   const { db, config } = options
   const app = Fastify({
@@ -51,6 +54,7 @@ export async function createApp(options: {
         { name: 'health', description: 'Service health checks' },
         { name: 'admin-auth', description: 'Administrator authentication' },
         { name: 'admin', description: 'Protected administrator APIs' },
+        { name: 'catalog', description: 'Product and SKU administration' },
       ],
     },
   })
@@ -112,5 +116,6 @@ export async function createApp(options: {
 
   const dummyPasswordHash = await hashPassword(randomBytes(32).toString('base64url'))
   registerAdminAuthRoutes(app, db, config, dummyPasswordHash)
+  registerAdminProductRoutes(app, db, config, options.productIdentityFactory)
   return app
 }
