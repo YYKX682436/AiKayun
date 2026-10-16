@@ -18,11 +18,11 @@ AiKayun 是可独立部署、可通过商业授权销售的数字商品商城。
 
 ## 数据与迁移
 
-PostgreSQL 18 为唯一业务数据库。Kysely Migrator 以版本化 TypeScript 迁移管理 schema；API 不在进程启动时隐式改表。当前业务表为 `admin_users`、`admin_sessions`、`products` 与 `product_variants`，另有 Kysely 自己的迁移元数据。商品和 SKU 使用独立 UUID 身份；商品名称不唯一。每个商品必须在事务提交时拥有一个内部组合键为空的默认 SKU，`(product_id, combination_key)` 唯一约束同时为 D2 多 SKU 扩展保留空间。SKU 编码全局唯一，商品和 SKU 的更新触发器递增修订版本并更新 `updated_at`。测试库重置命令在连接后检查数据库名以 `_test` 结尾，随后才允许清空其 schema。
+PostgreSQL 18 为唯一业务数据库。Kysely Migrator 以版本化 TypeScript 迁移管理 schema；API 不在进程启动时隐式改表。当前业务表为 `admin_users`、`admin_sessions`、`products` 与 `product_variants`，另有 Kysely 自己的迁移元数据。商品和 SKU 使用独立 UUID 身份；商品名称不唯一。商品创建时会生成真实默认 SKU，但默认 SKU 不是永久要求；数据库在事务提交时要求每个商品至少有一个真实 SKU，并阻止在仍有商品时对 SKU 表执行 `TRUNCATE`。`(product_id, combination_key)` 可延迟唯一，以允许事务内安全交换组合键；删除 SKU 或改变其商品归属/组合键前会更新商品修订行，串行化影响 SKU 关系的变更，避免并发删除绕过最低数量约束。SKU 编码全局唯一，商品和 SKU 的更新触发器递增修订版本并更新 `updated_at`。测试库重置命令在连接后检查数据库名以 `_test` 结尾，随后才允许清空其 schema。
 
 金额的基础精度约定：`product_variants.sale_price` 保留 `NUMERIC(18,5)`，数据库约束和 API/服务校验共同限定非负、最多两位小数，首版固定 CNY。更广义的单价运算仍可使用最多 13 位整数、5 位小数的 `packages/money` 精确十进制基础；实付、结算等未来已结算金额最多 16 位整数、2 位小数，对应 `NUMERIC(18,2)`。API 金额始终用十进制字符串，数据库金额由 PostgreSQL 驱动以字符串返回；商品售价输出统一格式化为两位小数，不转换为 JavaScript `number`。结算舍入采用四舍五入（half up），规则由 `packages/money` 明确实现和测试。TypeScript `number` 只用于数量等整数，不用于资金运算。
 
-阶段③-D1 提供 `POST /api/v1/admin/products` 创建草稿商品及默认 SKU，并提供 `GET /api/v1/admin/products/:id` 按稳定商品 ID 读取商品和 SKU。写请求复用管理员会话、同源 Origin 与 CSRF 校验；共享 TypeBox 契约拒绝未知字段。D1 不提供商品状态流转、规格组、库存、图片、管理页面或公开商品接口。`combination_key` 仅由服务端维护；默认 SKU 使用空字符串，D2 应在验证真实规格组合后为每个组合生成稳定规范键。
+阶段③-D1 提供 `POST /api/v1/admin/products` 创建草稿商品及默认 SKU，并提供 `GET /api/v1/admin/products/:id` 按稳定商品 ID 读取商品和 SKU。写请求复用管理员会话、同源 Origin 与 CSRF 校验；共享 TypeBox 契约拒绝未知字段。D1 不提供商品状态流转、规格组、库存、图片、管理页面或公开商品接口。`combination_key` 仅由服务端维护；无规格时默认 SKU 使用空字符串。D2 会引入真实规格组、规范组合键和组合校验，多规格商品届时可不保留默认 SKU。
 
 ## 管理员认证
 

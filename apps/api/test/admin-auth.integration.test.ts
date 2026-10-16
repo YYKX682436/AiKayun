@@ -23,6 +23,11 @@ let app: FastifyInstance
 let db: Kysely<Database>
 let skuCodeOverride: string | undefined
 let nextTestClient = 20
+const migrationSentinel = {
+  productId: '00000000-0000-4000-8000-000000000101',
+  variantId: '00000000-0000-4000-8000-000000000102',
+  skuCode: 'SKU-MIGRATION-SENTINEL',
+}
 
 const productIdentityFactory: ProductIdentityFactory = {
   ...defaultProductIdentityFactory,
@@ -93,6 +98,27 @@ beforeAll(async () => {
     email: testEmail,
     password_hash: await hashPassword(testPassword),
   }).execute()
+
+  const migratedCatalog = await migrator.migrateTo('202610160001_product_catalog_core')
+  if (migratedCatalog.error) throw migratedCatalog.error
+
+  await db.transaction().execute(async (trx) => {
+    await trx.insertInto('products').values({
+      id: migrationSentinel.productId,
+      name: '迁移前已有商品',
+      description: '必须跨前进迁移保留',
+      product_type: 'digital',
+      status: 'draft',
+    }).execute()
+    await trx.insertInto('product_variants').values({
+      id: migrationSentinel.variantId,
+      product_id: migrationSentinel.productId,
+      sku_code: migrationSentinel.skuCode,
+      combination_key: '',
+      sale_price: '19.90',
+      enabled: true,
+    }).execute()
+  })
 
   const upgradedSchema = await migrator.migrateToLatest()
   if (upgradedSchema.error) throw upgradedSchema.error
@@ -430,8 +456,8 @@ describe('Fastify API with PostgreSQL 18', () => {
       id: randomUUID(), name: '非法修订', description: '', product_type: 'digital', status: 'draft', revision: 0,
     }).execute()).rejects.toMatchObject({ code: '23514', constraint: 'products_revision_check' })
     await expect(db.insertInto('products').values({
-      id: randomUUID(), name: '无默认 SKU', description: '', product_type: 'digital', status: 'draft',
-    }).execute()).rejects.toMatchObject({ code: '23514', constraint: 'product_requires_default_sku' })
+      id: randomUUID(), name: '无 SKU 商品', description: '', product_type: 'digital', status: 'draft',
+    }).execute()).rejects.toMatchObject({ code: '23514', constraint: 'product_requires_sku' })
 
     await expect(db.insertInto('product_variants').values({
       id: randomUUID(), product_id: randomUUID(), sku_code: 'SKU-MISSING-PRODUCT',
@@ -477,6 +503,9 @@ describe('Fastify API with PostgreSQL 18', () => {
     const revised = await db.selectFrom('products').select('revision').where('id', '=', product.id).executeTakeFirstOrThrow()
     expect(revised.revision).toBe(2)
     expect(sku.revision).toBe(1)
+
+    await expect(sql`TRUNCATE TABLE product_variants`.execute(db))
+      .rejects.toMatchObject({ code: '23514', constraint: 'product_requires_sku' })
   })
 
   it('can rerun the forward migration without duplicating tables or changing existing data', async () => {
@@ -496,5 +525,190 @@ describe('Fastify API with PostgreSQL 18', () => {
     ])
     const admin = await db.selectFrom('admin_users').select('email').where('email', '=', testEmail).executeTakeFirst()
     expect(admin?.email).toBe(testEmail)
+    const migratedProduct = await db.selectFrom('products').select(['id', 'name']).where('id', '=', migrationSentinel.productId).executeTakeFirst()
+    expect(migratedProduct).toEqual({ id: migrationSentinel.productId, name: '迁移前已有商品' })
+    const migratedSku = await db.selectFrom('product_variants').select(['id', 'sku_code', 'sale_price'])
+      .where('id', '=', migrationSentinel.variantId).executeTakeFirst()
+    expect(migratedSku).toEqual({
+      id: migrationSentinel.variantId,
+      sku_code: migrationSentinel.skuCode,
+      sale_price: '19.90000',
+    })
   })
+
+  it('requires at least one SKU but permits multi-SKU products without a default SKU', async () => {
+    const auth = await loginAdmin()
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/admin/products',
+      headers: productHeaders(auth),
+      payload: productBody('允许移除默认 SKU'),
+    })
+    expect(created.statusCode).toBe(201)
+    const product = created.json<{ data: ProductDetail }>().data
+    const defaultSku = product.variants[0]!
+
+    const blueSkuId = randomUUID()
+    const redSkuId = randomUUID()
+    await db.insertInto('product_variants').values([
+      {
+        id: blueSkuId,
+        product_id: product.id,
+        sku_code: `SKU-${randomUUID().replaceAll('-', '').toUpperCase()}`,
+        combination_key: 'v1:option-value-blue',
+        sale_price: '0.00',
+      },
+      {
+        id: redSkuId,
+        product_id: product.id,
+        sku_code: `SKU-${randomUUID().replaceAll('-', '').toUpperCase()}`,
+        combination_key: 'v1:option-value-red',
+        sale_price: '19.90',
+      },
+    ]).execute()
+
+    const withCombinations = await app.inject({
+      method: 'GET',
+      url: `/api/v1/admin/products/${product.id}`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(withCombinations.statusCode).toBe(200)
+    expect(withCombinations.json<{ data: ProductDetail }>().data.variants).toHaveLength(3)
+
+    await db.deleteFrom('product_variants').where('id', '=', defaultSku.id).execute()
+    const onlyRealCombinations = await app.inject({
+      method: 'GET',
+      url: `/api/v1/admin/products/${product.id}`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(onlyRealCombinations.statusCode).toBe(200)
+    const remaining = onlyRealCombinations.json<{ data: ProductDetail }>().data.variants
+    expect(remaining.map((variant) => variant.id).sort()).toEqual([blueSkuId, redSkuId].sort())
+    expect(remaining.every((variant) => !variant.isDefault)).toBe(true)
+  })
+
+  it('swaps SKU combinations transactionally without changing SKU identities and rolls back invalid replacements', async () => {
+    const auth = await loginAdmin()
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/admin/products',
+      headers: productHeaders(auth),
+      payload: productBody('规格组合替换'),
+    })
+    const product = created.json<{ data: ProductDetail }>().data
+    const firstSku = product.variants[0]!
+    const secondSkuId = randomUUID()
+    await db.insertInto('product_variants').values({
+      id: secondSkuId,
+      product_id: product.id,
+      sku_code: `SKU-${randomUUID().replaceAll('-', '').toUpperCase()}`,
+      combination_key: 'v1:option-value-blue',
+      sale_price: '1.00',
+    }).execute()
+    const thirdSkuId = randomUUID()
+    await db.insertInto('product_variants').values({
+      id: thirdSkuId,
+      product_id: product.id,
+      sku_code: `SKU-${randomUUID().replaceAll('-', '').toUpperCase()}`,
+      combination_key: 'v1:option-value-red',
+      sale_price: '2.00',
+    }).execute()
+
+    const before = await db.selectFrom('product_variants')
+      .select(['id', 'sku_code', 'combination_key', 'sale_price', 'revision'])
+      .where('product_id', '=', product.id)
+      .orderBy('id')
+      .execute()
+    await expect(db.transaction().execute(async (trx) => {
+      await sql`SET CONSTRAINTS product_variants_product_combination_unique DEFERRED`.execute(trx)
+      await trx.updateTable('product_variants').set({ combination_key: 'v1:option-value-blue' })
+        .where('id', '=', firstSku.id).execute()
+    })).rejects.toMatchObject({ code: '23505', constraint: 'product_variants_product_combination_unique' })
+    expect(await db.selectFrom('product_variants')
+      .select(['id', 'sku_code', 'combination_key', 'sale_price', 'revision'])
+      .where('product_id', '=', product.id)
+      .orderBy('id')
+      .execute()).toEqual(before)
+
+    await db.transaction().execute(async (trx) => {
+      await sql`SET CONSTRAINTS product_variants_product_combination_unique DEFERRED`.execute(trx)
+      await trx.updateTable('product_variants').set({ combination_key: 'v1:option-value-red' })
+        .where('id', '=', secondSkuId).execute()
+      await trx.updateTable('product_variants').set({ combination_key: 'v1:option-value-blue' })
+        .where('id', '=', thirdSkuId).execute()
+    })
+
+    const after = await db.selectFrom('product_variants')
+      .select(['id', 'sku_code', 'combination_key'])
+      .where('product_id', '=', product.id)
+      .execute()
+    expect(after).toHaveLength(3)
+    expect(after.find((variant) => variant.id === firstSku.id)?.sku_code).toBe(firstSku.skuCode)
+    expect(after.find((variant) => variant.id === secondSkuId)?.combination_key).toBe('v1:option-value-red')
+    expect(after.find((variant) => variant.id === thirdSkuId)?.combination_key).toBe('v1:option-value-blue')
+  })
+
+  it('rejects deleting the last SKU and leaves its data and identity unchanged', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/admin/products',
+      headers: productHeaders(await loginAdmin()),
+      payload: productBody('不能没有 SKU'),
+    })
+    const sku = created.json<{ data: ProductDetail }>().data.variants[0]!
+    const before = await db.selectFrom('product_variants').selectAll().where('id', '=', sku.id).executeTakeFirstOrThrow()
+
+    await expect(db.deleteFrom('product_variants').where('id', '=', sku.id).execute())
+      .rejects.toMatchObject({ code: '23514', constraint: 'product_requires_sku' })
+
+    expect(await db.selectFrom('product_variants').selectAll().where('id', '=', sku.id).executeTakeFirst())
+      .toEqual(before)
+  })
+
+  it.each([
+    ['read committed', 'read committed', '23514'],
+    ['repeatable read', 'repeatable read', '40001'],
+  ] as const)('serializes concurrent SKU deletions at %s isolation', async (_label, isolation, expectedCode) => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/admin/products',
+      headers: productHeaders(await loginAdmin()),
+      payload: productBody(`并发删除 ${isolation}`),
+    })
+    const product = created.json<{ data: ProductDetail }>().data
+    const defaultSkuId = product.variants[0]!.id
+    const secondSkuId = randomUUID()
+    await db.insertInto('product_variants').values({
+      id: secondSkuId,
+      product_id: product.id,
+      sku_code: `SKU-${randomUUID().replaceAll('-', '').toUpperCase()}`,
+      combination_key: 'v1:concurrent-option',
+      sale_price: '0.00',
+    }).execute()
+
+    let releaseBarrier!: () => void
+    const bothTransactionsReady = new Promise<void>((resolve) => { releaseBarrier = resolve })
+    let arrivals = 0
+    const waitForBothTransactions = async () => {
+      arrivals += 1
+      if (arrivals === 2) releaseBarrier()
+      await bothTransactionsReady
+    }
+    const deleteInTransaction = (skuId: string) => db.transaction().setIsolationLevel(isolation).execute(async (trx) => {
+      await trx.selectFrom('products').select('id').where('id', '=', product.id).executeTakeFirstOrThrow()
+      await waitForBothTransactions()
+      await trx.deleteFrom('product_variants').where('id', '=', skuId).execute()
+    })
+    const results = await Promise.allSettled([
+      deleteInTransaction(defaultSkuId),
+      deleteInTransaction(secondSkuId),
+    ])
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    const rejected = results.find((result) => result.status === 'rejected')
+    expect(rejected?.status).toBe('rejected')
+    if (rejected?.status === 'rejected') expect(rejected.reason).toMatchObject({ code: expectedCode })
+    expect(await db.selectFrom('product_variants').select('id').where('product_id', '=', product.id).execute())
+      .toHaveLength(1)
+  }, 30_000)
 })

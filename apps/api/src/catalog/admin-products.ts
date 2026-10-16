@@ -155,8 +155,8 @@ export function productDatabaseFailure(error: unknown): { status: number; code: 
     if (databaseError.constraint === 'product_variants_sale_price_check') {
       return { status: 400, code: 'INVALID_SALE_PRICE', message: 'Sale price must be non-negative with at most two fractional digits' }
     }
-    if (databaseError.constraint === 'product_requires_default_sku') {
-      return { status: 400, code: 'DEFAULT_SKU_REQUIRED', message: 'Every product must have a default SKU' }
+    if (databaseError.constraint === 'product_requires_sku') {
+      return { status: 400, code: 'PRODUCT_SKU_REQUIRED', message: 'Every product must have at least one SKU' }
     }
   }
   if (databaseError.code === '22003') {
