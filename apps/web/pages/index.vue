@@ -19,7 +19,7 @@ useSeoMeta({ title: '店铺首页' })
 
         <h1
           id="store-title"
-          class="mt-6 max-w-4xl break-words text-4xl font-semibold leading-tight text-highlighted sm:text-5xl lg:text-6xl"
+          class="mt-6 max-w-4xl break-words text-[2rem] font-semibold leading-tight text-highlighted sm:text-5xl lg:text-6xl"
         >
           <span class="text-primary">{{ storeBrand.storeName }}</span>
         </h1>

@@ -39,14 +39,17 @@ async function readTheme(page: Page) {
       primaryShade400: getComputedStyle(root).getPropertyValue('--ui-color-primary-400').trim(),
       brandTextColor: heading ? getComputedStyle(heading).color : null,
       modeControlHeight: document.querySelector<HTMLElement>('[aria-label="显示模式"]')?.getBoundingClientRect().height ?? 0,
+      clientWidth: root.clientWidth,
       width: window.innerWidth,
       documentWidth: root.scrollWidth,
+      themeColor: document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.content,
     }
   }, preferenceKey)
 }
 
 async function assertThemeValue(page: Page, expected: 'light' | 'dark') {
   await expect.poll(async () => (await readTheme(page)).value).toBe(expected)
+  await expect.poll(async () => (await readTheme(page)).themeColor).toBe(expected === 'dark' ? '#020617' : '#f8fafc')
   const theme = await readTheme(page)
   expect(theme.colorScheme).toBe(expected)
   const backgroundLuminance = wcagLuminance(theme.backgroundColor)
@@ -179,12 +182,19 @@ test('the mode picker is keyboard reachable and remains usable at target widths'
     const expectedMode = mode === '浅色' ? 'light' : 'dark'
     await assertThemeValue(page, expectedMode)
 
-    for (const width of [320, 390, 768, 1440]) {
+    for (const width of [320, 390, 768, 1024, 1137, 1280, 1440]) {
       await page.setViewportSize({ width, height: 900 })
       const theme = await readTheme(page)
       expect(theme.width).toBe(width)
-      expect(theme.documentWidth).toBeLessThanOrEqual(width)
+      expect(theme.documentWidth).toBeLessThanOrEqual(theme.clientWidth)
       expect(theme.modeControlHeight).toBeGreaterThanOrEqual(44)
+      if (width === 320) {
+        const headingLines = await page.locator('#store-title').evaluate((element) => {
+          const styles = getComputedStyle(element)
+          return Math.round(element.getBoundingClientRect().height / Number.parseFloat(styles.lineHeight))
+        })
+        expect(headingLines).toBe(1)
+      }
       await page.screenshot({
         path: testInfo.outputPath(`${expectedMode}-${width}.png`),
         fullPage: true,
@@ -208,4 +218,65 @@ test('front and admin routes share the display preference and apply separate roo
   expect(admin.primaryShade600.toLowerCase()).toBe('#2563eb')
   expect(admin.primaryShade600.toLowerCase()).not.toBe(storefront.primaryShade600.toLowerCase())
   expect(admin.area).toBe('admin')
+})
+
+test('semantic status text keeps WCAG AA contrast in both themes', async ({ page }) => {
+  await page.goto('/dev-preview')
+
+  for (const mode of ['light', 'dark'] as const) {
+    await selectPreference(page, mode === 'light' ? '浅色' : '深色')
+    const samples = await page.evaluate(() => {
+      const canvas = document.createElement('canvas')
+      canvas.width = 1
+      canvas.height = 1
+      const context = canvas.getContext('2d')!
+      const bodyColor = getComputedStyle(document.body).backgroundColor
+
+      function renderedBackground(element: HTMLElement): string {
+        context.clearRect(0, 0, 1, 1)
+        context.fillStyle = bodyColor
+        context.fillRect(0, 0, 1, 1)
+        const ancestors: HTMLElement[] = []
+        for (let current: HTMLElement | null = element; current && current !== document.body; current = current.parentElement) {
+          ancestors.push(current)
+        }
+        for (const ancestor of ancestors.reverse()) {
+          const background = getComputedStyle(ancestor).backgroundColor
+          if (background !== 'transparent' && background !== 'rgba(0, 0, 0, 0)') {
+            context.fillStyle = background
+            context.fillRect(0, 0, 1, 1)
+          }
+        }
+        const [red, green, blue] = context.getImageData(0, 0, 1, 1).data
+        return `rgb(${red} ${green} ${blue})`
+      }
+
+      return [...document.querySelectorAll<HTMLElement>(
+        '#preview-main .text-success, #preview-main .text-warning, #preview-main .text-error, #preview-main .text-info',
+      )].map(element => ({
+        label: element.textContent?.trim() ?? '',
+        foreground: getComputedStyle(element).color,
+        background: renderedBackground(element),
+      }))
+    })
+
+    expect(samples.length).toBeGreaterThanOrEqual(4)
+    for (const sample of samples) {
+      expect(wcagContrast(sample.foreground, sample.background), `${mode} ${sample.label}`).toBeGreaterThanOrEqual(4.5)
+    }
+  }
+})
+
+test('reduced-motion preference shortens decorative transitions', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.goto('/')
+
+  const durations = await page.getByRole('button', { name: '显示模式' }).evaluate((element) => {
+    return getComputedStyle(element).transitionDuration.split(',').map((duration) => {
+      const value = Number.parseFloat(duration)
+      return duration.trim().endsWith('ms') ? value : value * 1000
+    })
+  })
+  expect(await page.evaluate(() => matchMedia('(prefers-reduced-motion: reduce)').matches)).toBe(true)
+  expect(Math.max(...durations)).toBeLessThanOrEqual(0.1)
 })

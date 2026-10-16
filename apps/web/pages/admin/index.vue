@@ -31,7 +31,10 @@ async function logout() {
 <template>
   <UDashboardPanel id="admin-overview">
     <template #header>
-      <UDashboardNavbar title="管理后台">
+      <UDashboardNavbar
+        title="管理后台"
+        :toggle="{ size: 'md', class: 'min-h-11 min-w-11' }"
+      >
         <template #right>
           <ThemeModeSelect />
         </template>

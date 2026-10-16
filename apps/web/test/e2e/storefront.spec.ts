@@ -4,18 +4,21 @@ import { wcagContrast } from 'culori'
 const viewportWidths = [320, 390, 768, 1024, 1137, 1280, 1440]
 
 async function assertAdminVisuals(page: import('@playwright/test').Page, area: string, mode: 'light' | 'dark') {
+  await expect.poll(() => page.locator('meta[name="theme-color"]').getAttribute('content')).toBe(mode === 'dark' ? '#020617' : '#f8fafc')
   const measurements = await page.evaluate(() => ({
     width: window.innerWidth,
+    clientWidth: document.documentElement.clientWidth,
     documentWidth: document.documentElement.scrollWidth,
     bodyBackground: getComputedStyle(document.body).backgroundColor,
     bodyText: getComputedStyle(document.body).color,
     area: document.documentElement.dataset.aikayunArea,
     mode: document.documentElement.classList.contains('dark') ? 'dark' : 'light',
+    themeColor: document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.content,
   }))
 
   expect(measurements.area).toBe(area)
   expect(measurements.mode).toBe(mode)
-  expect(measurements.documentWidth).toBeLessThanOrEqual(measurements.width)
+  expect(measurements.documentWidth).toBeLessThanOrEqual(measurements.clientWidth)
   expect(wcagContrast(measurements.bodyText, measurements.bodyBackground)).toBeGreaterThanOrEqual(4.5)
 
   if (await page.getByRole('button', { name: '安全登录' }).count()) {
@@ -191,6 +194,13 @@ test('mobile admin navigation supports keyboard focus and closes after route cha
 
   const menuToggle = page.locator('[data-slot="toggle"]')
   await expect(menuToggle).toBeVisible()
+  await expect(menuToggle.locator('[data-slot="leadingIcon"]')).toBeVisible()
+  const toggleSize = await menuToggle.evaluate(element => ({
+    width: element.getBoundingClientRect().width,
+    height: element.getBoundingClientRect().height,
+  }))
+  expect(toggleSize.width).toBeGreaterThanOrEqual(44)
+  expect(toggleSize.height).toBeGreaterThanOrEqual(44)
   await menuToggle.focus()
   await page.keyboard.press('Enter')
 
@@ -214,7 +224,21 @@ test('mobile admin navigation supports keyboard focus and closes after route cha
 
   for (const width of viewportWidths) {
     await page.setViewportSize({ width, height: 844 })
-    const documentWidth = await page.evaluate(() => document.documentElement.scrollWidth)
-    expect(documentWidth).toBeLessThanOrEqual(width)
+    const { documentWidth, clientWidth } = await page.evaluate(() => ({
+      documentWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+    }))
+    expect(documentWidth).toBeLessThanOrEqual(clientWidth)
   }
+})
+
+test('development design preview composes existing components without business actions', async ({ page }) => {
+  await page.goto('/dev-preview')
+  await expect(page).toHaveTitle('设计系统预览 · AiKayun 数字商城')
+  await expect(page.getByRole('heading', { name: '品牌与语义颜色' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '按钮与输入框' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '空状态样例' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '提交中' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: '不可用' })).toBeDisabled()
+  await expect(page.getByRole('link', { name: /购买|加入购物车/ })).toHaveCount(0)
 })

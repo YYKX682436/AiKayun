@@ -1,8 +1,14 @@
 <script setup lang="ts">
-defineProps<{
+const props = defineProps<{
   name: string
   logoUrl?: string
 }>()
+
+const logoFailed = ref(false)
+
+watch(() => props.logoUrl, () => {
+  logoFailed.value = false
+})
 </script>
 
 <template>
@@ -11,10 +17,11 @@ defineProps<{
     aria-hidden="true"
   >
     <img
-      v-if="logoUrl"
+      v-if="logoUrl && !logoFailed"
       :src="logoUrl"
       alt=""
       class="size-full object-contain"
+      @error="logoFailed = true"
     >
     <span v-else>{{ name.slice(0, 1) }}</span>
   </span>

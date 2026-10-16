@@ -5,8 +5,10 @@ import { createStorefrontThemeStyle } from '~/utils/store-brand'
 
 const route = useRoute()
 const storeBrand = useStoreBrand()
+const colorMode = useColorMode()
 const isAdminArea = computed(() => route.path.startsWith('/admin'))
 const storeThemeStyle = computed(() => createStorefrontThemeStyle(storeBrand.value.storeBrandColor))
+const browserThemeColor = computed(() => colorMode.value === 'dark' ? '#020617' : '#f8fafc')
 useHead(() => ({
   titleTemplate: (titleChunk) => {
     if (isAdminArea.value) return titleChunk ? `${titleChunk} · AiKayun` : 'AiKayun 管理后台'
@@ -16,6 +18,7 @@ useHead(() => ({
     'data-aikayun-area': computed(() => isAdminArea.value ? 'admin' : 'storefront'),
     style: computed(() => isAdminArea.value ? undefined : storeThemeStyle.value),
   },
+  meta: [{ name: 'theme-color', content: browserThemeColor }],
 }))
 </script>
 

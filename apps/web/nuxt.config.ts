@@ -8,6 +8,9 @@ export default defineNuxtConfig({
   },
   devtools: { enabled: false },
   modules: ['@nuxt/ui'],
+  icon: {
+    serverBundle: { collections: ['lucide'] },
+  },
   colorMode: {
     preference: 'system',
     storageKey: 'aikayun-color-mode',
@@ -23,12 +26,18 @@ export default defineNuxtConfig({
     },
   },
   typescript: { strict: true, typeCheck: true },
+  hooks: {
+    'pages:extend'(pages) {
+      if (process.env.NODE_ENV === 'development') return
+      const previewIndex = pages.findIndex(page => page.path === '/dev-preview')
+      if (previewIndex !== -1) pages.splice(previewIndex, 1)
+    },
+  },
   app: {
     head: {
       htmlAttrs: { lang: 'zh-CN' },
       meta: [
         { name: 'description', content: '独立部署的数字商品商城系统' },
-        { name: 'theme-color', content: '#f8fafc' },
       ],
     },
   },

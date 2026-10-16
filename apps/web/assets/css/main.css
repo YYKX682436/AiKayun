@@ -27,10 +27,10 @@
   --ui-bg-elevated: #fff;
   --ui-primary: var(--ui-color-primary-600);
   --ui-secondary: var(--ui-color-secondary-700);
-  --ui-success: var(--ui-color-success-700);
-  --ui-info: var(--ui-color-info-700);
-  --ui-warning: var(--ui-color-warning-700);
-  --ui-error: var(--ui-color-error-700);
+  --ui-success: var(--ui-color-success-800);
+  --ui-info: var(--ui-color-info-800);
+  --ui-warning: var(--ui-color-warning-800);
+  --ui-error: var(--ui-color-error-800);
   --ui-radius: 0.25rem;
   --ui-container: 80rem;
   --ui-header-height: 4rem;
@@ -49,7 +49,6 @@
 }
 
 html {
-  min-width: 320px;
   background-color: var(--ui-bg);
 }
 

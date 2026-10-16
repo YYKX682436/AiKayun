@@ -3,8 +3,13 @@ import { wcagContrast } from 'culori'
 
 test('an alternate deployment applies its logo and purple primary, then isolates the admin theme', async ({ page }, testInfo) => {
   const browserErrors: string[] = []
+  let expectedBrokenLogoResourceError = false
   page.on('pageerror', error => browserErrors.push(error.message))
   page.on('console', message => {
+    if (expectedBrokenLogoResourceError && message.text() === 'Failed to load resource: net::ERR_FAILED') {
+      expectedBrokenLogoResourceError = false
+      return
+    }
     if (message.type() === 'error' || /hydration/i.test(message.text())) browserErrors.push(message.text())
   })
 
@@ -51,6 +56,14 @@ test('an alternate deployment applies its logo and purple primary, then isolates
   expect(wcagContrast(storefrontContrast.foreground, storefrontContrast.background)).toBeGreaterThanOrEqual(4.5)
   await expect(page.locator('html')).toHaveClass(/dark/)
   await page.screenshot({ path: testInfo.outputPath('brand-purple-dark.png'), fullPage: true, animations: 'disabled' })
+
+  await page.route('**/broken-configured-logo.svg', route => route.abort())
+  expectedBrokenLogoResourceError = true
+  await page.locator('header img').evaluate((image: HTMLImageElement) => {
+    image.src = '/broken-configured-logo.svg'
+  })
+  await expect(page.locator('header img')).toHaveCount(0)
+  await expect(page.locator('header a').first().locator('[aria-hidden="true"]')).toHaveText('青')
 
   await page.goto('/admin/login')
   await expect(page.locator('html')).toHaveAttribute('data-aikayun-area', 'admin')

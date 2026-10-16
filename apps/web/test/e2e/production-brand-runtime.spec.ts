@@ -1,6 +1,10 @@
 import { expect, test } from '@playwright/test'
 
 test('a prebuilt production server reads tenant branding from runtime environment variables', async ({ page }) => {
+  const previewResponse = await page.request.get('/dev-preview')
+  expect(previewResponse.status()).toBe(404)
+  expect(await previewResponse.text()).not.toContain('品牌与语义颜色')
+
   const browserErrors: string[] = []
   page.on('pageerror', error => browserErrors.push(error.message))
   page.on('console', message => {

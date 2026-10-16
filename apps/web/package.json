@@ -20,6 +20,7 @@
     "vue": "3.5.44"
   },
   "devDependencies": {
+    "@iconify-json/lucide": "1.2.145",
     "@playwright/test": "1.64.1",
     "@types/culori": "4.0.1",
     "vue-tsc": "3.3.13"

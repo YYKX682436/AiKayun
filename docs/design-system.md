@@ -97,6 +97,7 @@ Nuxt UI 语义色映射在 `app.config.ts`：`primary → brand`、`secondary �
 - 店铺品牌配置位于 `runtimeConfig.public`：`storeName`、`storeLogoUrl`、`storeBrandColor`。独立部署通过 `NUXT_PUBLIC_STORE_NAME`、`NUXT_PUBLIC_STORE_LOGO_URL`、`NUXT_PUBLIC_STORE_BRAND_COLOR` 设置，无需修改源码或重新构建应用镜像。
 - Logo 仅接受站内根路径或 HTTPS URL；无 Logo 时统一显示店铺名称首字。品牌色仅接受 `#RGB` 或 `#RRGGBB`；非法颜色回退为 AiKayun 默认蓝 `#2563EB`。Culori 将主色转换为 OKLCH 并裁切到 sRGB，在统一色阶生成逻辑中检查实际浅色和深色页面表面、`primary/10` 半透明底色、主按钮反白文字，以及聚焦轮廓。色阶以高于 WCAG AA 的余量生成；浏览器测试对普通品牌文字和按钮验证至少 4.5:1，对焦点轮廓验证至少 3:1。成功、信息、警告、错误色保持独立。
 - 商城前台的浏览器标题由 `app.vue` 的响应式 `titleTemplate` 使用当前 `storeName`；管理后台和登录页使用固定 AiKayun 产品名称。SSR 按当前请求路由和 `runtimeConfig.public` 输出首屏标题，客户端路由时同步更新。
+- 浏览器 `theme-color` 由 `app.vue` 通过 Nuxt `useHead` 与 `useColorMode().value` 同步：浅色用 `#F8FAFC`，深色用 `#020617`；SSR 模式尚未解析时先输出浅色默认值，客户端解析后随实际显示模式更新，不另存模式状态。
 - 商城前台将生成的 `--ui-color-primary-*` 变量放在 `<html>` 根节点，页面导航切换时由 SSR/应用路由设置 `data-aikayun-area` 并更新根变量。管理后台及登录页不写入客户主色，沿用 AiKayun 蓝和中性色。
 - 根节点作用域使 UApp 中 Teleport 到 `body` 的菜单、弹窗和抽屉继承当前区域主题；不依赖可能被 Teleport 脱离的局部容器，也不在服务端模块间共享可变主题状态。
 - Color Mode 的早期 head 脚本在绘制前读取用户偏好并设置 `.light` / `.dark`；应用 SSR 不按未知系统状态分支渲染主题文案。品牌根变量由本次请求的 public runtimeConfig 计算并随首屏 HTML 输出。
@@ -136,3 +137,5 @@ Nuxt UI 语义色映射在 `app.config.ts`：`primary → brand`、`secondary �
 前后台共享组件语义和交互，但品牌边界由根节点主题范围决定：商城主题来自当前请求的商家运行时配置，后台始终使用 AiKayun 蓝色。弹窗、菜单通过 Nuxt UI 的 portal/teleport 继承当前根主题；组件内不得固定 HEX、`indigo-*` 或 `slate-*` 来表达主题含义。通过 `UApp` 保持主题上下文和全局组件行为，并让 SSR 首屏与客户端导航采用同一品牌配置。
 
 新页面选型顺序：先找 Nuxt UI 是否有匹配的基础组件；若有，直接组合并使用语义 token；仅当相同结构或稳定业务含义在多处重复时，新增边界清楚的项目组件。开始商品、订单、支付、卡密或数字交付开发时，先基于已确认的数据契约选型，不在基础组件内加入业务逻辑。
+
+开发环境提供 `/dev-preview` 设计预览页，直接组合当前 Nuxt UI 组件和语义 Token；该路由在非开发构建的页面清单中移除。
