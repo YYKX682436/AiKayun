@@ -1,157 +1,60 @@
 <script setup lang="ts">
-useSeoMeta({
-  title: '数字商品商城',
-  description: '为卡密、软件授权和虚拟商品打造的独立部署商城。',
-})
+const storeBrand = useStoreBrand()
 
-const capabilities = [
-  { number: '01', title: '数字商品优先', description: '围绕卡密、软件授权与虚拟商品设计，让数字交付流程保持清楚、可靠。' },
-  { number: '02', title: '交付方式灵活', description: '为 API 自动发货和人工交付留出明确边界，逐步扩展实际需要的能力。' },
-  { number: '03', title: '独立部署', description: '商城、管理后台与数据由商家自己掌控，适合面向客户部署和持续经营。' },
-]
+useSeoMeta({ title: '店铺首页' })
 </script>
 
 <template>
-  <section class="overflow-hidden">
-    <UContainer class="grid min-h-[620px] items-center gap-14 py-16 lg:grid-cols-[1.15fr_0.85fr] lg:py-24">
-      <div class="max-w-2xl">
-        <div class="mb-7 inline-flex items-center gap-2 rounded-full border border-primary/20 bg-elevated px-3 py-1.5 text-sm font-medium text-primary shadow-sm">
-          <span
-            class="size-2 rounded-full bg-success"
-            aria-hidden="true"
-          />
-          独立部署 · 数字商品专注
-        </div>
-        <h1 class="text-5xl font-semibold leading-[1.08] tracking-[-0.045em] text-highlighted sm:text-6xl lg:text-7xl">
-          让数字商品，<br>
-          <span class="text-primary">轻松开始销售。</span>
-        </h1>
-        <p class="mt-7 max-w-xl text-lg leading-8 text-muted">
-          AiKayun 为卡密、软件授权与虚拟商品提供清晰的商城基础。用自己的部署环境经营业务，从可靠的商品展示与交付开始。
-        </p>
-        <div class="mt-9 flex flex-wrap gap-3">
-          <UButton
-            to="/admin/login"
-            size="lg"
-            trailing-icon="i-lucide-arrow-right"
-          >
-            进入管理后台
-          </UButton>
-          <UButton
-            href="/api/docs"
-            external
-            color="neutral"
-            variant="outline"
-            size="lg"
-          >
-            查看 API 文档
-          </UButton>
-        </div>
-        <div class="mt-12 flex flex-wrap gap-x-8 gap-y-3 border-t border-default pt-6 text-sm text-muted">
-          <span>TypeScript 严格模式</span>
-          <span>PostgreSQL 数据持久化</span>
-          <span>前后端共享 API 契约</span>
-        </div>
-      </div>
-
-      <div class="relative mx-auto w-full max-w-md">
-        <UCard class="relative overflow-hidden border border-default">
-          <template #header>
-            <div class="flex items-center justify-between">
-              <div>
-                <p class="text-sm font-semibold text-highlighted">
-                  工程基础
-                </p>
-                <p class="mt-1 text-xs text-muted">
-                  为数字商品业务准备
-                </p>
-              </div>
-              <UBadge
-                color="primary"
-                variant="soft"
-                size="md"
-              >
-                阶段 01
-              </UBadge>
-            </div>
-          </template>
-          <div class="grid grid-cols-2 gap-3">
-            <div class="rounded-2xl bg-primary/10 p-4">
-              <p class="text-xs font-medium text-primary">
-                页面渲染
-              </p>
-              <p class="mt-2 text-xl font-semibold tracking-tight text-highlighted">
-                SSR
-              </p>
-            </div>
-            <div class="rounded-2xl bg-muted p-4">
-              <p class="text-xs font-medium text-toned">
-                应用架构
-              </p>
-              <p class="mt-2 text-xl font-semibold tracking-tight text-highlighted">
-                模块化单体
-              </p>
-            </div>
-          </div>
-          <div class="mt-4 rounded-2xl border border-default p-4">
-            <div class="mb-4 flex items-center justify-between">
-              <p class="text-sm font-medium text-default">
-                基础能力
-              </p>
-              <span class="text-xs text-dimmed">首个版本</span>
-            </div>
-            <div class="grid gap-3">
-              <div
-                v-for="item in ['共享 OpenAPI 契约', '管理员会话验证', 'PG18 + Kysely 迁移']"
-                :key="item"
-                class="flex items-center gap-3 text-sm text-muted"
-              >
-                <span
-                  class="grid size-6 place-items-center rounded-full bg-success/10 text-success"
-                  aria-hidden="true"
-                >✓</span>
-                {{ item }}
-              </div>
-            </div>
-          </div>
-          <template #footer>
-            <div class="flex items-center justify-between text-xs text-muted">
-              <span>当前阶段：工程基础搭建</span>
-              <span>v0.1</span>
-            </div>
-          </template>
-        </UCard>
-      </div>
-    </UContainer>
-  </section>
-
-  <section class="border-y border-default bg-elevated py-16 sm:py-20">
-    <UContainer>
-      <div class="mb-10 max-w-2xl">
-        <p class="text-sm font-semibold uppercase tracking-[0.15em] text-primary">
-          为实际经营打基础
-        </p>
-        <h2 class="mt-3 text-3xl font-semibold tracking-tight text-highlighted">
-          从清晰、可靠的商城核心开始。
-        </h2>
-      </div>
-      <div class="grid gap-4 md:grid-cols-3">
-        <article
-          v-for="capability in capabilities"
-          :key="capability.number"
-          class="rounded-2xl border border-default bg-muted p-6"
+  <main id="main-content">
+    <section aria-labelledby="store-title">
+      <UContainer class="py-14 sm:py-20 lg:py-24">
+        <UBadge
+          color="primary"
+          variant="soft"
+          size="md"
+          icon="i-lucide-store"
         >
-          <p class="text-sm font-semibold text-primary">
-            {{ capability.number }}
+          店铺首页
+        </UBadge>
+
+        <h1
+          id="store-title"
+          class="mt-6 max-w-4xl break-words text-4xl font-semibold leading-tight text-highlighted sm:text-5xl lg:text-6xl"
+        >
+          <span class="text-primary">{{ storeBrand.storeName }}</span>
+        </h1>
+        <p class="mt-5 max-w-2xl text-base leading-7 text-muted sm:text-lg sm:leading-8">
+          欢迎来到 {{ storeBrand.storeName }}。这里会展示店铺当前可浏览的内容。
+        </p>
+      </UContainer>
+    </section>
+
+    <section
+      aria-labelledby="store-content-title"
+      class="border-y border-default bg-elevated"
+    >
+      <UContainer class="py-10 sm:py-14">
+        <div class="max-w-2xl">
+          <p class="text-sm font-medium text-muted">
+            店铺内容
           </p>
-          <h3 class="mt-6 text-lg font-semibold text-highlighted">
-            {{ capability.title }}
-          </h3>
-          <p class="mt-3 text-sm leading-6 text-muted">
-            {{ capability.description }}
-          </p>
-        </article>
-      </div>
-    </UContainer>
-  </section>
+          <h2
+            id="store-content-title"
+            class="mt-1 text-2xl font-semibold text-highlighted"
+          >
+            商品展示
+          </h2>
+        </div>
+
+        <UEmpty
+          icon="i-lucide-package-open"
+          title="暂无可展示的商品"
+          description="店铺正在准备中，目前还没有可以浏览的商品。"
+          variant="naked"
+          size="lg"
+          class="mt-6 min-h-52"
+        />
+      </UContainer>
+    </section>
+  </main>
 </template>

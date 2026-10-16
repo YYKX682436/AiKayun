@@ -11,8 +11,8 @@ test('the AiKayun deployment uses the default storefront name and brand blue', a
 
   const response = await page.goto('/')
   expect(response?.status()).toBe(200)
-  expect(await response?.text()).toContain('<title>数字商品商城 · AiKayun 数字商城</title>')
-  await expect(page).toHaveTitle('数字商品商城 · AiKayun 数字商城')
+  expect(await response?.text()).toContain('<title>店铺首页 · AiKayun 数字商城</title>')
+  await expect(page).toHaveTitle('店铺首页 · AiKayun 数字商城')
   await expect(page.getByRole('link', { name: /AiKayun 数字商城/ }).first()).toBeVisible()
   await expect(page.locator('header img')).toHaveCount(0)
 
@@ -23,18 +23,18 @@ test('the AiKayun deployment uses the default storefront name and brand blue', a
   expect(brand.area).toBe('storefront')
   expect(brand.color).toMatch(/^#[\da-f]{6}$/i)
 
-  await page.getByRole('link', { name: '管理后台', exact: true }).click()
+  await page.getByRole('link', { name: '管理入口', exact: true }).click()
   await expect(page).toHaveURL(/\/admin\/login$/)
   await expect(page).toHaveTitle('管理员登录 · AiKayun')
   await expect(page.locator('html')).toHaveAttribute('data-aikayun-area', 'admin')
 
   await page.getByRole('link', { name: 'AiKayun' }).click()
-  await expect(page).toHaveTitle('数字商品商城 · AiKayun 数字商城')
+  await expect(page).toHaveTitle('店铺首页 · AiKayun 数字商城')
   await expect(page.locator('html')).toHaveAttribute('data-aikayun-area', 'storefront')
   expect(browserErrors).toEqual([])
 })
 
-test('generated brand colors keep actual storefront text, buttons, labels and focus contrast in both modes', async ({ page }) => {
+test('generated brand colors keep storefront text, status labels and keyboard focus contrast in both modes', async ({ page }) => {
   const errors: string[] = []
   page.on('pageerror', error => errors.push(error.message))
   page.on('console', message => {
@@ -91,28 +91,21 @@ test('generated brand colors keep actual storefront text, buttons, labels and fo
         }
 
         const pageSurface = document.querySelector<HTMLElement>('.bg-default')!
-        const elevatedSurface = document.querySelector<HTMLElement>('.bg-elevated')!
         const heroText = document.querySelector<HTMLElement>('h1 span.text-primary')!
         const badge = document.querySelector<HTMLElement>('span.bg-primary\\/10.text-primary')!
         const badgeText = getComputedStyle(badge).color
-        const badgeBackground = composite(getComputedStyle(badge).backgroundColor, getComputedStyle(elevatedSurface).backgroundColor)
-        const panel = document.querySelector<HTMLElement>('div.bg-primary\\/10 p.text-primary')!
-        const panelText = getComputedStyle(panel).color
-        const panelBackground = composite(getComputedStyle(panel.parentElement!).backgroundColor, getComputedStyle(elevatedSurface).backgroundColor)
-        const button = document.querySelector<HTMLElement>('main a[href="/admin/login"]')!
-        const buttonStyle = getComputedStyle(button)
+        const badgeBackground = composite(getComputedStyle(badge).backgroundColor, getComputedStyle(pageSurface).backgroundColor)
+        const focusControl = document.querySelector<HTMLElement>('[aria-label="显示模式"]')!
 
         document.documentElement.focus()
-        button.focus()
-        const focusStyle = getComputedStyle(button)
+        focusControl.focus()
+        const focusStyle = getComputedStyle(focusControl)
 
         return {
           hero: { foreground: getComputedStyle(heroText).color, background: getComputedStyle(pageSurface).backgroundColor },
           badge: { foreground: badgeText, background: badgeBackground },
-          panel: { foreground: panelText, background: panelBackground },
-          button: { foreground: buttonStyle.color, background: buttonStyle.backgroundColor },
           focus: {
-            visible: button.matches(':focus-visible'),
+            visible: focusControl.matches(':focus-visible'),
             width: focusStyle.outlineWidth,
             style: focusStyle.outlineStyle,
             foreground: focusStyle.outlineColor,
@@ -125,16 +118,12 @@ test('generated brand colors keep actual storefront text, buttons, labels and fo
       const textRatios = [
         contrast(measurements.hero.foreground, measurements.hero.background),
         contrast(measurements.badge.foreground, measurements.badge.background),
-        contrast(measurements.panel.foreground, measurements.panel.background),
-        contrast(measurements.button.foreground, measurements.button.background),
       ]
       textContrasts.push(...textRatios)
       const focusRatio = contrast(measurements.focus.foreground, measurements.focus.background)
       focusContrasts.push(focusRatio)
       expect(textRatios[0], `${name} ${mode} hero brand text`).toBeGreaterThanOrEqual(4.5)
       expect(textRatios[1], `${name} ${mode} tinted brand label`).toBeGreaterThanOrEqual(4.5)
-      expect(textRatios[2], `${name} ${mode} selected brand panel`).toBeGreaterThanOrEqual(4.5)
-      expect(textRatios[3], `${name} ${mode} primary button`).toBeGreaterThanOrEqual(4.5)
       expect(measurements.focus.visible, `${name} ${mode} keyboard focus is visible`).toBe(true)
       expect(measurements.focus.width).toBe('2px')
       expect(measurements.focus.style).toBe('solid')

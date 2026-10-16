@@ -29,80 +29,117 @@ async function logout() {
 </script>
 
 <template>
-  <div class="mx-auto max-w-4xl">
-    <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-      <div>
-        <p class="text-sm font-medium text-primary">
-          工作区
-        </p>
-        <h1 class="mt-2 text-3xl font-semibold tracking-tight text-highlighted">
-          管理概览
-        </h1>
-        <p class="mt-2 text-sm text-muted">
-          商城基础已就绪，可以从这里开始配置。
-        </p>
-      </div>
-      <UButton
-        color="neutral"
-        variant="outline"
-        :loading="busy"
-        :disabled="busy"
-        @click="logout"
+  <UDashboardPanel id="admin-overview">
+    <template #header>
+      <UDashboardNavbar title="管理后台">
+        <template #right>
+          <ThemeModeSelect />
+        </template>
+      </UDashboardNavbar>
+    </template>
+
+    <template #body>
+      <main
+        id="admin-main"
+        tabindex="-1"
+        class="mx-auto w-full max-w-6xl p-4 focus:outline-none sm:p-6 lg:p-8"
       >
-        退出登录
-      </UButton>
-    </div>
+        <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div class="min-w-0">
+            <p class="text-sm font-medium text-primary">
+              工作区
+            </p>
+            <h1 class="mt-1 text-3xl font-semibold tracking-tight text-highlighted">
+              管理概览
+            </h1>
+            <p class="mt-2 max-w-2xl text-sm leading-6 text-muted">
+              查看当前管理员会话与已开放的管理内容。
+            </p>
+          </div>
 
-    <UAlert
-      v-if="logoutError"
-      class="mt-6"
-      color="error"
-      variant="soft"
-      :title="logoutError"
-      role="alert"
-    />
+          <UButton
+            color="neutral"
+            variant="outline"
+            icon="i-lucide-log-out"
+            :loading="busy"
+            :disabled="busy"
+            class="min-h-11 shrink-0"
+            @click="logout"
+          >
+            退出登录
+          </UButton>
+        </div>
 
-    <section class="mt-8 grid gap-4 sm:grid-cols-2">
-      <UCard>
-        <p class="text-sm text-muted">
-          当前管理员
-        </p>
-        <p class="mt-2 break-all text-lg font-semibold text-highlighted">
-          {{ session?.data.admin.email }}
-        </p>
-      </UCard>
-      <UCard>
-        <p class="text-sm text-muted">
-          服务状态
-        </p>
-        <p class="mt-2 inline-flex items-center gap-2 text-lg font-semibold text-highlighted">
-          <span
-            class="size-2 rounded-full bg-success"
-            aria-hidden="true"
-          />
-          已安全登录
-        </p>
-      </UCard>
-    </section>
-
-    <UCard class="mt-6">
-      <h2 class="text-base font-semibold text-highlighted">
-        首版工程状态
-      </h2>
-      <p class="mt-2 text-sm leading-6 text-muted">
-        这套工程已接通共享 API 契约、PostgreSQL 迁移和管理员会话。商品、订单、支付和履约数据模型将在后续阶段按实际业务建立。
-      </p>
-      <div class="mt-5 flex flex-wrap gap-2">
-        <UBadge
-          v-for="tag in ['管理员会话', 'PostgreSQL', 'OpenAPI']"
-          :key="tag"
-          color="neutral"
+        <UAlert
+          v-if="logoutError"
+          class="mt-6"
+          color="error"
           variant="soft"
-          size="md"
+          :title="logoutError"
+          role="alert"
+          aria-live="assertive"
+        />
+
+        <section
+          aria-labelledby="session-title"
+          class="mt-8"
         >
-          {{ tag }}
-        </UBadge>
-      </div>
-    </UCard>
-  </div>
+          <h2
+            id="session-title"
+            class="text-lg font-semibold text-highlighted"
+          >
+            当前会话
+          </h2>
+          <UCard class="mt-4 max-w-2xl">
+            <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+              <div class="min-w-0">
+                <p class="text-sm text-muted">
+                  管理员邮箱
+                </p>
+                <p class="mt-1 break-all font-medium text-highlighted">
+                  {{ session?.data.admin.email }}
+                </p>
+              </div>
+              <UBadge
+                color="success"
+                variant="soft"
+                icon="i-lucide-shield-check"
+                class="w-fit shrink-0"
+              >
+                已验证
+              </UBadge>
+            </div>
+          </UCard>
+        </section>
+
+        <section
+          aria-labelledby="business-data-title"
+          class="mt-10 border-t border-default pt-8"
+        >
+          <div>
+            <p class="text-sm font-medium text-muted">
+              店铺经营
+            </p>
+            <h2
+              id="business-data-title"
+              class="mt-1 text-xl font-semibold text-highlighted"
+            >
+              经营数据
+            </h2>
+          </div>
+
+          <div class="mt-4 rounded-xl border border-default bg-elevated">
+            <UEmpty
+              icon="i-lucide-chart-no-axes-combined"
+              title="经营数据尚未开放"
+              description="目前没有商品、订单或销售数据可供查看。相关数据接入后，概览会在这里展示。"
+              variant="naked"
+              size="lg"
+              class="min-h-56"
+            />
+          </div>
+        </section>
+      </main>
+    </template>
+  </UDashboardPanel>
 </template>

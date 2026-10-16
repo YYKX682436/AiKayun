@@ -1,53 +1,124 @@
+<script setup lang="ts">
+import type { NavigationMenuItem } from '@nuxt/ui'
+
+const navigationItems: NavigationMenuItem[][] = [[
+  {
+    label: '概览',
+    icon: 'i-lucide-layout-dashboard',
+    to: '/admin',
+  },
+]]
+
+const unavailableModules = [
+  { label: '商品管理', icon: 'i-lucide-package' },
+  { label: '订单管理', icon: 'i-lucide-receipt' },
+  { label: '经营数据', icon: 'i-lucide-chart-no-axes-column-increasing' },
+]
+</script>
+
 <template>
-  <div class="min-h-screen bg-default">
-    <header class="border-b border-default bg-elevated">
-      <UContainer class="flex min-h-16 flex-wrap items-center justify-between gap-2 py-2">
+  <NuxtLink
+    to="#admin-main"
+    class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-elevated focus:px-4 focus:py-3 focus:text-highlighted focus:shadow-lg"
+  >
+    跳转到主要内容
+  </NuxtLink>
+
+  <UDashboardGroup
+    storage="cookie"
+    storage-key="aikayun-admin-workspace"
+    class="bg-default"
+  >
+    <UDashboardSidebar
+      id="admin-navigation"
+      mode="slideover"
+      :toggle="false"
+      :default-size="17"
+      :min-size="15"
+      :max-size="20"
+      :menu="{
+        side: 'left',
+        title: '后台导航',
+        description: '选择可用的管理区域或返回店铺。',
+      }"
+      :ui="{ content: 'w-[min(19rem,calc(100vw-1rem))] max-w-none' }"
+      class="bg-elevated"
+    >
+      <template #header>
         <NuxtLink
           to="/admin"
-          class="flex items-center gap-3 font-semibold text-highlighted"
+          class="flex min-h-11 min-w-0 items-center gap-3 rounded-sm font-semibold text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
         >
           <BrandMark name="AiKayun" />
-          <span>AiKayun <span class="hidden font-normal text-dimmed sm:inline">/ 管理后台</span></span>
+          <span class="min-w-0 leading-tight">
+            <span class="block truncate">AiKayun</span>
+            <span class="block text-xs font-normal text-muted">管理后台</span>
+          </span>
         </NuxtLink>
-        <nav class="flex items-center gap-2">
-          <ThemeModeSelect />
-          <NuxtLink
-            to="/"
-            class="text-sm font-medium text-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-          >
-            返回商城
-          </NuxtLink>
-        </nav>
-      </UContainer>
-    </header>
-    <div class="mx-auto grid min-h-[calc(100vh-4rem)] max-w-7xl lg:grid-cols-[220px_1fr]">
-      <aside class="border-b border-default bg-elevated p-4 lg:border-r lg:border-b-0 lg:p-5">
-        <p class="mb-3 px-3 text-xs font-semibold uppercase tracking-[0.16em] text-dimmed">
-          工作区
-        </p>
-        <nav
+      </template>
+
+      <template #default="{ collapsed }">
+        <div
+          role="group"
           aria-label="后台导航"
-          class="grid gap-1"
+          class="grid gap-5"
         >
-          <NuxtLink
-            to="/admin"
-            class="rounded-lg bg-primary/10 px-3 py-2.5 text-sm font-semibold text-primary"
-          >
-            概览
-          </NuxtLink>
-          <span
-            aria-disabled="true"
-            class="rounded-lg px-3 py-2.5 text-sm text-dimmed"
-          >商品管理 · 即将开放</span>
-          <span
-            aria-disabled="true"
-            class="rounded-lg px-3 py-2.5 text-sm text-dimmed"
-          >订单管理 · 即将开放</span>
-        </nav>
-      </aside>
-      <main class="p-5 sm:p-8 lg:p-10">
-        <slot />
-      </main>
-    </div>
-  </div>
+          <UNavigationMenu
+            :items="navigationItems"
+            :collapsed="collapsed"
+            orientation="vertical"
+            highlight
+            class="w-full"
+          />
+
+          <section aria-labelledby="unavailable-modules-title">
+            <h2
+              id="unavailable-modules-title"
+              class="px-2.5 py-1.5 text-xs font-medium text-dimmed"
+            >
+              尚未开放
+            </h2>
+            <ul class="grid gap-1">
+              <li
+                v-for="module in unavailableModules"
+                :key="module.label"
+                aria-disabled="true"
+                class="flex min-h-10 min-w-0 items-center gap-2 rounded-md px-2.5 py-2 text-sm text-dimmed"
+              >
+                <UIcon
+                  :name="module.icon"
+                  class="size-4 shrink-0"
+                  aria-hidden="true"
+                />
+                <span class="min-w-0 flex-1 truncate">{{ module.label }}</span>
+                <UBadge
+                  color="neutral"
+                  variant="subtle"
+                  size="xs"
+                  class="shrink-0"
+                >
+                  未开放
+                </UBadge>
+              </li>
+            </ul>
+          </section>
+        </div>
+      </template>
+
+      <template #footer>
+        <UButton
+          to="/"
+          color="neutral"
+          variant="ghost"
+          icon="i-lucide-store"
+          block
+          class="justify-start"
+        >
+          返回店铺
+        </UButton>
+      </template>
+    </UDashboardSidebar>
+
+    <slot />
+  </UDashboardGroup>
 </template>

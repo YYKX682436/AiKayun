@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test'
 import { wcagContrast } from 'culori'
 
-const viewportWidths = [320, 390, 768, 1440]
+const viewportWidths = [320, 390, 768, 1024, 1137, 1280, 1440]
 
 async function assertAdminVisuals(page: import('@playwright/test').Page, area: string, mode: 'light' | 'dark') {
   const measurements = await page.evaluate(() => ({
@@ -32,12 +32,20 @@ async function assertAdminVisuals(page: import('@playwright/test').Page, area: s
   }
 }
 
-test('renders the server-side storefront and its foundation capabilities', async ({ page }) => {
+test('renders the server-side storefront empty state without consumer actions that are not available', async ({ page }) => {
   const response = await page.goto('/')
   expect(response?.status()).toBe(200)
-  await expect(page.getByRole('heading', { name: /让数字商品/ })).toBeVisible()
-  await expect(page.getByText('PostgreSQL 数据持久化')).toBeVisible()
-  await expect(page.getByRole('link', { name: '进入管理后台' })).toBeVisible()
+  const serverHtml = await response?.text()
+
+  await expect(page.getByRole('heading', { level: 1, name: 'AiKayun 数字商城' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '暂无可展示的商品' })).toBeVisible()
+  await expect(page.getByRole('link', { name: '管理入口' })).toHaveAttribute('href', '/admin/login')
+  await expect(page.getByRole('link', { name: '登录' })).toHaveCount(0)
+  await expect(page.getByRole('link', { name: '注册' })).toHaveCount(0)
+  await expect(page.getByRole('search')).toHaveCount(0)
+  await expect(page.locator('input[type="search"], a[href="/api/docs"], a[href="/cart"]')).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /购买|加入购物车|立即购买/ })).toHaveCount(0)
+  expect(serverHtml).not.toMatch(/TypeScript 严格模式|PostgreSQL 数据持久化|API 文档|工程基础搭建|阶段 01/)
 })
 
 test('blocks the admin page until login, then creates and ends a session', async ({ page }, testInfo) => {
@@ -167,4 +175,46 @@ test('login fields stay disabled until client hydration completes', async ({ pag
   await expect(page.getByRole('button', { name: '安全登录' })).toBeDisabled()
   await page.keyboard.press('Enter')
   await expect(page).toHaveURL(/\/admin\/login$/)
+})
+
+test('mobile admin navigation supports keyboard focus and closes after route changes', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/admin')
+  await expect(page).toHaveURL(/\/admin\/login/)
+  await page.getByLabel('管理员邮箱').fill('browser-test@example.com')
+  await page.getByLabel('密码').fill('Only-For-E2E-Tests-2026!!')
+  await page.getByRole('button', { name: '安全登录' }).click()
+  await expect(page).toHaveURL(/\/admin$/)
+  await expect(page.getByRole('heading', { name: '经营数据尚未开放' })).toBeVisible()
+  await expect(page.getByRole('link', { name: '商品管理' })).toHaveCount(0)
+  await expect(page.getByRole('link', { name: '订单管理' })).toHaveCount(0)
+
+  const menuToggle = page.locator('[data-slot="toggle"]')
+  await expect(menuToggle).toBeVisible()
+  await menuToggle.focus()
+  await page.keyboard.press('Enter')
+
+  const drawer = page.getByRole('dialog')
+  await expect(drawer).toBeVisible()
+  await expect(drawer).toHaveAttribute('aria-labelledby', /.+/)
+  await expect(drawer.getByRole('link', { name: 'AiKayun' })).toBeVisible()
+  await expect(drawer.locator('[aria-disabled="true"]')).toHaveCount(3)
+  await expect.poll(() => drawer.evaluate(element => element.contains(document.activeElement))).toBe(true)
+  await page.keyboard.press('Escape')
+  await expect(drawer).toBeHidden()
+  await expect(menuToggle).toBeFocused()
+
+  await page.keyboard.press('Enter')
+  await expect(drawer).toBeVisible()
+  const returnToStore = drawer.getByRole('link', { name: '返回店铺' })
+  await expect(returnToStore).toBeVisible()
+  await returnToStore.click()
+  await expect(page).toHaveURL('/')
+  await expect(drawer).toBeHidden()
+
+  for (const width of viewportWidths) {
+    await page.setViewportSize({ width, height: 844 })
+    const documentWidth = await page.evaluate(() => document.documentElement.scrollWidth)
+    expect(documentWidth).toBeLessThanOrEqual(width)
+  }
 })

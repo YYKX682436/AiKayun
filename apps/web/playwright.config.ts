@@ -2,7 +2,8 @@ import { defineConfig, devices } from '@playwright/test'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
   ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
-const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
+const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3100'
+const webPort = new URL(baseURL).port || '3100'
 const useExternalServer = process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true'
 
 export default defineConfig({
@@ -34,7 +35,7 @@ export default defineConfig({
       },
     },
     {
-      command: 'pnpm --filter @aikayun/web dev --host 127.0.0.1',
+      command: `pnpm --filter @aikayun/web exec nuxt dev --host 127.0.0.1 --port ${webPort}`,
       url: baseURL,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,

@@ -72,7 +72,7 @@ jobs:
             sleep 2
           done
           curl --fail --silent http://localhost:8080/api/v1/health/ready
-          curl --fail --silent http://localhost:8080/ | grep -q '让数字商品'
+          curl --fail --silent http://localhost:8080/ | grep -q '暂无可展示的商品'
           docker compose exec -T -e ADMIN_INITIAL_EMAIL=browser-test@example.com -e 'ADMIN_INITIAL_PASSWORD=Only-For-E2E-Tests-2026!!' api node dist/admin-init.js
           PLAYWRIGHT_BASE_URL=http://localhost:8080 PLAYWRIGHT_EXTERNAL_SERVER=true pnpm e2e
       - name: Verify PostgreSQL data survives Compose rebuild
@@ -89,7 +89,7 @@ jobs:
           done
           docker compose exec -T db psql -U aikayun -d aikayun -Atc 'SELECT marker FROM compose_persistence_check' | grep -qx persisted
           curl --fail --silent http://localhost:8080/api/v1/health/ready
-          curl --fail --silent http://localhost:8080/ | grep -q '让数字商品'
+          curl --fail --silent http://localhost:8080/ | grep -q '暂无可展示的商品'
       - name: Remove CI containers and volumes
         if: always()
         run: docker compose down -v --remove-orphans

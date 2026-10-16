@@ -27,9 +27,6 @@ async function readTheme(page: Page) {
     const root = document.documentElement
     const heading = [...document.querySelectorAll('h1 span')]
       .find(element => element.classList.contains('text-primary'))
-    const primaryButton = [...document.querySelectorAll('a[href="/admin/login"]')]
-      .find((element) => getComputedStyle(element).backgroundColor !== 'rgba(0, 0, 0, 0)')
-    const buttonStyle = primaryButton ? getComputedStyle(primaryButton) : undefined
 
     return {
       area: root.dataset.aikayunArea,
@@ -41,8 +38,6 @@ async function readTheme(page: Page) {
       primaryShade600: getComputedStyle(root).getPropertyValue('--ui-color-primary-600').trim(),
       primaryShade400: getComputedStyle(root).getPropertyValue('--ui-color-primary-400').trim(),
       brandTextColor: heading ? getComputedStyle(heading).color : null,
-      buttonBackground: buttonStyle?.backgroundColor ?? null,
-      buttonText: buttonStyle?.color ?? null,
       modeControlHeight: document.querySelector<HTMLElement>('[aria-label="显示模式"]')?.getBoundingClientRect().height ?? 0,
       width: window.innerWidth,
       documentWidth: root.scrollWidth,
@@ -58,9 +53,7 @@ async function assertThemeValue(page: Page, expected: 'light' | 'dark') {
   expect(expected === 'dark' ? backgroundLuminance : 1 - backgroundLuminance).toBeLessThan(0.06)
   expect(wcagContrast(theme.textColor, theme.backgroundColor)).toBeGreaterThanOrEqual(4.5)
   expect(theme.area).toBe('storefront')
-  expect(theme.buttonBackground).not.toBeNull()
-  expect(theme.buttonText).not.toBeNull()
-  expect(wcagContrast(theme.buttonBackground!, theme.buttonText!)).toBeGreaterThanOrEqual(4.5)
+  expect(theme.brandTextColor).not.toBeNull()
   expect(wcagContrast(theme.brandTextColor!, theme.backgroundColor)).toBeGreaterThanOrEqual(4.5)
   return theme
 }
@@ -83,7 +76,7 @@ test('a first visit follows a light system preference and hydrates without error
   const colorModeBootstrap = serverHtml?.indexOf('__NUXT_COLOR_MODE__') ?? -1
   expect(colorModeBootstrap).toBeGreaterThanOrEqual(0)
   expect(colorModeBootstrap).toBeLessThan(headEnd)
-  await expect(page.getByRole('heading', { name: /让数字商品/ })).toBeVisible()
+  await expect(page.getByRole('heading', { level: 1, name: 'AiKayun 数字商城' })).toBeVisible()
   await expect(page.getByRole('button', { name: '显示模式' })).toContainText('跟随系统')
   await assertThemeValue(page, 'light')
   expect(errors).toEqual([])
@@ -97,7 +90,7 @@ test('a first visit follows a dark system preference', async ({ page }) => {
     localStorage.removeItem('aikayun-color-mode-r1')
   }, preferenceKey)
   await page.goto('/')
-  await expect(page.getByRole('heading', { name: /让数字商品/ })).toBeVisible()
+  await expect(page.getByRole('heading', { level: 1, name: 'AiKayun 数字商城' })).toBeVisible()
   await expect(page.getByRole('button', { name: '显示模式' })).toContainText('跟随系统')
   await assertThemeValue(page, 'dark')
 })
@@ -167,8 +160,9 @@ test('the mode picker is keyboard reachable and remains usable at target widths'
   const picker = page.getByRole('button', { name: '显示模式' })
   await expect(picker).toBeEnabled()
   await page.evaluate(() => document.activeElement instanceof HTMLElement && document.activeElement.blur())
-  await page.keyboard.press('Tab')
-  await page.keyboard.press('Tab')
+  for (let tab = 0; tab < 12 && !await picker.evaluate(element => element === document.activeElement); tab += 1) {
+    await page.keyboard.press('Tab')
+  }
   await expect(picker).toBeFocused()
   await expect.poll(() => picker.evaluate(element => element.matches(':focus-visible'))).toBe(true)
   await expect.poll(() => picker.evaluate((element) => {
@@ -191,7 +185,6 @@ test('the mode picker is keyboard reachable and remains usable at target widths'
       expect(theme.width).toBe(width)
       expect(theme.documentWidth).toBeLessThanOrEqual(width)
       expect(theme.modeControlHeight).toBeGreaterThanOrEqual(44)
-      expect(wcagContrast(theme.buttonBackground!, theme.buttonText!)).toBeGreaterThanOrEqual(4.5)
       await page.screenshot({
         path: testInfo.outputPath(`${expectedMode}-${width}.png`),
         fullPage: true,
@@ -214,5 +207,5 @@ test('front and admin routes share the display preference and apply separate roo
   expect(admin.value).toBe('dark')
   expect(admin.primaryShade600.toLowerCase()).toBe('#2563eb')
   expect(admin.primaryShade600.toLowerCase()).not.toBe(storefront.primaryShade600.toLowerCase())
-  expect(admin.buttonBackground).not.toBe(storefront.buttonBackground)
+  expect(admin.area).toBe('admin')
 })
