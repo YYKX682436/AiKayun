@@ -21,7 +21,11 @@ import type { Database } from './db/types.js'
 import { registerAdminAuthRoutes } from './auth/admin.js'
 import { hashPassword } from './auth/password.js'
 import { registerAdminProductRoutes } from './catalog/admin-products.js'
+import { defaultProductIdentityFactory } from './catalog/admin-products.js'
 import type { ProductIdentityFactory } from './catalog/admin-products.js'
+import { registerAdminCategoryRoutes } from './catalog/admin-categories.js'
+import { registerAdminProductDetailRoutes } from './catalog/admin-product-details.js'
+import { registerAdminVariantMatrixRoutes } from './catalog/admin-variant-matrix.js'
 
 export async function createApp(options: {
   db: Kysely<Database>
@@ -116,6 +120,10 @@ export async function createApp(options: {
 
   const dummyPasswordHash = await hashPassword(randomBytes(32).toString('base64url'))
   registerAdminAuthRoutes(app, db, config, dummyPasswordHash)
-  registerAdminProductRoutes(app, db, config, options.productIdentityFactory)
+  const identityFactory = options.productIdentityFactory ?? defaultProductIdentityFactory
+  registerAdminProductRoutes(app, db, config, identityFactory)
+  registerAdminCategoryRoutes(app, db, config)
+  registerAdminProductDetailRoutes(app, db, config)
+  registerAdminVariantMatrixRoutes(app, db, config, identityFactory)
   return app
 }

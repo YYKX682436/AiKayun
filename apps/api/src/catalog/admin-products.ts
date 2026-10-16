@@ -47,19 +47,59 @@ function normalizedSalePrice(value: ProductSalePrice): string {
   return parseUnitAmount(value).toFixed(2)
 }
 
-async function loadProduct(db: Kysely<Database>, id: string): Promise<ProductDetail | undefined> {
+export async function loadProduct(db: Kysely<Database>, id: string): Promise<ProductDetail | undefined> {
   const product = await db.selectFrom('products')
     .selectAll()
     .where('id', '=', id)
     .executeTakeFirst()
   if (!product) return undefined
 
-  const variants = await db.selectFrom('product_variants')
-    .selectAll()
-    .where('product_id', '=', id)
-    .orderBy('created_at')
-    .orderBy('id')
-    .execute()
+  const [variants, categoryRows, groupRows, valueRows, optionRows, attributeRows] = await Promise.all([
+    db.selectFrom('product_variants').selectAll().where('product_id', '=', id).orderBy('created_at').orderBy('id').execute(),
+    db.selectFrom('product_category_assignments as assignment')
+      .innerJoin('product_categories as category', 'category.id', 'assignment.category_id')
+      .select([
+        'category.id as category_id', 'category.name', 'category.parent_id', 'category.is_visible',
+        'assignment.is_primary', 'assignment.sort_order',
+      ])
+      .where('assignment.product_id', '=', id)
+      .orderBy('assignment.is_primary', 'desc').orderBy('assignment.sort_order').orderBy('category.id').execute(),
+    db.selectFrom('product_option_groups').selectAll().where('product_id', '=', id)
+      .orderBy('sort_order').orderBy('id').execute(),
+    db.selectFrom('product_option_values').selectAll().where('product_id', '=', id)
+      .orderBy('option_group_id').orderBy('sort_order').orderBy('id').execute(),
+    db.selectFrom('product_variant_option_values as selected')
+      .innerJoin('product_option_groups as option_group', (join) => join
+        .onRef('option_group.id', '=', 'selected.option_group_id')
+        .onRef('option_group.product_id', '=', 'selected.product_id'))
+      .innerJoin('product_option_values as option_value', (join) => join
+        .onRef('option_value.id', '=', 'selected.option_value_id')
+        .onRef('option_value.option_group_id', '=', 'selected.option_group_id')
+        .onRef('option_value.product_id', '=', 'selected.product_id'))
+      .select([
+        'selected.product_variant_id', 'option_group.id as group_id', 'option_group.name as group_name',
+        'option_group.sort_order as group_sort_order', 'option_value.id as value_id',
+        'option_value.name as value_name', 'option_value.sort_order as value_sort_order',
+      ])
+      .where('selected.product_id', '=', id)
+      .orderBy('selected.product_variant_id').orderBy('option_group.sort_order').orderBy('option_group.id')
+      .execute(),
+    db.selectFrom('product_attributes').selectAll().where('product_id', '=', id)
+      .orderBy('sort_order').orderBy('id').execute(),
+  ])
+
+  const optionsByVariant = new Map<string, Array<{ groupId: string; groupName: string; valueId: string; valueName: string }>>()
+  for (const option of optionRows) {
+    const selected = optionsByVariant.get(option.product_variant_id) ?? []
+    selected.push({ groupId: option.group_id, groupName: option.group_name, valueId: option.value_id, valueName: option.value_name })
+    optionsByVariant.set(option.product_variant_id, selected)
+  }
+  const valuesByGroup = new Map<string, typeof valueRows>()
+  for (const value of valueRows) {
+    const values = valuesByGroup.get(value.option_group_id) ?? []
+    values.push(value)
+    valuesByGroup.set(value.option_group_id, values)
+  }
 
   return {
     id: product.id,
@@ -70,6 +110,38 @@ async function loadProduct(db: Kysely<Database>, id: string): Promise<ProductDet
     revision: product.revision,
     createdAt: product.created_at.toISOString(),
     updatedAt: product.updated_at.toISOString(),
+    categories: categoryRows.map((category) => ({
+      categoryId: category.category_id,
+      name: category.name,
+      parentId: category.parent_id,
+      isVisible: category.is_visible,
+      isPrimary: category.is_primary,
+      sortOrder: category.sort_order,
+    })),
+    optionGroups: groupRows.map((group) => ({
+      id: group.id,
+      name: group.name,
+      sortOrder: group.sort_order,
+      enabled: group.enabled,
+      values: (valuesByGroup.get(group.id) ?? []).map((value) => ({
+        id: value.id,
+        name: value.name,
+        sortOrder: value.sort_order,
+        enabled: value.enabled,
+        createdAt: value.created_at.toISOString(),
+        updatedAt: value.updated_at.toISOString(),
+      })),
+      createdAt: group.created_at.toISOString(),
+      updatedAt: group.updated_at.toISOString(),
+    })),
+    attributes: attributeRows.map((attribute) => ({
+      id: attribute.id,
+      name: attribute.name,
+      value: attribute.value,
+      sortOrder: attribute.sort_order,
+      createdAt: attribute.created_at.toISOString(),
+      updatedAt: attribute.updated_at.toISOString(),
+    })),
     variants: variants.map((variant) => {
       const amount = parseUnitAmount(variant.sale_price)
       if (amount.isNegative() || amount.decimalPlaces() > 2) {
@@ -83,6 +155,7 @@ async function loadProduct(db: Kysely<Database>, id: string): Promise<ProductDet
         currency: 'CNY' as const,
         enabled: variant.enabled,
         isDefault: variant.combination_key === '',
+        options: optionsByVariant.get(variant.id) ?? [],
         revision: variant.revision,
         createdAt: variant.created_at.toISOString(),
         updatedAt: variant.updated_at.toISOString(),
@@ -241,7 +314,8 @@ export function registerAdminProductRoutes(
     },
   }, async (request, reply) => {
     const params = request.params as ProductIdParams
-    const product = await loadProduct(db, params.id)
+    const product = await db.transaction().setIsolationLevel('repeatable read')
+      .execute((trx) => loadProduct(trx, params.id))
     if (!product) return reply.code(404).send(failure('PRODUCT_NOT_FOUND', 'The product does not exist', request.id))
     return success(product, request.id)
   })
