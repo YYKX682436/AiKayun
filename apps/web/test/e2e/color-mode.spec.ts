@@ -221,6 +221,7 @@ test('front and admin routes share the display preference and apply separate roo
 })
 
 test('semantic status text keeps WCAG AA contrast in both themes', async ({ page }) => {
+  test.skip(process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true', '设计预览只在开发服务器中提供')
   await page.goto('/dev-preview')
 
   for (const mode of ['light', 'dark'] as const) {

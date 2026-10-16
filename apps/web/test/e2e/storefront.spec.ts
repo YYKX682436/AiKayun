@@ -233,7 +233,14 @@ test('mobile admin navigation supports keyboard focus and closes after route cha
 })
 
 test('development design preview composes existing components without business actions', async ({ page }) => {
-  await page.goto('/dev-preview')
+  const response = await page.goto('/dev-preview')
+  if (process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true') {
+    expect(response?.status()).toBe(404)
+    expect(await response?.text()).not.toContain('品牌与语义颜色')
+    return
+  }
+
+  expect(response?.status()).toBe(200)
   await expect(page).toHaveTitle('设计系统预览 · AiKayun 数字商城')
   await expect(page.getByRole('heading', { name: '品牌与语义颜色' })).toBeVisible()
   await expect(page.getByRole('heading', { name: '按钮与输入框' })).toBeVisible()
