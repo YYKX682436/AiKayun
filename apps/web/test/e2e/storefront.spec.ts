@@ -92,9 +92,79 @@ test('blocks the admin page until login, then creates and ends a session', async
   }
 
   await page.setViewportSize({ width: 1440, height: 900 })
+  let logoutAttempts = 0
+  await page.route('**/api/v1/admin/auth/logout', async (route) => {
+    logoutAttempts += 1
+    if (logoutAttempts === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        body: JSON.stringify({ statusCode: 503, statusMessage: 'Service Unavailable' }),
+      })
+      return
+    }
+    await route.continue()
+  })
+
+  await page.getByRole('button', { name: '退出登录' }).click()
+  await expect(page.getByRole('alert')).toContainText('退出登录暂时失败，请重试。')
+  await expect(page.getByRole('button', { name: '退出登录' })).toBeEnabled()
   await page.getByRole('button', { name: '退出登录' }).click()
   await expect(page).toHaveURL(/\/admin\/login/)
   const protectedResponse = await page.request.get('/api/v1/admin/overview')
   expect(protectedResponse.status()).toBe(401)
   expect((await protectedResponse.json()).error.code).toBe('UNAUTHORIZED')
+})
+
+test('login announces an authentication error and blocks repeated submissions while pending', async ({ page }) => {
+  let loginRequests = 0
+  let releaseLogin!: () => void
+  const loginResponse = new Promise<void>((resolve) => {
+    releaseLogin = resolve
+  })
+
+  await page.route('**/api/v1/admin/auth/csrf', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ data: { csrfToken: 'ui-test-token' } }),
+  }))
+  await page.route('**/api/v1/admin/auth/login', async (route) => {
+    loginRequests += 1
+    await loginResponse
+    await route.fulfill({
+      status: 401,
+      contentType: 'application/json',
+      body: JSON.stringify({ statusCode: 401, statusMessage: 'Unauthorized' }),
+    })
+  })
+
+  await page.goto('/admin/login')
+  const submitButton = page.getByRole('button', { name: '安全登录' })
+  await expect(submitButton).toBeEnabled()
+  await page.getByLabel('管理员邮箱').fill('admin@example.com')
+  await page.getByLabel('密码').fill('test-password')
+  const form = page.locator('form')
+  await page.getByLabel('密码').press('Enter')
+  await expect(submitButton).toBeDisabled()
+  await expect(page.getByLabel('管理员邮箱')).toBeDisabled()
+  await expect(page.getByLabel('密码')).toBeDisabled()
+  await form.evaluate(element => (element as HTMLFormElement).requestSubmit())
+  await expect.poll(() => loginRequests, { timeout: 2_000 }).toBe(1)
+  await page.waitForTimeout(100)
+  expect(loginRequests).toBe(1)
+
+  releaseLogin()
+  await expect(page.getByRole('alert')).toContainText('邮箱或密码不正确。')
+  await expect(submitButton).toBeEnabled()
+})
+
+test('login fields stay disabled until client hydration completes', async ({ page }) => {
+  await page.route('**/_nuxt/**', route => route.abort())
+  await page.goto('/admin/login')
+
+  await expect(page.getByLabel('管理员邮箱')).toBeDisabled()
+  await expect(page.getByLabel('密码')).toBeDisabled()
+  await expect(page.getByRole('button', { name: '安全登录' })).toBeDisabled()
+  await page.keyboard.press('Enter')
+  await expect(page).toHaveURL(/\/admin\/login$/)
 })

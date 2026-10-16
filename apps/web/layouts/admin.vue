@@ -6,7 +6,7 @@
           to="/admin"
           class="flex items-center gap-3 font-semibold text-highlighted"
         >
-          <span class="grid size-9 place-items-center rounded-xl bg-primary text-sm font-bold text-inverted">A</span>
+          <BrandMark name="AiKayun" />
           <span>AiKayun <span class="hidden font-normal text-dimmed sm:inline">/ 管理后台</span></span>
         </NuxtLink>
         <nav class="flex items-center gap-2">

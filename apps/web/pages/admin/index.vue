@@ -6,8 +6,12 @@ useSeoMeta({ title: '管理概览' })
 
 const { data: session } = await useFetch<ApiSuccess<AdminSession>>('/api/v1/admin/session')
 const busy = ref(false)
+const logoutError = ref('')
 
 async function logout() {
+  if (busy.value) return
+
+  logoutError.value = ''
   busy.value = true
   try {
     const { data: csrf } = await $fetch<ApiSuccess<{ csrfToken: string }>>('/api/v1/admin/auth/csrf')
@@ -16,6 +20,8 @@ async function logout() {
       headers: { 'x-csrf-token': csrf.csrfToken },
     })
     await navigateTo('/admin/login')
+  } catch {
+    logoutError.value = '退出登录暂时失败，请重试。'
   } finally {
     busy.value = false
   }
@@ -40,11 +46,21 @@ async function logout() {
         color="neutral"
         variant="outline"
         :loading="busy"
+        :disabled="busy"
         @click="logout"
       >
         退出登录
       </UButton>
     </div>
+
+    <UAlert
+      v-if="logoutError"
+      class="mt-6"
+      color="error"
+      variant="soft"
+      :title="logoutError"
+      role="alert"
+    />
 
     <section class="mt-8 grid gap-4 sm:grid-cols-2">
       <UCard>
@@ -77,11 +93,15 @@ async function logout() {
         这套工程已接通共享 API 契约、PostgreSQL 迁移和管理员会话。商品、订单、支付和履约数据模型将在后续阶段按实际业务建立。
       </p>
       <div class="mt-5 flex flex-wrap gap-2">
-        <span
+        <UBadge
           v-for="tag in ['管理员会话', 'PostgreSQL', 'OpenAPI']"
           :key="tag"
-          class="rounded-full bg-muted px-3 py-1.5 text-xs font-medium text-muted"
-        >{{ tag }}</span>
+          color="neutral"
+          variant="soft"
+          size="md"
+        >
+          {{ tag }}
+        </UBadge>
       </div>
     </UCard>
   </div>

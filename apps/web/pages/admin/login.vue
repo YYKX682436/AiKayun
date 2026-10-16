@@ -15,6 +15,8 @@ onMounted(() => {
 })
 
 async function submitLogin() {
+  if (busy.value) return
+
   errorMessage.value = ''
   busy.value = true
   try {
@@ -51,7 +53,7 @@ async function submitLogin() {
           to="/"
           class="mb-10 inline-flex items-center gap-3 font-semibold tracking-tight text-highlighted"
         >
-          <span class="grid size-9 place-items-center rounded-xl bg-primary text-sm font-bold text-inverted">A</span>
+          <BrandMark name="AiKayun" />
           AiKayun
         </NuxtLink>
         <h1 class="text-3xl font-semibold tracking-tight text-highlighted">
@@ -89,6 +91,7 @@ async function submitLogin() {
               required
               class="w-full"
               size="lg"
+              :disabled="busy || !clientReady"
             />
           </UFormField>
           <UFormField
@@ -103,6 +106,7 @@ async function submitLogin() {
               required
               class="w-full"
               size="lg"
+              :disabled="busy || !clientReady"
             />
           </UFormField>
           <UButton

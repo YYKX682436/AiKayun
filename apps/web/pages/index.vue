@@ -37,12 +37,15 @@ const capabilities = [
           >
             进入管理后台
           </UButton>
-          <a
+          <UButton
             href="/api/docs"
-            class="inline-flex h-11 items-center rounded-lg border border-default bg-elevated px-5 text-sm font-medium text-toned transition-colors hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+            external
+            color="neutral"
+            variant="outline"
+            size="lg"
           >
             查看 API 文档
-          </a>
+          </UButton>
         </div>
         <div class="mt-12 flex flex-wrap gap-x-8 gap-y-3 border-t border-default pt-6 text-sm text-muted">
           <span>TypeScript 严格模式</span>
@@ -63,7 +66,13 @@ const capabilities = [
                   为数字商品业务准备
                 </p>
               </div>
-              <span class="rounded-full bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary">阶段 01</span>
+              <UBadge
+                color="primary"
+                variant="soft"
+                size="md"
+              >
+                阶段 01
+              </UBadge>
             </div>
           </template>
           <div class="grid grid-cols-2 gap-3">

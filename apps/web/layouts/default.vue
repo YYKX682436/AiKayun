@@ -10,16 +10,10 @@ const storeBrand = useStoreBrand()
           to="/"
           class="flex min-w-0 items-center gap-3 rounded-sm font-semibold tracking-tight text-highlighted focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary"
         >
-          <span class="grid size-9 shrink-0 place-items-center overflow-hidden rounded-xl bg-primary text-sm font-bold text-inverted">
-            <img
-              v-if="storeBrand.storeLogoUrl"
-              :src="storeBrand.storeLogoUrl"
-              alt=""
-              aria-hidden="true"
-              class="size-full object-contain"
-            >
-            <span v-else>{{ storeBrand.storeName.slice(0, 1) }}</span>
-          </span>
+          <BrandMark
+            :name="storeBrand.storeName"
+            :logo-url="storeBrand.storeLogoUrl"
+          />
           <span class="truncate">{{ storeBrand.storeName }}</span>
         </NuxtLink>
         <nav
