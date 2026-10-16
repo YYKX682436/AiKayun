@@ -1,5 +1,5 @@
 <script setup lang="ts">
-if (!import.meta.dev) {
+if (!import.meta.dev && !import.meta.test) {
   throw createError({ statusCode: 404, statusMessage: 'Not Found' })
 }
 

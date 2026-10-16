@@ -28,7 +28,7 @@ export default defineNuxtConfig({
   typescript: { strict: true, typeCheck: true },
   hooks: {
     'pages:extend'(pages) {
-      if (process.env.NODE_ENV === 'development') return
+      if (process.env.NODE_ENV !== 'production') return
       const previewIndex = pages.findIndex(page => page.path === '/dev-preview')
       if (previewIndex !== -1) pages.splice(previewIndex, 1)
     },
