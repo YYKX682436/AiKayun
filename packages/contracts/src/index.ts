@@ -65,6 +65,149 @@ export const ProductSalePriceSchema = Type.String({
   description: 'Non-negative CNY amount with at most 13 integer and 2 fractional digits',
 })
 
+export const ProductCostPriceSchema = Type.String({
+  pattern: '^(?:0|[1-9]\\d{0,12})(?:\\.\\d{1,5})?(?![\\s\\S])',
+  description: 'Non-negative internal CNY cost with at most 13 integer and 5 fractional digits',
+})
+
+export const ProductInventoryModeSchema = Type.Union([
+  Type.Literal('quantity'),
+  Type.Literal('resource_pool'),
+  Type.Literal('unlimited'),
+  Type.Literal('external'),
+])
+
+export const NullableProductInventoryModeSchema = Type.Union([
+  ProductInventoryModeSchema,
+  Type.Null(),
+])
+
+export const AdminProductVariantPricesSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  productRevision: Type.Integer({ minimum: 1 }),
+  skuId: Type.String({ format: 'uuid' }),
+  skuCode: Type.String({ minLength: 1, maxLength: 64 }),
+  skuRevision: Type.Integer({ minimum: 1 }),
+  salePrice: ProductSalePriceSchema,
+  compareAtPrice: Type.Union([ProductSalePriceSchema, Type.Null()]),
+  costPrice: Type.Union([ProductCostPriceSchema, Type.Null()]),
+  currency: Type.Literal('CNY'),
+  retiredAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  updatedAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+
+export const UpdateAdminProductVariantPricesBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  expectedSkuRevision: Type.Integer({ minimum: 1 }),
+  salePrice: Type.Optional(ProductSalePriceSchema),
+  compareAtPrice: Type.Optional(Type.Union([ProductSalePriceSchema, Type.Null()])),
+  costPrice: Type.Optional(Type.Union([ProductCostPriceSchema, Type.Null()])),
+}, { additionalProperties: false, minProperties: 3 })
+
+export const ProductInventoryStatusSchema = Type.Object({
+  mode: NullableProductInventoryModeSchema,
+  configured: Type.Boolean(),
+  hasTrustedQuantity: Type.Boolean(),
+  stocked: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  reserved: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  available: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  sufficient: Type.Union([Type.Boolean(), Type.Null()]),
+  sourceReady: Type.Boolean(),
+  status: Type.Union([
+    Type.Literal('not_configured'),
+    Type.Literal('ready'),
+    Type.Literal('not_ready'),
+  ]),
+}, { additionalProperties: false })
+
+export const AdminProductVariantInventorySchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  productRevision: Type.Integer({ minimum: 1 }),
+  skuId: Type.String({ format: 'uuid' }),
+  skuCode: Type.String({ minLength: 1, maxLength: 64 }),
+  skuRevision: Type.Integer({ minimum: 1 }),
+  inventoryRevision: Type.Integer({ minimum: 0 }),
+  enabled: Type.Boolean(),
+  retiredAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  inventory: ProductInventoryStatusSchema,
+}, { additionalProperties: false })
+
+export const AdminProductInventorySummarySchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  productRevision: Type.Integer({ minimum: 1 }),
+  requestedQuantity: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }),
+  variants: Type.Array(AdminProductVariantInventorySchema),
+}, { additionalProperties: false })
+
+export const ProductInventorySummaryQuerySchema = Type.Object({
+  quantity: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_147_483_647 })),
+}, { additionalProperties: false })
+
+export const UpdateProductInventoryModeBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  expectedSkuRevision: Type.Integer({ minimum: 1 }),
+  expectedInventoryRevision: Type.Integer({ minimum: 0 }),
+  inventoryMode: NullableProductInventoryModeSchema,
+}, { additionalProperties: false })
+
+const InventoryAdjustmentCommonSchema = {
+  expectedInventoryRevision: Type.Integer({ minimum: 0 }),
+  operationId: Type.String({ format: 'uuid' }),
+  reason: Type.String({ minLength: 1, maxLength: 500 }),
+}
+
+export const CreateInventoryAdjustmentBodySchema = Type.Union([
+  Type.Object({
+    ...InventoryAdjustmentCommonSchema,
+    action: Type.Literal('increase'),
+    quantity: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    ...InventoryAdjustmentCommonSchema,
+    action: Type.Literal('decrease'),
+    quantity: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    ...InventoryAdjustmentCommonSchema,
+    action: Type.Literal('set'),
+    quantity: Type.Integer({ minimum: 0, maximum: 2_147_483_647 }),
+  }, { additionalProperties: false }),
+])
+
+export const InventoryAdjustmentSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  operationId: Type.String({ format: 'uuid' }),
+  productId: Type.String({ format: 'uuid' }),
+  skuId: Type.String({ format: 'uuid' }),
+  administratorId: Type.String({ format: 'uuid' }),
+  action: Type.Union([Type.Literal('increase'), Type.Literal('decrease'), Type.Literal('set')]),
+  requestedQuantity: Type.Integer({ minimum: 0, maximum: 2_147_483_647 }),
+  quantityBefore: Type.Integer({ minimum: 0, maximum: 2_147_483_647 }),
+  quantityAfter: Type.Integer({ minimum: 0, maximum: 2_147_483_647 }),
+  quantityDelta: Type.Integer({ minimum: -2_147_483_647, maximum: 2_147_483_647 }),
+  inventoryRevision: Type.Integer({ minimum: 1 }),
+  reason: Type.String({ minLength: 1, maxLength: 500 }),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+
+export const InventoryAdjustmentCursorSchema = Type.Object({
+  createdAt: Type.String({ format: 'date-time' }),
+  id: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+
+export const InventoryAdjustmentPageSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  skuId: Type.String({ format: 'uuid' }),
+  adjustments: Type.Array(InventoryAdjustmentSchema, { maxItems: 100 }),
+  nextCursor: Type.Union([InventoryAdjustmentCursorSchema, Type.Null()]),
+}, { additionalProperties: false })
+
+export const InventoryAdjustmentQuerySchema = Type.Object({
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  beforeCreatedAt: Type.Optional(Type.String({ format: 'date-time' })),
+  beforeId: Type.Optional(Type.String({ format: 'uuid' })),
+}, { additionalProperties: false })
+
 export const CreateProductBodySchema = Type.Object({
   name: Type.String({ minLength: 1, maxLength: 200 }),
   description: Type.Optional(Type.String({ maxLength: 20_000 })),
@@ -76,6 +219,10 @@ export const CreateProductBodySchema = Type.Object({
 
 export const ProductIdParamsSchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+export const ProductVariantIdParamsSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  variantId: Type.String({ format: 'uuid' }),
 }, { additionalProperties: false })
 export const ProductCategoryIdParamsSchema = ProductIdParamsSchema
 
@@ -267,6 +414,13 @@ export const ProductVariantMatrixChangeSchema = Type.Object({
     valueId: UuidSchema,
     valueName: OptionNameSchema,
   }, { additionalProperties: false })),
+  inventoryMutationBlocked: Type.Boolean(),
+  inventoryMutationBlockReason: Type.Union([
+    Type.Literal('stocked_quantity'),
+    Type.Literal('reserved_quantity'),
+    Type.Literal('adjustment_history'),
+    Type.Null(),
+  ]),
 }, { additionalProperties: false })
 
 export const ProductVariantMatrixPreviewSchema = Type.Object({
@@ -308,8 +462,23 @@ export type AdminOverview = Static<typeof AdminOverviewSchema>
 export type ProductType = Static<typeof ProductTypeSchema>
 export type ProductStatus = Static<typeof ProductStatusSchema>
 export type ProductSalePrice = Static<typeof ProductSalePriceSchema>
+export type ProductCostPrice = Static<typeof ProductCostPriceSchema>
+export type ProductInventoryMode = Static<typeof ProductInventoryModeSchema>
+export type NullableProductInventoryMode = Static<typeof NullableProductInventoryModeSchema>
+export type AdminProductVariantPrices = Static<typeof AdminProductVariantPricesSchema>
+export type UpdateAdminProductVariantPricesBody = Static<typeof UpdateAdminProductVariantPricesBodySchema>
+export type ProductInventoryStatus = Static<typeof ProductInventoryStatusSchema>
+export type AdminProductVariantInventory = Static<typeof AdminProductVariantInventorySchema>
+export type AdminProductInventorySummary = Static<typeof AdminProductInventorySummarySchema>
+export type ProductInventorySummaryQuery = Static<typeof ProductInventorySummaryQuerySchema>
+export type UpdateProductInventoryModeBody = Static<typeof UpdateProductInventoryModeBodySchema>
+export type CreateInventoryAdjustmentBody = Static<typeof CreateInventoryAdjustmentBodySchema>
+export type InventoryAdjustment = Static<typeof InventoryAdjustmentSchema>
+export type InventoryAdjustmentPage = Static<typeof InventoryAdjustmentPageSchema>
+export type InventoryAdjustmentQuery = Static<typeof InventoryAdjustmentQuerySchema>
 export type CreateProductBody = Static<typeof CreateProductBodySchema>
 export type ProductIdParams = Static<typeof ProductIdParamsSchema>
+export type ProductVariantIdParams = Static<typeof ProductVariantIdParamsSchema>
 export type ProductVariant = Static<typeof ProductVariantSchema>
 export type ProductOptionValue = Static<typeof ProductOptionValueSchema>
 export type ProductOptionGroup = Static<typeof ProductOptionGroupSchema>

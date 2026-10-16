@@ -28,6 +28,11 @@ const migrationSentinel = {
   variantId: '00000000-0000-4000-8000-000000000102',
   skuCode: 'SKU-MIGRATION-SENTINEL',
 }
+const migrationD2Sentinel = {
+  productId: '00000000-0000-4000-8000-000000000201',
+  variantId: '00000000-0000-4000-8000-000000000202',
+  skuCode: 'SKU-D2-MIGRATION-SENTINEL',
+}
 
 const productIdentityFactory: ProductIdentityFactory = {
   ...defaultProductIdentityFactory,
@@ -121,6 +126,61 @@ async function saveMatrix(
   })
 }
 
+async function getInventorySummary(
+  auth: Awaited<ReturnType<typeof loginAdmin>>,
+  productId: string,
+  quantity?: number,
+) {
+  const suffix = quantity === undefined ? '' : `?quantity=${quantity}`
+  return app.inject({
+    method: 'GET', url: `/api/v1/admin/products/${productId}/inventory${suffix}`,
+    headers: { cookie: auth.sessionCookie },
+  })
+}
+
+async function setInventoryMode(
+  auth: Awaited<ReturnType<typeof loginAdmin>>,
+  productId: string,
+  skuId: string,
+  body: Record<string, unknown>,
+  csrf = true,
+) {
+  return app.inject({
+    method: 'PUT',
+    url: `/api/v1/admin/products/${productId}/variants/${skuId}/inventory-mode`,
+    headers: csrf ? productHeaders(auth) : { cookie: auth.sessionCookie, origin: testOrigin },
+    payload: body,
+  })
+}
+
+async function adjustInventory(
+  auth: Awaited<ReturnType<typeof loginAdmin>>,
+  productId: string,
+  skuId: string,
+  body: Record<string, unknown>,
+) {
+  return app.inject({
+    method: 'POST',
+    url: `/api/v1/admin/products/${productId}/variants/${skuId}/inventory/adjustments`,
+    headers: productHeaders(auth),
+    payload: body,
+  })
+}
+
+async function patchSkuPrices(
+  auth: Awaited<ReturnType<typeof loginAdmin>>,
+  productId: string,
+  skuId: string,
+  body: Record<string, unknown>,
+) {
+  return app.inject({
+    method: 'PATCH',
+    url: `/api/v1/admin/products/${productId}/variants/${skuId}/prices`,
+    headers: productHeaders(auth),
+    payload: body,
+  })
+}
+
 beforeAll(async () => {
   if (!testDatabaseUrl) throw new Error('TEST_DATABASE_URL must point to a dedicated PostgreSQL database ending in _test')
   const databaseUrl = new URL(testDatabaseUrl)
@@ -158,6 +218,26 @@ beforeAll(async () => {
       sku_code: migrationSentinel.skuCode,
       combination_key: '',
       sale_price: '19.90',
+      enabled: true,
+    }).execute()
+  })
+
+  const migratedD2Schema = await migrator.migrateTo('202610160004_product_catalog_r1')
+  if (migratedD2Schema.error) throw migratedD2Schema.error
+  await db.transaction().execute(async (trx) => {
+    await trx.insertInto('products').values({
+      id: migrationD2Sentinel.productId,
+      name: 'D2 迁移基线商品',
+      description: 'D3 前进迁移必须保留商品、SKU 和分类规格基础',
+      product_type: 'digital',
+      status: 'draft',
+    }).execute()
+    await trx.insertInto('product_variants').values({
+      id: migrationD2Sentinel.variantId,
+      product_id: migrationD2Sentinel.productId,
+      sku_code: migrationD2Sentinel.skuCode,
+      combination_key: '',
+      sale_price: '29.90',
       enabled: true,
     }).execute()
   })
@@ -585,7 +665,8 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(result.rows.map((row) => row.table_name)).toEqual([
       'admin_sessions', 'admin_users', 'product_attributes', 'product_categories',
       'product_category_assignments', 'product_category_tree_guard', 'product_option_groups', 'product_option_values',
-      'product_variant_option_values', 'product_variants', 'products',
+      'product_variant_inventory_adjustments', 'product_variant_option_values',
+      'product_variant_quantity_inventory', 'product_variants', 'products',
     ])
     const admin = await db.selectFrom('admin_users').select('email').where('email', '=', testEmail).executeTakeFirst()
     expect(admin?.email).toBe(testEmail)
@@ -598,6 +679,31 @@ describe('Fastify API with PostgreSQL 18', () => {
       sku_code: migrationSentinel.skuCode,
       sale_price: '19.90000',
     })
+    const migratedInventoryDefaults = await db.selectFrom('product_variants')
+      .select(['inventory_mode', 'inventory_revision', 'compare_at_price', 'cost_price'])
+      .where('id', '=', migrationSentinel.variantId).executeTakeFirstOrThrow()
+    expect(migratedInventoryDefaults).toEqual({
+      inventory_mode: null,
+      inventory_revision: 0,
+      compare_at_price: null,
+      cost_price: null,
+    })
+    expect(await db.selectFrom('product_variant_quantity_inventory').select('product_variant_id')
+      .where('product_variant_id', '=', migrationSentinel.variantId).execute()).toEqual([])
+    const d2Product = await db.selectFrom('products').select(['id', 'name'])
+      .where('id', '=', migrationD2Sentinel.productId).executeTakeFirst()
+    expect(d2Product).toEqual({ id: migrationD2Sentinel.productId, name: 'D2 迁移基线商品' })
+    const d2Sku = await db.selectFrom('product_variants').select(['id', 'sku_code', 'sale_price', 'inventory_mode', 'inventory_revision'])
+      .where('id', '=', migrationD2Sentinel.variantId).executeTakeFirst()
+    expect(d2Sku).toEqual({
+      id: migrationD2Sentinel.variantId,
+      sku_code: migrationD2Sentinel.skuCode,
+      sale_price: '29.90000',
+      inventory_mode: null,
+      inventory_revision: 0,
+    })
+    expect(await db.selectFrom('product_variant_quantity_inventory').select('product_variant_id')
+      .where('product_variant_id', '=', migrationD2Sentinel.variantId).execute()).toEqual([])
   })
 
   it('requires at least one SKU but permits multi-SKU products without a default SKU', async () => {
@@ -1653,5 +1759,600 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(result.variants).toHaveLength(1)
     expect(result.variants[0]?.isDefault).toBe(true)
     expect(result.variants[0]?.id).not.toBe(skuToRetain.id)
+  })
+
+  it('manages per-SKU CNY pricing with product and SKU revisions and keeps cost data internal', async () => {
+    const unauthorized = await app.inject({ method: 'GET', url: '/api/v1/admin/products/00000000-0000-4000-8000-000000000001/variants/00000000-0000-4000-8000-000000000002/prices' })
+    expect(unauthorized.statusCode).toBe(401)
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, 'D3 SKU 价格')
+    const groupId = randomUUID()
+    const firstValueId = randomUUID()
+    const secondValueId = randomUUID()
+    const matrix = await saveMatrix(auth, product.id, {
+      expectedRevision: product.revision,
+      mode: 'selected',
+      groups: [optionGroup('时长', groupId, [{ id: firstValueId, name: '月卡' }, { id: secondValueId, name: '年卡' }])],
+      combinations: [
+        { optionValueIds: [firstValueId], salePrice: '19.90', enabled: true },
+        { optionValueIds: [secondValueId], salePrice: '129.00', enabled: true },
+      ],
+    })
+    const current = matrix.json<{ data: { product: ProductDetail } }>().data.product
+    const sku = current.variants.find((variant) => variant.options[0]?.valueId === firstValueId)!
+    const otherSku = current.variants.find((variant) => variant.id !== sku.id)!
+    const initialRead = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/variants/${sku.id}/prices`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(initialRead.statusCode).toBe(200)
+    const initialPrice = initialRead.json<{ data: { productRevision: number; skuRevision: number; salePrice: string; compareAtPrice: string | null; costPrice: string | null } }>().data
+    expect(initialPrice).toMatchObject({ salePrice: '19.90', compareAtPrice: null, costPrice: null })
+
+    const missingCsrf = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${sku.id}/prices`,
+      headers: { cookie: `${auth.sessionCookie}; ${auth.csrf.cookie}`, origin: testOrigin },
+      payload: { expectedRevision: initialPrice.productRevision, expectedSkuRevision: initialPrice.skuRevision, salePrice: '0.00' },
+    })
+    expect(missingCsrf.statusCode).toBe(403)
+
+    const repriced = await patchSkuPrices(auth, product.id, sku.id, {
+      expectedRevision: initialPrice.productRevision,
+      expectedSkuRevision: initialPrice.skuRevision,
+      salePrice: '0.00',
+      compareAtPrice: '9.99',
+      costPrice: '1.23456',
+    })
+    expect(repriced.statusCode).toBe(200)
+    const savedPrice = repriced.json<{ data: { productRevision: number; skuRevision: number; salePrice: string; compareAtPrice: string | null; costPrice: string | null } }>().data
+    expect(savedPrice).toMatchObject({ salePrice: '0.00', compareAtPrice: '9.99', costPrice: '1.23456' })
+    expect(savedPrice.productRevision).toBeGreaterThan(initialPrice.productRevision)
+    expect(savedPrice.skuRevision).toBeGreaterThan(initialPrice.skuRevision)
+    const dbPrice = await db.selectFrom('product_variants').select(['sale_price', 'compare_at_price', 'cost_price'])
+      .where('id', '=', sku.id).executeTakeFirstOrThrow()
+    expect(dbPrice).toEqual({ sale_price: '0.00000', compare_at_price: '9.99000', cost_price: '1.23456' })
+    await expect(db.updateTable('product_variants').set({ compare_at_price: '0.00000' })
+      .where('id', '=', sku.id).execute()).rejects.toMatchObject({
+      code: '23514', constraint: 'product_variants_compare_at_price_check',
+    })
+    await expect(db.updateTable('product_variants').set({ cost_price: '-0.00001' })
+      .where('id', '=', sku.id).execute()).rejects.toMatchObject({
+      code: '23514', constraint: 'product_variants_cost_price_check',
+    })
+
+    const otherPrice = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/variants/${otherSku.id}/prices`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(otherPrice.json<{ data: { salePrice: string } }>().data.salePrice).toBe('129.00')
+    const productRead = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie } })
+    expect(JSON.stringify(productRead.json())).not.toContain('costPrice')
+    const inventoryBeforePrice = await db.selectFrom('product_variants').select('inventory_revision')
+      .where('id', '=', sku.id).executeTakeFirstOrThrow()
+    expect(inventoryBeforePrice.inventory_revision).toBe(0)
+
+    for (const invalid of ['1.001', '-0.01', '1e2', '10000000000000.00']) {
+      const response = await patchSkuPrices(auth, product.id, sku.id, {
+        expectedRevision: savedPrice.productRevision,
+        expectedSkuRevision: savedPrice.skuRevision,
+        salePrice: invalid,
+      })
+      expect(response.statusCode).toBe(400)
+      expect(response.json().error.code).toBe('VALIDATION_ERROR')
+    }
+    for (const invalid of ['-0.01', '1.000001', '1e2', '10000000000000.00000']) {
+      const response = await patchSkuPrices(auth, product.id, sku.id, {
+        expectedRevision: savedPrice.productRevision,
+        expectedSkuRevision: savedPrice.skuRevision,
+        costPrice: invalid,
+      })
+      expect(response.statusCode).toBe(400)
+      expect(response.json().error.code).toBe('VALIDATION_ERROR')
+    }
+    const invalidComparePrecision = await patchSkuPrices(auth, product.id, sku.id, {
+      expectedRevision: savedPrice.productRevision,
+      expectedSkuRevision: savedPrice.skuRevision,
+      compareAtPrice: '1.001',
+    })
+    expect(invalidComparePrecision.statusCode).toBe(400)
+    expect(invalidComparePrecision.json().error.code).toBe('VALIDATION_ERROR')
+    const falseDiscount = await patchSkuPrices(auth, product.id, sku.id, {
+      expectedRevision: savedPrice.productRevision,
+      expectedSkuRevision: savedPrice.skuRevision,
+      compareAtPrice: '0.00',
+    })
+    expect(falseDiscount.statusCode).toBe(400)
+    expect(falseDiscount.json().error.code).toBe('INVALID_COMPARE_AT_PRICE')
+
+    const cleared = await patchSkuPrices(auth, product.id, sku.id, {
+      expectedRevision: savedPrice.productRevision,
+      expectedSkuRevision: savedPrice.skuRevision,
+      compareAtPrice: null,
+      costPrice: null,
+    })
+    expect(cleared.statusCode).toBe(200)
+    expect(cleared.json().data).toMatchObject({ salePrice: '0.00', compareAtPrice: null, costPrice: null })
+    const staleProduct = await patchSkuPrices(auth, product.id, sku.id, {
+      expectedRevision: savedPrice.productRevision,
+      expectedSkuRevision: cleared.json<{ data: { skuRevision: number } }>().data.skuRevision,
+      salePrice: '1.00',
+    })
+    expect(staleProduct.statusCode).toBe(409)
+    expect(staleProduct.json().error.code).toBe('PRODUCT_REVISION_CONFLICT')
+  })
+
+  it('does not permit repricing a permanently retired SKU', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '退役 SKU 价格')
+    const retiredSku = product.variants[0]!
+    const valueId = randomUUID()
+    const saved = await saveMatrix(auth, product.id, {
+      expectedRevision: product.revision,
+      mode: 'selected',
+      groups: [optionGroup('版本', randomUUID(), [{ id: valueId, name: '正式版' }])],
+      combinations: [{ optionValueIds: [valueId], salePrice: '20.00', enabled: true }],
+      retireSkuIds: [retiredSku.id],
+    })
+    expect(saved.statusCode).toBe(200)
+    const savedProduct = saved.json<{ data: { product: ProductDetail } }>().data.product
+    const retired = savedProduct.variants.find((variant) => variant.id === retiredSku.id)!
+    const response = await patchSkuPrices(auth, product.id, retired.id, {
+      expectedRevision: savedProduct.revision,
+      expectedSkuRevision: retired.revision,
+      salePrice: '1.00',
+    })
+    expect(response.statusCode).toBe(409)
+    expect(response.json().error.code).toBe('SKU_PERMANENTLY_RETIRED')
+  })
+
+  it('uses separate quantity inventory revisions, reserved boundaries, idempotency, and truthful mode states', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, 'D3 库存边界')
+    const sku = product.variants[0]!
+    const initialSummary = await getInventorySummary(auth, product.id)
+    expect(initialSummary.statusCode).toBe(200)
+    expect(initialSummary.json().data.variants[0].inventory).toMatchObject({
+      mode: null, configured: false, hasTrustedQuantity: false, stocked: null, reserved: null,
+      available: null, sufficient: null, sourceReady: false, status: 'not_configured',
+    })
+
+    const unauthenticatedAdjust = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/variants/${sku.id}/inventory/adjustments`,
+      payload: { expectedInventoryRevision: 0, operationId: randomUUID(), action: 'increase', quantity: 1, reason: '未授权' },
+    })
+    expect(unauthenticatedAdjust.statusCode).toBe(401)
+    const noCsrf = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: product.revision, expectedSkuRevision: sku.revision,
+      expectedInventoryRevision: 0, inventoryMode: 'quantity',
+    }, false)
+    expect(noCsrf.statusCode).toBe(403)
+    const noAdjustmentCsrf = await app.inject({
+      method: 'POST',
+      url: `/api/v1/admin/products/${product.id}/variants/${sku.id}/inventory/adjustments`,
+      headers: { cookie: `${auth.sessionCookie}; ${auth.csrf.cookie}`, origin: testOrigin },
+      payload: { expectedInventoryRevision: 0, operationId: randomUUID(), action: 'increase', quantity: 1, reason: '缺少 CSRF' },
+    })
+    expect(noAdjustmentCsrf.statusCode).toBe(403)
+
+    const quantityMode = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: product.revision,
+      expectedSkuRevision: sku.revision,
+      expectedInventoryRevision: 0,
+      inventoryMode: 'quantity',
+    })
+    expect(quantityMode.statusCode).toBe(200)
+    let modeState = quantityMode.json<{ data: { productRevision: number; skuRevision: number; inventoryRevision: number; inventory: Record<string, unknown> } }>().data
+    expect(modeState.inventory).toMatchObject({ mode: 'quantity', stocked: 0, reserved: 0, available: 0, sufficient: false, sourceReady: true, status: 'ready' })
+    expect(modeState.inventoryRevision).toBe(1)
+
+    const operationId = randomUUID()
+    const increaseBody = {
+      expectedInventoryRevision: modeState.inventoryRevision,
+      operationId,
+      action: 'increase',
+      quantity: 100,
+      reason: '首批入库',
+    }
+    const increased = await adjustInventory(auth, product.id, sku.id, increaseBody)
+    expect(increased.statusCode).toBe(201)
+    const adjustment = increased.json<{ data: { id: string; quantityBefore: number; quantityAfter: number; quantityDelta: number; inventoryRevision: number } }>().data
+    expect(adjustment).toMatchObject({ quantityBefore: 0, quantityAfter: 100, quantityDelta: 100, inventoryRevision: 2 })
+    const duplicate = await adjustInventory(auth, product.id, sku.id, increaseBody)
+    expect(duplicate.statusCode).toBe(200)
+    expect(duplicate.json().data).toEqual(adjustment)
+    const reusedOperation = await adjustInventory(auth, product.id, sku.id, { ...increaseBody, quantity: 99 })
+    expect(reusedOperation.statusCode).toBe(409)
+    expect(reusedOperation.json().error.code).toBe('INVENTORY_OPERATION_ID_CONFLICT')
+
+    const decreased = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: adjustment.inventoryRevision,
+      operationId: randomUUID(), action: 'decrease', quantity: 10, reason: '盘点扣减',
+    })
+    expect(decreased.statusCode).toBe(201)
+    const afterDecrease = decreased.json<{ data: { inventoryRevision: number } }>().data
+    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 10 })
+      .where('product_variant_id', '=', sku.id).execute()
+    await expect(db.updateTable('product_variant_quantity_inventory').set({ reserved: 91 })
+      .where('product_variant_id', '=', sku.id).execute()).rejects.toMatchObject({
+      code: '23514', constraint: 'product_variant_quantity_inventory_reserved_check',
+    })
+    const blockedByReservation = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: modeState.productRevision,
+      expectedSkuRevision: modeState.skuRevision,
+      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      inventoryMode: 'external',
+    })
+    expect(blockedByReservation.statusCode).toBe(409)
+    expect(blockedByReservation.json().error.code).toBe('INVENTORY_MODE_SWITCH_BLOCKED')
+    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 0 })
+      .where('product_variant_id', '=', sku.id).execute()
+    await expect(db.updateTable('product_variant_quantity_inventory').set({ stocked: -1 })
+      .where('product_variant_id', '=', sku.id).execute()).rejects.toMatchObject({
+      code: '23514',
+    })
+    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 10 })
+      .where('product_variant_id', '=', sku.id).execute()
+    const belowReserved = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      operationId: randomUUID(), action: 'decrease', quantity: 81, reason: '超出可售库存',
+    })
+    expect(belowReserved.statusCode).toBe(409)
+    expect(belowReserved.json().error.code).toBe('STOCK_BELOW_RESERVED_QUANTITY')
+    const setBelowReserved = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      operationId: randomUUID(), action: 'set', quantity: 9, reason: '错误目标值',
+    })
+    expect(setBelowReserved.statusCode).toBe(409)
+    const overflow = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 2_147_483_647, reason: '超范围补货',
+    })
+    expect(overflow.statusCode).toBe(400)
+    expect(overflow.json().error.code).toBe('INVENTORY_QUANTITY_OUT_OF_RANGE')
+    const invalidInteger = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 2_147_483_648, reason: '超过整数上限',
+    })
+    expect(invalidInteger.statusCode).toBe(400)
+    expect(invalidInteger.json().error.code).toBe('VALIDATION_ERROR')
+
+    const atReserved = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      operationId: randomUUID(), action: 'decrease', quantity: 80, reason: '保留预留数量',
+    })
+    expect(atReserved.statusCode).toBe(201)
+    const afterReserved = atReserved.json<{ data: { inventoryRevision: number } }>().data
+    const reservedSummary = await getInventorySummary(auth, product.id, 11)
+    expect(reservedSummary.json().data.variants[0].inventory).toMatchObject({
+      mode: 'quantity', stocked: 10, reserved: 10, available: 0, sufficient: false,
+    })
+    await expect(db.updateTable('product_variants').set({ inventory_mode: 'unlimited' })
+      .where('id', '=', sku.id).execute()).rejects.toMatchObject({
+      code: '23514', constraint: 'product_variant_quantity_state_consistent',
+    })
+
+    const productAfterStock = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie } })
+    const skuAfterStock = productAfterStock.json<{ data: ProductDetail }>().data.variants[0]!
+    expect(productAfterStock.json().data.revision).toBe(modeState.productRevision)
+    expect(skuAfterStock.revision).toBe(modeState.skuRevision)
+    const staleRevision = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 1, reason: '旧库存版本',
+    })
+    expect(staleRevision.statusCode).toBe(409)
+    expect(staleRevision.json().error.code).toBe('INVENTORY_REVISION_CONFLICT')
+
+    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 0 })
+      .where('product_variant_id', '=', sku.id).execute()
+    const drained = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: afterReserved.inventoryRevision,
+      operationId: randomUUID(), action: 'decrease', quantity: 10, reason: '清空库存',
+    })
+    expect(drained.statusCode).toBe(201)
+    modeState = {
+      ...modeState,
+      inventoryRevision: drained.json<{ data: { inventoryRevision: number } }>().data.inventoryRevision,
+    }
+    const setMode = async (
+      nextMode: 'quantity' | 'resource_pool' | 'unlimited' | 'external' | null,
+      current: { productRevision: number; skuRevision: number; inventoryRevision: number },
+    ) => setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: current.productRevision,
+      expectedSkuRevision: current.skuRevision,
+      expectedInventoryRevision: current.inventoryRevision,
+      inventoryMode: nextMode,
+    })
+
+    const toPool = await setMode('resource_pool', modeState)
+    expect(toPool.statusCode).toBe(200)
+    modeState = toPool.json().data
+    expect(modeState.inventory).toMatchObject({ mode: 'resource_pool', stocked: null, reserved: null, available: null, sufficient: null, sourceReady: false, status: 'not_ready' })
+    const noFakePoolAdjustment = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: modeState.inventoryRevision, operationId: randomUUID(),
+      action: 'increase', quantity: 5, reason: '不支持资源池手工库存',
+    })
+    expect(noFakePoolAdjustment.statusCode).toBe(409)
+    expect(noFakePoolAdjustment.json().error.code).toBe('INVENTORY_MODE_CONFLICT')
+
+    for (const [nextMode, expected] of [
+      ['unlimited', { sufficient: true, sourceReady: true, status: 'ready' }],
+      ['external', { sufficient: null, sourceReady: false, status: 'not_ready' }],
+      [null, { sufficient: null, sourceReady: false, status: 'not_configured' }],
+      ['quantity', { stocked: 0, reserved: 0, available: 0, sourceReady: true, status: 'ready' }],
+    ] as const) {
+      const changed = await setMode(nextMode, modeState)
+      expect(changed.statusCode).toBe(200)
+      modeState = changed.json().data
+      expect(modeState.inventory).toMatchObject(expected)
+    }
+    expect(modeState.inventoryRevision).toBeGreaterThan(afterReserved.inventoryRevision)
+
+    const history = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/variants/${sku.id}/inventory/adjustments?limit=2`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(history.statusCode).toBe(200)
+    const historyPage = history.json<{ data: { adjustments: Array<{ id: string; quantityAfter: number }>; nextCursor: { createdAt: string; id: string } | null } }>().data
+    expect(historyPage.adjustments).toHaveLength(2)
+    expect(historyPage.nextCursor).toBeTruthy()
+    const pageTwo = await app.inject({
+      method: 'GET',
+      url: `/api/v1/admin/products/${product.id}/variants/${sku.id}/inventory/adjustments?limit=2&beforeCreatedAt=${encodeURIComponent(historyPage.nextCursor!.createdAt)}&beforeId=${historyPage.nextCursor!.id}`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(pageTwo.statusCode).toBe(200)
+    expect(pageTwo.json().data.adjustments).toHaveLength(2)
+    expect(pageTwo.json().data.adjustments.map((row: { id: string }) => row.id).some((id: string) => historyPage.adjustments.some((row) => row.id === id))).toBe(false)
+    await expect(db.updateTable('product_variant_inventory_adjustments').set({ reason: '改写历史' }).where('id', '=', adjustment.id).execute())
+      .rejects.toMatchObject({ code: '23514', constraint: 'product_variant_inventory_adjustments_immutable' })
+    await expect(db.deleteFrom('product_variant_inventory_adjustments').where('id', '=', adjustment.id).execute())
+      .rejects.toMatchObject({ code: '23514', constraint: 'product_variant_inventory_adjustments_immutable' })
+
+    const refilled = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: modeState.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 1, reason: '验证停用与库存状态独立',
+    })
+    expect(refilled.statusCode).toBe(201)
+    const currentProduct = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie } })
+    const productBeforePause = currentProduct.json<{ data: ProductDetail }>().data
+    const skuBeforePause = productBeforePause.variants.find((variant) => variant.id === sku.id)!
+    const paused = await saveMatrix(auth, product.id, {
+      expectedRevision: productBeforePause.revision,
+      mode: 'selected', groups: [],
+      combinations: [{ skuId: sku.id, optionValueIds: [], salePrice: skuBeforePause.salePrice, enabled: false }],
+    })
+    expect(paused.statusCode).toBe(200)
+    const disabledAndInStock = await getInventorySummary(auth, product.id, 1)
+    expect(disabledAndInStock.json().data.variants[0]).toMatchObject({
+      enabled: false,
+      inventory: { mode: 'quantity', stocked: 1, available: 1, sufficient: true },
+    })
+  })
+
+  it('serializes concurrent inventory adjustments without lost updates or negative stock', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '并发库存调整')
+    const sku = product.variants[0]!
+    const modeResponse = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: product.revision, expectedSkuRevision: sku.revision,
+      expectedInventoryRevision: 0, inventoryMode: 'quantity',
+    })
+    const mode = modeResponse.json<{ data: { inventoryRevision: number } }>().data
+    const makeIncrease = () => ({
+      expectedInventoryRevision: mode.inventoryRevision, operationId: randomUUID(),
+      action: 'increase', quantity: 10, reason: '并发补货',
+    })
+    const concurrent = [makeIncrease(), makeIncrease()]
+    const results = await Promise.all(concurrent.map((body) => adjustInventory(auth, product.id, sku.id, body)))
+    expect(results.map((result) => result.statusCode).sort()).toEqual([201, 409])
+    const stale = results.find((result) => result.statusCode === 409)!
+    expect(stale.json().error.code).toBe('INVENTORY_REVISION_CONFLICT')
+    const summary = await getInventorySummary(auth, product.id)
+    expect(summary.json().data.variants[0].inventory.stocked).toBe(10)
+
+    const currentRevision = summary.json().data.variants[0].inventoryRevision as number
+    const retry = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: currentRevision, operationId: randomUUID(),
+      action: 'increase', quantity: 10, reason: '并发补货重试',
+    })
+    expect(retry.statusCode).toBe(201)
+    const beforeDecreases = await getInventorySummary(auth, product.id)
+    const revision = beforeDecreases.json().data.variants[0].inventoryRevision as number
+    const concurrentDecreases = await Promise.all([1, 2].map(() => adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: revision, operationId: randomUUID(),
+      action: 'decrease', quantity: 15, reason: '并发扣减',
+    })))
+    expect(concurrentDecreases.map((result) => result.statusCode).sort()).toEqual([201, 409])
+    const after = await getInventorySummary(auth, product.id)
+    expect(after.json().data.variants[0].inventory.stocked).toBe(5)
+    expect(after.json().data.variants[0].inventory.available).toBe(5)
+    expect(after.json().data.variants[0].inventory.stocked).toBeGreaterThanOrEqual(0)
+
+    const concurrentRetry = {
+      expectedInventoryRevision: after.json().data.variants[0].inventoryRevision as number,
+      operationId: randomUUID(), action: 'increase', quantity: 2, reason: '并发幂等补货',
+    }
+    const retries = await Promise.all([
+      adjustInventory(auth, product.id, sku.id, concurrentRetry),
+      adjustInventory(auth, product.id, sku.id, concurrentRetry),
+    ])
+    expect(retries.map((result) => result.statusCode).sort()).toEqual([200, 201])
+    expect(retries[0]!.json().data.id).toBe(retries[1]!.json().data.id)
+    const afterRetry = await getInventorySummary(auth, product.id)
+    expect(afterRetry.json().data.variants[0].inventory.stocked).toBe(7)
+  })
+
+  it('does not deadlock when a quantity adjustment races an inventory mode switch', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '模式切换与库存调整并发')
+    const sku = product.variants[0]!
+    const configured = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: product.revision,
+      expectedSkuRevision: sku.revision,
+      expectedInventoryRevision: 0,
+      inventoryMode: 'quantity',
+    })
+    const version = configured.json<{ data: { productRevision: number; skuRevision: number; inventoryRevision: number } }>().data
+    const [adjustment, modeSwitch] = await Promise.all([
+      adjustInventory(auth, product.id, sku.id, {
+        expectedInventoryRevision: version.inventoryRevision,
+        operationId: randomUUID(), action: 'increase', quantity: 1, reason: '模式切换并发补货',
+      }),
+      setInventoryMode(auth, product.id, sku.id, {
+        expectedRevision: version.productRevision,
+        expectedSkuRevision: version.skuRevision,
+        expectedInventoryRevision: version.inventoryRevision,
+        inventoryMode: 'unlimited',
+      }),
+    ])
+    expect([adjustment.statusCode, modeSwitch.statusCode].filter((status) => status === 409)).toHaveLength(1)
+    expect([adjustment.statusCode, modeSwitch.statusCode].filter((status) => status >= 200 && status < 300)).toHaveLength(1)
+
+    const summary = await getInventorySummary(auth, product.id)
+    const inventory = summary.json().data.variants[0].inventory
+    if (modeSwitch.statusCode === 200) {
+      expect(inventory).toMatchObject({ mode: 'unlimited', stocked: null, available: null, sourceReady: true })
+      expect(await db.selectFrom('product_variant_quantity_inventory').select('product_variant_id')
+        .where('product_variant_id', '=', sku.id).executeTakeFirst()).toBeUndefined()
+      expect(adjustment.json().error.code).toBe('INVENTORY_MODE_CONFLICT')
+    } else {
+      expect(inventory).toMatchObject({ mode: 'quantity', stocked: 1, available: 1 })
+      expect(modeSwitch.json().error.code).toBe('INVENTORY_REVISION_CONFLICT')
+    }
+  })
+
+  it('protects inventory history from matrix deletion and preserves SKU ownership through specification edits', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '库存引用阻止规格误删')
+    const legacySku = product.variants[0]!
+    const mode = await setInventoryMode(auth, product.id, legacySku.id, {
+      expectedRevision: product.revision, expectedSkuRevision: legacySku.revision,
+      expectedInventoryRevision: 0, inventoryMode: 'quantity',
+    })
+    const inventoryMode = mode.json<{ data: { productRevision: number; skuRevision: number; inventoryRevision: number } }>().data
+    const adjustment = await adjustInventory(auth, product.id, legacySku.id, {
+      expectedInventoryRevision: inventoryMode.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 5, reason: '有意义的库存历史',
+    })
+    expect(adjustment.statusCode).toBe(201)
+    const groupId = randomUUID()
+    const valueId = randomUUID()
+    const body = {
+      expectedRevision: inventoryMode.productRevision,
+      mode: 'selected',
+      groups: [optionGroup('版本', groupId, [{ id: valueId, name: '当前版' }])],
+      combinations: [{ optionValueIds: [valueId], salePrice: '20.00', enabled: true }],
+    }
+    const preview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/variant-matrix/preview`,
+      headers: productHeaders(auth), payload: body,
+    })
+    expect(preview.statusCode).toBe(200)
+    const removal = preview.json().data.changes.find((change: { skuId: string; change: string }) => change.skuId === legacySku.id && change.change === 'removed')
+    expect(removal).toMatchObject({ inventoryMutationBlocked: true, inventoryMutationBlockReason: 'adjustment_history' })
+    const blocked = await saveMatrix(auth, product.id, body)
+    expect(blocked.statusCode).toBe(409)
+    expect(blocked.json().error.code).toBe('SKU_HAS_REFERENCES')
+
+    const retired = await saveMatrix(auth, product.id, { ...body, retireSkuIds: [legacySku.id] })
+    expect(retired.statusCode).toBe(200)
+    const retiredProduct = retired.json<{ data: { product: ProductDetail } }>().data.product
+    expect(retiredProduct.variants.find((variant) => variant.id === legacySku.id)).toMatchObject({ retiredAt: expect.any(String), enabled: false })
+    const afterRetirement = await getInventorySummary(auth, product.id)
+    expect(afterRetirement.json().data.variants.find((variant: { skuId: string }) => variant.skuId === legacySku.id).inventory)
+      .toMatchObject({ stocked: 5, available: 5 })
+    const retiredAdjustment = await adjustInventory(auth, product.id, legacySku.id, {
+      expectedInventoryRevision: inventoryMode.inventoryRevision + 1,
+      operationId: randomUUID(), action: 'increase', quantity: 1, reason: '退役后不得补货',
+    })
+    expect(retiredAdjustment.statusCode).toBe(409)
+    expect(retiredAdjustment.json().error.code).toBe('SKU_PERMANENTLY_RETIRED')
+  })
+
+  it('allows safe deletion of an empty quantity record and rejects inventory identity remapping', async () => {
+    const auth = await loginAdmin()
+    const emptyProduct = await createTestProduct(auth, '空库存 SKU 可安全删除')
+    const emptySku = emptyProduct.variants[0]!
+    const quantityMode = await setInventoryMode(auth, emptyProduct.id, emptySku.id, {
+      expectedRevision: emptyProduct.revision, expectedSkuRevision: emptySku.revision,
+      expectedInventoryRevision: 0, inventoryMode: 'quantity',
+    })
+    const modeData = quantityMode.json<{ data: { productRevision: number } }>().data
+    const valueId = randomUUID()
+    const groupId = randomUUID()
+    const removed = await saveMatrix(auth, emptyProduct.id, {
+      expectedRevision: modeData.productRevision,
+      mode: 'selected',
+      groups: [optionGroup('类型', groupId, [{ id: valueId, name: '数字版' }])],
+      combinations: [{ optionValueIds: [valueId], salePrice: '5.00', enabled: true }],
+    })
+    expect(removed.statusCode).toBe(200)
+    expect(await db.selectFrom('product_variant_quantity_inventory').select('product_variant_id')
+      .where('product_variant_id', '=', emptySku.id).execute()).toEqual([])
+
+    const product = await createTestProduct(auth, '规格库存身份稳定')
+    const group = randomUUID()
+    const alpha = randomUUID()
+    const beta = randomUUID()
+    const created = await saveMatrix(auth, product.id, {
+      expectedRevision: product.revision,
+      mode: 'selected',
+      groups: [optionGroup('方案', group, [{ id: alpha, name: '甲', sortOrder: 0 }, { id: beta, name: '乙', sortOrder: 1 }])],
+      combinations: [
+        { optionValueIds: [alpha], salePrice: '10.00', enabled: true },
+        { optionValueIds: [beta], salePrice: '20.00', enabled: true },
+      ],
+    })
+    const before = created.json<{ data: { product: ProductDetail } }>().data.product
+    const alphaSku = before.variants.find((variant) => variant.options[0]?.valueId === alpha)!
+    const betaSku = before.variants.find((variant) => variant.options[0]?.valueId === beta)!
+    const alphaMode = await setInventoryMode(auth, product.id, alphaSku.id, {
+      expectedRevision: before.revision, expectedSkuRevision: alphaSku.revision,
+      expectedInventoryRevision: 0, inventoryMode: 'quantity',
+    })
+    const alphaState = alphaMode.json<{ data: { inventoryRevision: number } }>().data
+    expect((await adjustInventory(auth, product.id, alphaSku.id, {
+      expectedInventoryRevision: alphaState.inventoryRevision, operationId: randomUUID(),
+      action: 'increase', quantity: 3, reason: '绑定到甲规格',
+    })).statusCode).toBe(201)
+
+    const renamed = await saveMatrix(auth, product.id, {
+      expectedRevision: alphaMode.json<{ data: { productRevision: number } }>().data.productRevision,
+      mode: 'selected',
+      groups: [optionGroup('方案名称已更新', group, [
+        { id: alpha, name: '甲改名', sortOrder: 1 }, { id: beta, name: '乙改名', sortOrder: 0 },
+      ])],
+      combinations: [
+        { skuId: alphaSku.id, optionValueIds: [alpha], salePrice: '10.00', enabled: true },
+        { skuId: betaSku.id, optionValueIds: [beta], salePrice: '20.00', enabled: true },
+      ],
+    })
+    expect(renamed.statusCode).toBe(200)
+    const renamedProduct = renamed.json<{ data: { product: ProductDetail } }>().data.product
+    const afterRename = await getInventorySummary(auth, product.id)
+    expect(afterRename.json().data.variants.find((variant: { skuId: string }) => variant.skuId === alphaSku.id).inventory.stocked).toBe(3)
+    expect(renamedProduct.variants.find((variant) => variant.id === alphaSku.id)?.options[0]?.valueId).toBe(alpha)
+
+    const swap = {
+      expectedRevision: renamedProduct.revision,
+      mode: 'selected',
+      groups: [optionGroup('方案名称已更新', group, [
+        { id: alpha, name: '甲改名', sortOrder: 1 }, { id: beta, name: '乙改名', sortOrder: 0 },
+      ])],
+      combinations: [
+        { skuId: alphaSku.id, optionValueIds: [beta], salePrice: '10.00', enabled: true },
+        { skuId: betaSku.id, optionValueIds: [alpha], salePrice: '20.00', enabled: true },
+      ],
+    }
+    const swapPreview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/variant-matrix/preview`,
+      headers: productHeaders(auth), payload: swap,
+    })
+    expect(swapPreview.statusCode).toBe(200)
+    expect(swapPreview.json().data.changes.find((change: { skuId: string }) => change.skuId === alphaSku.id))
+      .toMatchObject({ inventoryMutationBlocked: true, inventoryMutationBlockReason: 'adjustment_history' })
+    const blockedSwap = await saveMatrix(auth, product.id, swap)
+    expect(blockedSwap.statusCode).toBe(409)
+    expect(blockedSwap.json().error.code).toBe('SKU_HAS_REFERENCES')
   })
 })

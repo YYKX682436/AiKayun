@@ -25,6 +25,9 @@ export function catalogDatabaseFailure(error: unknown): { status: number; code: 
     return conflict('CATALOG_CONCURRENT_MODIFICATION', 'The catalog changed concurrently; reload it and retry')
   }
   if (databaseError.code === '23505') {
+    if (constraint === 'product_variant_inventory_adjustments_operation_unique') {
+      return conflict('INVENTORY_OPERATION_ID_CONFLICT', 'This operationId has already been used')
+    }
     if (constraint.includes('category') && constraint.includes('name')) {
       return conflict('CATEGORY_NAME_CONFLICT', 'A category with this name already exists at that level')
     }
@@ -69,6 +72,18 @@ export function catalogDatabaseFailure(error: unknown): { status: number; code: 
   }
   if (databaseError.code === '23514') {
     const known: Record<string, { status: number; code: string; message: string }> = {
+      product_variants_compare_at_price_check: { status: 400, code: 'INVALID_COMPARE_AT_PRICE', message: 'Compare-at price must be non-negative, have at most two fractional digits, and exceed the sale price' },
+      product_variants_cost_price_check: { status: 400, code: 'INVALID_COST_PRICE', message: 'Cost price must be non-negative with at most five fractional digits' },
+      product_variants_inventory_mode_check: { status: 400, code: 'INVALID_INVENTORY_MODE', message: 'The inventory mode is not supported' },
+      product_variants_inventory_revision_check: { status: 400, code: 'INVALID_INVENTORY_REVISION', message: 'The inventory revision is invalid' },
+      product_variant_quantity_inventory_stocked_check: { status: 400, code: 'INVALID_INVENTORY_QUANTITY', message: 'Stocked quantity must be a non-negative integer' },
+      product_variant_quantity_inventory_reserved_check: conflict('STOCK_BELOW_RESERVED_QUANTITY', 'Reserved quantity must be non-negative and cannot exceed stocked quantity'),
+      product_variant_quantity_state_consistent: conflict('INVENTORY_MODE_CONFLICT', 'Quantity inventory state must match the SKU inventory mode'),
+      product_variant_inventory_adjustments_immutable: conflict('INVENTORY_HISTORY_IMMUTABLE', 'Inventory adjustment history cannot be changed or deleted'),
+      product_variant_inventory_adjustments_action_check: { status: 400, code: 'INVALID_INVENTORY_ADJUSTMENT', message: 'The inventory adjustment action is invalid' },
+      product_variant_inventory_adjustments_action_delta_check: { status: 400, code: 'INVALID_INVENTORY_ADJUSTMENT', message: 'The inventory adjustment quantity does not match its action' },
+      product_variant_inventory_adjustments_quantities_check: { status: 400, code: 'INVALID_INVENTORY_ADJUSTMENT', message: 'The inventory adjustment quantities are invalid' },
+      product_variant_inventory_adjustments_reason_nonempty: { status: 400, code: 'INVALID_INVENTORY_REASON', message: 'An inventory adjustment reason is required' },
       product_categories_no_cycle: { status: 400, code: 'CATEGORY_CYCLE', message: 'A category cannot be moved below itself or one of its descendants' },
       product_categories_max_depth: { status: 400, code: 'CATEGORY_DEPTH_LIMIT', message: 'The category tree cannot exceed four levels' },
       product_category_tree_guard_required: conflict('CATALOG_CONCURRENT_MODIFICATION', 'The category tree changed concurrently; reload it and retry'),

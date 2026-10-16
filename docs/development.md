@@ -50,7 +50,7 @@ pnpm e2e
 pnpm build
 ```
 
-API 集成测试会连接真实 PostgreSQL、清理测试库 schema，先建立管理员与既有商品迁移基线，写入迁移前商品/SKU 样本，再升级到最新迁移并重复执行迁移。测试覆盖健康检查、管理员登录/退出、会话保护、D1 商品/金额/最低 SKU 约束、分类树四级边界、自引用及 READ COMMITTED/REPEATABLE READ 并发移动、多分类主分类约束和删除冲突、动态规格组合预览/增量保存/交换、暂停后恢复、永久退役身份和引用保护、自动矩阵默认值隔离、TRUNCATE 防护、原子回滚、属性限制、CSRF、严格 TypeBox 校验和 OpenAPI。为了避免误删，测试只接受名字以 `_test` 结尾的数据库。Playwright E2E 会重置同一测试库、创建一次性测试管理员，启动 API 和 Nuxt dev server，再在 Chromium 中检查 SSR 页面及管理端认证流程。
+API 集成测试连接真实 PostgreSQL 并清理测试库 schema：先从 D1 和 D2 迁移基线写入既有商品/SKU，再升级至最新迁移并重复执行迁移。覆盖范围包括管理员认证与 CSRF、D1/D2 商品和规格矩阵约束、分类树和并发移动、SKU 退役及引用保护，以及 D3 CNY 售价/划线价/成本精度、库存模式状态、reserved 边界、并发调整、幂等、流水不可变、分页、模式切换和矩阵删 SKU/改组合保护。测试只接受名称以 `_test` 结尾的数据库。Playwright E2E 会重置同一测试库、创建一次性测试管理员，启动 API 和 Nuxt dev server，再在 Chromium 中检查 SSR 页面及管理端认证流程。
 
 ③-D2 管理 API 的主要写入边界如下：
 
@@ -60,6 +60,16 @@ API 集成测试会连接真实 PostgreSQL、清理测试库 schema，先建立�
 - `POST /api/v1/admin/products/:id/variant-matrix/preview` 只预览当前版本下的笛卡尔积、保留/新增/修改/移除结果；`PUT /api/v1/admin/products/:id/variant-matrix` 在一个事务中保存规格和 SKU。每个新 SKU 都要有明确售价和启用状态；`mode: "all"` 自动生成全组合前先检查总数，默认值只应用于新增 SKU，已有 SKU 保留价格和启用状态。`mode: "selected"` 只保存提交的组合；临时停用 SKU 可通过相同 ID 再次启用，`retireSkuIds` 则明确永久退役并保留 SKU 身份及规格引用。
 
 所有 D2 写请求都要求管理员会话与 CSRF 校验，并携带商品或分类修订版本。预览不会写数据库；保存时会重新校验修订版本。`combination_key` 是服务端内部字段，不应由客户端生成或持久化；相同的选项值 UUID 集合按规范顺序生成同一键，名称与排序变更不会改变 SKU 组合身份。
+
+## ③-D3 价格与库存管理
+
+- `GET/PATCH /api/v1/admin/products/:id/variants/:variantId/prices` 读取或修改单个 SKU 的 CNY 售价、划线价和成本价。修改携带 `expectedRevision`（商品修订）与 `expectedSkuRevision`；省略可选字段表示不修改，传 `null` 表示清空。售价与划线价为十进制字符串，最多两位小数；划线价必须高于售价。成本价最多五位小数，只在管理员价格响应中出现。
+- `GET /api/v1/admin/products/:id/inventory?quantity=1` 返回所有 SKU 的库存摘要。`quantity` 是用于计算 `sufficient` 的目标数量，默认 1。未配置、resource_pool、external 和 unlimited 不伪造数量；`unlimited` 的 `sufficient: true` 只说明库存策略不限制数量，不代表商品可购买或交付已就绪。
+- `PUT /api/v1/admin/products/:id/variants/:variantId/inventory-mode` 配置或切换模式，携带商品、SKU 和库存三个修订版本。切至 `quantity` 时在事务中创建 0 库存记录；从数量库存切出前必须先把 `stocked` 和 `reserved` 都处理为 0。`resource_pool` 与 `external` 目前返回 `not_ready`，没有资源池或供应商模拟接口。
+- `POST /api/v1/admin/products/:id/variants/:variantId/inventory/adjustments` 支持 `increase`、`decrease` 和目标值 `set`。请求包含 UUID `operationId`、`expectedInventoryRevision` 和调整原因；相同操作重放返回原流水，复用标识但内容不同返回冲突。所有数量在服务端根据当前行锁计算，客户端不能提交权威的前后库存。
+- `GET /api/v1/admin/products/:id/variants/:variantId/inventory/adjustments?limit=50` 返回最多 100 条，使用响应中的 `(createdAt, id)` 游标继续读取。流水不可修改或删除。
+
+库存更新锁定 SKU 与数量库存行，并在一个事务中更新数量、独立 `inventory_revision` 和流水；库存写入不递增商品修订或普通 SKU 修订。模式切换和价格修改属于商品编辑，使用 D2 商品修订锁并递增商品修订。数据库延迟约束保证仅 quantity 模式拥有数量库存行，外键 `RESTRICT` 保留流水所引用的 SKU。矩阵预览在 `inventoryMutationBlocked` / `inventoryMutationBlockReason` 中说明因库存数量、预留或流水历史导致的改配/删除限制；保存会再次检查。
 
 `pnpm verify` 会按顺序运行 lint、类型检查、单元/数据库测试、浏览器 E2E 和生产构建。
 
