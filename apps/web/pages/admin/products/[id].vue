@@ -22,7 +22,6 @@ import {
   validateProductRichContent,
 } from '@aikayun/contracts'
 import { AdminApiError, useAdminApi } from '~/composables/useAdminApi'
-import ProductRichContentEditor from '~/components/admin/ProductRichContentEditor.vue'
 
 definePageMeta({ middleware: 'admin-auth', layout: 'admin' })
 
@@ -87,6 +86,7 @@ const retireSkuIds = ref<string[]>([])
 const newSkuPrice = ref('')
 const newSkuEnabled = ref(true)
 const matrixPreview = ref<ProductVariantMatrixPreview | null>(null)
+const matrixPreviewBody = ref<ProductVariantMatrixBody | null>(null)
 const confirmMatrixChanges = ref(false)
 const skuPageNumber = ref(1)
 const skuPageSize = 25
@@ -221,6 +221,7 @@ function resetDrafts(source: ProductDetail) {
   retireSkuIds.value = []
   newSkuPrice.value = source.variants.find(variant => variant.retiredAt === null)?.salePrice ?? source.variants[0]?.salePrice ?? '0.00'
   matrixPreview.value = null
+  matrixPreviewBody.value = null
   confirmMatrixChanges.value = false
   for (const key of Object.keys(dirty)) dirty[key as keyof typeof dirty] = false
   for (const key of Object.keys(sectionErrors)) delete sectionErrors[key]
@@ -261,6 +262,15 @@ async function loadProduct() {
   try {
     const detail = await request<ProductDetail>(`/api/v1/admin/products/${productId.value}`)
     resetDrafts(detail)
+    const createSessionKey = 'aikayun-admin-product-create-v1'
+    try {
+      const createSession = sessionStorage.getItem(createSessionKey)
+      if (createSession && JSON.parse(createSession)?.productId === productId.value) {
+        sessionStorage.removeItem(createSessionKey)
+      }
+    } catch {
+      // Leave malformed recovery state for the create page to handle explicitly.
+    }
     const results = await Promise.allSettled([loadCategories(), loadPricePage(1), loadInventory()])
     const failed = results.find(result => result.status === 'rejected')
     if (failed?.status === 'rejected') loadError.value = failed.reason instanceof Error ? failed.reason.message : '部分商品配置暂时不可用。'
@@ -331,6 +341,7 @@ function resolveConflict(choice: 'discard' | 'keep') {
     if (conflictPrices.value) pricePage.value = conflictPrices.value
     if (conflictInventory.value) inventorySummary.value = conflictInventory.value
     matrixPreview.value = null
+    matrixPreviewBody.value = null
     confirmMatrixChanges.value = false
   }
   conflictLatest.value = null
@@ -343,7 +354,7 @@ function resolveConflict(choice: 'discard' | 'keep') {
 
 async function handleSectionError(section: string, error: unknown) {
   sectionErrors[section] = error instanceof Error ? error.message : '操作失败，请重试。'
-  if (error instanceof AdminApiError && error.status === 409) await refreshConflict(section)
+  if (error instanceof AdminApiError && error.code === 'PRODUCT_REVISION_CONFLICT') await refreshConflict(section)
 }
 
 function setProductRevision(revision: number) {
@@ -583,6 +594,7 @@ function markMatrixDirty() {
   dirty.matrix = true
   matrixPageNumber.value = 1
   matrixPreview.value = null
+  matrixPreviewBody.value = null
   confirmMatrixChanges.value = false
   clearSectionStatus('matrix')
 }
@@ -662,11 +674,17 @@ function matrixBody(): ProductVariantMatrixBody {
     && !retireSkuIds.value.includes(variant.id)
     && variant.options.length === 0)
   if (matrixMode.value === 'all' && !defaultSku) {
+    const skuEnabledUpdates = product.value.variants
+      .filter(variant => variant.retiredAt === null
+        && skuEnabledDraft[variant.id] !== undefined
+        && skuEnabledDraft[variant.id] !== variant.enabled)
+      .map(variant => ({ skuId: variant.id, enabled: skuEnabledDraft[variant.id]! }))
     return {
       mode: 'all',
       expectedRevision: product.value.revision,
       groups,
       newSkuDefaults: { salePrice: newSkuPrice.value.trim(), enabled: newSkuEnabled.value },
+      ...(skuEnabledUpdates.length ? { skuEnabledUpdates } : {}),
       ...(retireSkuIds.value.length ? { retireSkuIds: [...retireSkuIds.value] } : {}),
     }
   }
@@ -693,24 +711,38 @@ async function previewMatrix() {
   if (legacyDefaultSkuNeedsRetirement.value) {
     sectionErrors.matrix = 'D1 默认 SKU 不能直接改配到规格组合。请先在 SKU 清单中显式永久退役，保留其历史身份；库存未清时预览会阻止退役。'
     matrixPreview.value = null
+    matrixPreviewBody.value = null
     return
   }
   if (matrixMode.value === 'all' && allCombinations.value.some(combination => combination.retired)) {
     sectionErrors.matrix = '全部组合包含永久退役 SKU。请选择要保留的组合，退役 SKU 不能重新生成。'
     matrixPreview.value = null
+    matrixPreviewBody.value = null
+    return
+  }
+  if (matrixMode.value === 'all' && retireSkuIds.value.length > 0) {
+    sectionErrors.matrix = '自动生成全部组合会保留所有现有组合。若要永久退役 SKU，请切换为“保留所选组合”并预览差异。'
+    matrixPreview.value = null
+    matrixPreviewBody.value = null
     return
   }
   saving.value = 'matrix-preview'
   clearSectionStatus('matrix')
+  const body = matrixBody()
   try {
     matrixPreview.value = await request<ProductVariantMatrixPreview>(`/api/v1/admin/products/${productId.value}/variant-matrix/preview`, {
-      method: 'POST', body: matrixBody(),
+      method: 'POST', body,
     })
+    matrixPreviewBody.value = body
     confirmMatrixChanges.value = false
-  } catch (error) { await handleSectionError('matrix', error) } finally { saving.value = '' }
+  } catch (error) {
+    matrixPreview.value = null
+    matrixPreviewBody.value = null
+    await handleSectionError('matrix', error)
+  } finally { saving.value = '' }
 }
 async function saveMatrix() {
-  if (!product.value || !matrixPreview.value || isArchived.value || saving.value) return
+  if (!product.value || !matrixPreview.value || !matrixPreviewBody.value || isArchived.value || saving.value) return
   if (matrixNeedsConfirmation.value && !confirmMatrixChanges.value) {
     sectionErrors.matrix = '请先查看差异并确认此规格变更。'
     return
@@ -723,9 +755,10 @@ async function saveMatrix() {
   clearSectionStatus('matrix')
   try {
     const result = await request<ProductVariantMatrixSaveResult>(`/api/v1/admin/products/${productId.value}/variant-matrix`, {
-      method: 'PUT', body: matrixBody(),
+      method: 'PUT', body: matrixPreviewBody.value,
     })
     product.value = result.product
+    for (const variant of result.product.variants) skuEnabledDraft[variant.id] = variant.enabled
     groupsDraft.value = result.product.optionGroups.map(group => ({
       id: group.id, name: group.name, sortOrder: group.sortOrder, enabled: group.enabled,
       values: group.values.map(value => ({ id: value.id, name: value.name, sortOrder: value.sortOrder, enabled: value.enabled })),
@@ -734,6 +767,7 @@ async function saveMatrix() {
       .map(variant => matrixKey(variant.options.map(option => option.valueId)))
     retireSkuIds.value = []
     matrixPreview.value = null
+    matrixPreviewBody.value = null
     confirmMatrixChanges.value = false
     dirty.matrix = false
     sectionSuccess.matrix = '规格组和 SKU 矩阵已保存，已有 SKU 身份与价格已按后端差异结果保留。'
@@ -973,10 +1007,7 @@ async function moveCategory(category: AdminProductCategory) {
   await updateCategory(category, { parentId }, '分类层级已更新。')
 }
 async function reorderCategory(category: AdminProductCategory, direction: 'first' | 'last') {
-  const siblings = categories.value.filter(item => item.parentId === category.parentId)
-  const values = siblings.filter(item => item.id !== category.id).map(item => item.sortOrder)
-  const target = direction === 'first' ? 0 : Math.max(0, ...values) + 1
-  if (target > 1_000_000) { categoryMessage.value = '同级分类顺序已达到边界。'; return }
+  const target = direction === 'first' ? 0 : 1_000_000
   await updateCategory(category, { sortOrder: target }, direction === 'first' ? '分类已移到同级最前。' : '分类已移到同级最后。')
 }
 async function deleteCategory(category: AdminProductCategory) {
@@ -1660,7 +1691,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                   :title="sectionSuccess.rich"
                   role="status"
                 />
-                <ProductRichContentEditor
+                <LazyAdminProductRichContentEditor
                   v-model="richDraft"
                   :gallery="galleryDraft"
                   :disabled="isArchived"
@@ -2027,6 +2058,9 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                         <span class="font-mono text-xs text-muted">{{ change.skuCode ?? '新 SKU' }}</span>
                         <span class="text-highlighted">{{ change.options.map(option => `${option.groupName} ${option.valueName}`).join(' / ') || '默认 SKU' }}</span>
                       </div>
+                      <p class="mt-1 text-xs text-muted">
+                        售价 {{ change.salePrice === null ? '未设置' : `¥${change.salePrice}` }} · {{ change.enabled === null ? '该 SKU 将移除' : change.change === 'retired' ? '永久退役' : change.enabled ? '保存后启用销售' : '保存后暂时停用' }}
+                      </p>
                       <p
                         v-if="change.inventoryMutationBlocked"
                         class="mt-1 text-xs text-error"

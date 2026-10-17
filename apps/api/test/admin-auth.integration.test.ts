@@ -1219,6 +1219,79 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(list.json<{ data: { categories: Array<{ id: string }> } }>().data.categories).toHaveLength(10)
   })
 
+  it('reorders duplicate-ranked category siblings transactionally and normalizes both sides of a move', async () => {
+    const auth = await loginAdmin()
+    const create = async (name: string, parentId?: string) => {
+      const response = await app.inject({
+        method: 'POST', url: '/api/v1/admin/categories', headers: productHeaders(auth),
+        payload: { name, ...(parentId ? { parentId } : {}) },
+      })
+      expect(response.statusCode).toBe(201)
+      return response.json<{ data: { id: string; parentId: string | null; sortOrder: number; revision: number } }>().data
+    }
+    const patch = (category: { id: string; revision: number }, payload: Record<string, unknown>) => app.inject({
+      method: 'PATCH', url: `/api/v1/admin/categories/${category.id}`, headers: productHeaders(auth),
+      payload: { expectedRevision: category.revision, ...payload },
+    })
+    const read = async () => (await app.inject({
+      method: 'GET', url: '/api/v1/admin/categories', headers: { cookie: auth.sessionCookie },
+    })).json<{ data: { categories: Array<{ id: string; parentId: string | null; sortOrder: number; revision: number }> } }>().data.categories
+    const assertContiguous = (categories: Array<{ sortOrder: number }>) => {
+      expect(categories.map(category => category.sortOrder)).toEqual(categories.map((_, index) => index))
+    }
+
+    const originals = await Promise.all(['排序甲', '排序乙', '排序丙'].map(name => create(name)))
+    const initial = await read()
+    const rootOrder = initial.filter(category => category.parentId === null)
+    const trackedOrder = rootOrder.filter(category => originals.some(original => original.id === category.id))
+    expect(trackedOrder.map(category => category.sortOrder)).toEqual([0, 0, 0])
+    const firstBeforeMove = trackedOrder[0]!
+    const lastBeforeMove = trackedOrder.at(-1)!
+    const moveToFirst = await patch(lastBeforeMove, { sortOrder: 0 })
+    expect(moveToFirst.statusCode).toBe(200)
+    let allRoots = (await read()).filter(category => category.parentId === null)
+    assertContiguous(allRoots)
+    expect(allRoots[0]!.id).toBe(lastBeforeMove.id)
+    let reordered = allRoots.filter(category => originals.some(original => original.id === category.id))
+
+    const freshFirst = reordered.find(category => category.id === firstBeforeMove.id)!
+    const moveToLast = await patch(freshFirst, { sortOrder: 1_000_000 })
+    expect(moveToLast.statusCode).toBe(200)
+    allRoots = (await read()).filter(category => category.parentId === null)
+    assertContiguous(allRoots)
+    expect(allRoots.at(-1)!.id).toBe(firstBeforeMove.id)
+    reordered = allRoots.filter(category => originals.some(original => original.id === category.id))
+
+    const otherParent = await create('独立父类')
+    const otherSiblings = await Promise.all(['独立子甲', '独立子乙'].map(name => create(name, otherParent.id)))
+    const toMove = reordered[1]!
+    const moved = await patch(toMove, { parentId: otherParent.id })
+    expect(moved.statusCode).toBe(200)
+    expect(moved.json<{ data: { parentId: string; sortOrder: number } }>().data).toMatchObject({
+      parentId: otherParent.id, sortOrder: 2,
+    })
+    const afterMove = await read()
+    const sourceRoots = afterMove.filter(category => category.parentId === null)
+    assertContiguous(sourceRoots)
+    expect(sourceRoots.some(category => category.id === toMove.id)).toBe(false)
+    const destination = afterMove.filter(category => category.parentId === otherParent.id)
+    assertContiguous(destination)
+    expect(otherSiblings.every(sibling => destination.some(category => category.id === sibling.id))).toBe(true)
+    const normalizedSibling = reordered.find((category) => {
+      if (category.id === toMove.id) return false
+      const currentSibling = afterMove.find(candidate => candidate.id === category.id)
+      return currentSibling !== undefined && currentSibling.revision > category.revision
+    })
+    if (normalizedSibling) {
+      const currentSibling = afterMove.find(category => category.id === normalizedSibling.id)!
+      expect(currentSibling.sortOrder).not.toBe(normalizedSibling.sortOrder)
+    }
+    const staleCategory = normalizedSibling ?? toMove
+    const staleWrite = await patch(staleCategory, { name: '不可覆盖的旧修订' })
+    expect(staleWrite.statusCode).toBe(409)
+    expect(staleWrite.json().error.code).toBe('CATEGORY_REVISION_CONFLICT')
+  })
+
   it.each([
     ['read committed', 'read committed', '23514'],
     ['repeatable read', 'repeatable read', '40001'],
@@ -1599,6 +1672,7 @@ describe('Fastify API with PostgreSQL 18', () => {
     })
     expect(initial.statusCode).toBe(200)
     const populated = initial.json<{ data: { product: ProductDetail } }>().data.product
+    const monthSku = populated.variants.find((variant) => variant.options[0]?.valueId === values[0]!.id)!
     const addedValue = { id: randomUUID(), name: '两年卡' }
     const groups = [optionGroup('期限', groupId, [...values, addedValue])]
     const body = {
@@ -1606,6 +1680,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       mode: 'all',
       groups,
       newSkuDefaults: { salePrice: '1.00', enabled: false },
+      skuEnabledUpdates: [{ skuId: monthSku.id, enabled: false }],
     }
     const preview = await app.inject({
       method: 'POST', url: `/api/v1/admin/products/${product.id}/variant-matrix/preview`,
@@ -1617,10 +1692,12 @@ describe('Fastify API with PostgreSQL 18', () => {
       options: Array<{ valueId: string }>
     }> } }>().data
     expect(previewData.requestedSkuCount).toBe(4)
+    expect(previewData.changes.find((change) => change.skuId === monthSku.id))
+      .toMatchObject({ change: 'modified', skuCode: monthSku.skuCode, salePrice: '9.90', enabled: false })
     const retainedPreview = previewData.changes.filter((change) => change.change === 'retained')
-    expect(retainedPreview).toHaveLength(3)
+    expect(retainedPreview).toHaveLength(2)
     const expected = new Map([
-      [values[0]!.id, { salePrice: '9.90', enabled: true }],
+      [values[0]!.id, { salePrice: '9.90', enabled: false }],
       [values[1]!.id, { salePrice: '25.00', enabled: false }],
       [values[2]!.id, { salePrice: '88.00', enabled: true }],
     ])
@@ -1644,11 +1721,12 @@ describe('Fastify API with PostgreSQL 18', () => {
         id: variant.id,
         skuCode: variant.skuCode,
         salePrice: variant.salePrice,
-        enabled: variant.enabled,
+        enabled: variant.id === monthSku.id ? false : variant.enabled,
         retiredAt: null,
       })
       expect(savedData.changes.find((change) => change.skuId === variant.id))
-        .toMatchObject({ change: 'retained', skuCode: variant.skuCode, salePrice: variant.salePrice, enabled: variant.enabled })
+        .toMatchObject({ change: variant.id === monthSku.id ? 'modified' : 'retained', skuCode: variant.skuCode,
+          salePrice: variant.salePrice, enabled: variant.id === monthSku.id ? false : variant.enabled })
     }
     expect(savedData.product.variants.find((variant) => variant.options[0]?.valueId === addedValue.id))
       .toMatchObject({ salePrice: '1.00', enabled: false })
@@ -1664,6 +1742,38 @@ describe('Fastify API with PostgreSQL 18', () => {
       const stored = await db.selectFrom('product_variants').select('combination_key').where('id', '=', variant.id).executeTakeFirstOrThrow()
       expect(stored.combination_key).toBe(`v1:${variant.options[0]!.valueId}`)
     }
+  })
+
+  it('rejects automatic-matrix attempts to re-enable a permanently retired SKU', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '自动矩阵退役 SKU 不可恢复')
+    const optionGroupId = randomUUID()
+    const value = { id: randomUUID(), name: '标准版' }
+    const groups = [optionGroup('版本', optionGroupId, [value])]
+    const initialized = await saveMatrix(auth, product.id, {
+      expectedRevision: product.revision,
+      mode: 'selected',
+      groups,
+      combinations: [{ optionValueIds: [value.id], salePrice: '12.00', enabled: true }],
+      retireSkuIds: [product.variants[0]!.id],
+    })
+    expect(initialized.statusCode).toBe(200)
+    const retiredSkuId = product.variants[0]!.id
+    const current = initialized.json<{ data: { product: ProductDetail } }>().data.product
+    const attempt = await app.inject({
+      method: 'POST',
+      url: `/api/v1/admin/products/${product.id}/variant-matrix/preview`,
+      headers: productHeaders(auth),
+      payload: {
+        expectedRevision: current.revision,
+        mode: 'all',
+        groups,
+        newSkuDefaults: { salePrice: '8.00', enabled: true },
+        skuEnabledUpdates: [{ skuId: retiredSkuId, enabled: true }],
+      },
+    })
+    expect(attempt.statusCode).toBe(409)
+    expect(attempt.json().error.code).toBe('SKU_RETIRED')
   })
 
   it('rejects oversized, duplicate, cross-product, and incomplete option combinations before saving', async () => {

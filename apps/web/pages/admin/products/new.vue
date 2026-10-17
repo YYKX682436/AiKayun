@@ -6,6 +6,7 @@ useSeoMeta({ title: '新建商品' })
 
 const storageKey = 'aikayun-admin-product-create-v1'
 const { request } = useAdminApi()
+const route = useRoute()
 const name = ref('')
 const productType = ref<CreateProductBody['productType']>('digital')
 const salePrice = ref('')
@@ -70,6 +71,7 @@ async function openCreatedProduct() {
   if (!productId.value) return
   try {
     await navigateTo(`/admin/products/${productId.value}`)
+    if (route.path === `/admin/products/${productId.value}`) sessionStorage.removeItem(storageKey)
   } catch {
     errorMessage.value = '商品已创建。页面跳转失败，请使用下方按钮继续编辑。'
   }
@@ -98,6 +100,7 @@ async function createProduct() {
     persist()
     try {
       await navigateTo(`/admin/products/${result.id}`)
+      if (route.path === `/admin/products/${result.id}`) sessionStorage.removeItem(storageKey)
     } catch {
       errorMessage.value = '商品已创建。页面跳转失败，请使用下方按钮继续编辑。'
     }

@@ -659,12 +659,17 @@ const ProductVariantMatrixCombinationSchema = Type.Object({
 }, { additionalProperties: false })
 
 const ProductVariantRetireIdsSchema = Type.Optional(Type.Array(UuidSchema, { maxItems: 1000 }))
+const ProductVariantMatrixSkuEnabledUpdateSchema = Type.Object({
+  skuId: UuidSchema,
+  enabled: Type.Boolean(),
+}, { additionalProperties: false })
 
 export const ProductVariantMatrixAllBodySchema = Type.Object({
   expectedRevision: Type.Integer({ minimum: 1 }),
   groups: Type.Array(ProductVariantMatrixGroupSchema, { maxItems: 5 }),
   mode: Type.Literal('all'),
   newSkuDefaults: Type.Object({ salePrice: ProductSalePriceSchema, enabled: Type.Boolean() }, { additionalProperties: false }),
+  skuEnabledUpdates: Type.Optional(Type.Array(ProductVariantMatrixSkuEnabledUpdateSchema, { maxItems: 1000 })),
   retireSkuIds: ProductVariantRetireIdsSchema,
 }, { additionalProperties: false })
 

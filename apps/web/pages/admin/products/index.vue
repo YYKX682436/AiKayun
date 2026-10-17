@@ -33,6 +33,28 @@ const categoryId = computed(() => String(route.query.categoryId ?? ''))
 const sortBy = computed(() => String(route.query.sortBy ?? 'updatedAt'))
 const sortOrder = computed(() => String(route.query.sortOrder ?? 'desc'))
 const search = computed(() => String(route.query.search ?? ''))
+type ProductListQuery = {
+  page: number
+  pageSize: number
+  search: string
+  status: string
+  productType: string
+  categoryId: string
+  sortBy: string
+  sortOrder: string
+}
+const productQuery = computed<ProductListQuery>(() => ({
+  page: page.value,
+  pageSize: pageSize.value,
+  search: search.value,
+  status: status.value,
+  productType: productType.value,
+  categoryId: categoryId.value,
+  sortBy: sortBy.value,
+  sortOrder: sortOrder.value,
+}))
+let latestProductRequest = 0
+let routeSearchSync: string | null = null
 
 const columns: TableColumn<ProductListItem>[] = [
   { id: 'coverImage', header: '封面' },
@@ -78,7 +100,12 @@ function updateQuery(patch: Record<string, string | number | undefined>) {
   for (const [key, value] of Object.entries({ ...route.query, ...patch })) {
     if (value !== undefined && value !== '' && value !== null) next[key] = String(value)
   }
-  void router.replace({ query: next })
+  const stableEntries = (record: Record<string, string>) => JSON.stringify(Object.entries(record).sort(([left], [right]) => left.localeCompare(right)))
+  const current: Record<string, string> = {}
+  for (const [key, value] of Object.entries(route.query)) {
+    if (value !== undefined && value !== null && value !== '') current[key] = String(value)
+  }
+  if (stableEntries(current) !== stableEntries(next)) void router.push({ query: next })
 }
 
 async function loadCategories() {
@@ -91,46 +118,65 @@ async function loadCategories() {
   }
 }
 
-async function loadProducts() {
+async function loadProducts(queryState: ProductListQuery) {
   if (!import.meta.client) return
+  const requestId = ++latestProductRequest
   loading.value = true
   errorMessage.value = ''
-  searchInput.value = search.value
-  const query = new URLSearchParams({ page: String(page.value), pageSize: String(pageSize.value) })
+  items.value = []
+  total.value = 0
+  totalPages.value = 0
+  const query = new URLSearchParams({ page: String(queryState.page), pageSize: String(queryState.pageSize) })
   for (const [key, value] of Object.entries({
-    search: search.value,
-    status: status.value,
-    productType: productType.value,
-    categoryId: categoryId.value,
-    sortBy: sortBy.value,
-    sortOrder: sortOrder.value,
+    search: queryState.search,
+    status: queryState.status,
+    productType: queryState.productType,
+    categoryId: queryState.categoryId,
+    sortBy: queryState.sortBy,
+    sortOrder: queryState.sortOrder,
   })) {
     if (value) query.set(key, value)
   }
   try {
     const result = await request<ProductListResponse>(`/api/v1/admin/products?${query.toString()}`)
+    if (requestId !== latestProductRequest) return
     items.value = result.items
     total.value = result.total
     totalPages.value = result.totalPages
   } catch (error) {
+    if (requestId !== latestProductRequest) return
     errorMessage.value = error instanceof Error ? error.message : '商品列表加载失败。'
   } finally {
-    loading.value = false
+    if (requestId === latestProductRequest) loading.value = false
   }
 }
+function reloadProducts() { void loadProducts({ ...productQuery.value }) }
 
-watch(() => route.query, () => {
-  if (import.meta.client) void loadProducts()
-}, { deep: true, immediate: true })
+watch(productQuery, (queryState) => {
+  if (!import.meta.client) return
+  const nextSearch = queryState.search
+  if (searchInput.value !== nextSearch) {
+    if (searchTimer) clearTimeout(searchTimer)
+    routeSearchSync = nextSearch
+    searchInput.value = nextSearch
+  }
+  void loadProducts({ ...queryState })
+}, { immediate: true })
 onMounted(() => {
   void loadCategories()
-  void loadProducts()
 })
 watch(searchInput, (value) => {
+  if (routeSearchSync === value) {
+    routeSearchSync = null
+    return
+  }
   if (searchTimer) clearTimeout(searchTimer)
   searchTimer = setTimeout(() => updateQuery({ search: value.trim(), page: 1 }), 350)
 })
-onBeforeUnmount(() => { if (searchTimer) clearTimeout(searchTimer) })
+onBeforeUnmount(() => {
+  latestProductRequest++
+  if (searchTimer) clearTimeout(searchTimer)
+})
 
 function categoryName(product: ProductListItem) {
   return product.categories.find(category => category.isPrimary)?.name ?? '未分类'
@@ -172,7 +218,7 @@ async function changeLifecycle(product: ProductListItem, next: ProductListItem['
       body: { expectedRevision: product.revision, status: next },
     })
     actionMessage.value = `已${label}：${product.name}`
-    await loadProducts()
+    await loadProducts({ ...productQuery.value })
   } catch (error) {
     actionMessage.value = error instanceof Error ? error.message : `${label}失败。`
   } finally {
@@ -253,7 +299,7 @@ async function copyProduct(product: ProductListItem) {
               size="sm"
               color="error"
               variant="outline"
-              @click="loadProducts"
+              @click="reloadProducts"
             >
               重试
             </UButton>
@@ -571,7 +617,44 @@ async function copyProduct(product: ProductListItem) {
             :items-per-page="pageSize"
             show-controls
             @update:page="value => updateQuery({ page: value })"
-          />
+          >
+            <template #first>
+              <UButton
+                icon="i-lucide-chevrons-left"
+                color="neutral"
+                variant="outline"
+                size="sm"
+                aria-label="第一页"
+              />
+            </template>
+            <template #prev>
+              <UButton
+                icon="i-lucide-chevron-left"
+                color="neutral"
+                variant="outline"
+                size="sm"
+                aria-label="上一页"
+              />
+            </template>
+            <template #next>
+              <UButton
+                icon="i-lucide-chevron-right"
+                color="neutral"
+                variant="outline"
+                size="sm"
+                aria-label="下一页"
+              />
+            </template>
+            <template #last>
+              <UButton
+                icon="i-lucide-chevrons-right"
+                color="neutral"
+                variant="outline"
+                size="sm"
+                aria-label="最后一页"
+              />
+            </template>
+          </UPagination>
         </div>
       </main>
     </template>

@@ -156,6 +156,21 @@ async function planMatrix(
   const currentValueById = new Map(currentValues.map((value) => [value.id, value]))
   const existingById = new Map(currentVariants.map((variant) => [variant.id, variant]))
   const existingByKey = new Map(currentVariants.map((variant) => [variant.combination_key, variant]))
+  const enabledUpdates = new Map<string, boolean>()
+  if (body.mode === 'all') {
+    for (const update of body.skuEnabledUpdates ?? []) {
+      const skuId = update.skuId.toLowerCase()
+      if (enabledUpdates.has(skuId)) {
+        throw new CatalogError(400, 'DUPLICATE_SKU_ENABLED_UPDATE', 'A SKU enabled state may be updated only once')
+      }
+      const variant = existingById.get(skuId)
+      if (!variant) throw new CatalogError(409, 'SKU_ID_CONFLICT', 'An enabled-state update SKU does not belong to this product')
+      if (variant.retired_at !== null) {
+        throw new CatalogError(409, 'SKU_RETIRED', 'A permanently retired SKU cannot be reactivated or reused')
+      }
+      enabledUpdates.set(skuId, update.enabled)
+    }
+  }
   const existingOptions = new Map<string, ExistingOption[]>()
   for (const row of linkRows) {
     const options = existingOptions.get(row.product_variant_id) ?? []
@@ -314,7 +329,7 @@ async function planMatrix(
       if (current.compare_at_price !== null && !parseUnitAmount(price).lessThan(parseUnitAmount(current.compare_at_price))) {
         throw new CatalogError(400, 'INVALID_COMPARE_AT_PRICE', 'The sale price must remain below the SKU compare-at price')
       }
-      const enabled = requested.enabled ?? current.enabled
+      const enabled = requested.enabled ?? enabledUpdates.get(current.id) ?? current.enabled
       const changed = current.combination_key !== combinationKey
         || price !== parseUnitAmount(current.sale_price).toFixed(2)
         || enabled !== current.enabled
@@ -352,6 +367,12 @@ async function planMatrix(
       retirementBlockReason: null,
     }
   })
+
+  for (const skuId of enabledUpdates.keys()) {
+    if (!usedSkuIds.has(skuId)) {
+      throw new CatalogError(409, 'SKU_ENABLED_UPDATE_NOT_IN_MATRIX', 'An enabled-state update must refer to an existing SKU retained by the requested matrix')
+    }
+  }
 
   const retireIds = (body.retireSkuIds ?? []).map((id) => id.toLowerCase())
   if (new Set(retireIds).size !== retireIds.length) {

@@ -19,6 +19,12 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ 'update:modelValue': [content: ProductRichContent] }>()
 
+function cloneContent(content: ProductRichContent): ProductRichContent {
+  return JSON.parse(JSON.stringify(content)) as ProductRichContent
+}
+
+const editorValue = ref(cloneContent(props.modelValue))
+let lastEmittedContent = ''
 const selectedMediaId = ref(props.gallery[0]?.id ?? '')
 const linkUrl = ref('')
 type EditorCommands = Pick<Editor, 'chain' | 'isActive'>
@@ -27,6 +33,14 @@ const editorComponent = ref<{ editor?: EditorCommands } | null>(null)
 watch(() => props.gallery, (gallery) => {
   if (!gallery.some(image => image.id === selectedMediaId.value)) selectedMediaId.value = gallery[0]?.id ?? ''
 }, { deep: true })
+
+watch(() => props.modelValue, (content) => {
+  if (JSON.stringify(content) === lastEmittedContent) {
+    lastEmittedContent = ''
+    return
+  }
+  editorValue.value = cloneContent(content)
+})
 
 const MediaImage = Image.extend({
   addAttributes() {
@@ -148,7 +162,9 @@ function normalizedDocument(value: unknown): ProductRichContent {
 }
 
 function updateContent(value: unknown) {
-  emit('update:modelValue', normalizedDocument(value))
+  const normalized = normalizedDocument(value)
+  lastEmittedContent = JSON.stringify(normalized)
+  emit('update:modelValue', normalized)
 }
 
 function editorAction(action: (editor: EditorCommands) => void) {
@@ -167,9 +183,10 @@ function applyLink() {
 
 function insertSelectedImage() {
   if (!selectedMediaId.value) return
-  editorAction(editor => editor.chain().focus().insertContent({
-    type: 'image', attrs: { mediaId: selectedMediaId.value, alt: '' },
-  }).run())
+  editorAction(editor => editor.chain().focus().insertContent([
+    { type: 'image', attrs: { mediaId: selectedMediaId.value, alt: '' } },
+    { type: 'paragraph' },
+  ]).run())
 }
 
 </script>
@@ -181,6 +198,24 @@ function insertSelectedImage() {
       role="toolbar"
       aria-label="图文详情格式工具"
     >
+      <UButton
+        size="sm"
+        color="neutral"
+        variant="ghost"
+        icon="i-lucide-undo-2"
+        aria-label="撤销"
+        :disabled="disabled"
+        @click="editorAction(editor => editor.chain().focus().undo().run())"
+      />
+      <UButton
+        size="sm"
+        color="neutral"
+        variant="ghost"
+        icon="i-lucide-redo-2"
+        aria-label="重做"
+        :disabled="disabled"
+        @click="editorAction(editor => editor.chain().focus().redo().run())"
+      />
       <UButton
         size="sm"
         color="neutral"
@@ -268,7 +303,7 @@ function insertSelectedImage() {
         v-model="linkUrl"
         aria-label="链接地址"
         type="url"
-        placeholder="https://…"
+        placeholder="输入链接地址"
         size="sm"
         class="min-w-36 flex-1 sm:max-w-56"
         :disabled="disabled"
@@ -305,7 +340,7 @@ function insertSelectedImage() {
     </div>
     <UEditor
       ref="editorComponent"
-      :model-value="modelValue"
+      :model-value="editorValue"
       content-type="json"
       :starter-kit="false"
       :image="false"

@@ -134,13 +134,46 @@ export function registerAdminCategoryRoutes(app: FastifyInstance, db: Kysely<Dat
         if (current.revision !== body.expectedRevision) {
           throw new CatalogError(409, 'CATEGORY_REVISION_CONFLICT', 'The category changed; reload it and retry')
         }
+        const allCategories = await trx.selectFrom('product_categories')
+          .select(['id', 'parent_id', 'sort_order']).orderBy('sort_order').orderBy('id').execute()
+        const currentCategory = allCategories.find((category) => category.id === id)
+        if (!currentCategory) throw new CatalogError(404, 'CATEGORY_NOT_FOUND', 'The category does not exist')
+        const parentChanged = Object.hasOwn(body, 'parentId') && (body.parentId ?? null) !== currentCategory.parent_id
+        const destinationParentId = Object.hasOwn(body, 'parentId') ? body.parentId ?? null : currentCategory.parent_id
+        const ordered = (parentId: string | null) => allCategories
+          .filter((category) => category.parent_id === parentId && category.id !== id)
+        const destinationSiblings = ordered(destinationParentId)
+        const needsReorder = parentChanged || body.sortOrder !== undefined
+        const requestedIndex = body.sortOrder === undefined
+          ? destinationSiblings.length
+          : Math.min(body.sortOrder, destinationSiblings.length)
+        const destinationOrder = [...destinationSiblings]
+        if (needsReorder) destinationOrder.splice(requestedIndex, 0, currentCategory)
+
         const values: { name?: string; parent_id?: string | null; sort_order?: number; is_visible?: boolean } = {}
         if (body.name !== undefined) values.name = normalizedCategoryName(body.name)
-        if (Object.hasOwn(body, 'parentId')) values.parent_id = body.parentId ?? null
-        if (body.sortOrder !== undefined) values.sort_order = body.sortOrder
+        if (parentChanged) values.parent_id = destinationParentId
+        if (needsReorder) values.sort_order = requestedIndex
         if (body.isVisible !== undefined) values.is_visible = body.isVisible
-        return trx.updateTable('product_categories').set(values).where('id', '=', id)
+        const updated = await trx.updateTable('product_categories').set(values).where('id', '=', id)
           .returningAll().executeTakeFirstOrThrow()
+
+        if (parentChanged) {
+          const sourceSiblings = allCategories.filter((category) => category.parent_id === currentCategory.parent_id && category.id !== id)
+          for (const [sortOrder, sibling] of sourceSiblings.entries()) {
+            if (sibling.sort_order !== sortOrder) {
+              await trx.updateTable('product_categories').set({ sort_order: sortOrder }).where('id', '=', sibling.id).execute()
+            }
+          }
+        }
+        if (needsReorder) {
+          for (const [sortOrder, sibling] of destinationOrder.entries()) {
+            if (sibling.id !== id && sibling.sort_order !== sortOrder) {
+              await trx.updateTable('product_categories').set({ sort_order: sortOrder }).where('id', '=', sibling.id).execute()
+            }
+          }
+        }
+        return updated
       })
       return reply.send(success(asCategory(row), request.id))
     } catch (error) {

@@ -122,6 +122,8 @@ D5 集成测试使用真实 PostgreSQL 和独立临时媒体目录；测试数�
 - 上传仍经过浏览器 FormData、Nuxt BFF 的 H3 `proxyRequest`、Fastify multipart、Sharp 和真实媒体目录。Chromium E2E 检查浏览器 multipart `Content-Length`，并在 `aikayun_test` 的 API、数据库和文件目录上完成上传与图片读取；JSON body limit 保持原值。
 - 图文详情使用 Nuxt UI `UEditor`（Tiptap），图片节点扩展将编辑器 `src` 绑定转换为 D5 `{ mediaId, alt? }` 契约。保存前共享 TypeBox/富文本校验与服务端白名单仍为最终边界。
 
+R1 管理端一致性规则：`mode: "all"` 的 `skuEnabledUpdates` 只携带明确修改的现有 SKU UUID 和启用状态；预览和保存重用相同请求体，新 SKU 默认值只用于新增组合。既有 SKU 的身份、编码、价格和库存关系仍由 D2 组合键映射保持，退役 SKU 更新被拒绝。分类 PATCH 在树保护事务中按 `sort_order, id` 建立同级稳定顺序，插入后重新编号目标同级，移动时也重新编号来源同级；同级排序修订随事务更新。商品列表初始化只由 query watcher 发起一次请求，后续请求使用递增序号，只允许最新序号更新列表、分页、错误和加载状态。商品编辑页只对 `PRODUCT_REVISION_CONFLICT` 打开本地/服务器修订决策；库存和 SKU 的其他 409 保留各自错误原因及本地草稿，库存数量变更只使用独立 `inventory_revision`。商品富文本组件仅由管理商品编辑页异步加载，避免 Tiptap 进入无关路由的客户端入口。
+
 `apps/web/test/e2e/admin-products.spec.ts` 覆盖真实商品创建和刷新、分类关联、规格/SKU 身份与价格、浏览器图片上传、富文本重载、库存不确定响应后同 operationId 查询、完整生命周期、商品复制/删除、库存历史阻止删除与归档保留，以及旧商品修订冲突、SSR 未授权首屏、320px/浅深色主题。页面以同一 `_test` PostgreSQL 数据库运行，测试会重置该测试库，不连接生产数据或媒体目录。
 
 顾客可见的商品首页、搜索、商品详情和购买流程属于 D7，D6 不提供这些路由或虚构的订单、销量和交付能力。
