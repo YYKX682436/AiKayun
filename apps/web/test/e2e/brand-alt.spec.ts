@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { wcagContrast } from 'culori'
+import { addBrandContrastProbe } from './brand-probe'
 
 test('an alternate deployment applies its logo and purple primary, then isolates the admin theme', async ({ page }, testInfo) => {
   const browserErrors: string[] = []
@@ -22,13 +23,14 @@ test('an alternate deployment applies its logo and purple primary, then isolates
   const response = await page.goto('/')
   expect(response?.status()).toBe(200)
   const serverHtml = await response?.text()
-  expect(serverHtml).toContain('<title>店铺首页 · 青屿数字商店</title>')
+  expect(serverHtml).toContain('<title>全部商品 · 青屿数字商店</title>')
   expect(serverHtml).toContain('storeBrandColor:"#7C3AED"')
   expect(serverHtml).toMatch(/<html[^>]+style="--ui-color-primary-50:/)
-  await expect(page).toHaveTitle('店铺首页 · 青屿数字商店')
+  await expect(page).toHaveTitle('全部商品 · 青屿数字商店')
   await expect(page.getByRole('link', { name: /青屿数字商店/ }).first()).toBeVisible()
   await expect(page.locator('header img')).toHaveAttribute('src', '/configured-logo.svg')
   await expect.poll(() => page.locator('header img').evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(32)
+  await addBrandContrastProbe(page)
 
   const storefrontColor = await page.evaluate(() => {
     const root = document.documentElement
@@ -41,7 +43,7 @@ test('an alternate deployment applies its logo and purple primary, then isolates
   expect(storefrontColor.primary).toMatch(/^#[\da-f]{6}$/i)
   expect(storefrontColor.primary.toUpperCase()).not.toBe('#2563EB')
   const lightBrandText = await page.evaluate(() => {
-    const text = document.querySelector<HTMLElement>('h1 span.text-primary')!
+    const text = document.querySelector<HTMLElement>('#brand-color-text-probe')!
     return { background: getComputedStyle(document.body).backgroundColor, foreground: getComputedStyle(text).color }
   })
   expect(wcagContrast(lightBrandText.foreground, lightBrandText.background)).toBeGreaterThanOrEqual(4.5)
@@ -50,7 +52,7 @@ test('an alternate deployment applies its logo and purple primary, then isolates
   await page.getByRole('button', { name: '显示模式' }).click()
   await page.getByRole('option', { name: '深色' }).click()
   const storefrontContrast = await page.evaluate(() => {
-    const text = document.querySelector<HTMLElement>('h1 span.text-primary')!
+    const text = document.querySelector<HTMLElement>('#brand-color-text-probe')!
     return { background: getComputedStyle(document.body).backgroundColor, foreground: getComputedStyle(text).color }
   })
   expect(wcagContrast(storefrontContrast.foreground, storefrontContrast.background)).toBeGreaterThanOrEqual(4.5)
@@ -102,7 +104,7 @@ test('an alternate deployment applies its logo and purple primary, then isolates
 
   await page.getByRole('link', { name: '返回店铺' }).click()
   await expect(page.locator('html')).toHaveAttribute('data-aikayun-area', 'storefront')
-  await expect(page).toHaveTitle('店铺首页 · 青屿数字商店')
+  await expect(page).toHaveTitle('全部商品 · 青屿数字商店')
   await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--ui-color-primary-600').trim())).not.toBe('#2563EB')
   await expect(page.locator('html')).toHaveClass(/dark/)
 

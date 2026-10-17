@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import { wcagContrast, wcagLuminance } from 'culori'
+import { addBrandContrastProbe } from './brand-probe'
 
 const preferenceKey = 'aikayun-color-mode'
 
@@ -25,8 +26,7 @@ async function selectPreference(page: Page, label: string) {
 async function readTheme(page: Page) {
   return page.evaluate((key) => {
     const root = document.documentElement
-    const heading = [...document.querySelectorAll('h1 span')]
-      .find(element => element.classList.contains('text-primary'))
+    const brandText = document.querySelector<HTMLElement>('#brand-color-text-probe')
 
     return {
       area: root.dataset.aikayunArea,
@@ -37,7 +37,7 @@ async function readTheme(page: Page) {
       textColor: getComputedStyle(document.body).color,
       primaryShade600: getComputedStyle(root).getPropertyValue('--ui-color-primary-600').trim(),
       primaryShade400: getComputedStyle(root).getPropertyValue('--ui-color-primary-400').trim(),
-      brandTextColor: heading ? getComputedStyle(heading).color : null,
+      brandTextColor: brandText ? getComputedStyle(brandText).color : null,
       modeControlHeight: document.querySelector<HTMLElement>('[aria-label="显示模式"]')?.getBoundingClientRect().height ?? 0,
       clientWidth: root.clientWidth,
       width: window.innerWidth,
@@ -48,6 +48,7 @@ async function readTheme(page: Page) {
 }
 
 async function assertThemeValue(page: Page, expected: 'light' | 'dark') {
+  await addBrandContrastProbe(page)
   await expect.poll(async () => (await readTheme(page)).value).toBe(expected)
   await expect.poll(async () => (await readTheme(page)).themeColor).toBe(expected === 'dark' ? '#020617' : '#f8fafc')
   const theme = await readTheme(page)
@@ -79,7 +80,7 @@ test('a first visit follows a light system preference and hydrates without error
   const colorModeBootstrap = serverHtml?.indexOf('__NUXT_COLOR_MODE__') ?? -1
   expect(colorModeBootstrap).toBeGreaterThanOrEqual(0)
   expect(colorModeBootstrap).toBeLessThan(headEnd)
-  await expect(page.getByRole('heading', { level: 1, name: 'AiKayun 数字商城' })).toBeVisible()
+  await expect(page.getByRole('heading', { level: 1, name: '全部商品' })).toBeVisible()
   await expect(page.getByRole('button', { name: '显示模式' })).toContainText('跟随系统')
   await assertThemeValue(page, 'light')
   expect(errors).toEqual([])
@@ -93,7 +94,7 @@ test('a first visit follows a dark system preference', async ({ page }) => {
     localStorage.removeItem('aikayun-color-mode-r1')
   }, preferenceKey)
   await page.goto('/')
-  await expect(page.getByRole('heading', { level: 1, name: 'AiKayun 数字商城' })).toBeVisible()
+  await expect(page.getByRole('heading', { level: 1, name: '全部商品' })).toBeVisible()
   await expect(page.getByRole('button', { name: '显示模式' })).toContainText('跟随系统')
   await assertThemeValue(page, 'dark')
 })
@@ -189,7 +190,7 @@ test('the mode picker is keyboard reachable and remains usable at target widths'
       expect(theme.documentWidth).toBeLessThanOrEqual(theme.clientWidth)
       expect(theme.modeControlHeight).toBeGreaterThanOrEqual(44)
       if (width === 320) {
-        const headingLines = await page.locator('#store-title').evaluate((element) => {
+        const headingLines = await page.getByRole('heading', { level: 1, name: '全部商品' }).evaluate((element) => {
           const styles = getComputedStyle(element)
           return Math.round(element.getBoundingClientRect().height / Number.parseFloat(styles.lineHeight))
         })

@@ -50,7 +50,7 @@ pnpm e2e
 pnpm build
 ```
 
-API 集成测试连接真实 PostgreSQL 并清理测试库 schema：先从 D1 和 D2 迁移基线写入既有商品/SKU，再升级至最新迁移并重复执行迁移。覆盖范围包括管理员认证与 CSRF、D1/D2 商品和规格矩阵约束、分类树和并发移动、SKU 退役及引用保护，以及 D3 CNY 售价/划线价/成本精度、库存模式状态、reserved 边界、并发调整、幂等、流水不可变、分页、模式切换和矩阵删 SKU/改组合保护。测试只接受名称以 `_test` 结尾的数据库。Playwright E2E 会重置同一测试库、创建一次性测试管理员，启动 API 和 Nuxt dev server，再在 Chromium 中检查 SSR 页面及管理端认证流程。
+API 集成测试连接真实 PostgreSQL 并清理测试库 schema：先从 D1 和 D2 迁移基线写入既有商品/SKU，再升级至最新迁移并重复执行迁移。覆盖范围包括管理员认证与 CSRF、D1/D2 商品和规格矩阵约束、分类树和并发移动、SKU 退役及引用保护，以及 D3 CNY 售价/划线价/成本精度、库存模式状态、reserved 边界、并发调整、幂等、流水不可变、分页、模式切换和矩阵删 SKU/改组合保护。D7 增加独立公开投影、生命周期过滤、隐藏分类树、价格/SKU资格、中文搜索、库存状态及 sitemap 的 PostgreSQL 集成覆盖。测试只接受名称以 `_test` 结尾的数据库。Playwright E2E 会重置同一测试库、创建一次性测试管理员，启动 API 和 Nuxt dev server，再在 Chromium 中检查真实首页、分类、搜索、详情、媒体与 SKU 交互以及管理端认证流程。
 
 ③-D2 管理 API 的主要写入边界如下：
 
@@ -126,7 +126,13 @@ R1 管理端一致性规则：`mode: "all"` 的 `skuEnabledUpdates` 只携带明
 
 `apps/web/test/e2e/admin-products.spec.ts` 覆盖真实商品创建和刷新、分类关联、规格/SKU 身份与价格、浏览器图片上传、富文本重载、库存不确定响应后同 operationId 查询、完整生命周期、商品复制/删除、库存历史阻止删除与归档保留，以及旧商品修订冲突、SSR 未授权首屏、320px/浅深色主题。页面以同一 `_test` PostgreSQL 数据库运行，测试会重置该测试库，不连接生产数据或媒体目录。
 
-顾客可见的商品首页、搜索、商品详情和购买流程属于 D7，D6 不提供这些路由或虚构的订单、销量和交付能力。
+## ③-D7 商城顾客前台
+
+D7 前台路由、公开 Fastify API、字段安全规则、有效售价/库存规则、分类树、搜索、稀疏 SKU 选择、404/302 处理、富文本、SEO、缓存与验证路径详见[商城前台说明](storefront.md)。公开数据只经 `/api/v1/public/*` 读取，不调用管理员 ProductDetail；业务查询在 PostgreSQL 中先过滤 active 商品、可销售 SKU 和可见分类，再映射为公开 TypeBox 契约。Nuxt SSR 与同源 BFF 保持不变。
+
+Chromium D7 E2E 使用真实 `_test` PostgreSQL、Fastify、Nuxt BFF 和独立媒体目录。除页面和 SSR HTML 外，还通过真实后台 API 创建分类、SKU、图片和正文，校验首页/分类/详情、搜索 query 同步、缺失商品 302、客户端 API 500 不误跳转、sitemap、媒体 immutable 缓存、稀疏 SKU 组合与多个视口尺寸。独立 SSR 错误测试使用隔离的模拟 API 返回含堆栈标记的 500，验证服务端渲染保留商品 URL、只显示可重试错误且不将上游错误体序列化到 HTML。搜索交互断言等待控件完成客户端水合后执行；测试不会用 sleep 猜测页面就绪状态。
+
+D7 只提供商品浏览。购物车、订单、支付、库存预留、卡密/数字文件交付、第三方采购、评价及营销系统均留给后续阶段；页面明确提示购买功能尚未开放，不提供无效交易按钮。
 
 ## Compose 全栈
 

@@ -1,19 +1,22 @@
 import { defineConfig, devices } from '@playwright/test'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
   ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
 const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3100'
 const webPort = new URL(baseURL).port || '3100'
 const useExternalServer = process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true'
+const mediaRoot = join(tmpdir(), 'aikayun-d7-playwright-media')
 
 export default defineConfig({
   testDir: './test/e2e',
-  fullyParallel: true,
-  workers: process.env.CI ? 1 : undefined,
+  fullyParallel: false,
+  workers: 1,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? 'github' : 'list',
-  testIgnore: ['**/brand-alt.spec.ts', '**/production-brand-runtime.spec.ts'],
+  testIgnore: ['**/brand-alt.spec.ts', '**/production-brand-runtime.spec.ts', '**/d7-ssr-error.spec.ts'],
   use: {
     baseURL,
     trace: 'retain-on-failure',
@@ -25,21 +28,23 @@ export default defineConfig({
     {
       command: 'pnpm --filter @aikayun/api dev',
       url: 'http://127.0.0.1:3001/api/v1/health/live',
-      reuseExistingServer: !process.env.CI,
+      reuseExistingServer: false,
       timeout: 120_000,
       env: {
         DATABASE_URL: testDatabaseUrl,
         NODE_ENV: 'test',
         PUBLIC_ORIGIN: baseURL,
+        MEDIA_ROOT: mediaRoot,
         COOKIE_SECURE: 'false',
       },
     },
     {
       command: `pnpm --filter @aikayun/web exec nuxt dev --host 127.0.0.1 --port ${webPort}`,
       url: baseURL,
-      reuseExistingServer: !process.env.CI,
+      reuseExistingServer: false,
       timeout: 120_000,
-      env: { NUXT_API_INTERNAL_URL: 'http://127.0.0.1:3001' },
+      env: { NUXT_API_INTERNAL_URL: 'http://127.0.0.1:3001', NUXT_PUBLIC_SITE_URL: baseURL },
     },
   ],
+  globalTeardown: './test/e2e/global-teardown.ts',
 })

@@ -1,9 +1,15 @@
 import { execFileSync } from 'node:child_process'
-import { resolve } from 'node:path'
+import { mkdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import type { FullConfig } from '@playwright/test'
 
 export default async function globalSetup(_config: FullConfig): Promise<void> {
   if (process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true') return
+
+  const mediaRoot = join(tmpdir(), 'aikayun-d7-playwright-media')
+  rmSync(mediaRoot, { recursive: true, force: true })
+  mkdirSync(mediaRoot, { recursive: true })
 
   const testDatabaseUrl = process.env.TEST_DATABASE_URL
     ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'

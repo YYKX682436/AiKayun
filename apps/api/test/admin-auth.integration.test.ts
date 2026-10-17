@@ -4513,4 +4513,253 @@ describe('D6 product management API additions', () => {
     expect(history.json().data.adjustments).toHaveLength(1)
     expect(history.json().data.adjustments[0].operationId).toBe(operationId)
   }, 30_000)
+
+  it('serves only active public products and omits disabled or retired SKU business data', async () => {
+    const auth = await loginAdmin()
+    const draft = await createTestProduct(auth, 'D7 草稿不可公开商品')
+    const draftRead = await app.inject(`/api/v1/public/products/${draft.id}`)
+    expect(draftRead.statusCode).toBe(404)
+
+    const publishedResponse = await changeProductLifecycle(auth, draft.id, {
+      expectedRevision: draft.revision, status: 'active',
+    })
+    expect(publishedResponse.statusCode).toBe(200)
+    const published = publishedResponse.json<{ data: ProductDetail }>().data
+    const publicRead = await app.inject(`/api/v1/public/products/${published.id}`)
+    expect(publicRead.statusCode).toBe(200)
+    expect(publicRead.headers['cache-control']).toBe('no-store')
+    expect(publicRead.json().data).toMatchObject({
+      id: published.id,
+      name: published.name,
+      selectionStatus: 'available',
+      priceRange: { min: '19.90', max: '19.90', currency: 'CNY' },
+    })
+    const publicJson = JSON.stringify(publicRead.json().data)
+    expect(publicJson).not.toMatch(/costPrice|skuCode|combination_key|revision|administrator|audit|stocked|reserved|inventoryAdjustment/iu)
+    expect((await app.inject('/api/v1/public/products?pageSize=48')).json().data.items)
+      .toContainEqual(expect.objectContaining({ id: published.id, priceRange: expect.objectContaining({ min: '19.90' }) }))
+
+    const pausedResponse = await changeProductLifecycle(auth, published.id, {
+      expectedRevision: published.revision, status: 'paused',
+    })
+    expect(pausedResponse.statusCode).toBe(200)
+    const paused = pausedResponse.json<{ data: ProductDetail }>().data
+    expect((await app.inject(`/api/v1/public/products/${paused.id}`)).statusCode).toBe(404)
+    expect((await app.inject(`/api/v1/public/search?q=${encodeURIComponent(paused.name)}`)).json().data.items)
+      .not.toContainEqual(expect.objectContaining({ id: paused.id }))
+
+    const archivedResponse = await changeProductLifecycle(auth, paused.id, {
+      expectedRevision: paused.revision, status: 'archived',
+    })
+    expect(archivedResponse.statusCode).toBe(200)
+    const archived = archivedResponse.json<{ data: ProductDetail }>().data
+    expect((await app.inject(`/api/v1/public/products/${archived.id}`)).statusCode).toBe(404)
+    const deleted = await deleteProduct(auth, archived.id, archived.revision)
+    expect(deleted.statusCode).toBe(200)
+    expect((await app.inject(`/api/v1/public/products/${archived.id}`)).statusCode).toBe(404)
+
+    const disabled = await createTestProduct(auth, 'D7 所有规格停用仍可展示')
+    const groupId = randomUUID()
+    const valueId = randomUUID()
+    const matrix = await saveMatrix(auth, disabled.id, {
+      expectedRevision: disabled.revision,
+      mode: 'selected',
+      groups: [optionGroup('期限', groupId, [{ id: valueId, name: '月卡' }])],
+      combinations: [{ optionValueIds: [valueId], salePrice: '8.80', enabled: false }],
+    })
+    expect(matrix.statusCode).toBe(200)
+    await db.updateTable('product_variants').set({ cost_price: '7.12345', inventory_mode: 'external' })
+      .where('product_id', '=', disabled.id).execute()
+    const disabledBeforePublish = await getAdminProduct(auth, disabled.id)
+    const disabledLiveResponse = await changeProductLifecycle(auth, disabled.id, {
+      expectedRevision: disabledBeforePublish.json<{ data: ProductDetail }>().data.revision, status: 'active',
+    })
+    expect(disabledLiveResponse.statusCode, disabledLiveResponse.body).toBe(200)
+
+    const disabledCard = await app.inject('/api/v1/public/products?pageSize=48')
+    expect(disabledCard.statusCode).toBe(200)
+    expect(disabledCard.json().data.items).toContainEqual(expect.objectContaining({
+      id: disabled.id,
+      priceRange: null,
+      selectionStatus: 'none',
+      inventoryStatus: 'not_applicable',
+    }))
+    const largeRichContent = {
+      type: 'doc' as const,
+      content: [{ type: 'paragraph' as const, content: [{ type: 'text' as const, text: '<'.repeat(50_000) }] }],
+    }
+    await db.updateTable('products').set({ rich_content: largeRichContent }).where('id', '=', disabled.id).execute()
+    const disabledDetail = await app.inject(`/api/v1/public/products/${disabled.id}`)
+    expect(disabledDetail.statusCode).toBe(200)
+    expect(disabledDetail.json().data).toMatchObject({
+      selectionStatus: 'none',
+      priceRange: null,
+      variants: [],
+      optionGroups: [{ id: groupId, values: [{ id: valueId, available: false }] }],
+    })
+    expect(disabledDetail.json().data.richContentHtml.length).toBeGreaterThan(200_000)
+    expect(disabledDetail.json().data.richContentHtml.length).toBeGreaterThan(200_000)
+    expect(JSON.stringify(disabledDetail.json().data)).not.toMatch(/7\.12345|costPrice|skuCode|combination_key|inventoryAdjustment/iu)
+
+    const retired = await createTestProduct(auth, 'D7 退役规格价格不可公开')
+    await db.updateTable('product_variants').set({ enabled: false, retired_at: new Date(), cost_price: '2.12345' })
+      .where('id', '=', retired.variants[0]!.id).execute()
+    const retiredBeforePublish = await getAdminProduct(auth, retired.id)
+    const retiredResponse = await changeProductLifecycle(auth, retired.id, {
+      expectedRevision: retiredBeforePublish.json<{ data: ProductDetail }>().data.revision, status: 'active',
+    })
+    expect(retiredResponse.statusCode).toBe(200)
+    const retiredPublic = await app.inject(`/api/v1/public/products/${retired.id}`)
+    expect(retiredPublic.statusCode).toBe(200)
+    expect(retiredPublic.json().data).toMatchObject({ selectionStatus: 'none', priceRange: null, variants: [] })
+  }, 30_000)
+
+  it('publishes a four-level visible category tree and searches public Chinese product text without duplicates', async () => {
+    const auth = await loginAdmin()
+    const createCategory = async (name: string, parentId?: string, isVisible = true) => {
+      const response = await app.inject({
+        method: 'POST', url: '/api/v1/admin/categories', headers: productHeaders(auth),
+        payload: { name, ...(parentId ? { parentId } : {}), isVisible },
+      })
+      expect(response.statusCode).toBe(201)
+      return response.json<{ data: { id: string; revision: number } }>().data
+    }
+    const root = await createCategory('D7可见根类')
+    const level2 = await createCategory('D7可见二级', root.id)
+    const level3 = await createCategory('D7可见三级', level2.id)
+    const level4 = await createCategory('D7可见四级', level3.id)
+    const hidden = await createCategory('D7隐藏祖先', undefined, false)
+    const hiddenDescendant = await createCategory('D7隐藏后代', hidden.id)
+
+    const product = await createTestProduct(auth, 'D7公开商品中文检索词')
+    const assigned = await app.inject({
+      method: 'PUT', url: `/api/v1/admin/products/${product.id}/categories`, headers: productHeaders(auth),
+      payload: {
+        expectedRevision: product.revision,
+        assignments: [
+          { categoryId: root.id, isPrimary: true, sortOrder: 2 },
+          { categoryId: level4.id, isPrimary: false, sortOrder: 1 },
+          { categoryId: hiddenDescendant.id, isPrimary: false, sortOrder: 0 },
+        ],
+      },
+    })
+    expect(assigned.statusCode).toBe(200)
+    const assignedProduct = assigned.json<{ data: ProductDetail }>().data
+    const published = await changeProductLifecycle(auth, product.id, {
+      expectedRevision: assignedProduct.revision, status: 'active',
+    })
+    expect(published.statusCode).toBe(200)
+
+    const publicTree = await app.inject('/api/v1/public/categories')
+    expect(publicTree.statusCode).toBe(200)
+    const categories = publicTree.json<{ data: { categories: Array<{ id: string; level: number; path: Array<{ id: string }> }> } }>().data.categories
+    expect(categories.find(item => item.id === root.id)?.level).toBe(0)
+    const publicLevel4 = categories.find(item => item.id === level4.id)!
+    expect(publicLevel4.level).toBe(3)
+    expect(publicLevel4.path.map(item => item.id)).toEqual([root.id, level2.id, level3.id, level4.id])
+    expect(categories.map(item => item.id)).not.toContain(hidden.id)
+    expect(categories.map(item => item.id)).not.toContain(hiddenDescendant.id)
+
+    const rootProducts = await app.inject(`/api/v1/public/categories/${root.id}/products?page=1&pageSize=48`)
+    expect(rootProducts.statusCode).toBe(200)
+    expect(rootProducts.json().data.products.items.filter((item: { id: string }) => item.id === product.id)).toHaveLength(1)
+    expect((await app.inject(`/api/v1/public/categories/${hiddenDescendant.id}/products`)).statusCode).toBe(404)
+
+    const search = await app.inject(`/api/v1/public/search?q=${encodeURIComponent('中文检索词')}&categoryId=${root.id}&sort=price_asc`)
+    expect(search.statusCode).toBe(200)
+    expect(search.json().data.items.map((item: { id: string }) => item.id)).toContain(product.id)
+    const blankSearch = await app.inject('/api/v1/public/search?q=%20%20')
+    expect(blankSearch.statusCode).toBe(400)
+    const sitemap = await app.inject('/api/v1/public/sitemap?page=1&pageSize=50000')
+    expect(sitemap.json().data.items).toContainEqual(expect.objectContaining({ type: 'product', id: product.id }))
+    expect(sitemap.json().data.items).not.toContainEqual(expect.objectContaining({ type: 'product', id: hiddenDescendant.id }))
+  }, 30_000)
+
+  it('exposes only truthful public inventory summaries independently from SKU selection and price', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, 'D7 公开库存状态')
+    const variant = product.variants[0]!
+    const published = await changeProductLifecycle(auth, product.id, {
+      expectedRevision: product.revision, status: 'active',
+    })
+    expect(published.statusCode).toBe(200)
+
+    const initial = await app.inject(`/api/v1/public/products/${product.id}`)
+    expect(initial.statusCode).toBe(200)
+    expect(initial.json().data.variants[0].inventory).toMatchObject({ mode: null, status: 'not_configured' })
+
+    const pausedForQuantity = await changeProductLifecycle(auth, product.id, {
+      expectedRevision: published.json<{ data: ProductDetail }>().data.revision, status: 'paused',
+    })
+    expect(pausedForQuantity.statusCode).toBe(200)
+    const quantityMode = await setInventoryMode(auth, product.id, variant.id, {
+      expectedRevision: pausedForQuantity.json<{ data: ProductDetail }>().data.revision,
+      expectedSkuRevision: variant.revision,
+      expectedInventoryRevision: 0,
+      inventoryMode: 'quantity',
+    })
+    expect(quantityMode.statusCode).toBe(200)
+    let state = quantityMode.json<{ data: { productRevision: number; skuRevision: number; inventoryRevision: number } }>().data
+    const liveQuantity = await changeProductLifecycle(auth, product.id, {
+      expectedRevision: state.productRevision, status: 'active',
+    })
+    expect(liveQuantity.statusCode).toBe(200)
+    state.productRevision = liveQuantity.json<{ data: ProductDetail }>().data.revision
+    expect((await app.inject(`/api/v1/public/products/${product.id}`)).json().data.variants[0].inventory)
+      .toMatchObject({ mode: 'quantity', status: 'out_of_stock' })
+
+    const stocked = await adjustInventory(auth, product.id, variant.id, {
+      expectedInventoryRevision: state.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 2, reason: 'D7 前台库存验收',
+    })
+    expect(stocked.statusCode).toBe(201)
+    state.inventoryRevision = stocked.json<{ data: { inventoryRevision: number } }>().data.inventoryRevision
+    const inStock = await app.inject(`/api/v1/public/products/${product.id}`)
+    expect(inStock.json().data.variants[0].inventory).toMatchObject({ mode: 'quantity', status: 'in_stock' })
+
+    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 2 })
+      .where('product_variant_id', '=', variant.id).execute()
+    const fullyReserved = await app.inject(`/api/v1/public/products/${product.id}`)
+    expect(fullyReserved.json().data.variants[0].inventory).toMatchObject({ mode: 'quantity', status: 'out_of_stock' })
+    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 0 })
+      .where('product_variant_id', '=', variant.id).execute()
+    const drained = await adjustInventory(auth, product.id, variant.id, {
+      expectedInventoryRevision: state.inventoryRevision,
+      operationId: randomUUID(), action: 'decrease', quantity: 2, reason: 'D7 库存模式切换验收',
+    })
+    expect(drained.statusCode).toBe(201)
+    state.inventoryRevision = drained.json<{ data: { inventoryRevision: number } }>().data.inventoryRevision
+
+    for (const [mode, expected] of [
+      ['external', { mode: 'external', status: 'not_ready' }],
+      ['resource_pool', { mode: 'resource_pool', status: 'not_ready' }],
+      ['unlimited', { mode: 'unlimited', status: 'unlimited' }],
+    ] as const) {
+      const pauseForModeChange = await changeProductLifecycle(auth, product.id, {
+        expectedRevision: state.productRevision, status: 'paused',
+      })
+      expect(pauseForModeChange.statusCode).toBe(200)
+      state.productRevision = pauseForModeChange.json<{ data: ProductDetail }>().data.revision
+      const changed = await setInventoryMode(auth, product.id, variant.id, {
+        expectedRevision: state.productRevision,
+        expectedSkuRevision: state.skuRevision,
+        expectedInventoryRevision: state.inventoryRevision,
+        inventoryMode: mode,
+      })
+      expect(changed.statusCode, changed.body).toBe(200)
+      state = changed.json<{ data: typeof state }>().data
+      const restoreToActive = await changeProductLifecycle(auth, product.id, {
+        expectedRevision: state.productRevision, status: 'active',
+      })
+      expect(restoreToActive.statusCode).toBe(200)
+      state.productRevision = restoreToActive.json<{ data: ProductDetail }>().data.revision
+      const publicDetail = await app.inject(`/api/v1/public/products/${product.id}`)
+      expect(publicDetail.statusCode).toBe(200)
+      expect(publicDetail.json().data.variants[0].inventory).toMatchObject(expected)
+      expect(JSON.stringify(publicDetail.json().data)).not.toMatch(/stocked|reserved|inventoryAdjustment/iu)
+    }
+
+    expect((await app.inject('/api/v1/public/products')).headers['cache-control']).toBe('no-store')
+    expect((await app.inject('/api/v1/public/categories')).headers['cache-control']).toBe('no-store')
+  }, 30_000)
 })

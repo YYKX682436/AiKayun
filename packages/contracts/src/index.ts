@@ -504,6 +504,169 @@ export const ProductListResponseSchema = Type.Object({
   totalPages: Type.Integer({ minimum: 0 }),
 }, { additionalProperties: false })
 
+// Public catalog contracts deliberately expose only customer-facing projections.
+export const PublicCatalogSortSchema = Type.Union([
+  Type.Literal('default'), Type.Literal('newest'), Type.Literal('price_asc'), Type.Literal('price_desc'),
+])
+
+export const PublicProductListQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 48 })),
+  sort: Type.Optional(PublicCatalogSortSchema),
+}, { additionalProperties: false })
+
+export const PublicProductSearchQuerySchema = Type.Object({
+  q: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  categoryId: Type.Optional(Type.String({ format: 'uuid' })),
+  productType: Type.Optional(ProductTypeSchema),
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 48 })),
+  sort: Type.Optional(PublicCatalogSortSchema),
+}, { additionalProperties: false })
+
+export const PublicProductPriceRangeSchema = Type.Object({
+  min: ProductSalePriceSchema,
+  max: ProductSalePriceSchema,
+  currency: Type.Literal('CNY'),
+}, { additionalProperties: false })
+
+export const PublicProductImageSchema = Type.Object({
+  url: Type.String({ minLength: 1, maxLength: 200 }),
+  thumbnailUrl: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+  width: Type.Integer({ minimum: 1, maximum: 1920 }),
+  height: Type.Integer({ minimum: 1, maximum: 1920 }),
+  alt: Type.String({ maxLength: 200 }),
+}, { additionalProperties: false })
+
+export const PublicInventorySummarySchema = Type.Union([
+  Type.Object({ mode: Type.Literal('quantity'), status: Type.Union([Type.Literal('in_stock'), Type.Literal('out_of_stock')]) }, { additionalProperties: false }),
+  Type.Object({ mode: Type.Literal('resource_pool'), status: Type.Literal('not_ready') }, { additionalProperties: false }),
+  Type.Object({ mode: Type.Literal('external'), status: Type.Literal('not_ready') }, { additionalProperties: false }),
+  Type.Object({ mode: Type.Literal('unlimited'), status: Type.Literal('unlimited') }, { additionalProperties: false }),
+  Type.Object({ mode: Type.Null(), status: Type.Literal('not_configured') }, { additionalProperties: false }),
+])
+
+export const PublicProductCardSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 200 }),
+  description: Type.String({ maxLength: 280 }),
+  productType: ProductTypeSchema,
+  cover: Type.Union([PublicProductImageSchema, Type.Null()]),
+  priceRange: Type.Union([PublicProductPriceRangeSchema, Type.Null()]),
+  selectionStatus: Type.Union([Type.Literal('available'), Type.Literal('none')]),
+  inventoryStatus: Type.Union([
+    Type.Literal('in_stock'), Type.Literal('out_of_stock'),
+    Type.Literal('unconfirmed'), Type.Literal('not_applicable'),
+  ]),
+}, { additionalProperties: false })
+
+export const PublicProductPageSchema = Type.Object({
+  items: Type.Array(PublicProductCardSchema, { maxItems: 48 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 48 }),
+  total: Type.Integer({ minimum: 0 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+
+export const PublicCategoryPathItemSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 120 }),
+}, { additionalProperties: false })
+
+/** A visible category tree is represented as an ordered adjacency list plus its public path. */
+export const PublicCategorySchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  parentId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  name: Type.String({ minLength: 1, maxLength: 120 }),
+  sortOrder: Type.Integer(),
+  level: Type.Integer({ minimum: 0, maximum: 3 }),
+  path: Type.Array(PublicCategoryPathItemSchema, { minItems: 1, maxItems: 4 }),
+}, { additionalProperties: false })
+
+export const PublicCategoriesResponseSchema = Type.Object({
+  categories: Type.Array(PublicCategorySchema),
+}, { additionalProperties: false })
+
+export const PublicCategoryProductsResponseSchema = Type.Object({
+  category: PublicCategorySchema,
+  breadcrumbs: Type.Array(PublicCategoryPathItemSchema, { minItems: 1, maxItems: 4 }),
+  children: Type.Array(PublicCategorySchema, { maxItems: 10_000 }),
+  products: PublicProductPageSchema,
+}, { additionalProperties: false })
+
+export const PublicProductOptionValueSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 80 }),
+  sortOrder: Type.Integer(),
+  available: Type.Boolean(),
+}, { additionalProperties: false })
+
+export const PublicProductOptionGroupSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 80 }),
+  sortOrder: Type.Integer(),
+  values: Type.Array(PublicProductOptionValueSchema, { maxItems: 50 }),
+}, { additionalProperties: false })
+
+export const PublicProductVariantSchema = Type.Object({
+  options: Type.Array(Type.Object({
+    groupId: Type.String({ format: 'uuid' }),
+    valueId: Type.String({ format: 'uuid' }),
+  }, { additionalProperties: false }), { maxItems: 5 }),
+  salePrice: ProductSalePriceSchema,
+  compareAtPrice: Type.Union([ProductSalePriceSchema, Type.Null()]),
+  inventory: PublicInventorySummarySchema,
+}, { additionalProperties: false })
+
+export const PublicProductCategoryAssignmentSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 120 }),
+  path: Type.Array(PublicCategoryPathItemSchema, { minItems: 1, maxItems: 4 }),
+  isPrimary: Type.Boolean(),
+  sortOrder: Type.Integer(),
+}, { additionalProperties: false })
+
+export const PublicProductAttributeSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 80 }),
+  value: Type.String({ minLength: 1, maxLength: 500 }),
+}, { additionalProperties: false })
+
+export const PublicProductDetailSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 200 }),
+  description: Type.String({ maxLength: 20_000 }),
+  productType: ProductTypeSchema,
+  priceRange: Type.Union([PublicProductPriceRangeSchema, Type.Null()]),
+  selectionStatus: Type.Union([Type.Literal('available'), Type.Literal('none')]),
+  gallery: Type.Array(PublicProductImageSchema, { maxItems: 20 }),
+  // The validated 128 KiB JSON document can expand during HTML escaping; keep
+  // the response contract above its worst-case rendered size.
+  richContentHtml: Type.String({ maxLength: 900_000 }),
+  categories: Type.Array(PublicProductCategoryAssignmentSchema),
+  optionGroups: Type.Array(PublicProductOptionGroupSchema, { maxItems: 5 }),
+  variants: Type.Array(PublicProductVariantSchema, { maxItems: 1000 }),
+  attributes: Type.Array(PublicProductAttributeSchema, { maxItems: 30 }),
+}, { additionalProperties: false })
+
+export const PublicSitemapQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 50_000 })),
+}, { additionalProperties: false })
+
+export const PublicSitemapItemSchema = Type.Object({
+  type: Type.Union([Type.Literal('product'), Type.Literal('category')]),
+  id: Type.String({ format: 'uuid' }),
+  lastModified: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+
+export const PublicSitemapResponseSchema = Type.Object({
+  items: Type.Array(PublicSitemapItemSchema, { maxItems: 50_000 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 50_000 }),
+  total: Type.Integer({ minimum: 0 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+
 export const UpdateProductBodySchema = Type.Object({
   expectedRevision: Type.Integer({ minimum: 1 }),
   name: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
@@ -800,6 +963,25 @@ export type ProductDetail = Static<typeof ProductDetailSchema>
 export type ProductListQuery = Static<typeof ProductListQuerySchema>
 export type ProductListItem = Static<typeof ProductListItemSchema>
 export type ProductListResponse = Static<typeof ProductListResponseSchema>
+export type PublicCatalogSort = Static<typeof PublicCatalogSortSchema>
+export type PublicProductListQuery = Static<typeof PublicProductListQuerySchema>
+export type PublicProductSearchQuery = Static<typeof PublicProductSearchQuerySchema>
+export type PublicProductImage = Static<typeof PublicProductImageSchema>
+export type PublicProductCard = Static<typeof PublicProductCardSchema>
+export type PublicProductPage = Static<typeof PublicProductPageSchema>
+export type PublicCategoryPathItem = Static<typeof PublicCategoryPathItemSchema>
+export type PublicCategory = Static<typeof PublicCategorySchema>
+export type PublicCategoriesResponse = Static<typeof PublicCategoriesResponseSchema>
+export type PublicCategoryProductsResponse = Static<typeof PublicCategoryProductsResponseSchema>
+export type PublicInventorySummary = Static<typeof PublicInventorySummarySchema>
+export type PublicProductOptionGroup = Static<typeof PublicProductOptionGroupSchema>
+export type PublicProductVariant = Static<typeof PublicProductVariantSchema>
+export type PublicProductCategoryAssignment = Static<typeof PublicProductCategoryAssignmentSchema>
+export type PublicProductAttribute = Static<typeof PublicProductAttributeSchema>
+export type PublicProductDetail = Static<typeof PublicProductDetailSchema>
+export type PublicSitemapQuery = Static<typeof PublicSitemapQuerySchema>
+export type PublicSitemapItem = Static<typeof PublicSitemapItemSchema>
+export type PublicSitemapResponse = Static<typeof PublicSitemapResponseSchema>
 export type UpdateProductBody = Static<typeof UpdateProductBodySchema>
 export type UpdateProductLifecycleBody = Static<typeof UpdateProductLifecycleBodySchema>
 export type ProductExpectedRevisionBody = Static<typeof ProductExpectedRevisionBodySchema>

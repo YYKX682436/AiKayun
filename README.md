@@ -1,6 +1,6 @@
 # AiKayun
 
-AiKayun 是面向独立部署和商业授权的数字商品商城工程。阶段③-D1～D6 已具备商品、媒体、富文本、分类、动态规格、SKU、价格、数量库存和生命周期管理 API，以及真实商品管理后台；D7 商城前台商品首页与详情仍未实现。
+AiKayun 是面向独立部署和商业授权的数字商品商城工程。阶段③-D1～D6 提供商品、媒体、富文本、分类、动态规格、SKU、价格、数量库存、生命周期管理 API 和商品管理后台；D7 提供真实商品首页、分类浏览、搜索、SKU 商品详情、SSR 与 SEO。购物车、订单、支付、卡密交付和第三方采购尚未开放。
 
 ## 工程结构
 
@@ -30,7 +30,7 @@ pnpm db:migrate
 PUBLIC_ORIGIN=http://localhost:3000 pnpm dev
 ```
 
-商城地址为 <http://localhost:3000>，API 文档为 <http://localhost:3000/api/docs>。管理员登录入口是 `/admin/login`；管理员只允许使用一次性初始化命令创建。完整说明见 [本地开发](docs/development.md) 和 [部署](docs/deployment.md)。
+商城地址为 <http://localhost:3000>，API 文档为 <http://localhost:3000/api/docs>。公开商品页面包括 `/`、`/categories/[id]`、`/search` 和 `/products/[id]`；管理员登录入口是 `/admin/login`。独立部署的 canonical、OG 与 sitemap 域名通过 `NUXT_PUBLIC_SITE_URL` 配置。完整说明见 [前台目录](docs/storefront.md)、[本地开发](docs/development.md) 和 [部署](docs/deployment.md)。
 
 ## 检查命令
 

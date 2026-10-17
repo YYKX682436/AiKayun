@@ -30,6 +30,7 @@ import { registerAdminVariantMatrixRoutes } from './catalog/admin-variant-matrix
 import { registerAdminProductPriceRoutes } from './catalog/admin-product-prices.js'
 import { registerAdminInventoryRoutes } from './catalog/admin-inventory.js'
 import { registerProductMediaRoutes } from './media/admin.js'
+import { registerPublicProductRoutes } from './catalog/public-products.js'
 
 export async function createApp(options: {
   db: Kysely<Database>
@@ -63,12 +64,18 @@ export async function createApp(options: {
         { name: 'admin-auth', description: 'Administrator authentication' },
         { name: 'admin', description: 'Protected administrator APIs' },
         { name: 'catalog', description: 'Product and SKU administration' },
+        { name: 'public-catalog', description: 'Public product and visible category reads' },
       ],
     },
   })
   await app.register(cookie)
   await app.register(rateLimit, { global: false })
   await app.register(swaggerUi, { routePrefix: '/api/docs' })
+
+  app.addHook('onSend', async (request, reply, payload) => {
+    if (request.url.startsWith('/api/v1/public/')) reply.header('cache-control', 'no-store')
+    return payload
+  })
 
   app.setErrorHandler((untypedError, request, reply) => {
     const error = untypedError as FastifyError & { validation?: unknown }
@@ -133,5 +140,6 @@ export async function createApp(options: {
   registerAdminProductPriceRoutes(app, db, config)
   registerAdminInventoryRoutes(app, db, config)
   await registerProductMediaRoutes(app, db, config)
+  registerPublicProductRoutes(app, db)
   return app
 }

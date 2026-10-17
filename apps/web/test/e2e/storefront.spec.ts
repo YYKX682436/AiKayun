@@ -87,14 +87,26 @@ async function assertMobileAdminNavigation(page: import('@playwright/test').Page
   }
 }
 
-test('renders the server-side storefront empty state without consumer actions that are not available', async ({ page }) => {
+test('renders real server-side storefront products or the honest empty state without unavailable transaction actions', async ({ page }) => {
   const response = await page.goto('/')
   expect(response?.status()).toBe(200)
   const serverHtml = await response?.text()
+  const catalogResponse = await page.request.get('/api/v1/public/products?page=1&pageSize=24&sort=newest')
+  expect(catalogResponse.status()).toBe(200)
+  const catalog = (await catalogResponse.json()).data as { items: Array<{ id: string; name: string; priceRange: { min: string; max: string } | null }> }
 
-  await expect(page.getByRole('heading', { level: 1, name: 'AiKayun 数字商城' })).toBeVisible()
-  await expect(page.getByRole('heading', { name: '暂无可展示的商品' })).toBeVisible()
-  await expect(page.getByRole('link', { name: '管理入口' })).toHaveAttribute('href', '/admin/login')
+  await expect(page.getByRole('heading', { level: 1, name: '全部商品' })).toBeVisible()
+  if (catalog.items.length === 0) {
+    await expect(page.getByRole('heading', { name: '暂无可展示的商品' })).toBeVisible()
+  }
+  else {
+    await expect(page.locator('a[href^="/products/"]')).toHaveCount(catalog.items.length)
+    await expect(page.getByText(catalog.items[0]!.name, { exact: false })).toBeVisible()
+    expect(serverHtml).toContain(catalog.items[0]!.name)
+    if (catalog.items[0]!.priceRange) expect(serverHtml).toContain(catalog.items[0]!.priceRange!.min)
+  }
+  await expect(page.getByRole('banner').getByRole('link', { name: '管理入口' })).toHaveAttribute('href', '/admin/login')
+  await expect(page.getByRole('link', { name: '搜索商品' })).toHaveAttribute('href', '/search')
   await expect(page.getByRole('link', { name: '登录' })).toHaveCount(0)
   await expect(page.getByRole('link', { name: '注册' })).toHaveCount(0)
   await expect(page.getByRole('search')).toHaveCount(0)

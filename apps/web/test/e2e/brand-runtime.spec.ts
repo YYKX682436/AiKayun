@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test'
 import { wcagContrast } from 'culori'
 import { createStorefrontThemeStyle, defaultStoreBrand, normalizeHex, resolveStoreBrand } from '../../utils/store-brand'
+import { addBrandContrastProbe } from './brand-probe'
 
 test('the AiKayun deployment uses the default storefront name and brand blue', async ({ page }) => {
   const browserErrors: string[] = []
@@ -11,8 +12,8 @@ test('the AiKayun deployment uses the default storefront name and brand blue', a
 
   const response = await page.goto('/')
   expect(response?.status()).toBe(200)
-  expect(await response?.text()).toContain('<title>店铺首页 · AiKayun 数字商城</title>')
-  await expect(page).toHaveTitle('店铺首页 · AiKayun 数字商城')
+  expect(await response?.text()).toContain('<title>全部商品 · AiKayun 数字商城</title>')
+  await expect(page).toHaveTitle('全部商品 · AiKayun 数字商城')
   await expect(page.getByRole('link', { name: /AiKayun 数字商城/ }).first()).toBeVisible()
   await expect(page.locator('header img')).toHaveCount(0)
 
@@ -23,13 +24,13 @@ test('the AiKayun deployment uses the default storefront name and brand blue', a
   expect(brand.area).toBe('storefront')
   expect(brand.color).toMatch(/^#[\da-f]{6}$/i)
 
-  await page.getByRole('link', { name: '管理入口', exact: true }).click()
+  await page.getByRole('banner').getByRole('link', { name: '管理入口', exact: true }).click()
   await expect(page).toHaveURL(/\/admin\/login$/)
   await expect(page).toHaveTitle('管理员登录 · AiKayun')
   await expect(page.locator('html')).toHaveAttribute('data-aikayun-area', 'admin')
 
   await page.getByRole('link', { name: 'AiKayun' }).click()
-  await expect(page).toHaveTitle('店铺首页 · AiKayun 数字商城')
+  await expect(page).toHaveTitle('全部商品 · AiKayun 数字商城')
   await expect(page.locator('html')).toHaveAttribute('data-aikayun-area', 'storefront')
   expect(browserErrors).toEqual([])
 })
@@ -43,6 +44,7 @@ test('generated brand colors keep storefront text, status labels and keyboard fo
 
   await page.emulateMedia({ colorScheme: 'light' })
   await page.goto('/')
+  await addBrandContrastProbe(page)
 
   const brandSamples = [
     ['default blue', '#2563EB'],
@@ -91,8 +93,8 @@ test('generated brand colors keep storefront text, status labels and keyboard fo
         }
 
         const pageSurface = document.querySelector<HTMLElement>('.bg-default')!
-        const heroText = document.querySelector<HTMLElement>('h1 span.text-primary')!
-        const badge = document.querySelector<HTMLElement>('span.bg-primary\\/10.text-primary')!
+        const heroText = document.querySelector<HTMLElement>('#brand-color-text-probe')!
+        const badge = document.querySelector<HTMLElement>('#brand-color-badge-probe')!
         const badgeText = getComputedStyle(badge).color
         const badgeBackground = composite(getComputedStyle(badge).backgroundColor, getComputedStyle(pageSurface).backgroundColor)
         const focusControl = document.querySelector<HTMLElement>('[aria-label="显示模式"]')!

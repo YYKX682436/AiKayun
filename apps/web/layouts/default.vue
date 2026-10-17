@@ -1,12 +1,19 @@
 <script setup lang="ts">
-import type { NavigationMenuItem } from '@nuxt/ui'
-
 const storeBrand = useStoreBrand()
-const navigationItems: NavigationMenuItem[] = [{ label: '首页', to: '/' }]
+const { data: categoriesResponse } = await usePublicCategories()
+const categories = computed(() => categoriesResponse.value?.data.categories ?? [])
+const storefrontReady = ref(false)
+
+onMounted(() => {
+  storefrontReady.value = true
+})
 </script>
 
 <template>
-  <div class="min-h-dvh bg-default">
+  <div
+    class="min-h-dvh bg-default"
+    :data-storefront-ready="storefrontReady ? 'true' : 'false'"
+  >
     <NuxtLink
       to="#main-content"
       class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-elevated focus:px-4 focus:py-3 focus:text-highlighted focus:shadow-lg"
@@ -15,31 +22,36 @@ const navigationItems: NavigationMenuItem[] = [{ label: '首页', to: '/' }]
     </NuxtLink>
 
     <header class="border-b border-default bg-elevated">
-      <UContainer class="flex min-h-16 items-center justify-between gap-3 py-2">
+      <UContainer class="flex min-h-16 items-center justify-between gap-2 py-2">
         <NuxtLink
           to="/"
-          class="flex min-w-0 items-center gap-2.5 rounded-sm font-semibold text-highlighted focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary sm:gap-3"
+          class="flex min-w-0 shrink items-center gap-2 rounded-sm font-semibold text-highlighted focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary sm:gap-2.5"
         >
           <BrandMark
             :name="storeBrand.storeName"
             :logo-url="storeBrand.storeLogoUrl"
           />
-          <span class="max-w-[8rem] truncate sm:max-w-[16rem]">{{ storeBrand.storeName }}</span>
+          <span class="max-w-[3.25rem] truncate text-sm sm:max-w-[12rem] sm:text-base">{{ storeBrand.storeName }}</span>
         </NuxtLink>
 
-        <div class="flex shrink-0 items-center gap-1 sm:gap-2">
-          <UNavigationMenu
-            :items="navigationItems"
-            aria-label="商城导航"
-            class="hidden md:flex"
-          />
+        <div class="flex shrink-0 items-center gap-0 sm:gap-1">
+          <StorefrontCategoryNav :categories="categories" />
+          <UButton
+            to="/search"
+            color="neutral"
+            variant="ghost"
+            icon="i-lucide-search"
+            aria-label="搜索商品"
+            class="min-h-11 min-w-9 px-1.5 sm:min-w-10 sm:px-2"
+          >
+            <span class="hidden xl:inline">搜索商品</span>
+          </UButton>
           <ThemeModeSelect />
           <NuxtLink
             to="/admin/login"
-            class="inline-flex min-h-11 items-center rounded-lg px-2 text-xs font-medium text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:px-3 sm:text-sm"
+            class="hidden min-h-11 items-center rounded-lg px-3 text-sm font-medium text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary lg:inline-flex"
           >
-            <span class="sm:hidden">管理</span>
-            <span class="hidden sm:inline">管理入口</span>
+            管理入口
           </NuxtLink>
         </div>
       </UContainer>
@@ -48,8 +60,14 @@ const navigationItems: NavigationMenuItem[] = [{ label: '首页', to: '/' }]
     <slot />
 
     <footer class="border-t border-default bg-elevated">
-      <UContainer class="py-5 text-sm text-muted">
-        {{ storeBrand.storeName }}
+      <UContainer class="flex flex-wrap items-center justify-between gap-2 py-5 text-sm text-muted">
+        <span>{{ storeBrand.storeName }}</span>
+        <NuxtLink
+          to="/admin/login"
+          class="min-h-11 content-center rounded-lg px-2 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+        >
+          管理入口
+        </NuxtLink>
       </UContainer>
     </footer>
   </div>
