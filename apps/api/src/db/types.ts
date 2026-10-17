@@ -1,4 +1,7 @@
 import type { ColumnType, Generated } from 'kysely'
+import type { ProductRichContent } from '@aikayun/contracts'
+
+export type ProductMediaReferenceSource = 'gallery' | 'rich_content'
 
 export interface AdminUsersTable {
   id: string
@@ -26,11 +29,40 @@ export interface ProductsTable {
   id: string
   name: string
   description: string
+  rich_content: ColumnType<ProductRichContent, ProductRichContent | undefined, ProductRichContent>
   product_type: ProductType
   status: ProductStatus
   revision: Generated<number>
   created_at: Generated<Date>
   updated_at: Generated<Date>
+}
+
+export interface ProductMediaTable {
+  id: string
+  created_at: Generated<Date>
+}
+
+export type ProductMediaVariantName = 'thumbnail' | 'card' | 'detail'
+
+export interface ProductMediaVariantsTable {
+  media_id: string
+  variant: ProductMediaVariantName
+  storage_key: string
+  format: 'webp'
+  width: number
+  height: number
+  size_bytes: number
+  sha256: string
+  processing_version: string
+  created_at: Generated<Date>
+}
+
+export interface ProductMediaReferencesTable {
+  product_id: string
+  media_id: string
+  source: ProductMediaReferenceSource
+  sort_order: number | null
+  created_at: Generated<Date>
 }
 
 export interface ProductVariantsTable {
@@ -140,6 +172,7 @@ export interface ProductVariantOptionValuesTable {
 
 export type ProductManagementOperation =
   | 'created' | 'updated' | 'published' | 'paused' | 'relisted' | 'archived' | 'restored' | 'copied' | 'deleted'
+  | 'gallery_updated' | 'rich_content_updated'
 
 export interface ProductManagementAuditEventsTable {
   id: string
@@ -165,4 +198,7 @@ export interface Database {
   product_option_values: ProductOptionValuesTable
   product_variant_option_values: ProductVariantOptionValuesTable
   product_management_audit_events: ProductManagementAuditEventsTable
+  product_media: ProductMediaTable
+  product_media_variants: ProductMediaVariantsTable
+  product_media_references: ProductMediaReferencesTable
 }

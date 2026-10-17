@@ -34,6 +34,18 @@ services:
         condition: service_healthy
     restart: "no"
 
+  media-init:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p \"$$MEDIA_ROOT\" && chown node:node \"$$MEDIA_ROOT\""]
+    environment:
+      MEDIA_ROOT: ${MEDIA_ROOT:-/var/lib/aikayun/media}
+    volumes:
+      - product_media:${MEDIA_ROOT:-/var/lib/aikayun/media}
+    restart: "no"
+
   api:
     build:
       context: .
@@ -50,8 +62,11 @@ services:
       PGDATABASE: ${POSTGRES_DB:-aikayun}
       PGUSER: ${POSTGRES_USER:-aikayun}
       PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      MEDIA_ROOT: ${MEDIA_ROOT:-/var/lib/aikayun/media}
     expose:
       - "3001"
+    volumes:
+      - product_media:${MEDIA_ROOT:-/var/lib/aikayun/media}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
@@ -62,6 +77,8 @@ services:
       db:
         condition: service_healthy
       migrate:
+        condition: service_completed_successfully
+      media-init:
         condition: service_completed_successfully
     restart: unless-stopped
 
@@ -108,5 +125,6 @@ services:
 
 volumes:
   postgres_data:
+  product_media:
   caddy_data:
   caddy_config:

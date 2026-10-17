@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { PoolConfig } from 'pg'
 
 const rootEnvCandidates = [
@@ -10,6 +11,22 @@ const rootEnvCandidates = [
 const rootEnvPath = rootEnvCandidates.find((path) => existsSync(path))
 if (rootEnvPath) process.loadEnvFile(rootEnvPath)
 
+function repositoryRoot(): string | undefined {
+  const candidates = [
+    process.cwd(),
+    resolve(process.cwd(), '../..'),
+    resolve(import.meta.dirname, '../../..'),
+  ]
+  return candidates.find((candidate) =>
+    existsSync(resolve(candidate, 'apps/api/package.json'))
+      && existsSync(resolve(candidate, 'packages/contracts/package.json')))
+}
+
+function isWithin(parent: string, child: string): boolean {
+  const path = relative(parent, child)
+  return path === '' || (path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path))
+}
+
 export interface AppConfig {
   nodeEnv: string
   host: string
@@ -18,6 +35,7 @@ export interface AppConfig {
   cookieSecure: boolean
   trustProxy: boolean
   sessionTtlSeconds: number
+  mediaRoot: string
   database: PoolConfig
 }
 
@@ -43,6 +61,18 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error('COOKIE_SECURE must be true in production')
   }
 
+  const configuredMediaRoot = env.MEDIA_ROOT
+  if (configuredMediaRoot && !isAbsolute(configuredMediaRoot)) {
+    throw new Error('MEDIA_ROOT must be an absolute path')
+  }
+  const xdgDataHome = env.XDG_DATA_HOME ?? join(homedir(), '.local', 'share')
+  if (!isAbsolute(xdgDataHome)) throw new Error('XDG_DATA_HOME must be an absolute path')
+  const mediaRoot = resolve(configuredMediaRoot ?? join(xdgDataHome, 'aikayun', 'media'))
+  const repo = repositoryRoot()
+  if (repo && isWithin(repo, mediaRoot)) {
+    throw new Error('MEDIA_ROOT must be outside the repository')
+  }
+
   const database: PoolConfig = env.DATABASE_URL
     ? { connectionString: env.DATABASE_URL }
     : {
@@ -61,6 +91,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     cookieSecure,
     trustProxy: parseBoolean(env.TRUST_PROXY, false),
     sessionTtlSeconds: 60 * 60 * 12,
+    mediaRoot,
     database,
   }
 }

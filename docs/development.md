@@ -90,6 +90,28 @@ SKU 临时停用不受库存数量影响；永久退役要求 quantity 模式的
 
 新迁移 `202610170002_product_management` 仅添加不可变的商品管理审计表，不回填虚构的历史操作，也不修改之前迁移。API 集成测试会在 `_test` PostgreSQL 数据库上从阶段基线升级到最新迁移并重复迁移，再运行生命周期、编辑、列表、复制、删除、审计和并发路径。
 
+## ③-D5 商品媒体与富文本 API
+
+媒体元数据保存在 PostgreSQL，文件保存在 `MEDIA_ROOT`。本地默认目录是 `$XDG_DATA_HOME/aikayun/media`，未设置 `XDG_DATA_HOME` 时使用用户数据目录 `~/.local/share/aikayun/media`；配置值必须为仓库外的绝对路径。Docker Compose 将 API 的 `MEDIA_ROOT` 挂到独立命名卷 `product_media`，容器 API 进程仍以 `node` 用户运行。
+
+- `POST /api/v1/admin/media` 接受 multipart 单文件字段 `file`，管理员会话、同源 Origin 和 CSRF 校验缺一不可。只接收 JPEG、PNG、WebP；文件最多 10 MiB、图片最多 24 MP、每个请求只有 1 个文件/part 且不接受字段，总请求 Content-Length 上限为 10 MiB + 32 KiB。上传需携带有界 `Content-Length`；伪造 MIME、SVG/HTML、损坏/动画内容都会被拒绝。处理输出为剥离 EXIF 等元数据的 WebP，版本分别适配 320、960、1920 像素的缩略图、商品卡片与详情。
+- `GET /api/v1/admin/media/:id` 读取管理员可见的媒体元数据；公开图片使用 `GET/HEAD /api/v1/media/:id/:variant.webp`。`thumbnail`、`card`、`detail` 三个固定路径不接受客户端文件名或磁盘路径。内容是不可变 WebP，响应设置正确 MIME、SHA-256 ETag、Last-Modified、`nosniff` 和一年 immutable 缓存。
+- `GET /api/v1/admin/products/:id` 同时返回基础 `description`、富文本 `richContent` 和排序后的 `gallery`。`GET /api/v1/admin/products/:id/media` 只读取图库；`PUT` 同路径完整替换最多 20 张图片，数组顺序即图库顺序，首张即封面。
+- `PUT /api/v1/admin/products/:id/rich-content` 使用 `{ expectedRevision, content }` 保存唯一 Tiptap JSON 正文。服务端严格验证节点、mark、属性、链接、节点数/层级/文本/JSON 大小，并确认所有 `mediaId` 已处理完成。正文图片 URL 由服务端稳定生成，不存 HTML 或 Markdown。
+- `DELETE /api/v1/admin/media/:id` 仅删除没有图库或正文引用的媒体；引用检查由同一 PostgreSQL 事务锁和 `ON DELETE RESTRICT` 外键保护。取消图库关系不会自动删图。
+
+相册与正文保存均使用商品 `expectedRevision`，归档商品必须先恢复草稿。相册或正文修改不改变 SKU、售价、库存或 SKU 身份。空正文规范化为空段落 `doc`，可直接交给未来的 Tiptap 编辑器读取。`gallery_updated` 审计保存排序后的媒体 UUID 和数量；`rich_content_updated` 只保存 JSON 字节数、文本长度、节点数和媒体数，不复制正文。复制和永久删除审计也只保存媒体 UUID 与正文摘要。复制商品保留 JSON 并复制两类关系行；永久删除只释放已删除商品的引用，媒体文件在仍有其他引用时继续受保护。
+
+异常退出后检查媒体：
+
+```sh
+pnpm media:check
+```
+
+该命令校验所有登记版本的文件大小和 SHA-256，并报告缺失/损坏文件、没有元数据的对象和陈旧 staging。默认只读。显式清理时使用 API 容器内脚本，例如 `docker compose exec api node dist/media/reconcile-cli.js --delete-unreferenced-older-than=24h`；只删除超过指定宽限期且仍未登记的生成对象或 staging，已登记媒体绝不作为孤儿删除。
+
+D5 集成测试使用真实 PostgreSQL 和独立临时媒体目录；测试数据库必须以 `_test` 结尾。覆盖真实 multipart、Sharp 图像处理、媒体磁盘读写/摘要、事务失败清理、引用共享/复制/删除、Tiptap 恶意结构拒绝和并发修订保护。全栈 Compose 联合备份/恢复见 [部署与恢复](deployment.md)。
+
 ## Compose 全栈
 
 `docker compose up -d --build` 启动 PostgreSQL、迁移、Fastify、Nuxt SSR 和 Caddy。默认 HTTP 入口是 <http://localhost:8080>，HTTPS 入口预留为 8443；宿主机端口只绑定 `127.0.0.1`，开发默认站点只监听 HTTP。`docker compose down` 保留数据卷，`docker compose down -v` 会删除 PostgreSQL 和 Caddy 数据卷。

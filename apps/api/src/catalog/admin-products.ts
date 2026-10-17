@@ -16,6 +16,8 @@ import type { AppConfig } from '../config.js'
 import { requireAdmin, verifyCsrf } from '../auth/admin.js'
 import type { Database, ProductType } from '../db/types.js'
 import { appendProductAudit } from './product-audit.js'
+import { loadProductGallery } from '../media/queries.js'
+import { CatalogError, sendCatalogError } from './errors.js'
 
 const salePricePattern = /^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?(?![\s\S])/
 
@@ -55,7 +57,7 @@ export async function loadProduct(db: Kysely<Database>, id: string): Promise<Pro
     .executeTakeFirst()
   if (!product) return undefined
 
-  const [variants, categoryRows, groupRows, valueRows, optionRows, attributeRows] = await Promise.all([
+  const [variants, categoryRows, groupRows, valueRows, optionRows, attributeRows, gallery] = await Promise.all([
     db.selectFrom('product_variants').selectAll().where('product_id', '=', id).orderBy('created_at').orderBy('id').execute(),
     db.selectFrom('product_category_assignments as assignment')
       .innerJoin('product_categories as category', 'category.id', 'assignment.category_id')
@@ -87,6 +89,7 @@ export async function loadProduct(db: Kysely<Database>, id: string): Promise<Pro
       .execute(),
     db.selectFrom('product_attributes').selectAll().where('product_id', '=', id)
       .orderBy('sort_order').orderBy('id').execute(),
+    loadProductGallery(db, id),
   ])
 
   const optionsByVariant = new Map<string, Array<{ groupId: string; groupName: string; valueId: string; valueName: string }>>()
@@ -111,6 +114,8 @@ export async function loadProduct(db: Kysely<Database>, id: string): Promise<Pro
     revision: product.revision,
     createdAt: product.created_at.toISOString(),
     updatedAt: product.updated_at.toISOString(),
+    richContent: product.rich_content,
+    gallery,
     categories: categoryRows.map((category) => ({
       categoryId: category.category_id,
       name: category.name,
@@ -330,14 +335,20 @@ export function registerAdminProductRoutes(
         400: ApiErrorSchema,
         401: ApiErrorSchema,
         404: ApiErrorSchema,
+        503: ApiErrorSchema,
         500: ApiErrorSchema,
       },
     },
   }, async (request, reply) => {
     const params = request.params as ProductIdParams
-    const product = await db.transaction().setIsolationLevel('repeatable read')
-      .execute((trx) => loadProduct(trx, params.id))
-    if (!product) return reply.code(404).send(failure('PRODUCT_NOT_FOUND', 'The product does not exist', request.id))
-    return success(product, request.id)
+    try {
+      const product = await db.transaction().setIsolationLevel('repeatable read')
+        .execute((trx) => loadProduct(trx, params.id))
+      if (!product) return reply.code(404).send(failure('PRODUCT_NOT_FOUND', 'The product does not exist', request.id))
+      return reply.send(success(product, request.id))
+    } catch (error) {
+      if (error instanceof CatalogError) return sendCatalogError(reply, error, request.id)
+      throw error
+    }
   })
 }

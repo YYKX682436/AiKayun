@@ -7,6 +7,7 @@ import { productCatalogR1Migration } from './migrations/202610160004_product_cat
 import { productPricingInventoryMigration } from './migrations/202610160005_product_pricing_inventory.js'
 import { inventoryRetirementSafetyMigration } from './migrations/202610170001_inventory_retirement_safety.js'
 import { productManagementMigration } from './migrations/202610170002_product_management.js'
+import { productMediaAndRichContentMigration } from './migrations/202610170003_product_media_and_rich_content.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -19,6 +20,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610160005_product_pricing_inventory': productPricingInventoryMigration,
       '202610170001_inventory_retirement_safety': inventoryRetirementSafetyMigration,
       '202610170002_product_management': productManagementMigration,
+      '202610170003_product_media_and_rich_content': productMediaAndRichContentMigration,
     }
   }
 }

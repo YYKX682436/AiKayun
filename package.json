@@ -18,7 +18,8 @@
     "e2e": "pnpm --filter @aikayun/web test:e2e",
     "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm e2e && pnpm build && pnpm --filter @aikayun/web test:e2e:production-brand",
     "db:migrate": "pnpm --filter @aikayun/api db:migrate",
-    "admin:init": "pnpm --filter @aikayun/api admin:init"
+    "admin:init": "pnpm --filter @aikayun/api admin:init",
+    "media:check": "pnpm --filter @aikayun/api media:check"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

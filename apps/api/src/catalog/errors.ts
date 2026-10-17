@@ -24,6 +24,9 @@ export function catalogDatabaseFailure(error: unknown): { status: number; code: 
   if (databaseError.code === '40001' || databaseError.code === '40P01') {
     return conflict('CATALOG_CONCURRENT_MODIFICATION', 'The catalog changed concurrently; reload it and retry')
   }
+  if (databaseError.code === '23001' && databaseError.constraint === 'product_media_references_media_fkey') {
+    return conflict('MEDIA_STILL_REFERENCED', 'The image is still used by a product gallery or rich content')
+  }
   if (databaseError.code === '23505') {
     if (constraint === 'product_variant_inventory_adjustments_operation_unique') {
       return conflict('INVENTORY_OPERATION_ID_CONFLICT', 'This operationId has already been used')
@@ -52,6 +55,9 @@ export function catalogDatabaseFailure(error: unknown): { status: number; code: 
     return conflict('CATALOG_IDENTITY_CONFLICT', 'A catalog identity or name already exists')
   }
   if (databaseError.code === '23503') {
+    if (constraint === 'product_media_references_media_fkey') {
+      return conflict('MEDIA_STILL_REFERENCED', 'The image is still used by a product gallery or rich content')
+    }
     if (constraint === 'product_category_assignments_category_id_fkey') {
       return conflict('CATEGORY_HAS_PRODUCTS', 'Move or remove product category assignments before deleting this category')
     }

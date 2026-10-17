@@ -39,6 +39,7 @@ import { assertProductNotArchived, lockProductAtRevision } from './admin-product
 import type { LockedProduct } from './admin-product-guards.js'
 import { defaultProductIdentityFactory, loadProduct } from './admin-products.js'
 import type { ProductIdentityFactory } from './admin-products.js'
+import { validateProductRichContent } from '../media/rich-content.js'
 
 const defaultPageSize = 20
 
@@ -48,7 +49,10 @@ function descriptionLength(value: string): number {
 
 function auditSnapshot(
   product: Pick<LockedProduct, 'name' | 'description' | 'product_type' | 'status' | 'revision'>,
-  extra: Partial<Pick<ProductAuditSnapshot, 'description' | 'changedFields' | 'descriptionChanged' | 'skuCount' | 'sourceProductId'>> = {},
+  extra: Partial<Pick<ProductAuditSnapshot,
+    'description' | 'changedFields' | 'descriptionChanged' | 'skuCount' | 'sourceProductId'
+      | 'galleryCount' | 'galleryMediaIds' | 'richContentSummary'
+  >> = {},
 ): ProductAuditSnapshot {
   return {
     name: product.name,
@@ -474,12 +478,21 @@ async function copyProduct(
       .where('product_id', '=', sourceProductId).orderBy('category_id').execute()
     const selections = await trx.selectFrom('product_variant_option_values').selectAll()
       .where('product_id', '=', sourceProductId).orderBy('product_variant_id').orderBy('option_group_id').execute()
+    const mediaReferences = await trx.selectFrom('product_media_references').selectAll()
+      .where('product_id', '=', sourceProductId).orderBy('source').orderBy('sort_order').orderBy('media_id').execute()
+    const content = validateProductRichContent(source.rich_content)
+    const sourceContentReferences = mediaReferences.filter((reference) => reference.source === 'rich_content')
+      .map((reference) => reference.media_id).sort()
+    if (JSON.stringify(sourceContentReferences) !== JSON.stringify([...content.mediaIds].sort())) {
+      throw new CatalogError(409, 'PRODUCT_MEDIA_REFERENCE_INCONSISTENT', 'The source product rich content media references are inconsistent')
+    }
 
     const productId = identityFactory.nextProductId()
     await trx.insertInto('products').values({
       id: productId,
       name: source.name,
       description: source.description,
+      rich_content: content.document,
       product_type: source.product_type,
       status: 'draft',
     }).execute()
@@ -505,6 +518,14 @@ async function copyProduct(
         category_id: assignment.category_id,
         is_primary: assignment.is_primary,
         sort_order: assignment.sort_order,
+      }))).execute()
+    }
+    if (mediaReferences.length > 0) {
+      await trx.insertInto('product_media_references').values(mediaReferences.map((reference) => ({
+        product_id: productId,
+        media_id: reference.media_id,
+        source: reference.source,
+        sort_order: reference.sort_order,
       }))).execute()
     }
     if (attributes.length > 0) {
@@ -560,7 +581,15 @@ async function copyProduct(
       administratorId,
       operation: 'copied',
       before: null,
-      after: auditSnapshot(created, { sourceProductId, skuCount: variantsToCopy.length, description: created.description }),
+      after: auditSnapshot(created, {
+        sourceProductId,
+        skuCount: variantsToCopy.length,
+        description: created.description,
+        galleryCount: mediaReferences.filter((reference) => reference.source === 'gallery').length,
+        galleryMediaIds: mediaReferences.filter((reference) => reference.source === 'gallery')
+          .sort((left, right) => (left.sort_order ?? 0) - (right.sort_order ?? 0)).map((reference) => reference.media_id),
+        richContentSummary: content.summary,
+      }),
     })
     const detail = await loadProduct(trx, productId)
     if (!detail) throw new Error('Copied product could not be read inside its transaction')
@@ -597,9 +626,24 @@ async function deleteProduct(
       throw new CatalogError(409, 'PRODUCT_HAS_INVENTORY_HISTORY', 'A product with inventory adjustment history cannot be deleted; archive it instead')
     }
 
+    const mediaReferences = await trx.selectFrom('product_media_references')
+      .select(['media_id', 'source', 'sort_order'])
+      .where('product_id', '=', productId).orderBy('source').orderBy('sort_order').orderBy('media_id').execute()
+    const content = validateProductRichContent(product.rich_content)
+    const contentReferenceIds = mediaReferences.filter((reference) => reference.source === 'rich_content')
+      .map((reference) => reference.media_id).sort()
+    if (JSON.stringify(contentReferenceIds) !== JSON.stringify([...content.mediaIds].sort())) {
+      throw new CatalogError(409, 'PRODUCT_MEDIA_REFERENCE_INCONSISTENT', 'The saved rich content media references are inconsistent')
+    }
+    const galleryMediaIds = mediaReferences.filter((reference) => reference.source === 'gallery')
+      .sort((left, right) => (left.sort_order ?? 0) - (right.sort_order ?? 0)).map((reference) => reference.media_id)
+
     // Remove only empty quantity state and product-owned relations. The RESTRICT
     // foreign keys on SKU history/resources remain the final protection layer.
     await trx.deleteFrom('product_variant_quantity_inventory').where('product_id', '=', productId).execute()
+    // Product deletion removes only its own reference rows. Media is shared and
+    // remains protected by the RESTRICT foreign key while any product uses it.
+    await trx.deleteFrom('product_media_references').where('product_id', '=', productId).execute()
     await trx.deleteFrom('product_variant_option_values').where('product_id', '=', productId).execute()
     await trx.deleteFrom('product_category_assignments').where('product_id', '=', productId).execute()
     await trx.deleteFrom('product_attributes').where('product_id', '=', productId).execute()
@@ -611,7 +655,12 @@ async function deleteProduct(
       productId,
       administratorId,
       operation: 'deleted',
-      before: auditSnapshot(product, { skuCount: variants.length }),
+      before: auditSnapshot(product, {
+        skuCount: variants.length,
+        galleryCount: galleryMediaIds.length,
+        galleryMediaIds,
+        richContentSummary: content.summary,
+      }),
       after: null,
     })
     await trx.deleteFrom('products').where('id', '=', productId).execute()

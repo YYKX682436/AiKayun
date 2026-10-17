@@ -283,6 +283,109 @@ export const ProductAttributeSchema = Type.Object({
   updatedAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
 
+export type ProductRichContentMark =
+  | { type: 'bold' }
+  | { type: 'italic' }
+  | { type: 'link'; attrs: { href: string; target?: '_blank' | '_self' } }
+
+export type ProductRichContentInlineNode =
+  | { type: 'text'; text: string; marks?: ProductRichContentMark[] }
+  | { type: 'hardBreak'; marks?: ProductRichContentMark[] }
+
+export type ProductRichContentListItem = {
+  type: 'listItem'
+  content: ProductRichContentBlock[]
+}
+
+export type ProductRichContentBlock =
+  | { type: 'paragraph'; content?: ProductRichContentInlineNode[] }
+  | { type: 'heading'; attrs: { level: 1 | 2 | 3 }; content?: ProductRichContentInlineNode[] }
+  | { type: 'blockquote'; content: ProductRichContentBlock[] }
+  | { type: 'bulletList'; content: ProductRichContentListItem[] }
+  | { type: 'orderedList'; attrs?: { start?: number }; content: ProductRichContentListItem[] }
+  | { type: 'horizontalRule' }
+  | { type: 'image'; attrs: { mediaId: string; alt?: string } }
+
+export interface ProductRichContent {
+  type: 'doc'
+  content: ProductRichContentBlock[]
+}
+
+/** The service enforces the full Tiptap node and attribute allowlist. */
+export const ProductRichContentSchema = Type.Unsafe<ProductRichContent>(Type.Object({
+  type: Type.Literal('doc'),
+  content: Type.Array(Type.Unknown(), { maxItems: 500 }),
+}, { additionalProperties: false }))
+
+export const ProductMediaVariantSchema = Type.Union([
+  Type.Literal('thumbnail'), Type.Literal('card'), Type.Literal('detail'),
+])
+
+export const ProductMediaVariantMetadataSchema = Type.Object({
+  variant: ProductMediaVariantSchema,
+  url: Type.String({ minLength: 1, maxLength: 200 }),
+  contentType: Type.Literal('image/webp'),
+  width: Type.Integer({ minimum: 1, maximum: 1920 }),
+  height: Type.Integer({ minimum: 1, maximum: 1920 }),
+  sizeBytes: Type.Integer({ minimum: 1 }),
+  sha256: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+  processingVersion: Type.String({ minLength: 1, maxLength: 32 }),
+}, { additionalProperties: false })
+
+export const ProductMediaMetadataSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  createdAt: Type.String({ format: 'date-time' }),
+  variants: Type.Array(ProductMediaVariantMetadataSchema, { minItems: 3, maxItems: 3 }),
+}, { additionalProperties: false })
+
+export const ProductGalleryImageSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  sortOrder: Type.Integer({ minimum: 0, maximum: 19 }),
+  width: Type.Integer({ minimum: 1, maximum: 1920 }),
+  height: Type.Integer({ minimum: 1, maximum: 1920 }),
+  thumbnailUrl: Type.String({ minLength: 1, maxLength: 200 }),
+  cardUrl: Type.String({ minLength: 1, maxLength: 200 }),
+  detailUrl: Type.String({ minLength: 1, maxLength: 200 }),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+
+export const MediaIdParamsSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+
+export const MediaVariantParamsSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  variant: ProductMediaVariantSchema,
+}, { additionalProperties: false })
+
+export const ReplaceProductGalleryBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  mediaIds: Type.Array(Type.String({ format: 'uuid' }), { maxItems: 20, uniqueItems: true }),
+}, { additionalProperties: false })
+
+export const ProductGalleryResponseSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  revision: Type.Integer({ minimum: 1 }),
+  images: Type.Array(ProductGalleryImageSchema, { maxItems: 20 }),
+}, { additionalProperties: false })
+
+export const SaveProductRichContentBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  content: ProductRichContentSchema,
+}, { additionalProperties: false })
+
+export const ProductRichContentResponseSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  revision: Type.Integer({ minimum: 1 }),
+  content: ProductRichContentSchema,
+}, { additionalProperties: false })
+
+export const ProductMediaDeleteResponseSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  deleted: Type.Literal(true),
+  cleanupPending: Type.Boolean(),
+}, { additionalProperties: false })
+
 export const ProductDetailSchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
   name: Type.String({ minLength: 1, maxLength: 200 }),
@@ -292,6 +395,8 @@ export const ProductDetailSchema = Type.Object({
   revision: Type.Integer({ minimum: 1 }),
   createdAt: Type.String({ format: 'date-time' }),
   updatedAt: Type.String({ format: 'date-time' }),
+  richContent: ProductRichContentSchema,
+  gallery: Type.Array(ProductGalleryImageSchema, { maxItems: 20 }),
   categories: Type.Array(ProductCategoryAssignmentSchema),
   optionGroups: Type.Array(ProductOptionGroupSchema, { maxItems: 5 }),
   attributes: Type.Array(ProductAttributeSchema, { maxItems: 30 }),
@@ -368,6 +473,7 @@ export const ProductManagementOperationSchema = Type.Union([
   Type.Literal('created'), Type.Literal('updated'), Type.Literal('published'),
   Type.Literal('paused'), Type.Literal('relisted'), Type.Literal('archived'),
   Type.Literal('restored'), Type.Literal('copied'), Type.Literal('deleted'),
+  Type.Literal('gallery_updated'), Type.Literal('rich_content_updated'),
 ])
 
 export const ProductAuditSnapshotSchema = Type.Object({
@@ -383,6 +489,14 @@ export const ProductAuditSnapshotSchema = Type.Object({
   ]))),
   skuCount: Type.Optional(Type.Integer({ minimum: 0, maximum: 1000 })),
   sourceProductId: Type.Optional(Type.String({ format: 'uuid' })),
+  galleryCount: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
+  galleryMediaIds: Type.Optional(Type.Array(Type.String({ format: 'uuid' }), { maxItems: 20 })),
+  richContentSummary: Type.Optional(Type.Object({
+    byteLength: Type.Integer({ minimum: 0, maximum: 131_072 }),
+    textLength: Type.Integer({ minimum: 0, maximum: 50_000 }),
+    nodeCount: Type.Integer({ minimum: 1, maximum: 500 }),
+    mediaCount: Type.Integer({ minimum: 0, maximum: 100 }),
+  }, { additionalProperties: false })),
 }, { additionalProperties: false })
 
 export const ProductManagementAuditEventSchema = Type.Object({
@@ -602,6 +716,18 @@ export type ProductOptionValue = Static<typeof ProductOptionValueSchema>
 export type ProductOptionGroup = Static<typeof ProductOptionGroupSchema>
 export type ProductCategoryAssignment = Static<typeof ProductCategoryAssignmentSchema>
 export type ProductAttribute = Static<typeof ProductAttributeSchema>
+export type ProductMediaVariant = Static<typeof ProductMediaVariantSchema>
+export type ProductMediaVariantMetadata = Static<typeof ProductMediaVariantMetadataSchema>
+export type ProductMediaMetadata = Static<typeof ProductMediaMetadataSchema>
+export type ProductGalleryImage = Static<typeof ProductGalleryImageSchema>
+export type ReplaceProductGalleryBody = Static<typeof ReplaceProductGalleryBodySchema>
+export type ProductGalleryResponse = Static<typeof ProductGalleryResponseSchema>
+export type SaveProductRichContentBody = Static<typeof SaveProductRichContentBodySchema>
+export type ProductRichContentResponse = Static<typeof ProductRichContentResponseSchema>
+export type ProductMediaDeleteResponse = Static<typeof ProductMediaDeleteResponseSchema>
+
+export * from './product-rich-content.js'
+
 export type ProductDetail = Static<typeof ProductDetailSchema>
 export type ProductListQuery = Static<typeof ProductListQuerySchema>
 export type ProductListItem = Static<typeof ProductListItemSchema>

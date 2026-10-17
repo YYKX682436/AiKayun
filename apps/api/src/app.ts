@@ -29,6 +29,7 @@ import { registerAdminProductDetailRoutes } from './catalog/admin-product-detail
 import { registerAdminVariantMatrixRoutes } from './catalog/admin-variant-matrix.js'
 import { registerAdminProductPriceRoutes } from './catalog/admin-product-prices.js'
 import { registerAdminInventoryRoutes } from './catalog/admin-inventory.js'
+import { registerProductMediaRoutes } from './media/admin.js'
 
 export async function createApp(options: {
   db: Kysely<Database>
@@ -131,5 +132,6 @@ export async function createApp(options: {
   registerAdminVariantMatrixRoutes(app, db, config, identityFactory)
   registerAdminProductPriceRoutes(app, db, config)
   registerAdminInventoryRoutes(app, db, config)
+  await registerProductMediaRoutes(app, db, config)
   return app
 }

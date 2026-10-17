@@ -1,6 +1,10 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { beforeAll, afterAll, describe, expect, it } from 'vitest'
 import { sql } from 'kysely'
+import sharp from 'sharp'
 import { Migrator } from 'kysely/migration'
 import type { FastifyInstance } from 'fastify'
 import type { Kysely } from 'kysely'
@@ -12,17 +16,22 @@ import { AppMigrationProvider } from '../src/db/migration-provider.js'
 import { defaultProductIdentityFactory } from '../src/catalog/admin-products.js'
 import type { ProductIdentityFactory } from '../src/catalog/admin-products.js'
 import type { Database } from '../src/db/types.js'
+import { productRichContentToSafeHtml } from '@aikayun/contracts'
 import type { CreateProductBody, ProductDetail } from '@aikayun/contracts'
+import { MediaStorage } from '../src/media/storage.js'
+import { reconcileProductMedia } from '../src/media/reconcile.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const testEmail = 'admin@example.com'
 const testPassword = 'TestOnly-Valid-Password-2026!'
 const testOrigin = 'http://localhost:3000'
+const mediaTestRoot = mkdtempSync(join(tmpdir(), 'aikayun-d5-media-test-'))
 
 let app: FastifyInstance
 let db: Kysely<Database>
 let skuCodeOverride: string | undefined
 let nextTestClient = 20
+let mediaUploadRemoteAddress = 1
 const migrationSentinel = {
   productId: '00000000-0000-4000-8000-000000000101',
   variantId: '00000000-0000-4000-8000-000000000102',
@@ -54,16 +63,16 @@ function cookieFrom(response: { headers: Record<string, string | string[] | unde
   return cookie.split(';', 1)[0] ?? ''
 }
 
-async function getCsrf(): Promise<{ token: string; cookie: string }> {
-  const response = await app.inject({ method: 'GET', url: '/api/v1/admin/auth/csrf' })
+async function getCsrf(target: FastifyInstance = app): Promise<{ token: string; cookie: string }> {
+  const response = await target.inject({ method: 'GET', url: '/api/v1/admin/auth/csrf' })
   expect(response.statusCode).toBe(200)
   const body = response.json<{ data: { csrfToken: string } }>()
   return { token: body.data.csrfToken, cookie: cookieFrom(response, 'aikayun_admin_csrf') }
 }
 
-async function loginAdmin(): Promise<{ sessionCookie: string; csrf: { token: string; cookie: string } }> {
-  const csrf = await getCsrf()
-  const login = await app.inject({
+async function loginAdmin(target: FastifyInstance = app): Promise<{ sessionCookie: string; csrf: { token: string; cookie: string } }> {
+  const csrf = await getCsrf(target)
+  const login = await target.inject({
     method: 'POST',
     url: '/api/v1/admin/auth/login',
     remoteAddress: `192.0.2.${nextTestClient++}`,
@@ -234,6 +243,99 @@ async function deleteProduct(
   })
 }
 
+interface MultipartPart {
+  name: string
+  bytes?: Buffer
+  mimeType?: string
+  filename?: string
+  value?: string
+}
+
+function multipartPayload(parts: MultipartPart[]) {
+  const boundary = 'aikayun-d5-integration-boundary'
+  const chunks: Buffer[] = []
+  for (const part of parts) {
+    if (part.bytes) {
+      chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${part.name}"; filename="${part.filename ?? 'client-file.bin'}"\r\nContent-Type: ${part.mimeType ?? 'application/octet-stream'}\r\n\r\n`))
+      chunks.push(part.bytes)
+      chunks.push(Buffer.from('\r\n'))
+    } else {
+      chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${part.name}"\r\nContent-Type: text/plain\r\n\r\n${part.value ?? ''}\r\n`))
+    }
+  }
+  chunks.push(Buffer.from(`--${boundary}--\r\n`))
+  return {
+    boundary,
+    body: Buffer.concat(chunks),
+  }
+}
+
+async function uploadMedia(
+  auth: Awaited<ReturnType<typeof loginAdmin>>,
+  bytes: Buffer,
+  mimeType = 'image/png',
+  filename = 'client-image.png',
+  target: FastifyInstance = app,
+) {
+  const form = multipartPayload([{ name: 'file', bytes, mimeType, filename }])
+  return target.inject({
+    method: 'POST',
+    url: '/api/v1/admin/media',
+    remoteAddress: `198.51.100.${mediaUploadRemoteAddress++}`,
+    headers: { ...productHeaders(auth), 'content-type': `multipart/form-data; boundary=${form.boundary}` },
+    payload: form.body,
+  })
+}
+
+async function replaceGallery(
+  auth: Awaited<ReturnType<typeof loginAdmin>>,
+  productId: string,
+  expectedRevision: number,
+  mediaIds: string[],
+) {
+  return app.inject({
+    method: 'PUT', url: `/api/v1/admin/products/${productId}/media`,
+    headers: productHeaders(auth), payload: { expectedRevision, mediaIds },
+  })
+}
+
+async function saveRichContent(
+  auth: Awaited<ReturnType<typeof loginAdmin>>,
+  productId: string,
+  expectedRevision: number,
+  content: unknown,
+) {
+  return app.inject({
+    method: 'PUT', url: `/api/v1/admin/products/${productId}/rich-content`,
+    headers: productHeaders(auth), payload: { expectedRevision, content },
+  })
+}
+
+async function getAdminProduct(auth: Awaited<ReturnType<typeof loginAdmin>>, productId: string) {
+  return app.inject({
+    method: 'GET', url: `/api/v1/admin/products/${productId}`, headers: { cookie: auth.sessionCookie },
+  })
+}
+
+async function samplePng(): Promise<Buffer> {
+  return sharp({
+    create: { width: 48, height: 32, channels: 4, background: { r: 220, g: 40, b: 90, alpha: 0.45 } },
+  }).png().toBuffer()
+}
+
+async function sampleOrientedJpeg(): Promise<Buffer> {
+  const jpeg = await sharp({
+    create: { width: 48, height: 24, channels: 3, background: { r: 60, g: 110, b: 220 } },
+  }).jpeg().toBuffer()
+  const exifOrientation6 = Buffer.from([
+    0xff, 0xe1, 0x00, 0x22, 0x45, 0x78, 0x69, 0x66, 0x00, 0x00,
+    0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  ])
+  return Buffer.concat([jpeg.subarray(0, 2), exifOrientation6, jpeg.subarray(2)])
+}
+
 beforeAll(async () => {
   if (!testDatabaseUrl) throw new Error('TEST_DATABASE_URL must point to a dedicated PostgreSQL database ending in _test')
   const databaseUrl = new URL(testDatabaseUrl)
@@ -350,6 +452,7 @@ beforeAll(async () => {
     NODE_ENV: 'test',
     PUBLIC_ORIGIN: testOrigin,
     COOKIE_SECURE: 'false',
+    MEDIA_ROOT: mediaTestRoot,
   })
   app = await createApp({ db, config, logger: false, productIdentityFactory })
   await app.ready()
@@ -358,6 +461,7 @@ beforeAll(async () => {
 afterAll(async () => {
   if (app) await app.close()
   if (db) await db.destroy()
+  rmSync(mediaTestRoot, { recursive: true, force: true })
 })
 
 describe('Fastify API with PostgreSQL 18', () => {
@@ -764,6 +868,7 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(result.rows.map((row) => row.table_name)).toEqual([
       'admin_sessions', 'admin_users', 'product_attributes', 'product_categories',
       'product_category_assignments', 'product_category_tree_guard', 'product_management_audit_events',
+      'product_media', 'product_media_references', 'product_media_variants',
       'product_option_groups', 'product_option_values',
       'product_variant_inventory_adjustments', 'product_variant_option_values',
       'product_variant_quantity_inventory', 'product_variants', 'products',
@@ -774,6 +879,8 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(migratedProduct).toEqual({ id: migrationSentinel.productId, name: '迁移前已有商品' })
     expect(await db.selectFrom('product_management_audit_events').select('id')
       .where('product_id', '=', migrationSentinel.productId).execute()).toEqual([])
+    expect(await db.selectFrom('products').select('rich_content').where('id', '=', migrationSentinel.productId).executeTakeFirstOrThrow())
+      .toEqual({ rich_content: { type: 'doc', content: [{ type: 'paragraph' }] } })
     const migratedSku = await db.selectFrom('product_variants').select(['id', 'sku_code', 'sale_price'])
       .where('id', '=', migrationSentinel.variantId).executeTakeFirst()
     expect(migratedSku).toEqual({
@@ -3723,5 +3830,432 @@ describe('Fastify API with PostgreSQL 18', () => {
       expect(await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
         .where('product_variant_id', '=', sku.id).executeTakeFirstOrThrow()).toEqual({ stocked: 1, reserved: 0 })
     }
+  }, 30_000)
+})
+
+describe('D5 product media and rich content', () => {
+  it('authenticates uploads, processes supported images, and serves immutable WebP variants safely', async () => {
+    const auth = await loginAdmin()
+    const png = await samplePng()
+    const jpeg = await sampleOrientedJpeg()
+    const webp = await sharp(png).webp().toBuffer()
+    const anonymousForm = multipartPayload([{ name: 'file', bytes: png }])
+    const anonymous = await app.inject({
+      method: 'POST', url: '/api/v1/admin/media',
+      headers: { 'content-type': `multipart/form-data; boundary=${anonymousForm.boundary}` },
+      payload: anonymousForm.body,
+    })
+    expect(anonymous.statusCode).toBe(401)
+
+    const noCsrf = await app.inject({
+      method: 'POST', url: '/api/v1/admin/media',
+      headers: {
+        origin: testOrigin,
+        cookie: `${auth.sessionCookie}; ${auth.csrf.cookie}`,
+        'content-type': `multipart/form-data; boundary=${anonymousForm.boundary}`,
+      },
+      payload: anonymousForm.body,
+    })
+    expect(noCsrf.statusCode).toBe(403)
+
+    const pngUpload = await uploadMedia(auth, png, 'image/png', '../../server-secret.png')
+    const jpegUpload = await uploadMedia(auth, jpeg, 'image/jpeg', 'photo.jpg')
+    const webpUpload = await uploadMedia(auth, webp, 'image/webp', 'photo.webp')
+    expect([pngUpload.statusCode, jpegUpload.statusCode, webpUpload.statusCode]).toEqual([201, 201, 201])
+    const pngMeta = pngUpload.json<{ data: { id: string; variants: Array<{ variant: string; url: string; contentType: string; width: number; height: number; sha256: string; sizeBytes: number }> } }>().data
+    const jpegMeta = jpegUpload.json<{ data: { id: string; variants: Array<{ variant: string; width: number; height: number }> } }>().data
+    const webpMeta = webpUpload.json<{ data: { id: string; variants: Array<{ variant: string; contentType: string }> } }>().data
+    expect(pngMeta.variants.map((item) => item.variant)).toEqual(['thumbnail', 'card', 'detail'])
+    expect(pngMeta.variants.every((item) => item.contentType === 'image/webp' && item.width <= 1920 && item.height <= 1920)).toBe(true)
+    expect(jpegMeta.variants.find((item) => item.variant === 'detail')).toMatchObject({ width: 24, height: 48 })
+    expect(webpMeta.variants.every((item) => item.contentType === 'image/webp')).toBe(true)
+
+    const detail = pngMeta.variants.find((item) => item.variant === 'detail')!
+    const image = await app.inject(detail.url)
+    expect(image.statusCode).toBe(200)
+    expect(image.headers['content-type']).toBe('image/webp')
+    expect(image.headers['cache-control']).toBe('public, max-age=31536000, immutable')
+    expect(image.headers['etag']).toBe(`"${detail.sha256}"`)
+    expect(Number(image.headers['content-length'])).toBe(detail.sizeBytes)
+    expect(createHash('sha256').update(image.rawPayload).digest('hex')).toBe(detail.sha256)
+    expect((await sharp(image.rawPayload).metadata()).hasAlpha).toBe(true)
+    const head = await app.inject({ method: 'HEAD', url: detail.url })
+    expect(head.statusCode).toBe(200)
+    expect(head.rawPayload.length).toBe(0)
+    expect((await app.inject({ method: 'GET', url: detail.url, headers: { 'if-none-match': `"${detail.sha256}"` } })).statusCode).toBe(304)
+    expect((await app.inject({ method: 'GET', url: detail.url, headers: { 'if-modified-since': image.headers['last-modified']! } })).statusCode).toBe(304)
+    expect((await app.inject(`/api/v1/media/${randomUUID()}/detail.webp`)).statusCode).toBe(404)
+    expect((await app.inject(`/api/v1/media/${pngMeta.id}/../../etc/passwd`)).statusCode).toBe(404)
+
+    const storedKey = await db.selectFrom('product_media_variants').select('storage_key')
+      .where('media_id', '=', pngMeta.id).where('variant', '=', 'detail').executeTakeFirstOrThrow()
+    expect(storedKey.storage_key).toMatch(/^objects\/[0-9a-f]{2}\/[0-9a-f-]+-detail\.webp$/)
+    expect(storedKey.storage_key).not.toContain('server-secret')
+
+    const badMime = await uploadMedia(auth, png, 'image/jpeg')
+    const html = await uploadMedia(auth, Buffer.from('<!doctype html><script>alert(1)</script>'), 'image/png')
+    const svg = await uploadMedia(auth, Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'), 'image/svg+xml')
+    const damaged = await uploadMedia(auth, Buffer.from('not an image'), 'image/webp')
+    const tooLarge = await uploadMedia(auth, Buffer.alloc(10 * 1024 * 1024 + 1), 'image/png')
+    expect([badMime.statusCode, html.statusCode, svg.statusCode, damaged.statusCode]).toEqual([400, 400, 400, 400])
+    expect(tooLarge.statusCode).toBe(413)
+
+    const hugePng = Buffer.alloc(45)
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(hugePng, 0)
+    hugePng.writeUInt32BE(13, 8)
+    hugePng.write('IHDR', 12)
+    hugePng.writeUInt32BE(50_000, 16)
+    hugePng.writeUInt32BE(50_000, 20)
+    hugePng[24] = 8
+    hugePng[25] = 6
+    hugePng.writeUInt32BE(0, 33)
+    hugePng.write('IEND', 37)
+    const dimensions = await uploadMedia(auth, hugePng, 'image/png')
+    expect(dimensions.statusCode).toBe(400)
+
+    const multiple = multipartPayload([
+      { name: 'file', bytes: png, mimeType: 'image/png' },
+      { name: 'file', bytes: png, mimeType: 'image/png' },
+    ])
+    const multipleFiles = await app.inject({
+      method: 'POST', url: '/api/v1/admin/media',
+      headers: { ...productHeaders(auth), 'content-type': `multipart/form-data; boundary=${multiple.boundary}` },
+      payload: multiple.body,
+    })
+    expect([400, 413]).toContain(multipleFiles.statusCode)
+    const extraField = multipartPayload([
+      { name: 'file', bytes: png, mimeType: 'image/png' },
+      { name: 'unexpected', value: 'field' },
+    ])
+    const fields = await app.inject({
+      method: 'POST', url: '/api/v1/admin/media',
+      headers: { ...productHeaders(auth), 'content-type': `multipart/form-data; boundary=${extraField.boundary}` },
+      payload: extraField.body,
+    })
+    expect([400, 413]).toContain(fields.statusCode)
+  }, 30_000)
+
+  it('cleans files when metadata persistence fails and leaves no records after a storage write failure', async () => {
+    const auth = await loginAdmin()
+    const before = await db.selectFrom('product_media').select('id').execute()
+    await sql`CREATE FUNCTION fail_d5_media_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'injected integration failure'; END; $$`.execute(db)
+    await sql`CREATE TRIGGER fail_d5_media_insert BEFORE INSERT ON product_media
+      FOR EACH ROW EXECUTE FUNCTION fail_d5_media_insert()`.execute(db)
+    let failedInsert
+    try {
+      failedInsert = await uploadMedia(auth, await samplePng())
+    } finally {
+      await sql`DROP TRIGGER fail_d5_media_insert ON product_media`.execute(db)
+      await sql`DROP FUNCTION fail_d5_media_insert()`.execute(db)
+    }
+    expect(failedInsert!.statusCode).toBe(500)
+    expect(await db.selectFrom('product_media').select('id').execute()).toHaveLength(before.length)
+    const registeredKeys = new Set((await db.selectFrom('product_media_variants').select('storage_key').execute())
+      .map((row) => row.storage_key))
+    const stored = await new MediaStorage(mediaTestRoot).scanGeneratedFiles()
+    expect(stored.filter((file) => file.staged)).toHaveLength(0)
+    expect(stored.filter((file) => !file.staged && !registeredKeys.has(file.storageKey))).toHaveLength(0)
+
+    const blockedStorage = join(mediaTestRoot, 'not-a-directory')
+    writeFileSync(blockedStorage, 'regular file')
+    const badConfig = readConfig({
+      ...process.env,
+      DATABASE_URL: testDatabaseUrl,
+      NODE_ENV: 'test',
+      PUBLIC_ORIGIN: testOrigin,
+      COOKIE_SECURE: 'false',
+      MEDIA_ROOT: blockedStorage,
+    })
+    const badApp = await createApp({ db, config: badConfig, logger: false, productIdentityFactory })
+    await badApp.ready()
+    try {
+      const badAuth = await loginAdmin(badApp)
+      const response = await uploadMedia(badAuth, await samplePng(), 'image/png', 'ignored.png', badApp)
+      expect(response.statusCode).toBe(500)
+      expect(await db.selectFrom('product_media').select('id').execute()).toHaveLength(before.length)
+    } finally {
+      await badApp.close()
+      rmSync(blockedStorage, { force: true })
+    }
+  }, 30_000)
+
+  it('orders gallery references, protects shared media, copies content references, and only removes product-owned links', async () => {
+    const auth = await loginAdmin()
+    const image1 = (await uploadMedia(auth, await samplePng())).json<{ data: { id: string } }>().data
+    const image2 = (await uploadMedia(auth, await samplePng())).json<{ data: { id: string } }>().data
+    const image3 = (await uploadMedia(auth, await samplePng())).json<{ data: { id: string } }>().data
+    const first = await createTestProduct(auth, 'D5 gallery owner')
+    const second = await createTestProduct(auth, 'D5 shared image owner')
+    const skuBefore = first.variants[0]!
+
+    const gallery = await replaceGallery(auth, first.id, first.revision, [image1.id, image2.id])
+    expect(gallery.statusCode).toBe(200)
+    const galleryData = gallery.json<{ data: { revision: number; images: Array<{ id: string; sortOrder: number }> } }>().data
+    expect(galleryData.images.map((item) => [item.id, item.sortOrder])).toEqual([[image1.id, 0], [image2.id, 1]])
+    expect((await replaceGallery(auth, first.id, galleryData.revision, [image1.id, image1.id])).statusCode).toBe(400)
+    expect((await replaceGallery(auth, first.id, first.revision, [image2.id, image1.id])).json().error.code)
+      .toBe('PRODUCT_REVISION_CONFLICT')
+    const secondGallery = await replaceGallery(auth, second.id, second.revision, [image1.id])
+    expect(secondGallery.statusCode).toBe(200)
+
+    const richContent = {
+      type: 'doc',
+      content: [
+        { type: 'heading', attrs: { level: 2 }, content: [{ type: 'text', text: '商品详情', marks: [{ type: 'bold' }] }] },
+        { type: 'paragraph', content: [
+          { type: 'text', text: '阅读说明 ' },
+          { type: 'text', text: '安全链接', marks: [{ type: 'link', attrs: { href: 'https://example.com', target: '_blank', rel: 'noopener noreferrer nofollow', class: null } }, { type: 'italic' }] },
+        ] },
+        { type: 'bulletList', content: [{ type: 'listItem', content: [{ type: 'paragraph', content: [{ type: 'text', text: '内容项' }] }] }] },
+        { type: 'blockquote', content: [{ type: 'paragraph', content: [{ type: 'text', text: '引用内容' }] }] },
+        { type: 'image', attrs: { mediaId: image2.id, alt: '产品图片' } },
+        { type: 'image', attrs: { mediaId: image2.id, alt: '重复引用同一媒体' } },
+        { type: 'horizontalRule' },
+      ],
+    }
+    const contentSaved = await saveRichContent(auth, first.id, galleryData.revision, richContent)
+    expect(contentSaved.statusCode).toBe(200)
+    const saved = contentSaved.json<{ data: { revision: number; content: typeof richContent } }>().data
+    const detail = await getAdminProduct(auth, first.id)
+    const product = detail.json<{ data: ProductDetail }>().data
+    expect(product.richContent).toEqual(saved.content)
+    expect(product.gallery.map((item) => item.id)).toEqual([image1.id, image2.id])
+    expect(product.description).toBe(first.description)
+    expect(product.variants[0]).toMatchObject({ id: skuBefore.id, salePrice: skuBefore.salePrice, revision: skuBefore.revision })
+    const contentReferences = await db.selectFrom('product_media_references').select('media_id')
+      .where('product_id', '=', first.id).where('source', '=', 'rich_content').execute()
+    expect(contentReferences.map((row) => row.media_id)).toEqual([image2.id])
+    const history = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${first.id}/history`, headers: { cookie: auth.sessionCookie },
+    })
+    const operations = history.json<{ data: { events: Array<{ operation: string; after: Record<string, unknown> | null }> } }>()
+      .data.events.map((event) => event.operation)
+    expect(operations).toContain('gallery_updated')
+    expect(operations).toContain('rich_content_updated')
+    expect(JSON.stringify(history.json()).length).toBeLessThan(20_000)
+    expect(productRichContentToSafeHtml(richContent)).toContain('<img src="/api/v1/media/')
+
+    const archived = await changeProductLifecycle(auth, first.id, { expectedRevision: saved.revision, status: 'archived' })
+    expect(archived.statusCode).toBe(200)
+    const archivedRevision = archived.json<{ data: ProductDetail }>().data.revision
+    expect((await replaceGallery(auth, first.id, archivedRevision, [])).json().error.code).toBe('PRODUCT_ARCHIVED')
+    expect((await saveRichContent(auth, first.id, archivedRevision, { type: 'doc', content: [] })).json().error.code)
+      .toBe('PRODUCT_ARCHIVED')
+    const restored = await changeProductLifecycle(auth, first.id, { expectedRevision: archivedRevision, status: 'draft' })
+    expect(restored.statusCode).toBe(200)
+    const restoredProduct = restored.json<{ data: ProductDetail }>().data
+
+    const copied = await copyProduct(auth, first.id, restoredProduct.revision)
+    expect(copied.statusCode).toBe(201)
+    const copy = copied.json<{ data: ProductDetail }>().data
+    expect(copy.status).toBe('draft')
+    expect(copy.gallery.map((item) => item.id)).toEqual([image1.id, image2.id])
+    expect(copy.richContent).toEqual(product.richContent)
+    expect((await db.selectFrom('product_media_references').select('source')
+      .where('product_id', '=', copy.id).where('media_id', '=', image2.id).execute()).map((row) => row.source).sort())
+      .toEqual(['gallery', 'rich_content'])
+
+    const sharedDelete = await app.inject({
+      method: 'DELETE', url: `/api/v1/admin/media/${image1.id}`,
+      headers: productHeaders(auth),
+    })
+    expect(sharedDelete.statusCode, sharedDelete.body).toBe(409)
+    expect(sharedDelete.json().error.code).toBe('MEDIA_STILL_REFERENCED')
+    const bodyReferencedDelete = await app.inject({
+      method: 'DELETE', url: `/api/v1/admin/media/${image2.id}`,
+      headers: productHeaders(auth),
+    })
+    expect(bodyReferencedDelete.statusCode).toBe(409)
+
+    const deletedFirst = await deleteProduct(auth, first.id, restoredProduct.revision)
+    expect(deletedFirst.statusCode).toBe(200)
+    expect(await db.selectFrom('product_media_references').select('media_id').where('product_id', '=', first.id).execute())
+      .toEqual([])
+    expect((await app.inject({ method: 'DELETE', url: `/api/v1/admin/media/${image1.id}`, headers: productHeaders(auth) })).statusCode)
+      .toBe(409)
+
+    const secondCurrent = await getAdminProduct(auth, second.id)
+    const secondRevision = secondCurrent.json<{ data: ProductDetail }>().data.revision
+    const secondCleared = await replaceGallery(auth, second.id, secondRevision, [])
+    const copyClearedGallery = await replaceGallery(auth, copy.id, copy.revision, [])
+    const copyRevisionAfterGallery = copyClearedGallery.json<{ data: { revision: number } }>().data.revision
+    expect(secondCleared.statusCode).toBe(200)
+    expect(copyClearedGallery.statusCode).toBe(200)
+    const copyClearedContent = await saveRichContent(auth, copy.id, copyRevisionAfterGallery, { type: 'doc', content: [] })
+    expect(copyClearedContent.statusCode).toBe(200)
+
+    for (const media of [image1, image2, image3]) {
+      const removed = await app.inject({
+        method: 'DELETE', url: `/api/v1/admin/media/${media.id}`, headers: productHeaders(auth),
+      })
+      expect(removed.statusCode).toBe(200)
+      expect(removed.json().data.deleted).toBe(true)
+      expect((await app.inject(`/api/v1/media/${media.id}/detail.webp`)).statusCode).toBe(404)
+    }
+  }, 30_000)
+
+  it('validates Tiptap structure, bounds text and nesting, synchronizes references, and serializes concurrent saves', async () => {
+    const auth = await loginAdmin()
+    const uploaded = await uploadMedia(auth, await samplePng())
+    const media = uploaded.json<{ data: { id: string } }>().data
+    const product = await createTestProduct(auth, 'D5 rich content safety')
+    const valid = {
+      type: 'doc',
+      content: [{ type: 'paragraph', content: [{ type: 'text', text: '<script>alert("x")</script>' }] },
+        { type: 'image', attrs: { mediaId: media.id, alt: '" onerror="alert(1)' } }],
+    }
+    const initial = await saveRichContent(auth, product.id, product.revision, valid)
+    expect(initial.statusCode).toBe(200)
+    const savedRevision = initial.json<{ data: { revision: number } }>().data.revision
+    const serialized = productRichContentToSafeHtml(valid)
+    expect(serialized).toContain('&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;')
+    expect(serialized).toContain('alt="&quot; onerror=&quot;alert(1)"')
+    expect(serialized).not.toContain('<script>')
+    expect(serialized).not.toContain('data:')
+
+    const invalidDocuments: unknown[] = [
+      { type: 'doc', content: [{ type: 'script', content: [] }] },
+      { type: 'doc', content: [{ type: 'paragraph', attrs: { onclick: 'alert(1)' } }] },
+      { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'unsafe', marks: [{ type: 'link', attrs: { href: 'javascript:alert(1)' } }] }] }] },
+      { type: 'doc', content: [{ type: 'image', attrs: { src: 'data:image/png;base64,AAAA' } }] },
+      { type: 'doc', content: [{ type: 'image', attrs: { mediaId: randomUUID(), src: '/private/file.png' } }] },
+      { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'unsafe', marks: [{ type: 'link', attrs: { href: '//evil.example' } }] }] }] },
+      { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'unsafe', marks: [{ type: 'link', attrs: { href: '/\\\\evil.example' } }] }] }] },
+    ]
+    for (const content of invalidDocuments) {
+      const rejected = await saveRichContent(auth, product.id, savedRevision, content)
+      expect(rejected.statusCode).toBe(400)
+    }
+    const missingMedia = await saveRichContent(auth, product.id, savedRevision, {
+      type: 'doc', content: [{ type: 'image', attrs: { mediaId: randomUUID() } }],
+    })
+    expect(missingMedia.statusCode).toBe(400)
+    expect(missingMedia.json().error.code).toBe('MEDIA_NOT_FOUND')
+    const tooManyImages = await saveRichContent(auth, product.id, savedRevision, {
+      type: 'doc', content: Array.from({ length: 101 }, () => ({ type: 'image', attrs: { mediaId: media.id } })),
+    })
+    expect(tooManyImages.statusCode).toBe(400)
+    const oversizedJson = await saveRichContent(auth, product.id, savedRevision, {
+      type: 'doc',
+      content: Array.from({ length: 80 }, () => ({
+        type: 'paragraph',
+        content: [{ type: 'text', text: 'x', marks: [{ type: 'link', attrs: { href: `https://example.com/${'a'.repeat(2000)}` } }] }],
+      })),
+    })
+    expect(oversizedJson.statusCode).toBe(400)
+    expect(oversizedJson.json().error.code).toBe('INVALID_PRODUCT_RICH_CONTENT')
+    const tooMuchText = await saveRichContent(auth, product.id, savedRevision, {
+      type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: '汉'.repeat(45_000) }] }],
+    })
+    expect(tooMuchText.statusCode).toBe(400)
+    expect(tooMuchText.json().error.code).toBe('INVALID_PRODUCT_RICH_CONTENT')
+    const tooManyNodes = await saveRichContent(auth, product.id, savedRevision, {
+      type: 'doc', content: Array.from({ length: 500 }, () => ({ type: 'paragraph' })),
+    })
+    expect(tooManyNodes.statusCode).toBe(400)
+    let deeplyNested: Record<string, unknown> = { type: 'paragraph' }
+    for (let index = 0; index < 20; index += 1) deeplyNested = { type: 'blockquote', content: [deeplyNested] }
+    const tooDeep = await saveRichContent(auth, product.id, savedRevision, { type: 'doc', content: [deeplyNested] })
+    expect(tooDeep.statusCode).toBe(400)
+
+    const failedRevision = savedRevision
+    await sql`CREATE FUNCTION fail_d5_content_reference() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF OLD.source = 'rich_content' THEN RAISE EXCEPTION 'injected reference failure'; END IF;
+        RETURN OLD;
+      END; $$`.execute(db)
+    await sql`CREATE TRIGGER fail_d5_content_reference BEFORE DELETE ON product_media_references
+      FOR EACH ROW EXECUTE FUNCTION fail_d5_content_reference()`.execute(db)
+    let failedContentSave
+    try {
+      failedContentSave = await saveRichContent(auth, product.id, savedRevision, { type: 'doc', content: [] })
+    } finally {
+      await sql`DROP TRIGGER fail_d5_content_reference ON product_media_references`.execute(db)
+      await sql`DROP FUNCTION fail_d5_content_reference()`.execute(db)
+    }
+    expect(failedContentSave!.statusCode).toBe(500)
+    const rolledBackProduct = await getAdminProduct(auth, product.id)
+    expect(rolledBackProduct.json<{ data: ProductDetail }>().data.revision).toBe(failedRevision)
+    expect(rolledBackProduct.json<{ data: ProductDetail }>().data.richContent).toEqual(valid)
+    expect(await db.selectFrom('product_media_references').select('media_id')
+      .where('product_id', '=', product.id).where('source', '=', 'rich_content').execute()).toEqual([{ media_id: media.id }])
+
+    const emptySave = await saveRichContent(auth, product.id, savedRevision, { type: 'doc', content: [] })
+    expect(emptySave.statusCode).toBe(200)
+    const emptyRevision = emptySave.json<{ data: { revision: number } }>().data.revision
+    expect(emptySave.json<{ data: { content: unknown } }>().data.content)
+      .toEqual({ type: 'doc', content: [{ type: 'paragraph' }] })
+    expect(await db.selectFrom('product_media_references').select('media_id')
+      .where('product_id', '=', product.id).where('source', '=', 'rich_content').execute()).toEqual([])
+
+    const concurrent = await Promise.all([
+      saveRichContent(auth, product.id, emptyRevision, { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'first write' }] }] }),
+      saveRichContent(auth, product.id, emptyRevision, { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'second write' }] }] }),
+    ])
+    expect(concurrent.map((response) => response.statusCode).sort()).toEqual([200, 409])
+    const current = await getAdminProduct(auth, product.id)
+    const currentData = current.json<{ data: ProductDetail }>().data
+    expect(currentData.revision).toBe(emptyRevision + 1)
+    expect(['first write', 'second write']).toContain((currentData.richContent.content[0] as { content: Array<{ text: string }> }).content[0]!.text)
+  }, 30_000)
+
+  it('checks media checksums and only prunes aged unregistered files after explicit cleanup', async () => {
+    const auth = await loginAdmin()
+    const registered = await uploadMedia(auth, await samplePng())
+    expect(registered.statusCode).toBe(201)
+    const mediaId = registered.json<{ data: { id: string } }>().data.id
+    const detail = await db.selectFrom('product_media_variants').select(['storage_key', 'sha256'])
+      .where('media_id', '=', mediaId).where('variant', '=', 'detail').executeTakeFirstOrThrow()
+    const storage = new MediaStorage(mediaTestRoot)
+    const detailPath = join(mediaTestRoot, detail.storage_key)
+    const originalBytes = readFileSync(detailPath)
+    writeFileSync(detailPath, Buffer.from('corrupt'))
+    const corrupted = await reconcileProductMedia(db, storage)
+    expect(corrupted.invalidFiles).toBe(1)
+    expect(corrupted.needsAttention).toBe(true)
+    writeFileSync(detailPath, originalBytes)
+    expect(createHash('sha256').update(readFileSync(detailPath)).digest('hex')).toBe(detail.sha256.trim())
+
+    const orphan = await storage.publishImage({ bytes: await samplePng(), mimeType: 'image/png' })
+    const staleStage = join(mediaTestRoot, '.staging', `upload-${randomUUID()}-thumbnail-${randomUUID()}.tmp`)
+    writeFileSync(staleStage, 'incomplete staging bytes')
+    const older = new Date(Date.now() - 2 * 60 * 60 * 1000)
+    for (const variant of orphan.variants) utimesSync(join(mediaTestRoot, variant.storageKey), older, older)
+    utimesSync(staleStage, older, older)
+
+    const now = Date.now() + 26 * 60 * 60 * 1000
+    const dryRun = await reconcileProductMedia(db, storage, { now })
+    expect(dryRun.unreferencedFiles).toBe(3)
+    expect(dryRun.staleStagingFiles).toBe(1)
+    expect(dryRun.deletedFiles).toBe(0)
+    expect(readFileSync(staleStage, 'utf8')).toBe('incomplete staging bytes')
+
+    const cleanup = await reconcileProductMedia(db, storage, {
+      now,
+      deleteUnreferencedOlderThanMs: 60 * 60 * 1000,
+    })
+    expect(cleanup.deletedFiles).toBe(4)
+    expect(cleanup.unreferencedFiles).toBe(0)
+    expect(cleanup.staleStagingFiles).toBe(0)
+    expect(cleanup.invalidFiles).toBe(0)
+    expect(cleanup.needsAttention).toBe(false)
+    expect(readFileSync(detailPath)).toEqual(originalBytes)
+    expect(() => readFileSync(staleStage)).toThrow()
+    expect(await db.selectFrom('product_media').select('id').where('id', '=', mediaId).execute()).toHaveLength(1)
+  }, 30_000)
+
+  it('fails closed when a gallery media record is missing a processed variant', async () => {
+    const auth = await loginAdmin()
+    const uploaded = await uploadMedia(auth, await samplePng())
+    const mediaId = uploaded.json<{ data: { id: string } }>().data.id
+    const product = await createTestProduct(auth, 'D5 incomplete media fails closed')
+    const gallery = await replaceGallery(auth, product.id, product.revision, [mediaId])
+    expect(gallery.statusCode).toBe(200)
+
+    await db.deleteFrom('product_media_variants').where('media_id', '=', mediaId).where('variant', '=', 'card').execute()
+    const detail = await getAdminProduct(auth, product.id)
+    expect(detail.statusCode).toBe(503)
+    expect(detail.json().error.code).toBe('MEDIA_VARIANT_UNAVAILABLE')
   }, 30_000)
 })
