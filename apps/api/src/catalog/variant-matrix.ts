@@ -11,6 +11,7 @@ import type { Database } from '../db/types.js'
 import type { ProductIdentityFactory } from './admin-products.js'
 import { loadProduct } from './admin-products.js'
 import { CatalogError } from './errors.js'
+import { assertProductNotArchived, lockProductAtRevision } from './admin-product-guards.js'
 
 type MatrixGroupInput = ProductVariantMatrixBody['groups'][number]
 type MatrixCombinationInput = Extract<ProductVariantMatrixBody, { mode: 'selected' }>['combinations'][number]
@@ -122,16 +123,6 @@ function cartesian(groups: NormalizedGroup[]): NormalizedValue[][] {
     rows = rows.flatMap((row) => values.map((value) => [...row, value]))
   }
   return rows
-}
-
-async function lockProduct(trx: Transaction<Database>, productId: string, expectedRevision: number) {
-  const product = await trx.selectFrom('products').select(['id', 'revision'])
-    .where('id', '=', productId).forUpdate().executeTakeFirst()
-  if (!product) throw new CatalogError(404, 'PRODUCT_NOT_FOUND', 'The product does not exist')
-  if (product.revision !== expectedRevision) {
-    throw new CatalogError(409, 'PRODUCT_REVISION_CONFLICT', 'The product changed; reload it and retry')
-  }
-  return product
 }
 
 async function planMatrix(
@@ -472,7 +463,7 @@ export async function previewVariantMatrix(
   body: ProductVariantMatrixBody,
 ): Promise<ProductVariantMatrixPreview> {
   return db.transaction().execute(async (trx) => {
-    const product = await lockProduct(trx, productId, body.expectedRevision)
+    const product = await lockProductAtRevision(trx, productId, body.expectedRevision)
     const plan = await planMatrix(trx, productId, body)
     return {
       productId,
@@ -639,7 +630,8 @@ export async function saveVariantMatrix(
   identityFactory: ProductIdentityFactory,
 ): Promise<ProductVariantMatrixSaveResult> {
   return db.transaction().execute(async (trx) => {
-    await lockProduct(trx, productId, body.expectedRevision)
+    const product = await lockProductAtRevision(trx, productId, body.expectedRevision)
+    assertProductNotArchived(product)
     const plan = await planMatrix(trx, productId, body)
     const updatedProduct = await applyMatrixPlan(trx, plan, identityFactory)
     return { product: updatedProduct, changes: matrixChanges(plan) }

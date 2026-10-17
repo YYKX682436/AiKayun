@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyReply } from 'fastify'
-import { sql, type Kysely, type Selectable } from 'kysely'
+import { sql, type Kysely } from 'kysely'
 import { parseUnitAmount } from '@aikayun/money'
 import {
   ApiErrorSchema,
@@ -32,14 +32,15 @@ import type {
 } from '@aikayun/contracts'
 import type { AppConfig } from '../config.js'
 import { requireAdmin, verifyCsrf } from '../auth/admin.js'
-import type { Database, ProductsTable } from '../db/types.js'
+import type { Database } from '../db/types.js'
 import { CatalogError, sendCatalogError } from './errors.js'
 import { appendProductAudit, type ProductAuditData } from './product-audit.js'
+import { assertProductNotArchived, lockProductAtRevision } from './admin-product-guards.js'
+import type { LockedProduct } from './admin-product-guards.js'
 import { defaultProductIdentityFactory, loadProduct } from './admin-products.js'
 import type { ProductIdentityFactory } from './admin-products.js'
 
 const defaultPageSize = 20
-type LockedProduct = Selectable<ProductsTable>
 
 function descriptionLength(value: string): number {
   return Array.from(value).length
@@ -57,20 +58,6 @@ function auditSnapshot(
     descriptionLength: descriptionLength(product.description),
     ...extra,
   }
-}
-
-async function lockProduct(
-  db: Kysely<Database>,
-  productId: string,
-  expectedRevision: number,
-): Promise<LockedProduct> {
-  const product = await db.selectFrom('products').selectAll()
-    .where('id', '=', productId).forUpdate().executeTakeFirst()
-  if (!product) throw new CatalogError(404, 'PRODUCT_NOT_FOUND', 'The product does not exist')
-  if (product.revision !== expectedRevision) {
-    throw new CatalogError(409, 'PRODUCT_REVISION_CONFLICT', 'The product changed; reload it and retry')
-  }
-  return product
 }
 
 function normalizedProductName(value: string): string {
@@ -239,7 +226,7 @@ async function listProducts(db: Kysely<Database>, query: ProductListQuery): Prom
   const sortExpression = query.sortBy === 'createdAt'
     ? 'product.created_at'
     : query.sortBy === 'price'
-      ? '(SELECT min(price_variant.sale_price) FROM product_variants AS price_variant WHERE price_variant.product_id = product.id)'
+      ? '(SELECT min(price_variant.sale_price) FROM product_variants AS price_variant WHERE price_variant.product_id = product.id AND price_variant.retired_at IS NULL)'
       : 'product.updated_at'
   const rows = await sql<ProductListDbRow>`
     SELECT
@@ -251,8 +238,10 @@ async function listProducts(db: Kysely<Database>, query: ProductListQuery): Prom
       product.created_at,
       product.updated_at,
       (SELECT count(*)::integer FROM product_variants AS variant WHERE variant.product_id = product.id) AS sku_count,
-      (SELECT min(variant.sale_price)::text FROM product_variants AS variant WHERE variant.product_id = product.id) AS min_sale_price,
-      (SELECT max(variant.sale_price)::text FROM product_variants AS variant WHERE variant.product_id = product.id) AS max_sale_price,
+      (SELECT min(variant.sale_price)::text FROM product_variants AS variant
+       WHERE variant.product_id = product.id AND variant.retired_at IS NULL) AS min_sale_price,
+      (SELECT max(variant.sale_price)::text FROM product_variants AS variant
+       WHERE variant.product_id = product.id AND variant.retired_at IS NULL) AS max_sale_price,
       COALESCE((
         SELECT jsonb_agg(jsonb_build_object(
           'categoryId', category.id,
@@ -266,26 +255,32 @@ async function listProducts(db: Kysely<Database>, query: ProductListQuery): Prom
       ), '[]'::jsonb) AS categories
     FROM products AS product
     ${where}
-    ORDER BY ${sql.raw(sortExpression)} ${sql.raw(sortOrder)}, product.id ASC
+    ORDER BY ${sql.raw(sortExpression)} ${sql.raw(sortOrder)} NULLS LAST, product.id ASC
     LIMIT ${pageSize} OFFSET ${offset}
   `.execute(db)
 
   const total = totalResult.rows[0]?.total ?? 0
   const items = rows.rows.map((row) => {
-    if (row.min_sale_price === null || row.max_sale_price === null || row.sku_count < 1) {
-      throw new Error('Product list encountered a product without a valid SKU price range')
+    if (row.sku_count < 1) {
+      throw new Error('Product list encountered a product without a SKU')
     }
+    if ((row.min_sale_price === null) !== (row.max_sale_price === null)) {
+      throw new Error('Product list encountered an incomplete active SKU price range')
+    }
+    const priceRange = row.min_sale_price === null || row.max_sale_price === null
+      ? null
+      : {
+          min: parseUnitAmount(row.min_sale_price).toFixed(2),
+          max: parseUnitAmount(row.max_sale_price).toFixed(2),
+          currency: 'CNY' as const,
+        }
     return {
       id: row.id,
       name: row.name,
       productType: row.product_type,
       status: row.status,
       skuCount: row.sku_count,
-      priceRange: {
-        min: parseUnitAmount(row.min_sale_price).toFixed(2),
-        max: parseUnitAmount(row.max_sale_price).toFixed(2),
-        currency: 'CNY' as const,
-      },
+      priceRange,
       categories: row.categories,
       revision: row.revision,
       createdAt: row.created_at.toISOString(),
@@ -369,10 +364,8 @@ async function updateProduct(
   body: UpdateProductBody,
 ) {
   return db.transaction().execute(async (trx) => {
-    const product = await lockProduct(trx, productId, body.expectedRevision)
-    if (product.status === 'archived') {
-      throw new CatalogError(409, 'PRODUCT_ARCHIVED', 'Restore the product to draft before editing its basic information')
-    }
+    const product = await lockProductAtRevision(trx, productId, body.expectedRevision)
+    assertProductNotArchived(product)
     const changes: { name?: string; description?: string; product_type?: ProductType } = {}
     if (Object.hasOwn(body, 'name')) {
       const name = normalizedProductName(body.name!)
@@ -425,7 +418,7 @@ async function transitionProduct(
   body: UpdateProductLifecycleBody,
 ) {
   return db.transaction().execute(async (trx) => {
-    const product = await lockProduct(trx, productId, body.expectedRevision)
+    const product = await lockProductAtRevision(trx, productId, body.expectedRevision)
     if (product.status === body.status) {
       const unchanged = await loadProduct(trx, productId)
       if (!unchanged) throw new Error('Unchanged product could not be read inside its transaction')
@@ -465,7 +458,7 @@ async function copyProduct(
   identityFactory: ProductIdentityFactory,
 ) {
   return db.transaction().execute(async (trx) => {
-    const source = await lockProduct(trx, sourceProductId, expectedRevision)
+    const source = await lockProductAtRevision(trx, sourceProductId, expectedRevision)
     const sourceVariants = await trx.selectFrom('product_variants').selectAll()
       .where('product_id', '=', sourceProductId).orderBy('id').forUpdate().execute()
     if (sourceVariants.length === 0) {
@@ -582,7 +575,7 @@ async function deleteProduct(
   expectedRevision: number,
 ): Promise<void> {
   await db.transaction().execute(async (trx) => {
-    const product = await lockProduct(trx, productId, expectedRevision)
+    const product = await lockProductAtRevision(trx, productId, expectedRevision)
     const variants = await trx.selectFrom('product_variants').selectAll()
       .where('product_id', '=', productId).orderBy('id').forUpdate().execute()
     if (variants.length === 0) throw new CatalogError(409, 'PRODUCT_SKU_REQUIRED', 'The product has no SKU rows to delete safely')

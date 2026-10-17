@@ -16,16 +16,7 @@ import { requireAdmin, verifyCsrf } from '../auth/admin.js'
 import type { Database } from '../db/types.js'
 import { loadProduct } from './admin-products.js'
 import { CatalogError, sendCatalogError } from './errors.js'
-
-async function lockProduct(db: Kysely<Database>, productId: string, expectedRevision: number) {
-  const product = await db.selectFrom('products').select(['id', 'revision'])
-    .where('id', '=', productId).forUpdate().executeTakeFirst()
-  if (!product) throw new CatalogError(404, 'PRODUCT_NOT_FOUND', 'The product does not exist')
-  if (product.revision !== expectedRevision) {
-    throw new CatalogError(409, 'PRODUCT_REVISION_CONFLICT', 'The product changed; reload it and retry')
-  }
-  return product
-}
+import { assertProductNotArchived, lockProductAtRevision } from './admin-product-guards.js'
 
 function fail(reply: FastifyReply, error: unknown, requestId: string) {
   return sendCatalogError(reply, error, requestId)
@@ -64,7 +55,8 @@ export function registerAdminProductDetailRoutes(app: FastifyInstance, db: Kysel
       }
 
       const result = await db.transaction().execute(async (trx) => {
-        await lockProduct(trx, productId, body.expectedRevision)
+        const lockedProduct = await lockProductAtRevision(trx, productId, body.expectedRevision)
+        assertProductNotArchived(lockedProduct)
         const normalizedIds = [...new Set(categoryIds)]
         if (normalizedIds.length > 0) {
           const categories = await trx.selectFrom('product_categories').select('id')
@@ -126,7 +118,8 @@ export function registerAdminProductDetailRoutes(app: FastifyInstance, db: Kysel
       }
 
       const result = await db.transaction().execute(async (trx) => {
-        await lockProduct(trx, productId, body.expectedRevision)
+        const lockedProduct = await lockProductAtRevision(trx, productId, body.expectedRevision)
+        assertProductNotArchived(lockedProduct)
         const existing = await trx.selectFrom('product_attributes').selectAll().where('product_id', '=', productId).execute()
         const existingById = new Map(existing.map((attribute) => [attribute.id, attribute]))
         for (const attribute of attributes) {

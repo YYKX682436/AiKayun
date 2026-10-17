@@ -14,6 +14,7 @@ import type { AppConfig } from '../config.js'
 import { requireAdmin, verifyCsrf } from '../auth/admin.js'
 import type { Database } from '../db/types.js'
 import { CatalogError, sendCatalogError } from './errors.js'
+import { assertProductNotArchived, lockProductAtRevision } from './admin-product-guards.js'
 
 const salePricePattern = /^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?(?![\s\S])/u
 const costPricePattern = /^(?:0|[1-9]\d{0,12})(?:\.\d{1,5})?(?![\s\S])/u
@@ -131,12 +132,8 @@ export function registerAdminProductPriceRoutes(app: FastifyInstance, db: Kysely
     const { id: productId, variantId } = request.params as { id: string; variantId: string }
     try {
       const result = await db.transaction().execute(async (trx) => {
-        const product = await trx.selectFrom('products').select(['id', 'revision'])
-          .where('id', '=', productId).forUpdate().executeTakeFirst()
-        if (!product) throw new CatalogError(404, 'PRODUCT_NOT_FOUND', 'The product does not exist')
-        if (product.revision !== body.expectedRevision) {
-          throw new CatalogError(409, 'PRODUCT_REVISION_CONFLICT', 'The product changed; reload it and retry')
-        }
+        const product = await lockProductAtRevision(trx, productId, body.expectedRevision)
+        assertProductNotArchived(product)
 
         const variant = await trx.selectFrom('product_variants').selectAll()
           .where('product_id', '=', productId).where('id', '=', variantId).forUpdate().executeTakeFirst()

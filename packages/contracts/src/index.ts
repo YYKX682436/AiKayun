@@ -324,11 +324,11 @@ export const ProductListItemSchema = Type.Object({
   productType: ProductTypeSchema,
   status: ProductStatusSchema,
   skuCount: Type.Integer({ minimum: 1, maximum: 1000 }),
-  priceRange: Type.Object({
+  priceRange: Type.Union([Type.Object({
     min: ProductSalePriceSchema,
     max: ProductSalePriceSchema,
     currency: Type.Literal('CNY'),
-  }, { additionalProperties: false }),
+  }, { additionalProperties: false }), Type.Null()]),
   categories: Type.Array(ProductListCategorySchema),
   revision: Type.Integer({ minimum: 1 }),
   createdAt: Type.String({ format: 'date-time' }),

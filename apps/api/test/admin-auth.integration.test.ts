@@ -3058,7 +3058,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       headers: { cookie: auth.sessionCookie },
     })
     expect(pageOne.statusCode).toBe(200)
-    const firstPage = pageOne.json<{ data: { items: Array<{ id: string; skuCount: number; priceRange: { min: string; max: string; currency: string }; categories: unknown[] }>; page: number; pageSize: number; total: number; totalPages: number } }>().data
+    const firstPage = pageOne.json<{ data: { items: Array<{ id: string; skuCount: number; priceRange: { min: string; max: string; currency: string } | null; categories: unknown[] }>; page: number; pageSize: number; total: number; totalPages: number } }>().data
     expect(firstPage).toMatchObject({ page: 1, pageSize: 2, total: 4, totalPages: 2 })
     const tiedById = [gammaProduct.id, deltaProduct.id].sort((left, right) => left.localeCompare(right))
     expect(firstPage.items.map((item) => item.id)).toEqual([betaProduct.id, tiedById[0]])
@@ -3068,7 +3068,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       headers: { cookie: auth.sessionCookie },
     })
     expect(pageTwo.statusCode).toBe(200)
-    const secondPage = pageTwo.json<{ data: { items: Array<{ id: string; skuCount: number; priceRange: { min: string; max: string; currency: string }; categories: unknown[] }> } }>().data.items
+    const secondPage = pageTwo.json<{ data: { items: Array<{ id: string; skuCount: number; priceRange: { min: string; max: string; currency: string } | null; categories: unknown[] }> } }>().data.items
     const gammaSummary = [...firstPage.items, ...secondPage].find((item) => item.id === gammaProduct.id)
     expect(gammaSummary?.categories).toHaveLength(2)
     expect(gammaSummary).toMatchObject({
@@ -3103,6 +3103,256 @@ describe('Fastify API with PostgreSQL 18', () => {
     const invalidSearch = await app.inject({ method: 'GET', url: '/api/v1/admin/products?search=%20%20', headers: { cookie: auth.sessionCookie } })
     expect(invalidSearch.statusCode).toBe(400)
     expect(deltaProduct.status).toBe('draft')
+  })
+
+  it('blocks archived catalog edits across D2 and D3 while retaining reads and inventory maintenance', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '归档一致性商品')
+    const category = await app.inject({
+      method: 'POST', url: '/api/v1/admin/categories', headers: productHeaders(auth), payload: { name: '归档商品分类' },
+    })
+    const secondCategory = await app.inject({
+      method: 'POST', url: '/api/v1/admin/categories', headers: productHeaders(auth), payload: { name: '替换商品分类' },
+    })
+    const categoryId = category.json<{ data: { id: string; revision: number } }>().data.id
+    const secondCategoryId = secondCategory.json<{ data: { id: string } }>().data.id
+    const assigned = await app.inject({
+      method: 'PUT', url: `/api/v1/admin/products/${product.id}/categories`, headers: productHeaders(auth),
+      payload: { expectedRevision: product.revision, assignments: [{ categoryId, isPrimary: true, sortOrder: 0 }] },
+    })
+    expect(assigned.statusCode).toBe(200)
+    let current = assigned.json<{ data: ProductDetail }>().data
+    const attributes = await app.inject({
+      method: 'PUT', url: `/api/v1/admin/products/${product.id}/attributes`, headers: productHeaders(auth),
+      payload: { expectedRevision: current.revision, attributes: [{ name: '颜色', value: '蓝色', sortOrder: 0 }] },
+    })
+    expect(attributes.statusCode).toBe(200)
+    current = attributes.json<{ data: ProductDetail }>().data
+
+    const groupId = randomUUID()
+    const lowValueId = randomUUID()
+    const liveValueId = randomUUID()
+    const matrix = await saveMatrix(auth, product.id, {
+      expectedRevision: current.revision,
+      mode: 'selected',
+      groups: [optionGroup('归档规格', groupId, [
+        { id: lowValueId, name: '低价' }, { id: liveValueId, name: '保留' },
+      ])],
+      combinations: [
+        { optionValueIds: [lowValueId], salePrice: '2.00', enabled: true },
+        { optionValueIds: [liveValueId], salePrice: '3.00', enabled: true },
+      ],
+    })
+    expect(matrix.statusCode).toBe(200)
+    current = matrix.json<{ data: { product: ProductDetail } }>().data.product
+    const sku = current.variants.find((variant) => variant.options[0]?.valueId === liveValueId)!
+    const mode = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: current.revision,
+      expectedSkuRevision: sku.revision,
+      expectedInventoryRevision: 0,
+      inventoryMode: 'quantity',
+    })
+    expect(mode.statusCode).toBe(200)
+    const modeData = mode.json<{ data: { productRevision: number; skuRevision: number; inventoryRevision: number } }>().data
+    const stocked = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: modeData.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 4, reason: '归档状态测试库存初始化',
+    })
+    expect(stocked.statusCode).toBe(201)
+    const beforeArchive = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie },
+    })
+    expect(beforeArchive.statusCode).toBe(200)
+    current = beforeArchive.json<{ data: ProductDetail }>().data
+
+    const archivedResponse = await changeProductLifecycle(auth, product.id, {
+      expectedRevision: current.revision, status: 'archived',
+    })
+    expect(archivedResponse.statusCode).toBe(200)
+    const archived = archivedResponse.json<{ data: ProductDetail }>().data
+    expect(archived).toMatchObject({ status: 'archived', name: '归档一致性商品', categories: [{ categoryId }], attributes: [{ value: '蓝色' }] })
+    expect(archived.variants.find((variant) => variant.id === sku.id)).toMatchObject({ enabled: true, retiredAt: null })
+    expect(await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+      .where('product_variant_id', '=', sku.id).executeTakeFirstOrThrow()).toEqual({ stocked: 4, reserved: 0 })
+
+    const edits = await Promise.all([
+      editProduct(auth, product.id, { expectedRevision: archived.revision, name: '不应改名' }),
+      app.inject({
+        method: 'PUT', url: `/api/v1/admin/products/${product.id}/categories`, headers: productHeaders(auth),
+        payload: { expectedRevision: archived.revision, assignments: [{ categoryId: secondCategoryId, isPrimary: true, sortOrder: 0 }] },
+      }),
+      app.inject({
+        method: 'PUT', url: `/api/v1/admin/products/${product.id}/attributes`, headers: productHeaders(auth),
+        payload: { expectedRevision: archived.revision, attributes: [{ name: '颜色', value: '红色', sortOrder: 0 }] },
+      }),
+      saveMatrix(auth, product.id, {
+        expectedRevision: archived.revision,
+        mode: 'selected',
+        groups: [optionGroup('归档规格已改', groupId, [
+          { id: lowValueId, name: '低价' }, { id: liveValueId, name: '保留' },
+        ])],
+        combinations: [
+          { skuId: archived.variants[0]!.id, optionValueIds: [lowValueId], salePrice: '2.00', enabled: true },
+          { skuId: sku.id, optionValueIds: [liveValueId], salePrice: '3.00', enabled: true },
+        ],
+      }),
+      patchSkuPrices(auth, product.id, sku.id, {
+        expectedRevision: archived.revision, expectedSkuRevision: sku.revision, salePrice: '30.00',
+      }),
+      setInventoryMode(auth, product.id, sku.id, {
+        expectedRevision: archived.revision,
+        expectedSkuRevision: modeData.skuRevision,
+        expectedInventoryRevision: modeData.inventoryRevision + 1,
+        inventoryMode: null,
+      }),
+    ])
+    expect(edits.map((response) => response.statusCode)).toEqual([409, 409, 409, 409, 409, 409])
+    expect(edits.map((response) => response.json().error.code)).toEqual(Array(6).fill('PRODUCT_ARCHIVED'))
+
+    const categoryEdit = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/categories/${categoryId}`, headers: productHeaders(auth),
+      payload: { expectedRevision: category.json<{ data: { revision: number } }>().data.revision, name: '归档商品分类仍可独立维护' },
+    })
+    expect(categoryEdit.statusCode).toBe(200)
+
+    const archivedDetail = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie },
+    })
+    expect(archivedDetail.statusCode).toBe(200)
+    expect(archivedDetail.json().data).toMatchObject({ status: 'archived', name: '归档一致性商品' })
+    expect(archivedDetail.json().data.categories[0].name).toBe('归档商品分类仍可独立维护')
+    expect(archivedDetail.json().data.attributes).toMatchObject([{ name: '颜色', value: '蓝色' }])
+    expect(archivedDetail.json().data.optionGroups).toMatchObject([{ name: '归档规格' }])
+    expect(archivedDetail.json().data.variants.find((variant: { id: string }) => variant.id === sku.id))
+      .toMatchObject({ salePrice: '3.00', enabled: true, retiredAt: null })
+    const archivedInventory = await getInventorySummary(auth, product.id)
+    expect(archivedInventory.statusCode).toBe(200)
+    expect(archivedInventory.json().data.variants.find((variant: { skuId: string }) => variant.skuId === sku.id).inventory)
+      .toMatchObject({ mode: 'quantity', stocked: 4, reserved: 0 })
+    const archivedHistory = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/history`, headers: { cookie: auth.sessionCookie },
+    })
+    expect(archivedHistory.statusCode).toBe(200)
+    expect(archivedHistory.json().data.events[0]).toMatchObject({ operation: 'archived' })
+
+    const clearOut = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: modeData.inventoryRevision + 1,
+      operationId: randomUUID(), action: 'decrease', quantity: 4, reason: '归档 SKU 合法清退库存',
+    })
+    expect(clearOut.statusCode).toBe(201)
+    const stillArchived = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie },
+    })
+    expect(stillArchived.json().data.status).toBe('archived')
+    const restored = await changeProductLifecycle(auth, product.id, {
+      expectedRevision: archived.revision, status: 'draft',
+    })
+    expect(restored.statusCode).toBe(200)
+    const restoredProduct = restored.json<{ data: ProductDetail }>().data
+    const editableAgain = await editProduct(auth, product.id, {
+      expectedRevision: restoredProduct.revision, name: '恢复后的正常编辑',
+    })
+    expect(editableAgain.statusCode).toBe(200)
+    expect(editableAgain.json().data.name).toBe('恢复后的正常编辑')
+  })
+
+  it('serializes archive transitions with D3 pricing writes using the same product revision lock', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '归档价格并发商品')
+    const sku = product.variants[0]!
+    const [archive, reprice] = await Promise.all([
+      changeProductLifecycle(auth, product.id, { expectedRevision: product.revision, status: 'archived' }),
+      patchSkuPrices(auth, product.id, sku.id, {
+        expectedRevision: product.revision, expectedSkuRevision: sku.revision, salePrice: '29.00',
+      }),
+    ])
+    const latest = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie },
+    })
+    const finalProduct = latest.json<{ data: ProductDetail }>().data
+    if (archive.statusCode === 200) {
+      expect(reprice.statusCode).toBe(409)
+      expect(finalProduct.status).toBe('archived')
+      expect(finalProduct.variants[0]!.salePrice).toBe(sku.salePrice)
+    } else {
+      expect(archive.statusCode).toBe(409)
+      expect(reprice.statusCode).toBe(200)
+      expect(finalProduct.status).toBe('draft')
+      expect(finalProduct.variants[0]!.salePrice).toBe('29.00')
+    }
+  })
+
+  it('excludes retired SKU prices from nullable list ranges and stable ascending and descending sorts', async () => {
+    const auth = await loginAdmin()
+    const varied = await createTestProduct(auth, 'D4R1 价格范围 多 SKU')
+    const groupId = randomUUID()
+    const valueIds = [randomUUID(), randomUUID(), randomUUID()]
+    const matrix = await saveMatrix(auth, varied.id, {
+      expectedRevision: varied.revision,
+      mode: 'selected',
+      groups: [optionGroup('价格范围规格', groupId, valueIds.map((id, index) => ({ id, name: `规格${index}` })))],
+      combinations: valueIds.map((id, index) => ({ optionValueIds: [id], salePrice: ['1.00', '5.00', '9.00'][index]!, enabled: true })),
+    })
+    expect(matrix.statusCode).toBe(200)
+    const variedProduct = matrix.json<{ data: { product: ProductDetail } }>().data.product
+    const low = variedProduct.variants.find((variant) => variant.options[0]?.valueId === valueIds[0])!
+    const middle = variedProduct.variants.find((variant) => variant.options[0]?.valueId === valueIds[1])!
+    const high = variedProduct.variants.find((variant) => variant.options[0]?.valueId === valueIds[2])!
+    const retireExtremes = await saveMatrix(auth, varied.id, {
+      expectedRevision: variedProduct.revision,
+      mode: 'selected',
+      groups: [optionGroup('价格范围规格', groupId, valueIds.map((id, index) => ({ id, name: `规格${index}` })))],
+      combinations: [{ skuId: middle.id, optionValueIds: [valueIds[1]!], enabled: false }],
+      retireSkuIds: [low.id, high.id],
+    })
+    expect(retireExtremes.statusCode).toBe(200)
+
+    const tied = await createTestProduct(auth, 'D4R1 价格范围 同价')
+    const expensive = await createTestProduct(auth, 'D4R1 价格范围 高价')
+    const noPrice = await createTestProduct(auth, 'D4R1 价格范围 全退役')
+    const tiedPrice = await patchSkuPrices(auth, tied.id, tied.variants[0]!.id, {
+      expectedRevision: tied.revision, expectedSkuRevision: tied.variants[0]!.revision, salePrice: '5.00',
+    })
+    const expensivePrice = await patchSkuPrices(auth, expensive.id, expensive.variants[0]!.id, {
+      expectedRevision: expensive.revision, expectedSkuRevision: expensive.variants[0]!.revision, salePrice: '10.00',
+    })
+    expect([tiedPrice.statusCode, expensivePrice.statusCode]).toEqual([200, 200])
+    await db.updateTable('product_variants').set({ enabled: false, retired_at: new Date() })
+      .where('product_id', '=', noPrice.id).execute()
+
+    const list = async (order: 'asc' | 'desc', page: number) => app.inject({
+      method: 'GET',
+      url: `/api/v1/admin/products?search=${encodeURIComponent('D4R1 价格范围')}&page=${page}&pageSize=2&sortBy=price&sortOrder=${order}`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    const ascOne = await list('asc', 1)
+    const ascTwo = await list('asc', 2)
+    const ascThree = await list('asc', 3)
+    expect([ascOne.statusCode, ascTwo.statusCode, ascThree.statusCode]).toEqual([200, 200, 200])
+    const ascItems = [
+      ...ascOne.json().data.items,
+      ...ascTwo.json().data.items,
+      ...ascThree.json().data.items,
+    ] as Array<{ id: string; skuCount: number; priceRange: { min: string; max: string; currency: string } | null; costPrice?: unknown }>
+    const tiedIds = [varied.id, tied.id].sort((left, right) => left.localeCompare(right))
+    expect(ascItems.map((item) => item.id)).toEqual([tiedIds[0], tiedIds[1], expensive.id, noPrice.id])
+    expect(ascItems.find((item) => item.id === varied.id)).toMatchObject({
+      skuCount: 3,
+      priceRange: { min: '5.00', max: '5.00', currency: 'CNY' },
+    })
+    expect(ascItems.find((item) => item.id === noPrice.id)).toMatchObject({ skuCount: 1, priceRange: null })
+    expect(ascItems.every((item) => !('costPrice' in item))).toBe(true)
+
+    const descOne = await list('desc', 1)
+    const descTwo = await list('desc', 2)
+    const descItems = [...descOne.json().data.items, ...descTwo.json().data.items] as Array<{ id: string; priceRange: unknown }>
+    expect(descItems.map((item) => item.id)).toEqual([expensive.id, tiedIds[0], tiedIds[1], noPrice.id])
+    expect(descItems.at(-1)?.priceRange).toBeNull()
+    expect(new Set([...ascItems.map((item) => item.id), ...descItems.map((item) => item.id)]).size).toBe(4)
+    const retiredPrices = await db.selectFrom('product_variants').select(['id', 'sale_price', 'retired_at'])
+      .where('id', 'in', [low.id, high.id]).orderBy('sale_price').execute()
+    expect(retiredPrices.map((row) => row.sale_price)).toEqual(['1.00000', '9.00000'])
+    expect(retiredPrices.every((row) => row.retired_at !== null)).toBe(true)
   })
 
   it('copies catalog identities and mappings while resetting every inventory identity', async () => {

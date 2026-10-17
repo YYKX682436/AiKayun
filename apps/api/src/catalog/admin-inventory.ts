@@ -32,6 +32,7 @@ import type { AppConfig } from '../config.js'
 import { requireAdmin, verifyCsrf } from '../auth/admin.js'
 import type { Database, InventoryAdjustmentAction } from '../db/types.js'
 import { CatalogError, sendCatalogError } from './errors.js'
+import { assertProductNotArchived, lockProductAtRevision } from './admin-product-guards.js'
 
 const maxInventoryQuantity = 2_147_483_647
 const inventoryModes = new Set<ProductInventoryMode>(['quantity', 'resource_pool', 'unlimited', 'external'])
@@ -277,12 +278,8 @@ export function registerAdminInventoryRoutes(app: FastifyInstance, db: Kysely<Da
     const { id: productId, variantId: skuId } = request.params as { id: string; variantId: string }
     try {
       const result = await db.transaction().execute(async (trx) => {
-        const product = await trx.selectFrom('products').select(['id', 'revision'])
-          .where('id', '=', productId).forUpdate().executeTakeFirst()
-        if (!product) throw new CatalogError(404, 'PRODUCT_NOT_FOUND', 'The product does not exist')
-        if (product.revision !== body.expectedRevision) {
-          throw new CatalogError(409, 'PRODUCT_REVISION_CONFLICT', 'The product changed; reload it and retry')
-        }
+        const product = await lockProductAtRevision(trx, productId, body.expectedRevision)
+        assertProductNotArchived(product)
         const variant = await trx.selectFrom('product_variants').selectAll()
           .where('product_id', '=', productId).where('id', '=', skuId).forUpdate().executeTakeFirst()
         if (!variant) throw new CatalogError(404, 'SKU_NOT_FOUND', 'The SKU does not belong to this product')
