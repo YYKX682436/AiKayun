@@ -15,6 +15,7 @@ import { parseUnitAmount } from '@aikayun/money'
 import type { AppConfig } from '../config.js'
 import { requireAdmin, verifyCsrf } from '../auth/admin.js'
 import type { Database, ProductType } from '../db/types.js'
+import { appendProductAudit } from './product-audit.js'
 
 const salePricePattern = /^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?(?![\s\S])/
 
@@ -168,6 +169,7 @@ export async function loadProduct(db: Kysely<Database>, id: string): Promise<Pro
 export async function createDraftProduct(
   db: Kysely<Database>,
   body: CreateProductBody,
+  administratorId: string,
   identityFactory: ProductIdentityFactory = defaultProductIdentityFactory,
 ): Promise<ProductDetail> {
   const name = body.name.trim()
@@ -196,6 +198,22 @@ export async function createDraftProduct(
       sale_price: salePrice,
       enabled: true,
     }).executeTakeFirstOrThrow()
+
+    await appendProductAudit(trx, {
+      productId: product.id,
+      administratorId,
+      operation: 'created',
+      before: null,
+      after: {
+        name: product.name,
+        productType: product.product_type,
+        status: product.status,
+        revision: product.revision,
+        description: product.description,
+        descriptionLength: Array.from(product.description).length,
+        skuCount: 1,
+      },
+    })
 
     const created = await loadProduct(trx, product.id)
     if (!created) throw new Error('Created product could not be read inside its transaction')
@@ -292,7 +310,9 @@ export function registerAdminProductRoutes(
 
     try {
       const body = request.body as CreateProductBody
-      const product = await createDraftProduct(db, body, identityFactory)
+      const administratorId = request.admin?.id
+      if (!administratorId) return reply.code(401).send(failure('UNAUTHORIZED', 'Administrator authentication is required', request.id))
+      const product = await createDraftProduct(db, body, administratorId, identityFactory)
       return reply.code(201).send(success(product, request.id))
     } catch (error) {
       return sendKnownProductFailure(reply, error, request.id)

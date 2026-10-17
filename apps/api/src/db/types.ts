@@ -138,6 +138,19 @@ export interface ProductVariantOptionValuesTable {
   created_at: Generated<Date>
 }
 
+export type ProductManagementOperation =
+  | 'created' | 'updated' | 'published' | 'paused' | 'relisted' | 'archived' | 'restored' | 'copied' | 'deleted'
+
+export interface ProductManagementAuditEventsTable {
+  id: string
+  product_id: string
+  administrator_id: string
+  operation: ProductManagementOperation
+  before_data: ColumnType<Record<string, unknown> | null, Record<string, unknown> | null, never>
+  after_data: ColumnType<Record<string, unknown> | null, Record<string, unknown> | null, never>
+  created_at: Generated<Date>
+}
+
 export interface Database {
   admin_users: AdminUsersTable
   admin_sessions: AdminSessionsTable
@@ -151,4 +164,5 @@ export interface Database {
   product_option_groups: ProductOptionGroupsTable
   product_option_values: ProductOptionValuesTable
   product_variant_option_values: ProductVariantOptionValuesTable
+  product_management_audit_events: ProductManagementAuditEventsTable
 }

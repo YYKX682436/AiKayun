@@ -75,6 +75,19 @@ SKU 临时停用不受库存数量影响；永久退役要求 quantity 模式的
 
 `pnpm verify` 会按顺序运行 lint、类型检查、单元/数据库测试、浏览器 E2E 和生产构建。
 
+## ③-D4 商品生命周期与管理操作
+
+所有商品管理写请求都要求管理员会话、同源 Origin、CSRF Cookie 与 `X-CSRF-Token`，并严格拒绝未知字段。商品修改、状态变更、复制和删除均携带 `expectedRevision`；商品锁使用 `products FOR UPDATE`，库存操作继续以独立 `inventory_revision` 并发控制。
+
+- `GET /api/v1/admin/products` 支持 `page`（默认 1）、`pageSize`（默认 20，最大 100）、`search`、`status`、`productType`、`categoryId`、`sortBy` 和 `sortOrder`。搜索覆盖商品名称、UUID 和 SKU 编码；分类筛选使用 `EXISTS`。排序项是创建时间、更新时间或最低 SKU 售价，默认更新时间倒序，商品 UUID 始终作为稳定次级排序。列表直接返回 SKU 数、价格范围和分类摘要，不逐商品请求详情，也不返回成本价。
+- `PATCH /api/v1/admin/products/:id` 编辑 `name`、`description`、`productType` 与 `expectedRevision`。名称会 trim 后验证；相同值不会修改修订或增加审计。归档商品必须先恢复为草稿。性质只允许草稿或已下架商品修改，且任何 SKU 已配置库存模式、存在数量库存行/调整流水或存在永久退役 SKU 时会冲突拒绝。
+- `PATCH /api/v1/admin/products/:id/lifecycle` 请求 `status` 和 `expectedRevision`。状态流转为草稿发布、销售中下架、下架后重新上架；草稿/销售中/暂停均可归档，归档只可恢复到草稿。同状态请求返回当前商品，不更新修订、不产生重复审计。发布验证名称、性质、至少一个 SKU 和启用 SKU 规格完整性，不要求库存大于零，也不要求有启用 SKU。
+- `POST /api/v1/admin/products/:id/copy` 请求源商品 `expectedRevision`。复制在事务内锁定源商品，重新生成商品、SKU、规格组、规格值和属性 UUID 及 SKU 编码，映射规格组合并复用分类关系。新商品永远为草稿；所有新 SKU 的库存模式为未配置、库存修订为 0，数量、预留和流水均不复制。全部源 SKU 已退役时，会生成一个新的禁用默认 SKU 维持数据库 SKU 下限。
+- `DELETE /api/v1/admin/products/:id` 请求 `expectedRevision`。仅当商品没有库存流水、非零库存/预留、永久退役 SKU 或资源来源时才永久删除；拒绝时保留商品并建议归档。删除清理商品自有关系和空数量库存记录，库存历史的 `ON DELETE RESTRICT` 不变，所有步骤与删除审计在同一事务中提交。即使商品已归档也必须通过相同检查。
+- `GET /api/v1/admin/products/:id/history` 提供管理员专属审计历史，`limit` 最大 100，并以 `(createdAt, id)` 游标翻页。历史按商品 UUID 保存且无商品外键，删除商品后仍可查；数据库拒绝审计行更新、删除和截断。创建、复制及描述编辑会记录描述前后值；审计不包含 SKU 成本、库存流水、卡密或凭据。
+
+新迁移 `202610170002_product_management` 仅添加不可变的商品管理审计表，不回填虚构的历史操作，也不修改之前迁移。API 集成测试会在 `_test` PostgreSQL 数据库上从阶段基线升级到最新迁移并重复迁移，再运行生命周期、编辑、列表、复制、删除、审计和并发路径。
+
 ## Compose 全栈
 
 `docker compose up -d --build` 启动 PostgreSQL、迁移、Fastify、Nuxt SSR 和 Caddy。默认 HTTP 入口是 <http://localhost:8080>，HTTPS 入口预留为 8443；宿主机端口只绑定 `127.0.0.1`，开发默认站点只监听 HTTP。`docker compose down` 保留数据卷，`docker compose down -v` 会删除 PostgreSQL 和 Caddy 数据卷。

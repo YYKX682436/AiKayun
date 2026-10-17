@@ -298,6 +298,118 @@ export const ProductDetailSchema = Type.Object({
   variants: Type.Array(ProductVariantSchema, { minItems: 1 }),
 })
 
+export const ProductListQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  search: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  status: Type.Optional(ProductStatusSchema),
+  productType: Type.Optional(ProductTypeSchema),
+  categoryId: Type.Optional(Type.String({ format: 'uuid' })),
+  sortBy: Type.Optional(Type.Union([
+    Type.Literal('createdAt'), Type.Literal('updatedAt'), Type.Literal('price'),
+  ])),
+  sortOrder: Type.Optional(Type.Union([Type.Literal('asc'), Type.Literal('desc')])),
+}, { additionalProperties: false })
+
+export const ProductListCategorySchema = Type.Object({
+  categoryId: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 120 }),
+  isPrimary: Type.Boolean(),
+  sortOrder: Type.Integer(),
+}, { additionalProperties: false })
+
+export const ProductListItemSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 200 }),
+  productType: ProductTypeSchema,
+  status: ProductStatusSchema,
+  skuCount: Type.Integer({ minimum: 1, maximum: 1000 }),
+  priceRange: Type.Object({
+    min: ProductSalePriceSchema,
+    max: ProductSalePriceSchema,
+    currency: Type.Literal('CNY'),
+  }, { additionalProperties: false }),
+  categories: Type.Array(ProductListCategorySchema),
+  revision: Type.Integer({ minimum: 1 }),
+  createdAt: Type.String({ format: 'date-time' }),
+  updatedAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+
+export const ProductListResponseSchema = Type.Object({
+  items: Type.Array(ProductListItemSchema, { maxItems: 100 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  total: Type.Integer({ minimum: 0 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+
+export const UpdateProductBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  name: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+  description: Type.Optional(Type.String({ maxLength: 20_000 })),
+  productType: Type.Optional(ProductTypeSchema),
+}, { additionalProperties: false, minProperties: 2 })
+
+export const UpdateProductLifecycleBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  status: ProductStatusSchema,
+}, { additionalProperties: false })
+
+export const ProductExpectedRevisionBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+}, { additionalProperties: false })
+
+export const ProductDeleteResultSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  deleted: Type.Literal(true),
+}, { additionalProperties: false })
+
+export const ProductManagementOperationSchema = Type.Union([
+  Type.Literal('created'), Type.Literal('updated'), Type.Literal('published'),
+  Type.Literal('paused'), Type.Literal('relisted'), Type.Literal('archived'),
+  Type.Literal('restored'), Type.Literal('copied'), Type.Literal('deleted'),
+])
+
+export const ProductAuditSnapshotSchema = Type.Object({
+  name: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+  description: Type.Optional(Type.String({ maxLength: 20_000 })),
+  productType: Type.Optional(ProductTypeSchema),
+  status: Type.Optional(ProductStatusSchema),
+  revision: Type.Optional(Type.Integer({ minimum: 1 })),
+  descriptionLength: Type.Optional(Type.Integer({ minimum: 0, maximum: 20_000 })),
+  descriptionChanged: Type.Optional(Type.Boolean()),
+  changedFields: Type.Optional(Type.Array(Type.Union([
+    Type.Literal('name'), Type.Literal('description'), Type.Literal('productType'),
+  ]))),
+  skuCount: Type.Optional(Type.Integer({ minimum: 0, maximum: 1000 })),
+  sourceProductId: Type.Optional(Type.String({ format: 'uuid' })),
+}, { additionalProperties: false })
+
+export const ProductManagementAuditEventSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  productId: Type.String({ format: 'uuid' }),
+  administratorId: Type.String({ format: 'uuid' }),
+  operation: ProductManagementOperationSchema,
+  occurredAt: Type.String({ format: 'date-time' }),
+  before: Type.Union([ProductAuditSnapshotSchema, Type.Null()]),
+  after: Type.Union([ProductAuditSnapshotSchema, Type.Null()]),
+}, { additionalProperties: false })
+
+export const ProductAuditHistoryQuerySchema = Type.Object({
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  beforeCreatedAt: Type.Optional(Type.String({ format: 'date-time' })),
+  beforeId: Type.Optional(Type.String({ format: 'uuid' })),
+}, { additionalProperties: false })
+
+export const ProductAuditHistoryPageSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  events: Type.Array(ProductManagementAuditEventSchema, { maxItems: 100 }),
+  nextCursor: Type.Union([Type.Object({
+    createdAt: Type.String({ format: 'date-time' }),
+    id: Type.String({ format: 'uuid' }),
+  }, { additionalProperties: false }), Type.Null()]),
+}, { additionalProperties: false })
+
 const UuidSchema = Type.String({ format: 'uuid' })
 const SortOrderSchema = Type.Integer({ minimum: 0, maximum: 1_000_000 })
 const CategoryNameSchema = Type.String({ minLength: 1, maxLength: 120 })
@@ -491,6 +603,18 @@ export type ProductOptionGroup = Static<typeof ProductOptionGroupSchema>
 export type ProductCategoryAssignment = Static<typeof ProductCategoryAssignmentSchema>
 export type ProductAttribute = Static<typeof ProductAttributeSchema>
 export type ProductDetail = Static<typeof ProductDetailSchema>
+export type ProductListQuery = Static<typeof ProductListQuerySchema>
+export type ProductListItem = Static<typeof ProductListItemSchema>
+export type ProductListResponse = Static<typeof ProductListResponseSchema>
+export type UpdateProductBody = Static<typeof UpdateProductBodySchema>
+export type UpdateProductLifecycleBody = Static<typeof UpdateProductLifecycleBodySchema>
+export type ProductExpectedRevisionBody = Static<typeof ProductExpectedRevisionBodySchema>
+export type ProductDeleteResult = Static<typeof ProductDeleteResultSchema>
+export type ProductManagementOperation = Static<typeof ProductManagementOperationSchema>
+export type ProductAuditSnapshot = Static<typeof ProductAuditSnapshotSchema>
+export type ProductManagementAuditEvent = Static<typeof ProductManagementAuditEventSchema>
+export type ProductAuditHistoryQuery = Static<typeof ProductAuditHistoryQuerySchema>
+export type ProductAuditHistoryPage = Static<typeof ProductAuditHistoryPageSchema>
 export type AdminProductCategory = Static<typeof AdminProductCategorySchema>
 export type CreateProductCategoryBody = Static<typeof CreateProductCategoryBodySchema>
 export type UpdateProductCategoryBody = Static<typeof UpdateProductCategoryBodySchema>

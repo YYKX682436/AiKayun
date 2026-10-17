@@ -68,7 +68,7 @@ export function catalogDatabaseFailure(error: unknown): { status: number; code: 
     if (constraint === 'product_categories_parent_id_fkey') {
       return conflict('CATEGORY_REFERENCE_CONFLICT', 'The category has a parent or child reference that must be resolved first')
     }
-    return conflict('CATALOG_REFERENCE_CONFLICT', 'A catalog item is still referenced and cannot be removed')
+    return conflict('CATALOG_REFERENCE_CONFLICT', 'A catalog item is still referenced and cannot be removed; archive the product when business history must be retained')
   }
   if (databaseError.code === '23514') {
     const known: Record<string, { status: number; code: string; message: string }> = {

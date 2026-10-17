@@ -21,6 +21,7 @@ import type { Database } from './db/types.js'
 import { registerAdminAuthRoutes } from './auth/admin.js'
 import { hashPassword } from './auth/password.js'
 import { registerAdminProductRoutes } from './catalog/admin-products.js'
+import { registerAdminProductManagementRoutes } from './catalog/admin-product-management.js'
 import { defaultProductIdentityFactory } from './catalog/admin-products.js'
 import type { ProductIdentityFactory } from './catalog/admin-products.js'
 import { registerAdminCategoryRoutes } from './catalog/admin-categories.js'
@@ -124,6 +125,7 @@ export async function createApp(options: {
   registerAdminAuthRoutes(app, db, config, dummyPasswordHash)
   const identityFactory = options.productIdentityFactory ?? defaultProductIdentityFactory
   registerAdminProductRoutes(app, db, config, identityFactory)
+  registerAdminProductManagementRoutes(app, db, config, identityFactory)
   registerAdminCategoryRoutes(app, db, config)
   registerAdminProductDetailRoutes(app, db, config)
   registerAdminVariantMatrixRoutes(app, db, config, identityFactory)
