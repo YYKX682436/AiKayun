@@ -866,7 +866,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       order by tablename
     `.execute(db)
     expect(result.rows.map((row) => row.table_name)).toEqual([
-      'admin_sessions', 'admin_users', 'product_attributes', 'product_categories',
+      'admin_product_creation_requests', 'admin_sessions', 'admin_users', 'product_attributes', 'product_categories',
       'product_category_assignments', 'product_category_tree_guard', 'product_management_audit_events',
       'product_media', 'product_media_references', 'product_media_variants',
       'product_option_groups', 'product_option_values',
@@ -4257,5 +4257,150 @@ describe('D5 product media and rich content', () => {
     const detail = await getAdminProduct(auth, product.id)
     expect(detail.statusCode).toBe(503)
     expect(detail.json().error.code).toBe('MEDIA_VARIANT_UNAVAILABLE')
+  }, 30_000)
+})
+
+describe('D6 product management API additions', () => {
+  it('replays product draft creation by idempotency key and rejects changed payloads', async () => {
+    const auth = await loginAdmin()
+    const key = randomUUID()
+    const headers = { ...productHeaders(auth), 'idempotency-key': key }
+    const body = productBody('D6 idempotent draft')
+
+    const created = await app.inject({ method: 'POST', url: '/api/v1/admin/products', headers, payload: body })
+    const replayed = await app.inject({ method: 'POST', url: '/api/v1/admin/products', headers, payload: body })
+    expect(created.statusCode).toBe(201)
+    expect(replayed.statusCode).toBe(200)
+    expect(replayed.json<{ data: ProductDetail }>().data.id).toBe(created.json<{ data: ProductDetail }>().data.id)
+
+    const changed = await app.inject({
+      method: 'POST', url: '/api/v1/admin/products', headers, payload: productBody('D6 changed payload'),
+    })
+    expect(changed.statusCode).toBe(409)
+    expect(changed.json().error.code).toBe('PRODUCT_CREATION_KEY_CONFLICT')
+  })
+
+  it('pages and atomically updates SKU prices with revision checks', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, 'D6 paginated price management')
+    const groupId = randomUUID()
+    const firstValueId = randomUUID()
+    const secondValueId = randomUUID()
+    const matrix = await saveMatrix(auth, product.id, {
+      expectedRevision: product.revision,
+      mode: 'selected',
+      groups: [optionGroup('版本', groupId, [{ id: firstValueId, name: '标准' }, { id: secondValueId, name: '高级' }])],
+      combinations: [
+        { optionValueIds: [firstValueId], salePrice: '19.90', enabled: true },
+        { optionValueIds: [secondValueId], salePrice: '39.90', enabled: true },
+      ],
+    })
+    const updatedProduct = matrix.json<{ data: { product: ProductDetail } }>().data.product
+    const pageOne = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=1`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    const pageTwo = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=2&pageSize=1`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(pageOne.statusCode).toBe(200)
+    expect(pageTwo.statusCode).toBe(200)
+    const first = pageOne.json<{ data: { items: Array<{ skuId: string; skuRevision: number; productRevision: number }>; total: number; totalPages: number } }>().data
+    const second = pageTwo.json<{ data: { items: Array<{ skuId: string; skuRevision: number }> } }>().data
+    expect(first).toMatchObject({ total: 2, totalPages: 2 })
+    expect(first.items[0]?.productRevision).toBe(updatedProduct.revision)
+    expect(first.items[0]?.skuId).not.toBe(second.items[0]?.skuId)
+
+    const prices = [first.items[0]!, second.items[0]!]
+    const batch = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/prices/batch`,
+      headers: productHeaders(auth),
+      payload: {
+        expectedRevision: first.items[0]!.productRevision,
+        updates: prices.map((price, index) => ({
+          skuId: price.skuId,
+          expectedSkuRevision: price.skuRevision,
+          ...(index === 0 ? { salePrice: '18.80', compareAtPrice: '28.80' } : { salePrice: '38.80', costPrice: '1.23456' }),
+        })),
+      },
+    })
+    expect(batch.statusCode).toBe(200)
+    const batchData = batch.json<{ data: { productRevision: number; items: Array<{ skuId: string; salePrice: string; compareAtPrice: string | null; costPrice: string | null }> } }>().data
+    const saved = batchData.items
+    expect(saved.map(item => item.salePrice).sort()).toEqual(['18.80', '38.80'])
+    expect(saved.find(item => item.salePrice === '18.80')).toMatchObject({ compareAtPrice: '28.80', costPrice: null })
+    expect(saved.find(item => item.salePrice === '38.80')).toMatchObject({ costPrice: '1.23456' })
+
+    const staleBatch = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/prices/batch`,
+      headers: productHeaders(auth),
+      payload: {
+        expectedRevision: batchData.productRevision,
+        updates: prices.map((price, index) => ({
+          skuId: price.skuId,
+          expectedSkuRevision: index === 0 ? 99 : price.skuRevision,
+          salePrice: '1.00',
+        })),
+      },
+    })
+    expect(staleBatch.statusCode).toBe(409)
+    const afterConflict = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=20`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(afterConflict.json<{ data: { items: Array<{ salePrice: string }> } }>().data.items.map(item => item.salePrice).sort())
+      .toEqual(['18.80', '38.80'])
+  })
+
+  it('lists reusable media, exposes the gallery cover, and filters inventory history by operation ID', async () => {
+    const auth = await loginAdmin()
+    const uploaded = await uploadMedia(auth, await samplePng())
+    expect(uploaded.statusCode).toBe(201)
+    const media = uploaded.json<{ data: { id: string; variants: Array<{ variant: string }> } }>().data
+    const library = await app.inject({ method: 'GET', url: '/api/v1/admin/media?page=1&pageSize=2', headers: { cookie: auth.sessionCookie } })
+    expect(library.statusCode).toBe(200)
+    expect(library.json<{ data: { items: Array<{ id: string; referenceCount: number; variants: Array<{ variant: string; url: string }> }> } }>().data.items)
+      .toContainEqual(expect.objectContaining({ id: media.id, referenceCount: 0, variants: expect.arrayContaining([expect.objectContaining({ variant: 'detail', url: `/api/v1/media/${media.id}/detail.webp` })]) }))
+
+    const product = await createTestProduct(auth, 'D6 list cover and inventory operation')
+    const gallery = await replaceGallery(auth, product.id, product.revision, [media.id])
+    expect(gallery.statusCode).toBe(200)
+    const list = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products?search=${encodeURIComponent(product.name)}`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(list.json<{ data: { items: Array<{ coverImage: { id: string; cardUrl: string } | null }> } }>().data.items[0]?.coverImage)
+      .toMatchObject({ id: media.id, cardUrl: `/api/v1/media/${media.id}/card.webp` })
+
+    const detail = await getAdminProduct(auth, product.id)
+    const current = detail.json<{ data: ProductDetail }>().data
+    const sku = current.variants[0]!
+    const inventoryBeforeMode = await getInventorySummary(auth, product.id)
+    const inventorySku = inventoryBeforeMode.json<{ data: { variants: Array<{ skuId: string; inventoryRevision: number }> } }>().data.variants[0]!
+    const mode = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: current.revision,
+      expectedSkuRevision: sku.revision,
+      expectedInventoryRevision: inventorySku.inventoryRevision,
+      inventoryMode: 'quantity',
+    })
+    expect(mode.statusCode).toBe(200)
+    const modeData = mode.json<{ data: { inventoryRevision: number } }>().data
+    const operationId = randomUUID()
+    const adjustment = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: modeData.inventoryRevision,
+      operationId,
+      action: 'increase',
+      quantity: 3,
+      reason: 'D6 operation query',
+    })
+    expect(adjustment.statusCode).toBe(201)
+    const history = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/variants/${sku.id}/inventory/adjustments?operationId=${operationId}`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(history.statusCode).toBe(200)
+    expect(history.json().data.adjustments).toHaveLength(1)
+    expect(history.json().data.adjustments[0].operationId).toBe(operationId)
   }, 30_000)
 })

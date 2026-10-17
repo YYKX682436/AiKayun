@@ -21,6 +21,14 @@ export interface AdminSessionsTable {
   revoked_at: Date | null
 }
 
+export interface AdminProductCreationRequestsTable {
+  idempotency_key: string
+  administrator_id: string
+  payload_sha256: string
+  product_id: string
+  created_at: Generated<Date>
+}
+
 export type ProductType = 'physical' | 'digital' | 'service'
 export type ProductStatus = 'draft' | 'active' | 'paused' | 'archived'
 export type ProductInventoryMode = 'quantity' | 'resource_pool' | 'unlimited' | 'external'
@@ -187,6 +195,7 @@ export interface ProductManagementAuditEventsTable {
 export interface Database {
   admin_users: AdminUsersTable
   admin_sessions: AdminSessionsTable
+  admin_product_creation_requests: AdminProductCreationRequestsTable
   products: ProductsTable
   product_variants: ProductVariantsTable
   product_variant_quantity_inventory: ProductVariantQuantityInventoryTable

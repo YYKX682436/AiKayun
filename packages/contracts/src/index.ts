@@ -96,6 +96,39 @@ export const AdminProductVariantPricesSchema = Type.Object({
   updatedAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
 
+export const AdminProductVariantPricesQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  search: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+}, { additionalProperties: false })
+
+export const AdminProductVariantPricesPageSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  productRevision: Type.Integer({ minimum: 1 }),
+  items: Type.Array(AdminProductVariantPricesSchema, { maxItems: 100 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  total: Type.Integer({ minimum: 0 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+
+export const UpdateAdminProductVariantPricesBatchBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  updates: Type.Array(Type.Object({
+    skuId: Type.String({ format: 'uuid' }),
+    expectedSkuRevision: Type.Integer({ minimum: 1 }),
+    salePrice: Type.Optional(ProductSalePriceSchema),
+    compareAtPrice: Type.Optional(Type.Union([ProductSalePriceSchema, Type.Null()])),
+    costPrice: Type.Optional(Type.Union([ProductCostPriceSchema, Type.Null()])),
+  }, { additionalProperties: false, minProperties: 3 }), { minItems: 1, maxItems: 50 }),
+}, { additionalProperties: false })
+
+export const AdminProductVariantPricesBatchResultSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  productRevision: Type.Integer({ minimum: 1 }),
+  items: Type.Array(AdminProductVariantPricesSchema, { minItems: 1, maxItems: 50 }),
+}, { additionalProperties: false })
+
 export const UpdateAdminProductVariantPricesBodySchema = Type.Object({
   expectedRevision: Type.Integer({ minimum: 1 }),
   expectedSkuRevision: Type.Integer({ minimum: 1 }),
@@ -204,6 +237,7 @@ export const InventoryAdjustmentPageSchema = Type.Object({
 
 export const InventoryAdjustmentQuerySchema = Type.Object({
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  operationId: Type.Optional(Type.String({ format: 'uuid' })),
   beforeCreatedAt: Type.Optional(Type.String({ format: 'date-time' })),
   beforeId: Type.Optional(Type.String({ format: 'uuid' })),
 }, { additionalProperties: false })
@@ -338,6 +372,27 @@ export const ProductMediaMetadataSchema = Type.Object({
   variants: Type.Array(ProductMediaVariantMetadataSchema, { minItems: 3, maxItems: 3 }),
 }, { additionalProperties: false })
 
+export const ProductMediaLibraryQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  search: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+}, { additionalProperties: false })
+
+export const ProductMediaLibraryItemSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  createdAt: Type.String({ format: 'date-time' }),
+  variants: Type.Array(ProductMediaVariantMetadataSchema, { minItems: 3, maxItems: 3 }),
+  referenceCount: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+
+export const ProductMediaLibraryPageSchema = Type.Object({
+  items: Type.Array(ProductMediaLibraryItemSchema, { maxItems: 100 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  total: Type.Integer({ minimum: 0 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+
 export const ProductGalleryImageSchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
   sortOrder: Type.Integer({ minimum: 0, maximum: 19 }),
@@ -428,6 +483,7 @@ export const ProductListItemSchema = Type.Object({
   name: Type.String({ minLength: 1, maxLength: 200 }),
   productType: ProductTypeSchema,
   status: ProductStatusSchema,
+  coverImage: Type.Union([ProductGalleryImageSchema, Type.Null()]),
   skuCount: Type.Integer({ minimum: 1, maximum: 1000 }),
   priceRange: Type.Union([Type.Object({
     min: ProductSalePriceSchema,
@@ -698,6 +754,10 @@ export type ProductCostPrice = Static<typeof ProductCostPriceSchema>
 export type ProductInventoryMode = Static<typeof ProductInventoryModeSchema>
 export type NullableProductInventoryMode = Static<typeof NullableProductInventoryModeSchema>
 export type AdminProductVariantPrices = Static<typeof AdminProductVariantPricesSchema>
+export type AdminProductVariantPricesQuery = Static<typeof AdminProductVariantPricesQuerySchema>
+export type AdminProductVariantPricesPage = Static<typeof AdminProductVariantPricesPageSchema>
+export type UpdateAdminProductVariantPricesBatchBody = Static<typeof UpdateAdminProductVariantPricesBatchBodySchema>
+export type AdminProductVariantPricesBatchResult = Static<typeof AdminProductVariantPricesBatchResultSchema>
 export type UpdateAdminProductVariantPricesBody = Static<typeof UpdateAdminProductVariantPricesBodySchema>
 export type ProductInventoryStatus = Static<typeof ProductInventoryStatusSchema>
 export type AdminProductVariantInventory = Static<typeof AdminProductVariantInventorySchema>
@@ -719,6 +779,9 @@ export type ProductAttribute = Static<typeof ProductAttributeSchema>
 export type ProductMediaVariant = Static<typeof ProductMediaVariantSchema>
 export type ProductMediaVariantMetadata = Static<typeof ProductMediaVariantMetadataSchema>
 export type ProductMediaMetadata = Static<typeof ProductMediaMetadataSchema>
+export type ProductMediaLibraryQuery = Static<typeof ProductMediaLibraryQuerySchema>
+export type ProductMediaLibraryItem = Static<typeof ProductMediaLibraryItemSchema>
+export type ProductMediaLibraryPage = Static<typeof ProductMediaLibraryPageSchema>
 export type ProductGalleryImage = Static<typeof ProductGalleryImageSchema>
 export type ReplaceProductGalleryBody = Static<typeof ReplaceProductGalleryBodySchema>
 export type ProductGalleryResponse = Static<typeof ProductGalleryResponseSchema>
@@ -742,6 +805,7 @@ export type ProductManagementAuditEvent = Static<typeof ProductManagementAuditEv
 export type ProductAuditHistoryQuery = Static<typeof ProductAuditHistoryQuerySchema>
 export type ProductAuditHistoryPage = Static<typeof ProductAuditHistoryPageSchema>
 export type AdminProductCategory = Static<typeof AdminProductCategorySchema>
+export type AdminProductCategories = Static<typeof AdminProductCategoriesSchema>
 export type CreateProductCategoryBody = Static<typeof CreateProductCategoryBodySchema>
 export type UpdateProductCategoryBody = Static<typeof UpdateProductCategoryBodySchema>
 export type DeleteProductCategoryBody = Static<typeof DeleteProductCategoryBodySchema>

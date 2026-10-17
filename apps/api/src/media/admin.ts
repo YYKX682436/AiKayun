@@ -1,6 +1,6 @@
 import multipart from '@fastify/multipart'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
-import type { Kysely } from 'kysely'
+import { sql, type Kysely } from 'kysely'
 import {
   ApiErrorSchema,
   ApiSuccessSchemaOf,
@@ -9,6 +9,8 @@ import {
   ProductGalleryResponseSchema,
   ProductIdParamsSchema,
   ProductMediaDeleteResponseSchema,
+  ProductMediaLibraryPageSchema,
+  ProductMediaLibraryQuerySchema,
   ProductMediaMetadataSchema,
   ProductRichContentResponseSchema,
   ReplaceProductGalleryBodySchema,
@@ -18,6 +20,8 @@ import {
 } from '@aikayun/contracts'
 import type {
   ProductMediaVariant,
+  ProductMediaLibraryPage,
+  ProductMediaLibraryQuery,
   ReplaceProductGalleryBody,
   SaveProductRichContentBody,
 } from '@aikayun/contracts'
@@ -239,6 +243,83 @@ export async function registerProductMediaRoutes(
     await scope.register(multipart, {
       limits: multipartLimits,
       throwFileSizeLimit: false,
+    })
+
+    scope.get('/api/v1/admin/media', {
+      preHandler: authenticate,
+      schema: {
+        tags: ['admin', 'catalog'],
+        summary: 'List processed product images with reference counts',
+        querystring: ProductMediaLibraryQuerySchema,
+        response: { 200: ApiSuccessSchemaOf(ProductMediaLibraryPageSchema), 400: ApiErrorSchema, 401: ApiErrorSchema },
+      },
+    }, async (request, reply) => {
+      try {
+        const query = request.query as ProductMediaLibraryQuery
+        const page = query.page ?? 1
+        const pageSize = query.pageSize ?? 20
+        const offset = (page - 1) * pageSize
+        const search = query.search?.trim()
+        const predicate = search ? sql`WHERE media.id::text ILIKE ${`%${search}%`}` : sql``
+        const total = await sql<{ total: number }>`
+          SELECT count(*)::integer AS total FROM product_media AS media ${predicate}
+        `.execute(db)
+        type MediaRow = {
+          id: string
+          created_at: Date
+          reference_count: number
+          variants: Array<{
+            variant: ProductMediaVariant
+            width: number
+            height: number
+            sizeBytes: number
+            sha256: string
+            processingVersion: string
+          }>
+        }
+        const rows = await sql<MediaRow>`
+          SELECT media.id, media.created_at,
+            COALESCE(media_refs.reference_count, 0)::integer AS reference_count,
+            jsonb_agg(jsonb_build_object(
+              'variant', image.variant,
+              'width', image.width,
+              'height', image.height,
+              'sizeBytes', image.size_bytes,
+              'sha256', trim(image.sha256),
+              'processingVersion', image.processing_version
+            ) ORDER BY CASE image.variant WHEN 'thumbnail' THEN 0 WHEN 'card' THEN 1 ELSE 2 END) AS variants
+          FROM product_media AS media
+          LEFT JOIN LATERAL (
+            SELECT count(*) AS reference_count
+            FROM product_media_references AS reference
+            WHERE reference.media_id = media.id
+          ) AS media_refs ON TRUE
+          INNER JOIN product_media_variants AS image ON image.media_id = media.id
+          ${predicate}
+          GROUP BY media.id, media.created_at, media_refs.reference_count
+          ORDER BY media.created_at DESC, media.id DESC
+          LIMIT ${pageSize} OFFSET ${offset}
+        `.execute(db)
+        const result: ProductMediaLibraryPage = {
+          page,
+          pageSize,
+          total: total.rows[0]?.total ?? 0,
+          totalPages: (total.rows[0]?.total ?? 0) === 0 ? 0 : Math.ceil((total.rows[0]?.total ?? 0) / pageSize),
+          items: rows.rows.map((row) => ({
+            id: row.id,
+            createdAt: row.created_at.toISOString(),
+            referenceCount: row.reference_count,
+            variants: row.variants.map((variant) => ({
+              ...variant,
+              url: `/api/v1/media/${row.id}/${variant.variant}.webp`,
+              contentType: 'image/webp' as const,
+            })),
+          })),
+        }
+        return reply.send(success(result, request.id))
+      } catch (error) {
+        return fail(reply, error, request.id)
+      }
     })
 
     scope.post('/api/v1/admin/media', {

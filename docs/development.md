@@ -112,6 +112,20 @@ pnpm media:check
 
 D5 集成测试使用真实 PostgreSQL 和独立临时媒体目录；测试数据库必须以 `_test` 结尾。覆盖真实 multipart、Sharp 图像处理、媒体磁盘读写/摘要、事务失败清理、引用共享/复制/删除、Tiptap 恶意结构拒绝和并发修订保护。全栈 Compose 联合备份/恢复见 [部署与恢复](deployment.md)。
 
+## ③-D6 商品管理后台
+
+后台页面为 `/admin/products`、`/admin/products/new` 和 `/admin/products/:id`，仅开放商品管理导航。列表使用 D4 服务端分页查询并将搜索、状态、性质、分类和排序保存在 URL；手机改用卡片布局。新建页用 D1 草稿及默认 SKU 接口，并发送 UUID `Idempotency-Key`；迁移 `202610170004_product_creation_idempotency` 在数据库保留键、管理员、规范化载荷摘要和创建商品身份，使相同请求安全返回原商品。
+
+- D6 新增 `GET /api/v1/admin/products/:id/prices?page=...&pageSize=...` 和 `PATCH /api/v1/admin/products/:id/prices/batch`。批量接口每次最多 50 个 SKU，在同一事务校验商品修订、每个 SKU 修订、退役状态、售价/划线价关系和成本精度，再返回当前价格页。资金始终作为十进制字符串处理。
+- `GET /api/v1/admin/media?page=...&pageSize=...` 提供可复用图片库及引用数量；商品列表 API 返回相册封面投影。图库移除仅解除当前商品引用，独立 `DELETE /api/v1/admin/media/:id` 仍受共享引用检查和数据库外键保护。
+- 库存流水查询 `GET /api/v1/admin/products/:id/variants/:variantId/inventory/adjustments` 可按 `operationId` 找回结果。浏览器请求结果不确定时保存原 operationId，先查流水再以原请求内容安全重试；数量及流水只由服务端决定。
+- 上传仍经过浏览器 FormData、Nuxt BFF 的 H3 `proxyRequest`、Fastify multipart、Sharp 和真实媒体目录。Chromium E2E 检查浏览器 multipart `Content-Length`，并在 `aikayun_test` 的 API、数据库和文件目录上完成上传与图片读取；JSON body limit 保持原值。
+- 图文详情使用 Nuxt UI `UEditor`（Tiptap），图片节点扩展将编辑器 `src` 绑定转换为 D5 `{ mediaId, alt? }` 契约。保存前共享 TypeBox/富文本校验与服务端白名单仍为最终边界。
+
+`apps/web/test/e2e/admin-products.spec.ts` 覆盖真实商品创建和刷新、分类关联、规格/SKU 身份与价格、浏览器图片上传、富文本重载、库存不确定响应后同 operationId 查询、完整生命周期、商品复制/删除、库存历史阻止删除与归档保留，以及旧商品修订冲突、SSR 未授权首屏、320px/浅深色主题。页面以同一 `_test` PostgreSQL 数据库运行，测试会重置该测试库，不连接生产数据或媒体目录。
+
+顾客可见的商品首页、搜索、商品详情和购买流程属于 D7，D6 不提供这些路由或虚构的订单、销量和交付能力。
+
 ## Compose 全栈
 
 `docker compose up -d --build` 启动 PostgreSQL、迁移、Fastify、Nuxt SSR 和 Caddy。默认 HTTP 入口是 <http://localhost:8080>，HTTPS 入口预留为 8443；宿主机端口只绑定 `127.0.0.1`，开发默认站点只监听 HTTP。`docker compose down` 保留数据卷，`docker compose down -v` 会删除 PostgreSQL 和 Caddy 数据卷。

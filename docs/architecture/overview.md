@@ -4,7 +4,7 @@
 
 AiKayun 是可独立部署、可通过商业授权销售的数字商品商城。系统采用 TypeScript 模块化单体：一个 Nuxt 前端工程通过同源 BFF 路由调用单一 Fastify API，API 与前端共用 TypeBox 契约。当前目录按可运行的技术边界拆分，不预先创建空业务模块。
 
-当前已实现商城基础、后台基础、管理员安全入口，以及阶段③-D1～D5 的商品、媒体、富文本、分类、动态规格、SKU、价格、库存和商品生命周期管理 API。商品管理页面和前台商品详情尚未实现；消费者账户、订单、支付和履约仍不在数据库范围内，卡密/账号资源池、第三方库存同步及公开商品接口也尚未实现。后续按阶段推进，避免以插件名义引入没有明确边界的万能扩展框架。
+当前已实现商城基础、后台基础、管理员安全入口，以及阶段③-D1～D6 的商品管理 API 与商品管理后台。D7 商城前台商品首页、搜索和商品详情尚未实现；消费者账户、订单、支付和履约仍不在数据库范围内，卡密/账号资源池、第三方库存同步及公开商品接口也尚未实现。后续按阶段推进，避免以插件名义引入没有明确边界的万能扩展框架。
 
 旧 MyShop 仓库只允许在后续需要时只读核对业务经验；本工程不复制其代码，不继承其数据库、API、配置或部署依赖，也不接入闲鱼系统。
 
@@ -64,9 +64,21 @@ SKU 矩阵预览会标出因正库存、预留或库存调整历史而无法移�
 
 `product_media_references` 是商品图片引用的唯一关系来源：`source = gallery` 表示相册，`source = rich_content` 表示正文引用。图库每商品最多 20 张，`sort_order = 0` 是封面；同一媒体可在多个商品、图库和正文间复用。相册/正文修改都锁定商品并校验 `expectedRevision`，归档商品在恢复为草稿前不可编辑。媒体外键使用 `ON DELETE RESTRICT`，所以删除 API 无法越过任何商品引用；永久删除商品只删除其自身引用行，归档保留引用，复制则复用媒体身份并复制正文关系。
 
-富文本 JSON 仅允许服务端明确验证的段落、1～3 级标题、加粗、斜体、安全链接、无序/有序列表、引用、分隔线、换行和商品图片节点。空正文写入时规范化为含一个空段落的 Tiptap `doc`，符合 ProseMirror 文档节点结构。文档限制为 128 KiB、50,000 个文本字符、500 个节点、20 层嵌套和 100 张图。图片节点使用 `{ type: "image", attrs: { mediaId, alt? } }`，拒绝 `src`、任意 URL、`data:`、`blob:` 和客户端路径。链接只接受 HTTP(S)、mailto、tel、站内根相对路径和片段；属性采用精确白名单。共享 `productRichContentToSafeHtml` 只从通过服务端校验的 JSON 生成转义 HTML，未来前台仍需以该可信转换边界渲染。当前没有创建编辑器或商品页面。
+富文本 JSON 仅允许服务端明确验证的段落、1～3 级标题、加粗、斜体、安全链接、无序/有序列表、引用、分隔线、换行和商品图片节点。空正文写入时规范化为含一个空段落的 Tiptap `doc`，符合 ProseMirror 文档节点结构。文档限制为 128 KiB、50,000 个文本字符、500 个节点、20 层嵌套和 100 张图。图片节点使用 `{ type: "image", attrs: { mediaId, alt? } }`，拒绝 `src`、任意 URL、`data:`、`blob:` 和客户端路径。链接只接受 HTTP(S)、mailto、tel、站内根相对路径和片段；属性采用精确白名单。共享 `productRichContentToSafeHtml` 只从通过服务端校验的 JSON 生成转义 HTML，未来前台仍需以该可信转换边界渲染。D6 管理后台通过 Nuxt UI `UEditor` 与 Tiptap 自定义图片节点适配该 JSON；D7 前台详情正文渲染尚未实现。
 
 图片公开地址为同源 `/api/v1/media/:id/:variant.webp`，经已有 Nuxt `/api/**` BFF 转发，不增加第二套媒体代理或 Caddy 路由。它只按 UUID 和固定变体读取已登记路径，支持 GET/HEAD、SHA-256 ETag、Last-Modified、条件 304 和一年 immutable 缓存。磁盘文件不在每次请求时解码或转换。
+
+## ③-D6 商品管理后台
+
+D6 开放 `/admin/products`、`/admin/products/new` 和 `/admin/products/:id`，沿用已有管理员登录、`admin-auth` 路由中间件、Nuxt 同源 BFF、`UDashboard` 布局与 AiKayun 蓝色后台主题。页面服务端不读取商品列表或详情，未登录首屏不会输出商品管理数据；写 API 仍逐请求检查管理员会话、Origin、CSRF 和各自的商品、SKU 或库存修订。
+
+列表通过 D4 服务端分页、搜索、分类/状态/性质过滤和日期/价格排序，查询状态写入 URL。创建仍由 D1 创建草稿及默认 SKU，`Idempotency-Key` 通过 `admin_product_creation_requests` 与商品同事务登记，浏览器刷新/重试可返回原商品。SKU 价格列表分页读取，批量修改最多 50 个 SKU、检查商品和 SKU 修订并在单事务内写入；商品列表封面直接由相册首图投影得到。媒体库分页返回引用数量，媒体文件只有完全未引用时才允许永久删除。
+
+SKU 矩阵保存前调用 D2 预览，保留 ID/组合可匹配的 SKU；D1 无规格默认 SKU 加入规格组时必须由管理员显式永久退役，再创建有明确价格/启用状态的新组合。退役身份与历史保留，库存或引用阻止时预览/保存显示原因。库存摘要、模式和 `inventory_revision` 继续用 D3 独立接口；调整以唯一 `operationId` 幂等提交，失败后先按同一 ID 查流水再重试。库存流水支持服务端游标分页及 operationId 筛选。
+
+图片仍按 FormData → Nuxt `proxyRequest` → Fastify multipart → Sharp → PostgreSQL 元数据与媒体目录的链路处理。Chromium 浏览器回归记录 multipart `Content-Length` 并观察上传返回 201，图片 URL 经同源 BFF 访问；全局 JSON body limit 和 Fastify 内部监听边界保持不变。UEditor 的基础格式映射到现有 Tiptap 节点；图片使用自定义 `mediaId` 节点，读写都执行共享契约校验，不将公开 URL 存为媒体身份。
+
+阶段③-D6 不开放商城顾客商品页面；订单、销量、购买能力、卡密资源池、自动发货和供应商集成仍未实现。
 
 ## 管理员认证
 

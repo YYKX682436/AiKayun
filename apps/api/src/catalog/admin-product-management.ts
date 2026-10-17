@@ -184,6 +184,11 @@ type ProductListDbRow = {
   name: string
   product_type: ProductType
   status: ProductStatus
+  cover_image_id: string | null
+  cover_created_at: Date | null
+  cover_sort_order: number | null
+  cover_width: number | null
+  cover_height: number | null
   sku_count: number
   min_sale_price: string | null
   max_sale_price: string | null
@@ -238,6 +243,11 @@ async function listProducts(db: Kysely<Database>, query: ProductListQuery): Prom
       product.name,
       product.product_type,
       product.status,
+      cover.media_id AS cover_image_id,
+      cover.created_at AS cover_created_at,
+      cover.sort_order AS cover_sort_order,
+      cover.width AS cover_width,
+      cover.height AS cover_height,
       product.revision,
       product.created_at,
       product.updated_at,
@@ -258,6 +268,15 @@ async function listProducts(db: Kysely<Database>, query: ProductListQuery): Prom
         WHERE assignment.product_id = product.id
       ), '[]'::jsonb) AS categories
     FROM products AS product
+    LEFT JOIN LATERAL (
+      SELECT media.id AS media_id, media.created_at, reference.sort_order, image.width, image.height
+      FROM product_media_references AS reference
+      INNER JOIN product_media AS media ON media.id = reference.media_id
+      INNER JOIN product_media_variants AS image ON image.media_id = media.id AND image.variant = 'detail'
+      WHERE reference.product_id = product.id AND reference.source = 'gallery'
+      ORDER BY reference.sort_order, media.id
+      LIMIT 1
+    ) AS cover ON TRUE
     ${where}
     ORDER BY ${sql.raw(sortExpression)} ${sql.raw(sortOrder)} NULLS LAST, product.id ASC
     LIMIT ${pageSize} OFFSET ${offset}
@@ -283,6 +302,16 @@ async function listProducts(db: Kysely<Database>, query: ProductListQuery): Prom
       name: row.name,
       productType: row.product_type,
       status: row.status,
+      coverImage: row.cover_image_id === null || !row.cover_created_at || row.cover_width === null || row.cover_height === null ? null : {
+        id: row.cover_image_id,
+        sortOrder: row.cover_sort_order ?? 0,
+        width: row.cover_width,
+        height: row.cover_height,
+        thumbnailUrl: `/api/v1/media/${row.cover_image_id}/thumbnail.webp`,
+        cardUrl: `/api/v1/media/${row.cover_image_id}/card.webp`,
+        detailUrl: `/api/v1/media/${row.cover_image_id}/detail.webp`,
+        createdAt: row.cover_created_at.toISOString(),
+      },
       skuCount: row.sku_count,
       priceRange,
       categories: row.categories,

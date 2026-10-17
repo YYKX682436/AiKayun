@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { Kysely } from 'kysely'
 import {
@@ -171,12 +171,7 @@ export async function loadProduct(db: Kysely<Database>, id: string): Promise<Pro
   }
 }
 
-export async function createDraftProduct(
-  db: Kysely<Database>,
-  body: CreateProductBody,
-  administratorId: string,
-  identityFactory: ProductIdentityFactory = defaultProductIdentityFactory,
-): Promise<ProductDetail> {
+function normalizeCreateBody(body: CreateProductBody) {
   const name = body.name.trim()
   if (!name) {
     throw new ProductInputError('INVALID_PRODUCT_NAME', 'Product name must not be empty')
@@ -185,12 +180,20 @@ export async function createDraftProduct(
     throw new ProductInputError('INVALID_PRODUCT_NAME', 'Product name must be at most 200 characters')
   }
   const salePrice = normalizedSalePrice(body.defaultSku.salePrice)
+  return { name, description: body.description ?? '', productType: body.productType, salePrice }
+}
 
-  return db.transaction().execute(async (trx) => {
+async function insertDraftProduct(
+  trx: Kysely<Database>,
+  body: ReturnType<typeof normalizeCreateBody>,
+  administratorId: string,
+  productId: string,
+  identityFactory: ProductIdentityFactory,
+): Promise<ProductDetail> {
     const product = await trx.insertInto('products').values({
-      id: identityFactory.nextProductId(),
-      name,
-      description: body.description ?? '',
+      id: productId,
+      name: body.name,
+      description: body.description,
       product_type: body.productType,
       status: 'draft',
     }).returningAll().executeTakeFirstOrThrow()
@@ -200,7 +203,7 @@ export async function createDraftProduct(
       product_id: product.id,
       sku_code: identityFactory.nextSkuCode(),
       combination_key: '',
-      sale_price: salePrice,
+      sale_price: body.salePrice,
       enabled: true,
     }).executeTakeFirstOrThrow()
 
@@ -223,6 +226,54 @@ export async function createDraftProduct(
     const created = await loadProduct(trx, product.id)
     if (!created) throw new Error('Created product could not be read inside its transaction')
     return created
+}
+
+export async function createDraftProduct(
+  db: Kysely<Database>,
+  body: CreateProductBody,
+  administratorId: string,
+  identityFactory: ProductIdentityFactory = defaultProductIdentityFactory,
+): Promise<ProductDetail> {
+  const normalized = normalizeCreateBody(body)
+  return db.transaction().execute((trx) => insertDraftProduct(
+    trx, normalized, administratorId, identityFactory.nextProductId(), identityFactory,
+  ))
+}
+
+export async function createDraftProductIdempotently(
+  db: Kysely<Database>,
+  body: CreateProductBody,
+  administratorId: string,
+  idempotencyKey: string,
+  identityFactory: ProductIdentityFactory = defaultProductIdentityFactory,
+): Promise<{ product: ProductDetail; replayed: boolean }> {
+  const normalized = normalizeCreateBody(body)
+  const payloadHash = createHash('sha256').update(JSON.stringify(normalized)).digest('hex')
+  const productId = identityFactory.nextProductId()
+  return db.transaction().execute(async (trx) => {
+    const reservation = await trx.insertInto('admin_product_creation_requests').values({
+      idempotency_key: idempotencyKey,
+      administrator_id: administratorId,
+      payload_sha256: payloadHash,
+      product_id: productId,
+    }).onConflict((conflict) => conflict.column('idempotency_key').doNothing())
+      .returning('idempotency_key').executeTakeFirst()
+
+    if (!reservation) {
+      const existing = await trx.selectFrom('admin_product_creation_requests').selectAll()
+        .where('idempotency_key', '=', idempotencyKey).forUpdate().executeTakeFirst()
+      if (!existing || existing.administrator_id !== administratorId || existing.payload_sha256.trim() !== payloadHash) {
+        throw new CatalogError(409, 'PRODUCT_CREATION_KEY_CONFLICT', 'This create request key was already used for different product data')
+      }
+      const product = await loadProduct(trx, existing.product_id)
+      if (!product) {
+        throw new CatalogError(409, 'PRODUCT_CREATION_KEY_EXPIRED', 'This create request already completed, but its product was later removed')
+      }
+      return { product, replayed: true }
+    }
+
+    const product = await insertDraftProduct(trx, normalized, administratorId, productId, identityFactory)
+    return { product, replayed: false }
   })
 }
 
@@ -266,6 +317,7 @@ export function productDatabaseFailure(error: unknown): { status: number; code: 
 }
 
 function sendKnownProductFailure(reply: FastifyReply, error: unknown, requestId: string) {
+  if (error instanceof CatalogError) return sendCatalogError(reply, error, requestId)
   const known = productDatabaseFailure(error)
   if (!known) throw error
   return reply.code(known.status).send(failure(known.code, known.message, requestId))
@@ -288,6 +340,7 @@ export function registerAdminProductRoutes(
       summary: 'Create a draft product and its default SKU',
       body: CreateProductBodySchema,
       response: {
+        200: ApiSuccessSchemaOf(ProductDetailSchema),
         201: ApiSuccessSchemaOf(ProductDetailSchema),
         400: ApiErrorSchema,
         401: ApiErrorSchema,
@@ -317,6 +370,14 @@ export function registerAdminProductRoutes(
       const body = request.body as CreateProductBody
       const administratorId = request.admin?.id
       if (!administratorId) return reply.code(401).send(failure('UNAUTHORIZED', 'Administrator authentication is required', request.id))
+      const idempotencyKey = request.headers['idempotency-key']
+      if (idempotencyKey !== undefined) {
+        if (typeof idempotencyKey !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(idempotencyKey)) {
+          return reply.code(400).send(failure('INVALID_IDEMPOTENCY_KEY', 'The create request key must be a UUID', request.id))
+        }
+        const result = await createDraftProductIdempotently(db, body, administratorId, idempotencyKey, identityFactory)
+        return reply.code(result.replayed ? 200 : 201).send(success(result.product, request.id))
+      }
       const product = await createDraftProduct(db, body, administratorId, identityFactory)
       return reply.code(201).send(success(product, request.id))
     } catch (error) {

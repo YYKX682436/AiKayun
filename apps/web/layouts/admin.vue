@@ -7,10 +7,14 @@ const navigationItems: NavigationMenuItem[][] = [[
     icon: 'i-lucide-layout-dashboard',
     to: '/admin',
   },
+  {
+    label: '商品管理',
+    icon: 'i-lucide-package',
+    to: '/admin/products',
+  },
 ]]
 
 const unavailableModules = [
-  { label: '商品管理', icon: 'i-lucide-package' },
   { label: '订单管理', icon: 'i-lucide-receipt' },
   { label: '经营数据', icon: 'i-lucide-chart-no-axes-column-increasing' },
 ]

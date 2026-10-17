@@ -529,6 +529,9 @@ export function registerAdminInventoryRoutes(app: FastifyInstance, db: Kysely<Da
         ])
         .where('adjustment.product_id', '=', productId)
         .where('adjustment.product_variant_id', '=', skuId)
+      if (query.operationId) {
+        statement = statement.where('adjustment.operation_id', '=', query.operationId)
+      }
       if (query.beforeCreatedAt && query.beforeId) {
         statement = statement.where(sql<boolean>`(
           adjustment.created_at < ${query.beforeCreatedAt}::timestamptz

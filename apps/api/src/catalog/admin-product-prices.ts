@@ -1,14 +1,26 @@
 import type { FastifyInstance, FastifyReply } from 'fastify'
-import type { Kysely } from 'kysely'
+import { sql, type Kysely } from 'kysely'
 import {
   AdminProductVariantPricesSchema,
+  AdminProductVariantPricesBatchResultSchema,
+  AdminProductVariantPricesPageSchema,
+  AdminProductVariantPricesQuerySchema,
   ApiErrorSchema,
   ApiSuccessSchemaOf,
+  ProductIdParamsSchema,
   ProductVariantIdParamsSchema,
+  UpdateAdminProductVariantPricesBatchBodySchema,
   UpdateAdminProductVariantPricesBodySchema,
   success,
 } from '@aikayun/contracts'
-import type { AdminProductVariantPrices, UpdateAdminProductVariantPricesBody } from '@aikayun/contracts'
+import type {
+  AdminProductVariantPrices,
+  AdminProductVariantPricesBatchResult,
+  AdminProductVariantPricesPage,
+  AdminProductVariantPricesQuery,
+  UpdateAdminProductVariantPricesBatchBody,
+  UpdateAdminProductVariantPricesBody,
+} from '@aikayun/contracts'
 import { parseUnitAmount } from '@aikayun/money'
 import type { AppConfig } from '../config.js'
 import { requireAdmin, verifyCsrf } from '../auth/admin.js'
@@ -92,6 +104,139 @@ function fail(reply: FastifyReply, error: unknown, requestId: string) {
 export function registerAdminProductPriceRoutes(app: FastifyInstance, db: Kysely<Database>, config: AppConfig): void {
   const authenticate = requireAdmin(db, config)
   const csrfCheck = verifyCsrf(config)
+
+  app.get('/api/v1/admin/products/:id/prices', {
+    preHandler: authenticate,
+    schema: {
+      tags: ['admin', 'catalog'],
+      summary: 'Read a paginated page of SKU prices for a product',
+      params: ProductIdParamsSchema,
+      querystring: AdminProductVariantPricesQuerySchema,
+      response: { 200: ApiSuccessSchemaOf(AdminProductVariantPricesPageSchema), 401: ApiErrorSchema, 404: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    const { id: productId } = request.params as { id: string }
+    const query = request.query as AdminProductVariantPricesQuery
+    try {
+      const page = query.page ?? 1
+      const pageSize = query.pageSize ?? 50
+      const offset = (page - 1) * pageSize
+      const search = query.search?.trim()
+      if (query.search !== undefined && !search) {
+        throw new CatalogError(400, 'INVALID_SKU_SEARCH', 'SKU search must not be empty')
+      }
+      const filter = search
+        ? sql`AND (variant.sku_code ILIKE ${`%${search}%`} OR variant.id::text ILIKE ${`%${search}%`})`
+        : sql``
+      const count = await sql<{ total: number }>`
+        SELECT count(*)::integer AS total
+        FROM product_variants AS variant
+        WHERE variant.product_id = ${productId}::uuid ${filter}
+      `.execute(db)
+      const total = count.rows[0]?.total ?? 0
+      if (total === 0) {
+        const exists = await db.selectFrom('products').select('id').where('id', '=', productId).executeTakeFirst()
+        if (!exists) throw new CatalogError(404, 'PRODUCT_NOT_FOUND', 'The product does not exist')
+      }
+      const rows = await sql<PriceRow>`
+        SELECT product.id AS product_id, product.revision AS product_revision,
+          variant.id AS sku_id, variant.sku_code, variant.revision AS sku_revision,
+          variant.sale_price::text AS sale_price, variant.compare_at_price::text AS compare_at_price,
+          variant.cost_price::text AS cost_price, variant.retired_at, variant.updated_at
+        FROM product_variants AS variant
+        INNER JOIN products AS product ON product.id = variant.product_id
+        WHERE variant.product_id = ${productId}::uuid ${filter}
+        ORDER BY variant.created_at, variant.id
+        LIMIT ${pageSize} OFFSET ${offset}
+      `.execute(db)
+      const result: AdminProductVariantPricesPage = {
+        productId,
+        productRevision: rows.rows[0]?.product_revision
+          ?? (await db.selectFrom('products').select('revision').where('id', '=', productId).executeTakeFirstOrThrow()).revision,
+        items: rows.rows.map(toPriceContract),
+        page,
+        pageSize,
+        total,
+        totalPages: total === 0 ? 0 : Math.ceil(total / pageSize),
+      }
+      return reply.send(success(result, request.id))
+    } catch (error) {
+      return fail(reply, error, request.id)
+    }
+  })
+
+  app.patch('/api/v1/admin/products/:id/prices/batch', {
+    preHandler: [authenticate, csrfCheck],
+    schema: {
+      tags: ['admin', 'catalog'],
+      summary: 'Atomically update prices for up to 50 product SKUs',
+      params: ProductIdParamsSchema,
+      body: UpdateAdminProductVariantPricesBatchBodySchema,
+      response: {
+        200: ApiSuccessSchemaOf(AdminProductVariantPricesBatchResultSchema),
+        400: ApiErrorSchema, 401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema,
+      },
+    },
+  }, async (request, reply) => {
+    const { id: productId } = request.params as { id: string }
+    const body = request.body as UpdateAdminProductVariantPricesBatchBody
+    try {
+      const result: AdminProductVariantPricesBatchResult = await db.transaction().execute(async (trx) => {
+        const product = await lockProductAtRevision(trx, productId, body.expectedRevision)
+        assertProductNotArchived(product)
+        const ids = body.updates.map((update) => update.skuId.toLowerCase())
+        if (new Set(ids).size !== ids.length) {
+          throw new CatalogError(400, 'DUPLICATE_SKU_PRICE_UPDATE', 'A SKU can appear only once in a batch price update')
+        }
+        const variants = await trx.selectFrom('product_variants').selectAll()
+          .where('product_id', '=', productId).where('id', 'in', ids).orderBy('id').forUpdate().execute()
+        if (variants.length !== ids.length) throw new CatalogError(404, 'SKU_NOT_FOUND', 'One or more SKUs do not belong to this product')
+        const variantById = new Map(variants.map((variant) => [variant.id, variant]))
+        const normalized = body.updates.map((update) => {
+          const variant = variantById.get(update.skuId.toLowerCase())
+          if (!variant) throw new CatalogError(404, 'SKU_NOT_FOUND', 'The SKU does not belong to this product')
+          if (variant.revision !== update.expectedSkuRevision) {
+            throw new CatalogError(409, 'SKU_REVISION_CONFLICT', `SKU ${variant.sku_code} changed; reload prices before saving`)
+          }
+          if (variant.retired_at !== null) {
+            throw new CatalogError(409, 'SKU_PERMANENTLY_RETIRED', `SKU ${variant.sku_code} is permanently retired and cannot be repriced`)
+          }
+          const salePrice = Object.hasOwn(update, 'salePrice')
+            ? normalizeSalePrice(update.salePrice!)
+            : parseUnitAmount(variant.sale_price).toFixed(2)
+          const compareAtPrice = Object.hasOwn(update, 'compareAtPrice')
+            ? normalizeOptionalPrice(update.compareAtPrice!, 'compare')
+            : variant.compare_at_price === null ? null : parseUnitAmount(variant.compare_at_price).toFixed(2)
+          const costPrice = Object.hasOwn(update, 'costPrice')
+            ? normalizeOptionalPrice(update.costPrice!, 'cost')
+            : variant.cost_price === null ? null : parseUnitAmount(variant.cost_price).toFixed(5)
+          if (compareAtPrice !== null && !parseUnitAmount(compareAtPrice).greaterThan(parseUnitAmount(salePrice))) {
+            throw new CatalogError(400, 'INVALID_COMPARE_AT_PRICE', `Compare-at price for SKU ${variant.sku_code} must be greater than its sale price`)
+          }
+          return { variantId: variant.id, salePrice, compareAtPrice, costPrice }
+        })
+
+        for (const update of normalized) {
+          await trx.updateTable('product_variants').set({
+            sale_price: update.salePrice,
+            compare_at_price: update.compareAtPrice,
+            cost_price: update.costPrice,
+          }).where('product_id', '=', productId).where('id', '=', update.variantId).execute()
+        }
+        const updatedRows = await Promise.all(normalized.map((update) => selectPriceRow(trx, productId, update.variantId)))
+        if (updatedRows.some((row) => !row)) throw new Error('Batch price updates could not be read inside the transaction')
+        const items = updatedRows.map((row) => toPriceContract(row!))
+        return {
+          productId,
+          productRevision: items[0]!.productRevision,
+          items,
+        }
+      })
+      return reply.send(success(result, request.id))
+    } catch (error) {
+      return fail(reply, error, request.id)
+    }
+  })
 
   app.get('/api/v1/admin/products/:id/variants/:variantId/prices', {
     preHandler: authenticate,
