@@ -69,7 +69,9 @@ API 集成测试连接真实 PostgreSQL 并清理测试库 schema：先从 D1 �
 - `POST /api/v1/admin/products/:id/variants/:variantId/inventory/adjustments` 支持 `increase`、`decrease` 和目标值 `set`。请求包含 UUID `operationId`、`expectedInventoryRevision` 和调整原因；相同操作重放返回原流水，复用标识但内容不同返回冲突。所有数量在服务端根据当前行锁计算，客户端不能提交权威的前后库存。
 - `GET /api/v1/admin/products/:id/variants/:variantId/inventory/adjustments?limit=50` 返回最多 100 条，使用响应中的 `(createdAt, id)` 游标继续读取。流水不可修改或删除。
 
-库存更新锁定 SKU 与数量库存行，并在一个事务中更新数量、独立 `inventory_revision` 和流水；库存写入不递增商品修订或普通 SKU 修订。模式切换和价格修改属于商品编辑，使用 D2 商品修订锁并递增商品修订。数据库延迟约束保证仅 quantity 模式拥有数量库存行，外键 `RESTRICT` 保留流水所引用的 SKU。矩阵预览在 `inventoryMutationBlocked` / `inventoryMutationBlockReason` 中说明因库存数量、预留或流水历史导致的改配/删除限制；保存会再次检查。
+SKU 临时停用不受库存数量影响；永久退役要求 quantity 模式的 `stocked` 与 `reserved` 都为 0。矩阵预览用 `retirementBlocked` / `retirementBlockReason` 明确标出正库存或预留阻止退役，保存与数据库触发器都会再次校验。已有流水不阻止清零后的退役，历史记录保持不变。升级自早期 D3、已经退役但仍有数量库存的 SKU 会原样保留；管理员可以使用带 `expectedInventoryRevision` 与 `operationId` 的减少/降低目标库存请求逐步清退，退役 SKU 不允许补货或切换模式。迁移通过 PostgreSQL NOTICE 报告这类记录数；reserved 大于零时，必须先由负责该预留的后续业务或受控维护流程释放，D3 不提供伪造的预留释放接口。
+
+库存更新锁定商品、SKU 与数量库存行，并在一个事务中更新数量、独立 `inventory_revision` 和流水；库存写入不递增商品修订或普通 SKU 修订。模式切换和价格修改属于商品编辑，使用 D2 商品修订锁并递增商品修订。数据库延迟约束保证仅 quantity 模式拥有数量库存行，外键 `RESTRICT` 保留流水所引用的 SKU。矩阵预览在 `inventoryMutationBlocked` / `inventoryMutationBlockReason` 中说明因库存数量、预留或流水历史导致的改配/删除限制；保存会再次检查。库存数量表和流水表拒绝 `TRUNCATE`，包括由 `product_variants TRUNCATE ... CASCADE` 触发的级联；测试库 schema 重置仍使用受 `_test` 名称保护的 `DROP SCHEMA ... CASCADE`。
 
 `pnpm verify` 会按顺序运行 lint、类型检查、单元/数据库测试、浏览器 E2E 和生产构建。
 

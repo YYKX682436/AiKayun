@@ -388,8 +388,9 @@ export function registerAdminInventoryRoutes(app: FastifyInstance, db: Kysely<Da
         const variant = await trx.selectFrom('product_variants').selectAll()
           .where('product_id', '=', productId).where('id', '=', skuId).forUpdate().executeTakeFirst()
         if (!variant) throw new CatalogError(404, 'SKU_NOT_FOUND', 'The SKU does not belong to this product')
-        if (variant.retired_at !== null) {
-          throw new CatalogError(409, 'SKU_PERMANENTLY_RETIRED', 'A permanently retired SKU cannot receive inventory adjustments')
+        const retired = variant.retired_at !== null
+        if (retired && requestData.action === 'increase') {
+          throw new CatalogError(409, 'SKU_PERMANENTLY_RETIRED', 'A permanently retired SKU cannot receive additional inventory')
         }
         if (variant.inventory_mode !== 'quantity') {
           throw new CatalogError(409, 'INVENTORY_MODE_CONFLICT', 'Quantity adjustments require the SKU to use quantity inventory mode')
@@ -429,6 +430,9 @@ export function registerAdminInventoryRoutes(app: FastifyInstance, db: Kysely<Da
           }
         } else {
           quantityAfter = requestData.quantity
+        }
+        if (retired && quantityAfter >= inventory.stocked) {
+          throw new CatalogError(409, 'SKU_PERMANENTLY_RETIRED', 'A permanently retired SKU only permits reducing legacy stocked quantity')
         }
         if (quantityAfter < inventory.reserved) {
           throw new CatalogError(409, 'STOCK_BELOW_RESERVED_QUANTITY', 'Stocked quantity cannot be lower than the reserved quantity')

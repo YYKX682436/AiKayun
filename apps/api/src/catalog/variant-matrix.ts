@@ -21,6 +21,8 @@ interface ExistingVariant {
   sku_code: string
   combination_key: string
   sale_price: string
+  compare_at_price: string | null
+  cost_price: string | null
   enabled: boolean
   retired_at: Date | null
   revision: number
@@ -60,6 +62,7 @@ interface PlannedVariant {
   enabled: boolean
   change: 'added' | 'retained' | 'modified'
   inventoryMutationBlockReason: 'stocked_quantity' | 'reserved_quantity' | 'adjustment_history' | null
+  retirementBlockReason: 'stocked_quantity' | 'reserved_quantity' | null
 }
 
 interface ExistingOption {
@@ -80,6 +83,7 @@ interface MatrixPlan {
   removed: ExistingVariant[]
   existingOptions: Map<string, ExistingOption[]>
   inventoryMutationBlockReasons: Map<string, 'stocked_quantity' | 'reserved_quantity' | 'adjustment_history'>
+  retirementBlockReasons: Map<string, 'stocked_quantity' | 'reserved_quantity'>
 }
 
 const salePricePattern = /^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?(?![\s\S])/
@@ -138,7 +142,7 @@ async function planMatrix(
   const [currentValues, currentVariants, linkRows, quantityRows, adjustmentRows] = await Promise.all([
     trx.selectFrom('product_option_values').selectAll().where('product_id', '=', productId).execute(),
     trx.selectFrom('product_variants')
-      .select(['id', 'product_id', 'sku_code', 'combination_key', 'sale_price', 'enabled', 'retired_at', 'revision', 'created_at', 'updated_at'])
+      .select(['id', 'product_id', 'sku_code', 'combination_key', 'sale_price', 'compare_at_price', 'cost_price', 'enabled', 'retired_at', 'revision', 'created_at', 'updated_at'])
       .where('product_id', '=', productId).execute(),
     trx.selectFrom('product_variant_option_values as selected')
       .innerJoin('product_option_groups as option_group', (join) => join
@@ -168,9 +172,15 @@ async function planMatrix(
     existingOptions.set(row.product_variant_id, options)
   }
   const inventoryMutationBlockReasons = new Map<string, 'stocked_quantity' | 'reserved_quantity' | 'adjustment_history'>()
+  const retirementBlockReasons = new Map<string, 'stocked_quantity' | 'reserved_quantity'>()
   for (const row of quantityRows) {
-    if (row.reserved > 0) inventoryMutationBlockReasons.set(row.product_variant_id, 'reserved_quantity')
-    else if (row.stocked > 0) inventoryMutationBlockReasons.set(row.product_variant_id, 'stocked_quantity')
+    if (row.reserved > 0) {
+      inventoryMutationBlockReasons.set(row.product_variant_id, 'reserved_quantity')
+      retirementBlockReasons.set(row.product_variant_id, 'reserved_quantity')
+    } else if (row.stocked > 0) {
+      inventoryMutationBlockReasons.set(row.product_variant_id, 'stocked_quantity')
+      retirementBlockReasons.set(row.product_variant_id, 'stocked_quantity')
+    }
   }
   for (const row of adjustmentRows) {
     inventoryMutationBlockReasons.set(row.product_variant_id, 'adjustment_history')
@@ -310,6 +320,9 @@ async function planMatrix(
     if (current) {
       usedSkuIds.add(current.id)
       const price = requested.salePrice === undefined ? parseUnitAmount(current.sale_price).toFixed(2) : normalizePrice(requested.salePrice)
+      if (current.compare_at_price !== null && !parseUnitAmount(price).lessThan(parseUnitAmount(current.compare_at_price))) {
+        throw new CatalogError(400, 'INVALID_COMPARE_AT_PRICE', 'The sale price must remain below the SKU compare-at price')
+      }
       const enabled = requested.enabled ?? current.enabled
       const changed = current.combination_key !== combinationKey
         || price !== parseUnitAmount(current.sale_price).toFixed(2)
@@ -326,6 +339,7 @@ async function planMatrix(
         inventoryMutationBlockReason: current.combination_key !== combinationKey
           ? inventoryMutationBlockReasons.get(current.id) ?? null
           : null,
+        retirementBlockReason: null,
       }
     }
 
@@ -344,6 +358,7 @@ async function planMatrix(
       enabled: newEnabled,
       change: 'added',
       inventoryMutationBlockReason: null,
+      retirementBlockReason: null,
     }
   })
 
@@ -394,6 +409,7 @@ async function planMatrix(
     removed,
     existingOptions,
     inventoryMutationBlockReasons,
+    retirementBlockReasons,
   }
 }
 
@@ -416,6 +432,8 @@ function matrixChanges(plan: MatrixPlan): ProductVariantMatrixPreview['changes']
     options: variant.options,
       inventoryMutationBlocked: variant.inventoryMutationBlockReason !== null,
       inventoryMutationBlockReason: variant.inventoryMutationBlockReason,
+      retirementBlocked: false,
+      retirementBlockReason: null,
   }))
   for (const variant of plan.retireNow) {
     changes.push({
@@ -427,6 +445,8 @@ function matrixChanges(plan: MatrixPlan): ProductVariantMatrixPreview['changes']
       options: oldOptions(plan, variant.id),
       inventoryMutationBlocked: false,
       inventoryMutationBlockReason: null,
+      retirementBlocked: plan.retirementBlockReasons.has(variant.id),
+      retirementBlockReason: plan.retirementBlockReasons.get(variant.id) ?? null,
     })
   }
   for (const variant of plan.removed) {
@@ -439,6 +459,8 @@ function matrixChanges(plan: MatrixPlan): ProductVariantMatrixPreview['changes']
       options: oldOptions(plan, variant.id),
       inventoryMutationBlocked: plan.inventoryMutationBlockReasons.has(variant.id),
       inventoryMutationBlockReason: plan.inventoryMutationBlockReasons.get(variant.id) ?? null,
+      retirementBlocked: false,
+      retirementBlockReason: null,
     })
   }
   return changes
@@ -469,6 +491,7 @@ async function applyMatrixPlan(
 ): Promise<ProductDetail> {
   const blockedChange = plan.combinations.find((variant) => variant.inventoryMutationBlockReason)
   const blockedRemoval = plan.removed.find((variant) => plan.inventoryMutationBlockReasons.has(variant.id))
+  const blockedRetirement = plan.retireNow.find((variant) => plan.retirementBlockReasons.has(variant.id))
   if (blockedChange || blockedRemoval) {
     const reason = blockedChange?.inventoryMutationBlockReason
       ?? (blockedRemoval ? plan.inventoryMutationBlockReasons.get(blockedRemoval.id) : undefined)
@@ -476,6 +499,17 @@ async function applyMatrixPlan(
       409,
       'SKU_HAS_REFERENCES',
       `A SKU with ${reason?.replaceAll('_', ' ')} cannot be remapped or removed; retain it as permanently retired instead`,
+    )
+  }
+  if (blockedRetirement) {
+    const reason = plan.retirementBlockReasons.get(blockedRetirement.id)
+    const reserved = reason === 'reserved_quantity'
+    throw new CatalogError(
+      409,
+      reserved ? 'SKU_STOCK_RESERVED' : 'SKU_STOCK_NOT_CLEARED',
+      reserved
+        ? 'A SKU with reserved quantity cannot be permanently retired; release reservations first'
+        : 'Stocked quantity must be reduced to zero before permanently retiring a SKU',
     )
   }
   await sql`SET CONSTRAINTS product_variants_product_combination_unique DEFERRED`.execute(trx)

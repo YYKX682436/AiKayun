@@ -5,6 +5,7 @@ import { productSkuInvariantMigration } from './migrations/202610160002_product_
 import { productTaxonomyOptionsMigration } from './migrations/202610160003_product_taxonomy_options.js'
 import { productCatalogR1Migration } from './migrations/202610160004_product_catalog_r1.js'
 import { productPricingInventoryMigration } from './migrations/202610160005_product_pricing_inventory.js'
+import { inventoryRetirementSafetyMigration } from './migrations/202610170001_inventory_retirement_safety.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -15,6 +16,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610160003_product_taxonomy_options': productTaxonomyOptionsMigration,
       '202610160004_product_catalog_r1': productCatalogR1Migration,
       '202610160005_product_pricing_inventory': productPricingInventoryMigration,
+      '202610170001_inventory_retirement_safety': inventoryRetirementSafetyMigration,
     }
   }
 }

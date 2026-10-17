@@ -33,6 +33,13 @@ const migrationD2Sentinel = {
   variantId: '00000000-0000-4000-8000-000000000202',
   skuCode: 'SKU-D2-MIGRATION-SENTINEL',
 }
+const legacyRetiredInventorySentinel = {
+  productId: '00000000-0000-4000-8000-000000000301',
+  variantId: '00000000-0000-4000-8000-000000000302',
+  skuCode: 'SKU-LEGACY-RETIRED-STOCK',
+  adjustmentId: '00000000-0000-4000-8000-000000000303',
+  operationId: '00000000-0000-4000-8000-000000000304',
+}
 
 const productIdentityFactory: ProductIdentityFactory = {
   ...defaultProductIdentityFactory,
@@ -240,6 +247,50 @@ beforeAll(async () => {
       sale_price: '29.90',
       enabled: true,
     }).execute()
+  })
+
+  const migratedD3Schema = await migrator.migrateTo('202610160005_product_pricing_inventory')
+  if (migratedD3Schema.error) throw migratedD3Schema.error
+  const migrationAdmin = await db.selectFrom('admin_users').select('id').where('email', '=', testEmail).executeTakeFirstOrThrow()
+  await db.transaction().execute(async (trx) => {
+    await trx.insertInto('products').values({
+      id: legacyRetiredInventorySentinel.productId,
+      name: '升级前遗留退役库存',
+      product_type: 'digital',
+      status: 'draft',
+    }).execute()
+    await trx.insertInto('product_variants').values({
+      id: legacyRetiredInventorySentinel.variantId,
+      product_id: legacyRetiredInventorySentinel.productId,
+      sku_code: legacyRetiredInventorySentinel.skuCode,
+      combination_key: '',
+      sale_price: '7.50',
+      enabled: true,
+    }).execute()
+    await trx.updateTable('product_variants').set({ inventory_mode: 'quantity', inventory_revision: 1 })
+      .where('id', '=', legacyRetiredInventorySentinel.variantId).execute()
+    await trx.insertInto('product_variant_quantity_inventory').values({
+      product_id: legacyRetiredInventorySentinel.productId,
+      product_variant_id: legacyRetiredInventorySentinel.variantId,
+      stocked: 5,
+      reserved: 0,
+    }).execute()
+    await trx.insertInto('product_variant_inventory_adjustments').values({
+      id: legacyRetiredInventorySentinel.adjustmentId,
+      product_id: legacyRetiredInventorySentinel.productId,
+      product_variant_id: legacyRetiredInventorySentinel.variantId,
+      operation_id: legacyRetiredInventorySentinel.operationId,
+      administrator_id: migrationAdmin.id,
+      action: 'increase',
+      requested_quantity: 5,
+      quantity_before: 0,
+      quantity_after: 5,
+      quantity_delta: 5,
+      inventory_revision: 1,
+      reason: 'D3 R1 migration preservation fixture',
+    }).execute()
+    await trx.updateTable('product_variants').set({ enabled: false, retired_at: new Date() })
+      .where('id', '=', legacyRetiredInventorySentinel.variantId).execute()
   })
 
   const upgradedSchema = await migrator.migrateToLatest()
@@ -704,6 +755,57 @@ describe('Fastify API with PostgreSQL 18', () => {
     })
     expect(await db.selectFrom('product_variant_quantity_inventory').select('product_variant_id')
       .where('product_variant_id', '=', migrationD2Sentinel.variantId).execute()).toEqual([])
+    const legacyInventory = await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+      .where('product_variant_id', '=', legacyRetiredInventorySentinel.variantId).executeTakeFirst()
+    expect(legacyInventory).toEqual({ stocked: 5, reserved: 0 })
+    const legacyAdjustment = await db.selectFrom('product_variant_inventory_adjustments')
+      .select(['id', 'quantity_before', 'quantity_after', 'reason'])
+      .where('id', '=', legacyRetiredInventorySentinel.adjustmentId).executeTakeFirst()
+    expect(legacyAdjustment).toEqual({
+      id: legacyRetiredInventorySentinel.adjustmentId,
+      quantity_before: 0,
+      quantity_after: 5,
+      reason: 'D3 R1 migration preservation fixture',
+    })
+  })
+
+  it('preserves and permits audited reduction of retired inventory left by the earlier D3 migration', async () => {
+    const auth = await loginAdmin()
+    const summary = await getInventorySummary(auth, legacyRetiredInventorySentinel.productId)
+    const legacySku = summary.json().data.variants[0]
+    expect(legacySku).toMatchObject({
+      skuId: legacyRetiredInventorySentinel.variantId,
+      retiredAt: expect.any(String),
+      inventory: { mode: 'quantity', stocked: 5, reserved: 0, available: 5 },
+    })
+
+    const cleanup = await adjustInventory(auth, legacyRetiredInventorySentinel.productId,
+      legacyRetiredInventorySentinel.variantId, {
+        expectedInventoryRevision: 1,
+        operationId: randomUUID(),
+        action: 'decrease',
+        quantity: 5,
+        reason: '受控清退升级前已退役 SKU 库存',
+      })
+    expect(cleanup.statusCode).toBe(201)
+    const cleared = await getInventorySummary(auth, legacyRetiredInventorySentinel.productId)
+    expect(cleared.json().data.variants[0]).toMatchObject({
+      retiredAt: expect.any(String),
+      inventory: { stocked: 0, reserved: 0, available: 0 },
+    })
+    expect(await db.selectFrom('product_variant_inventory_adjustments').select(['id', 'quantity_before', 'quantity_after'])
+      .where('product_variant_id', '=', legacyRetiredInventorySentinel.variantId)
+      .orderBy('inventory_revision').execute()).toEqual([
+      { id: legacyRetiredInventorySentinel.adjustmentId, quantity_before: 0, quantity_after: 5 },
+      { id: cleanup.json().data.id, quantity_before: 5, quantity_after: 0 },
+    ])
+    const cannotRestock = await adjustInventory(auth, legacyRetiredInventorySentinel.productId,
+      legacyRetiredInventorySentinel.variantId, {
+        expectedInventoryRevision: 3,
+        operationId: randomUUID(), action: 'increase', quantity: 1, reason: '退役后禁止补货',
+      })
+    expect(cannotRestock.statusCode).toBe(409)
+    expect(cannotRestock.json().error.code).toBe('SKU_PERMANENTLY_RETIRED')
   })
 
   it('requires at least one SKU but permits multi-SKU products without a default SKU', async () => {
@@ -1905,6 +2007,66 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(response.json().error.code).toBe('SKU_PERMANENTLY_RETIRED')
   })
 
+  it('enforces existing compare-at prices in matrix preview and save without overwriting optional prices', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '规格矩阵沿用划线价约束')
+    const sku = product.variants[0]!
+    const initialPrices = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/variants/${sku.id}/prices`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    const price = initialPrices.json<{ data: { productRevision: number; skuRevision: number } }>().data
+    const configured = await patchSkuPrices(auth, product.id, sku.id, {
+      expectedRevision: price.productRevision,
+      expectedSkuRevision: price.skuRevision,
+      salePrice: '19.90',
+      compareAtPrice: '29.90',
+      costPrice: '4.44444',
+    })
+    expect(configured.statusCode).toBe(200)
+    const configuredPrice = configured.json<{ data: { productRevision: number; skuRevision: number } }>().data
+    const excessive = {
+      expectedRevision: configuredPrice.productRevision,
+      mode: 'selected',
+      groups: [],
+      combinations: [{ skuId: sku.id, optionValueIds: [], salePrice: '39.90', enabled: true }],
+    }
+    const invalidPreview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/variant-matrix/preview`,
+      headers: productHeaders(auth), payload: excessive,
+    })
+    expect(invalidPreview.statusCode).toBe(400)
+    expect(invalidPreview.json().error.code).toBe('INVALID_COMPARE_AT_PRICE')
+    const invalidSave = await saveMatrix(auth, product.id, excessive)
+    expect(invalidSave.statusCode).toBe(400)
+    expect(invalidSave.json().error.code).toBe('INVALID_COMPARE_AT_PRICE')
+
+    const afterRejectedSave = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/variants/${sku.id}/prices`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(afterRejectedSave.json().data).toMatchObject({
+      salePrice: '19.90', compareAtPrice: '29.90', costPrice: '4.44444',
+    })
+    expect(afterRejectedSave.json().data.productRevision).toBe(configuredPrice.productRevision)
+
+    const legal = { ...excessive, expectedRevision: configuredPrice.productRevision, combinations: [
+      { skuId: sku.id, optionValueIds: [], salePrice: '24.90', enabled: true },
+    ] }
+    const legalPreview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/variant-matrix/preview`,
+      headers: productHeaders(auth), payload: legal,
+    })
+    expect(legalPreview.statusCode).toBe(200)
+    const legalSave = await saveMatrix(auth, product.id, legal)
+    expect(legalSave.statusCode).toBe(200)
+    const finalPrices = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/variants/${sku.id}/prices`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(finalPrices.json().data).toMatchObject({ salePrice: '24.90', compareAtPrice: '29.90', costPrice: '4.44444' })
+  })
+
   it('uses separate quantity inventory revisions, reserved boundaries, idempotency, and truthful mode states', async () => {
     const auth = await loginAdmin()
     const product = await createTestProduct(auth, 'D3 库存边界')
@@ -2129,6 +2291,160 @@ describe('Fastify API with PostgreSQL 18', () => {
     })
   })
 
+  it('allows disabling and re-enabling an in-stock SKU without retiring or changing its quantity', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '有库存 SKU 临时停用')
+    const sku = product.variants[0]!
+    const configured = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: product.revision,
+      expectedSkuRevision: sku.revision,
+      expectedInventoryRevision: 0,
+      inventoryMode: 'quantity',
+    })
+    const mode = configured.json<{ data: { productRevision: number; inventoryRevision: number } }>().data
+    const stocked = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: mode.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 3, reason: '临时停用状态测试库存',
+    })
+    expect(stocked.statusCode).toBe(201)
+    const productAfterStock = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie },
+    })
+    const current = productAfterStock.json<{ data: ProductDetail }>().data
+    const currentSku = current.variants.find((variant) => variant.id === sku.id)!
+    const paused = await saveMatrix(auth, product.id, {
+      expectedRevision: current.revision,
+      mode: 'selected', groups: [],
+      combinations: [{ skuId: sku.id, optionValueIds: [], salePrice: currentSku.salePrice, enabled: false }],
+    })
+    expect(paused.statusCode).toBe(200)
+    const pausedSku = paused.json<{ data: { product: ProductDetail } }>().data.product.variants.find((variant) => variant.id === sku.id)!
+    expect(pausedSku).toMatchObject({ enabled: false, retiredAt: null })
+    expect((await getInventorySummary(auth, product.id)).json().data.variants[0].inventory)
+      .toMatchObject({ stocked: 3, reserved: 0, available: 3 })
+
+    const resumed = await saveMatrix(auth, product.id, {
+      expectedRevision: paused.json<{ data: { product: ProductDetail } }>().data.product.revision,
+      mode: 'selected', groups: [],
+      combinations: [{ skuId: sku.id, optionValueIds: [], salePrice: currentSku.salePrice, enabled: true }],
+    })
+    expect(resumed.statusCode).toBe(200)
+    const resumedSku = resumed.json<{ data: { product: ProductDetail } }>().data.product.variants.find((variant) => variant.id === sku.id)!
+    expect(resumedSku).toMatchObject({ enabled: true, retiredAt: null })
+    expect((await getInventorySummary(auth, product.id)).json().data.variants[0].inventory)
+      .toMatchObject({ stocked: 3, reserved: 0, available: 3 })
+  })
+
+  it('prevents permanent retirement while quantity is reserved and marks that reason in matrix preview', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '预留阻止 SKU 退役')
+    const sku = product.variants[0]!
+    const configured = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: product.revision, expectedSkuRevision: sku.revision,
+      expectedInventoryRevision: 0, inventoryMode: 'quantity',
+    })
+    const mode = configured.json<{ data: { productRevision: number; inventoryRevision: number } }>().data
+    expect((await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: mode.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 4, reason: '预留测试库存',
+    })).statusCode).toBe(201)
+    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 2 })
+      .where('product_variant_id', '=', sku.id).execute()
+
+    const groupId = randomUUID()
+    const valueId = randomUUID()
+    const retirement = {
+      expectedRevision: mode.productRevision,
+      mode: 'selected',
+      groups: [optionGroup('替代方案', groupId, [{ id: valueId, name: '新方案' }])],
+      combinations: [{ optionValueIds: [valueId], salePrice: '8.00', enabled: true }],
+      retireSkuIds: [sku.id],
+    }
+    const preview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/variant-matrix/preview`,
+      headers: productHeaders(auth), payload: retirement,
+    })
+    const retireChange = preview.json().data.changes.find((change: { skuId: string; change: string }) => change.skuId === sku.id && change.change === 'retired')
+    expect(retireChange).toMatchObject({ retirementBlocked: true, retirementBlockReason: 'reserved_quantity' })
+    const rejected = await saveMatrix(auth, product.id, retirement)
+    expect(rejected.statusCode).toBe(409)
+    expect(rejected.json().error.code).toBe('SKU_STOCK_RESERVED')
+    await expect(db.updateTable('product_variants').set({ enabled: false, retired_at: new Date() })
+      .where('id', '=', sku.id).execute()).rejects.toMatchObject({
+      code: '23514', constraint: 'product_variant_retirement_reserved_check',
+    })
+    expect(await db.selectFrom('product_variants').select('retired_at').where('id', '=', sku.id).executeTakeFirstOrThrow())
+      .toEqual({ retired_at: null })
+    expect(await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+      .where('product_variant_id', '=', sku.id).executeTakeFirstOrThrow()).toEqual({ stocked: 4, reserved: 2 })
+  })
+
+  it('blocks inventory table TRUNCATE and TRUNCATE CASCADE without removing SKU or audit data', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '库存表禁止 TRUNCATE')
+    const sku = product.variants[0]!
+    const configured = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: product.revision, expectedSkuRevision: sku.revision,
+      expectedInventoryRevision: 0, inventoryMode: 'quantity',
+    })
+    const mode = configured.json<{ data: { inventoryRevision: number } }>().data
+    await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: mode.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 1, reason: 'TRUNCATE 保护流水',
+    })
+
+    await expect(sql`TRUNCATE TABLE product_variant_inventory_adjustments`.execute(db)).rejects.toMatchObject({
+      code: '23514', constraint: 'product_variant_inventory_adjustments_truncate_forbidden',
+    })
+    await expect(sql`TRUNCATE TABLE product_variant_quantity_inventory`.execute(db)).rejects.toMatchObject({
+      code: '23514', constraint: 'product_variant_quantity_inventory_truncate_forbidden',
+    })
+    await expect(sql`TRUNCATE TABLE product_variants CASCADE`.execute(db)).rejects.toMatchObject({ code: '23514' })
+    expect(await db.selectFrom('product_variants').select('id').where('id', '=', sku.id).execute()).toHaveLength(1)
+    expect(await db.selectFrom('product_variant_quantity_inventory').select('stocked')
+      .where('product_variant_id', '=', sku.id).executeTakeFirstOrThrow()).toEqual({ stocked: 1 })
+    expect(await db.selectFrom('product_variant_inventory_adjustments').select('id')
+      .where('product_variant_id', '=', sku.id).execute()).toHaveLength(1)
+  })
+
+  it('serializes quantity adjustment and permanent retirement without leaving a retired in-stock SKU', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, '库存调整与退役并发')
+    const sku = product.variants[0]!
+    const configured = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: product.revision, expectedSkuRevision: sku.revision,
+      expectedInventoryRevision: 0, inventoryMode: 'quantity',
+    })
+    const mode = configured.json<{ data: { productRevision: number; inventoryRevision: number } }>().data
+    const groupId = randomUUID()
+    const valueId = randomUUID()
+    const retirement = {
+      expectedRevision: mode.productRevision,
+      mode: 'selected',
+      groups: [optionGroup('后续规格', groupId, [{ id: valueId, name: '替换 SKU' }])],
+      combinations: [{ optionValueIds: [valueId], salePrice: '8.00', enabled: true }],
+      retireSkuIds: [sku.id],
+    }
+    const [adjustment, matrixSave] = await Promise.all([
+      adjustInventory(auth, product.id, sku.id, {
+        expectedInventoryRevision: mode.inventoryRevision,
+        operationId: randomUUID(), action: 'increase', quantity: 1, reason: '与永久退役竞争',
+      }),
+      saveMatrix(auth, product.id, retirement),
+    ])
+    expect([adjustment.statusCode, matrixSave.statusCode].filter((status) => status === 409)).toHaveLength(1)
+    expect([adjustment.statusCode, matrixSave.statusCode].filter((status) => status >= 200 && status < 300)).toHaveLength(1)
+    const finalSummary = await getInventorySummary(auth, product.id)
+    const finalSku = finalSummary.json().data.variants.find((variant: { skuId: string }) => variant.skuId === sku.id)
+    if (matrixSave.statusCode === 200) {
+      expect(finalSku).toMatchObject({ retiredAt: expect.any(String), inventory: { stocked: 0, reserved: 0 } })
+      expect(adjustment.json().error.code).toBe('SKU_PERMANENTLY_RETIRED')
+    } else {
+      expect(finalSku).toMatchObject({ retiredAt: null, inventory: { stocked: 1, reserved: 0 } })
+      expect(matrixSave.json().error.code).toBe('SKU_STOCK_NOT_CLEARED')
+    }
+  })
+
   it('serializes concurrent inventory adjustments without lost updates or negative stock', async () => {
     const auth = await loginAdmin()
     const product = await createTestProduct(auth, '并发库存调整')
@@ -2254,15 +2570,41 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(blocked.statusCode).toBe(409)
     expect(blocked.json().error.code).toBe('SKU_HAS_REFERENCES')
 
-    const retired = await saveMatrix(auth, product.id, { ...body, retireSkuIds: [legacySku.id] })
+    const retirementBody = { ...body, retireSkuIds: [legacySku.id] }
+    const retirementPreview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/variant-matrix/preview`,
+      headers: productHeaders(auth), payload: retirementBody,
+    })
+    expect(retirementPreview.statusCode).toBe(200)
+    const retirementChange = retirementPreview.json().data.changes.find((change: { skuId: string; change: string }) => change.skuId === legacySku.id && change.change === 'retired')
+    expect(retirementChange).toMatchObject({ retirementBlocked: true, retirementBlockReason: 'stocked_quantity' })
+    const stockedRetirement = await saveMatrix(auth, product.id, retirementBody)
+    expect(stockedRetirement.statusCode).toBe(409)
+    expect(stockedRetirement.json().error.code).toBe('SKU_STOCK_NOT_CLEARED')
+    await expect(db.updateTable('product_variants').set({ enabled: false, retired_at: new Date() })
+      .where('id', '=', legacySku.id).execute()).rejects.toMatchObject({
+      code: '23514', constraint: 'product_variant_retirement_stocked_check',
+    })
+    const stillActive = await db.selectFrom('product_variants').select(['retired_at', 'enabled'])
+      .where('id', '=', legacySku.id).executeTakeFirstOrThrow()
+    expect(stillActive).toEqual({ retired_at: null, enabled: true })
+
+    const drained = await adjustInventory(auth, product.id, legacySku.id, {
+      expectedInventoryRevision: inventoryMode.inventoryRevision + 1,
+      operationId: randomUUID(), action: 'decrease', quantity: 5, reason: '永久退役前清零库存',
+    })
+    expect(drained.statusCode).toBe(201)
+    const retired = await saveMatrix(auth, product.id, retirementBody)
     expect(retired.statusCode).toBe(200)
     const retiredProduct = retired.json<{ data: { product: ProductDetail } }>().data.product
     expect(retiredProduct.variants.find((variant) => variant.id === legacySku.id)).toMatchObject({ retiredAt: expect.any(String), enabled: false })
     const afterRetirement = await getInventorySummary(auth, product.id)
     expect(afterRetirement.json().data.variants.find((variant: { skuId: string }) => variant.skuId === legacySku.id).inventory)
-      .toMatchObject({ stocked: 5, available: 5 })
+      .toMatchObject({ stocked: 0, reserved: 0, available: 0 })
+    expect(await db.selectFrom('product_variant_inventory_adjustments').select('id')
+      .where('product_variant_id', '=', legacySku.id).execute()).toHaveLength(2)
     const retiredAdjustment = await adjustInventory(auth, product.id, legacySku.id, {
-      expectedInventoryRevision: inventoryMode.inventoryRevision + 1,
+      expectedInventoryRevision: inventoryMode.inventoryRevision + 2,
       operationId: randomUUID(), action: 'increase', quantity: 1, reason: '退役后不得补货',
     })
     expect(retiredAdjustment.statusCode).toBe(409)

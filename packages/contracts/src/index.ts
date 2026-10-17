@@ -421,6 +421,12 @@ export const ProductVariantMatrixChangeSchema = Type.Object({
     Type.Literal('adjustment_history'),
     Type.Null(),
   ]),
+  retirementBlocked: Type.Boolean(),
+  retirementBlockReason: Type.Union([
+    Type.Literal('stocked_quantity'),
+    Type.Literal('reserved_quantity'),
+    Type.Null(),
+  ]),
 }, { additionalProperties: false })
 
 export const ProductVariantMatrixPreviewSchema = Type.Object({
