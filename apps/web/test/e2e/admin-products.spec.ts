@@ -14,6 +14,7 @@ async function signIn(page: import('@playwright/test').Page) {
     return
   }
   await page.goto('/admin/login')
+  await expect(page.locator('[data-admin-login-ready="true"]')).toBeAttached()
   await expect(page.getByLabel('管理员邮箱')).toBeEnabled()
   await page.getByLabel('管理员邮箱').fill(adminEmail)
   await page.getByLabel('密码').fill(adminPassword)
@@ -230,7 +231,9 @@ test('admin manages a real product through category, SKU, price, media, rich tex
   await rich.getByRole('button', { name: '标题二级' }).click()
   await expect(editor.locator('h2')).toContainText('二级标题结构验收')
   await editor.press('ControlOrMeta+End')
-  await editor.press('Shift+ControlOrMeta+ArrowLeft')
+  await editor.press('Shift+ArrowLeft')
+  await editor.press('Shift+ArrowLeft')
+  await expect.poll(() => editor.evaluate(element => element.ownerDocument.getSelection()?.toString())).toBe('验收')
   await rich.getByRole('button', { name: '加粗' }).click()
   await expect(editor.locator('h2 strong')).toContainText('验收')
   await rich.getByRole('button', { name: '撤销' }).click()

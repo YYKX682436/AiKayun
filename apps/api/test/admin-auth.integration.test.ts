@@ -271,6 +271,7 @@ async function createReservedOrderForTest(
     await trx.insertInto('order_inventory_reservations').values({
       id: randomUUID(), order_item_id: itemId, product_id: productId, product_variant_id: variantId, quantity,
     }).execute()
+    await trx.updateTable('orders').set({ items_sealed: true }).where('id', '=', orderId).execute()
   })
   return orderId
 }

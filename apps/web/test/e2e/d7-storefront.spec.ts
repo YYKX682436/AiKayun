@@ -11,6 +11,8 @@ type ProductRecord = {
   variants: Array<{ id: string; revision: number; salePrice: string; options: Array<{ groupName: string; valueName: string }> }>
 }
 
+let authenticatedCookies: Awaited<ReturnType<import('@playwright/test').BrowserContext['storageState']>>['cookies'] | null = null
+
 async function dataOf<T>(response: Awaited<ReturnType<APIRequestContext['get']>>, status: number): Promise<T> {
   expect(response.status()).toBe(status)
   const body = await response.json() as { data: T; error?: { message?: string } }
@@ -19,6 +21,11 @@ async function dataOf<T>(response: Awaited<ReturnType<APIRequestContext['get']>>
 }
 
 async function authenticate(page: Page): Promise<void> {
+  if (authenticatedCookies) {
+    await page.context().addCookies(authenticatedCookies)
+    return
+  }
+
   const csrfResponse = await page.request.get('/api/v1/admin/auth/csrf')
   expect(csrfResponse.status()).toBe(200)
   const csrf = (await csrfResponse.json()).data.csrfToken as string
@@ -27,6 +34,7 @@ async function authenticate(page: Page): Promise<void> {
     data: { email: 'browser-test@example.com', password: 'Only-For-E2E-Tests-2026!!' },
   })
   expect(login.status()).toBe(200)
+  authenticatedCookies = (await page.context().storageState()).cookies
 }
 
 async function createCategory(page: Page, name: string, parentId?: string) {
@@ -81,6 +89,48 @@ async function deleteProduct(page: Page, product: ProductRecord): Promise<void> 
   expect(response.status()).toBe(200)
 }
 
+async function deleteProductFromList(page: Page, product: { id: string; revision: number }): Promise<void> {
+  const response = await page.request.delete(`/api/v1/admin/products/${product.id}`, {
+    headers: { 'x-csrf-token': await csrfToken(page), origin: new URL(page.url()).origin },
+    data: { expectedRevision: product.revision },
+  })
+  expect(response.status()).toBe(200)
+}
+
+async function cleanInterruptedD7Fixtures(page: Page): Promise<void> {
+  await authenticate(page)
+
+  for (const search of ['D7', 'R2搜索B专属商品']) {
+    const response = await page.request.get(`/api/v1/admin/products?search=${encodeURIComponent(search)}&pageSize=100`)
+    const result = await dataOf<{ items: Array<{ id: string; name: string; revision: number }> }>(response, 200)
+    const fixtures = search === 'D7'
+      ? result.items.filter(product => product.name.startsWith('D7'))
+      : result.items.filter(product => product.name === 'R2搜索B专属商品')
+    for (const product of fixtures) await deleteProductFromList(page, product)
+  }
+
+  const categoriesResponse = await page.request.get('/api/v1/admin/categories')
+  const categories = (await dataOf<{ categories: Array<{ id: string; name: string; revision: number }> }>(categoriesResponse, 200)).categories
+  for (const name of ['D7四级分类', 'D7三级分类', 'D7二级分类', 'D7真实目录']) {
+    const category = categories.find(item => item.name === name)
+    if (!category) continue
+    const response = await page.request.delete(`/api/v1/admin/categories/${category.id}`, {
+      headers: { 'x-csrf-token': await csrfToken(page), origin: new URL(page.url()).origin },
+      data: { expectedRevision: category.revision },
+    })
+    expect(response.status()).toBe(200)
+  }
+
+  const mediaResponse = await page.request.get('/api/v1/admin/media?pageSize=100')
+  const media = await dataOf<{ items: Array<{ id: string; referenceCount: number }> }>(mediaResponse, 200)
+  for (const item of media.items.filter(candidate => candidate.referenceCount === 0)) {
+    const response = await page.request.delete(`/api/v1/admin/media/${item.id}`, {
+      headers: { 'x-csrf-token': await csrfToken(page), origin: new URL(page.url()).origin },
+    })
+    expect(response.status()).toBe(200)
+  }
+}
+
 async function expectTemporaryHomeRedirect(page: Page, product: ProductRecord): Promise<void> {
   const response = await page.request.get(`/products/${product.id}`, { maxRedirects: 0 })
   expect(response.status()).toBe(302)
@@ -89,6 +139,7 @@ async function expectTemporaryHomeRedirect(page: Page, product: ProductRecord): 
 }
 
 async function navigateClient(page: Page, path: string): Promise<void> {
+  await expect(page.locator('[data-storefront-ready="true"]')).toBeAttached()
   await page.evaluate(async (nextPath) => {
     const root = document.querySelector('#__nuxt') as (HTMLElement & {
       __vue_app__?: { config: { globalProperties: { $router?: { push: (location: string) => Promise<unknown> } } } }
@@ -100,6 +151,9 @@ async function navigateClient(page: Page, path: string): Promise<void> {
 }
 
 test('D7 serves a real SSR catalog, visible category path, safe media details, sparse SKU selection, and responsive search', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.locator('[data-storefront-ready="true"]')).toBeAttached()
+  await cleanInterruptedD7Fixtures(page)
   await page.goto('/')
   await expect(page.locator('[data-storefront-ready="true"]')).toBeAttached()
   await expect(page.getByRole('heading', { name: '暂无可展示的商品' })).toBeVisible()

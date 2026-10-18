@@ -125,6 +125,7 @@ export interface OrdersTable {
   status: Generated<OrderStatus>
   total_amount: ColumnType<string, string, string>
   currency: Generated<'CNY'>
+  items_sealed: Generated<boolean>
   created_at: Generated<Date>
   unpaid_expires_at: Date | null
   history_hidden_at: Date | null
@@ -193,11 +194,15 @@ export interface WalletAccountsTable {
 
 export type WalletOperationType =
   | 'top_up' | 'order_payment' | 'refund' | 'gift' | 'withdrawal_freeze'
-  | 'withdrawal_release' | 'withdrawal_complete' | 'adjustment'
+  | 'withdrawal_release' | 'withdrawal_complete' | 'order_payment_hold'
+  | 'order_payment_settlement' | 'order_payment_release' | 'adjustment'
 
 export interface WalletOperationsTable {
   id: string
   customer_id: string
+  order_id: Generated<string | null>
+  resolves_operation_id: Generated<string | null>
+  requested_amount: Generated<string | null>
   operation_type: WalletOperationType
   request_sha256: string
   actor_admin_id: string | null
@@ -221,6 +226,8 @@ export interface PaymentAttemptsTable {
   provider: string | null
   provider_payment_id: string | null
   wallet_operation_id: string | null
+  wallet_hold_operation_id: Generated<string | null>
+  requested_wallet_amount: Generated<string | null>
   created_at: Generated<Date>
   expires_at: Date | null
   completed_at: Date | null

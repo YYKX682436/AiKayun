@@ -45,8 +45,8 @@ export const tradeFoundationMigration: Migration = {
       )
     `.execute(db)
     await sql`CREATE UNIQUE INDEX customers_username_lower_unique ON customers (lower(username)) WHERE username IS NOT NULL`.execute(db)
-    await sql`CREATE UNIQUE INDEX customers_email_lower_unique ON customers (lower(email)) WHERE email IS NOT NULL`.execute(db)
-    await sql`CREATE UNIQUE INDEX customers_phone_unique ON customers (phone) WHERE phone IS NOT NULL`.execute(db)
+    await sql`CREATE UNIQUE INDEX customers_email_verified_lower_unique ON customers (lower(email)) WHERE email_verified_at IS NOT NULL`.execute(db)
+    await sql`CREATE UNIQUE INDEX customers_phone_verified_unique ON customers (phone) WHERE phone_verified_at IS NOT NULL`.execute(db)
 
     await sql`
       CREATE TABLE guest_order_sessions (
@@ -83,6 +83,7 @@ export const tradeFoundationMigration: Migration = {
         status varchar(24) NOT NULL DEFAULT 'pending_payment',
         total_amount numeric(18, 2) NOT NULL,
         currency char(3) NOT NULL DEFAULT 'CNY',
+        items_sealed boolean NOT NULL DEFAULT false,
         created_at timestamptz NOT NULL DEFAULT now(),
         unpaid_expires_at timestamptz,
         history_hidden_at timestamptz,
@@ -213,17 +214,35 @@ export const tradeFoundationMigration: Migration = {
       CREATE TABLE wallet_operations (
         id uuid PRIMARY KEY,
         customer_id uuid NOT NULL,
+        order_id uuid,
+        resolves_operation_id uuid,
+        requested_amount numeric(18, 2),
         operation_type varchar(24) NOT NULL,
         request_sha256 char(64) NOT NULL,
         actor_admin_id uuid,
         created_at timestamptz NOT NULL DEFAULT now(),
         CONSTRAINT wallet_operations_customer_fkey FOREIGN KEY (customer_id) REFERENCES wallet_accounts (customer_id) ON DELETE RESTRICT,
+        CONSTRAINT wallet_operations_order_fkey FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE RESTRICT,
+        CONSTRAINT wallet_operations_resolves_fkey FOREIGN KEY (customer_id, resolves_operation_id)
+          REFERENCES wallet_operations (customer_id, id) ON DELETE RESTRICT,
         CONSTRAINT wallet_operations_actor_admin_fkey FOREIGN KEY (actor_admin_id) REFERENCES admin_users (id) ON DELETE RESTRICT,
         CONSTRAINT wallet_operations_customer_id_unique UNIQUE (customer_id, id),
         CONSTRAINT wallet_operations_type_check CHECK (operation_type IN (
           'top_up', 'order_payment', 'refund', 'gift', 'withdrawal_freeze',
-          'withdrawal_release', 'withdrawal_complete', 'adjustment'
+          'withdrawal_release', 'withdrawal_complete', 'order_payment_hold',
+          'order_payment_settlement', 'order_payment_release', 'adjustment'
         )),
+        CONSTRAINT wallet_operations_order_payment_shape_check CHECK (
+          (operation_type IN ('order_payment', 'order_payment_hold') AND order_id IS NOT NULL
+            AND requested_amount IS NOT NULL AND requested_amount > 0 AND resolves_operation_id IS NULL)
+          OR (operation_type = 'order_payment_settlement' AND order_id IS NOT NULL
+            AND requested_amount IS NULL AND resolves_operation_id IS NOT NULL)
+          OR (operation_type = 'order_payment_release' AND order_id IS NULL
+            AND requested_amount IS NULL AND resolves_operation_id IS NOT NULL)
+          OR (operation_type NOT IN ('order_payment', 'order_payment_hold', 'order_payment_settlement', 'order_payment_release')
+            AND order_id IS NULL AND requested_amount IS NULL AND resolves_operation_id IS NULL)
+        ),
+        CONSTRAINT wallet_operations_no_self_resolution_check CHECK (resolves_operation_id IS NULL OR resolves_operation_id <> id),
         CONSTRAINT wallet_operations_hash_check CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
         CONSTRAINT wallet_operations_admin_actor_check CHECK (
           (operation_type IN ('gift', 'adjustment') AND actor_admin_id IS NOT NULL)
@@ -231,6 +250,8 @@ export const tradeFoundationMigration: Migration = {
         )
       )
     `.execute(db)
+    await sql`CREATE UNIQUE INDEX wallet_operations_resolves_once_unique ON wallet_operations (resolves_operation_id) WHERE resolves_operation_id IS NOT NULL`.execute(db)
+    await sql`CREATE INDEX wallet_operations_order_idx ON wallet_operations (order_id, created_at, id) WHERE order_id IS NOT NULL`.execute(db)
 
     await sql`
       CREATE TABLE payment_attempts (
@@ -245,15 +266,21 @@ export const tradeFoundationMigration: Migration = {
         provider varchar(64),
         provider_payment_id varchar(200),
         wallet_operation_id uuid,
+        wallet_hold_operation_id uuid,
+        requested_wallet_amount numeric(18, 2),
         created_at timestamptz NOT NULL DEFAULT now(),
         expires_at timestamptz,
         completed_at timestamptz,
         CONSTRAINT payment_attempts_order_fkey FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE RESTRICT,
         CONSTRAINT payment_attempts_topup_customer_fkey FOREIGN KEY (topup_customer_id) REFERENCES customers (id) ON DELETE RESTRICT,
         CONSTRAINT payment_attempts_wallet_operation_fkey FOREIGN KEY (wallet_operation_id) REFERENCES wallet_operations (id) ON DELETE RESTRICT,
+        CONSTRAINT payment_attempts_wallet_hold_operation_fkey FOREIGN KEY (wallet_hold_operation_id) REFERENCES wallet_operations (id) ON DELETE RESTRICT,
         CONSTRAINT payment_attempts_single_target_check CHECK (num_nonnulls(order_id, topup_customer_id) = 1),
         CONSTRAINT payment_attempts_source_check CHECK (source IN ('external', 'wallet')),
         CONSTRAINT payment_attempts_amount_check CHECK (amount > 0),
+        CONSTRAINT payment_attempts_requested_wallet_amount_check CHECK (
+          requested_wallet_amount IS NULL OR (order_id IS NOT NULL AND requested_wallet_amount > 0)
+        ),
         CONSTRAINT payment_attempts_status_check CHECK (status IN (
           'created', 'pending', 'succeeded', 'failed', 'expired', 'cancelled',
           'late_succeeded', 'reconciliation_required'
@@ -265,10 +292,10 @@ export const tradeFoundationMigration: Migration = {
         CONSTRAINT payment_attempts_hash_check CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
         CONSTRAINT payment_attempts_source_target_check CHECK (
           (source = 'external' AND provider IS NOT NULL AND btrim(provider) <> ''
-            AND wallet_operation_id IS NULL)
+            AND wallet_operation_id IS NULL AND (wallet_hold_operation_id IS NULL OR order_id IS NOT NULL))
           OR (source = 'wallet' AND order_id IS NOT NULL
             AND topup_customer_id IS NULL AND provider IS NULL AND provider_payment_id IS NULL
-            AND wallet_operation_id IS NOT NULL)
+            AND wallet_operation_id IS NOT NULL AND wallet_hold_operation_id IS NULL)
         ),
         CONSTRAINT payment_attempts_provider_id_check CHECK (
           provider_payment_id IS NULL OR (source = 'external' AND btrim(provider_payment_id) <> '')
@@ -278,6 +305,7 @@ export const tradeFoundationMigration: Migration = {
     `.execute(db)
     await sql`CREATE UNIQUE INDEX payment_attempts_provider_payment_unique ON payment_attempts (provider, provider_payment_id) WHERE provider_payment_id IS NOT NULL`.execute(db)
     await sql`CREATE INDEX payment_attempts_order_created_idx ON payment_attempts (order_id, created_at DESC, id DESC) WHERE order_id IS NOT NULL`.execute(db)
+    await sql`CREATE UNIQUE INDEX payment_attempts_one_active_order_unique ON payment_attempts (order_id) WHERE order_id IS NOT NULL AND status IN ('created', 'pending')`.execute(db)
     await sql`CREATE INDEX payment_attempts_topup_created_idx ON payment_attempts (topup_customer_id, created_at DESC, id DESC) WHERE topup_customer_id IS NOT NULL`.execute(db)
 
     await sql`
@@ -397,7 +425,7 @@ export const tradeFoundationMigration: Migration = {
     `.execute(db)
     await sql`CREATE INDEX wallet_ledger_entries_customer_created_idx ON wallet_ledger_entries (customer_id, created_at DESC, id DESC)`.execute(db)
     await sql`CREATE INDEX wallet_ledger_entries_source_payment_idx ON wallet_ledger_entries (payment_attempt_id) WHERE payment_attempt_id IS NOT NULL`.execute(db)
-    await sql`CREATE UNIQUE INDEX wallet_ledger_entries_payment_attempt_bucket_unique ON wallet_ledger_entries (payment_attempt_id, bucket) WHERE payment_attempt_id IS NOT NULL`.execute(db)
+    await sql`CREATE UNIQUE INDEX wallet_ledger_entries_payment_attempt_bucket_action_unique ON wallet_ledger_entries (payment_attempt_id, bucket, action) WHERE payment_attempt_id IS NOT NULL`.execute(db)
     await sql`CREATE UNIQUE INDEX wallet_ledger_entries_refund_allocation_unique ON wallet_ledger_entries (refund_allocation_id) WHERE refund_allocation_id IS NOT NULL`.execute(db)
     await sql`CREATE UNIQUE INDEX wallet_ledger_entries_withdrawal_action_unique ON wallet_ledger_entries (withdrawal_id, action) WHERE withdrawal_id IS NOT NULL`.execute(db)
 
@@ -544,7 +572,23 @@ export const tradeFoundationMigration: Migration = {
       END;
       $$
     `.execute(db)
-    await sql`CREATE TRIGGER customers_enforce_store_policy BEFORE INSERT OR UPDATE OF status, email, phone ON customers FOR EACH ROW EXECUTE FUNCTION enforce_customer_policy()`.execute(db)
+    await sql`CREATE TRIGGER customers_enforce_store_policy BEFORE INSERT ON customers FOR EACH ROW EXECUTE FUNCTION enforce_customer_policy()`.execute(db)
+
+    await sql`
+      CREATE FUNCTION reset_customer_contact_verification() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.email IS DISTINCT FROM OLD.email THEN
+          NEW.email_verified_at := NULL;
+        END IF;
+        IF NEW.phone IS DISTINCT FROM OLD.phone THEN
+          NEW.phone_verified_at := NULL;
+        END IF;
+        RETURN NEW;
+      END;
+      $$
+    `.execute(db)
+    await sql`CREATE TRIGGER customers_reset_contact_verification BEFORE UPDATE OF email, phone ON customers FOR EACH ROW EXECUTE FUNCTION reset_customer_contact_verification()`.execute(db)
 
     await sql`
       CREATE FUNCTION prevent_customer_resurrection() RETURNS trigger
@@ -635,8 +679,11 @@ export const tradeFoundationMigration: Migration = {
       DECLARE
         operation_kind varchar(24);
         expected_customer uuid;
+        operation_order uuid;
+        resolved_operation uuid;
       BEGIN
-        SELECT operation_type, customer_id INTO operation_kind, expected_customer
+        SELECT operation_type, customer_id, order_id, resolves_operation_id
+          INTO operation_kind, expected_customer, operation_order, resolved_operation
         FROM wallet_operations WHERE id = NEW.wallet_operation_id;
         IF NOT FOUND OR expected_customer <> NEW.customer_id THEN
           RAISE EXCEPTION 'Wallet operation does not belong to this account'
@@ -646,6 +693,9 @@ export const tradeFoundationMigration: Migration = {
         IF NOT (
           (operation_kind = 'top_up' AND NEW.bucket = 'cash' AND NEW.action = 'credit_available')
           OR (operation_kind = 'order_payment' AND NEW.action = 'debit_available')
+          OR (operation_kind = 'order_payment_hold' AND NEW.action = 'freeze')
+          OR (operation_kind = 'order_payment_settlement' AND NEW.action = 'debit_frozen')
+          OR (operation_kind = 'order_payment_release' AND NEW.action = 'unfreeze')
           OR (operation_kind = 'refund' AND NEW.action = 'credit_available')
           OR (operation_kind = 'gift' AND NEW.bucket = 'gift' AND NEW.action = 'credit_available')
           OR (operation_kind = 'withdrawal_freeze' AND NEW.bucket = 'cash' AND NEW.action = 'freeze')
@@ -657,7 +707,8 @@ export const tradeFoundationMigration: Migration = {
             USING ERRCODE = '23514', CONSTRAINT = 'wallet_ledger_operation_action';
         END IF;
 
-        IF (operation_kind IN ('top_up', 'order_payment') AND NEW.payment_attempt_id IS NULL)
+        IF (operation_kind IN ('top_up', 'order_payment', 'order_payment_hold',
+            'order_payment_settlement', 'order_payment_release') AND NEW.payment_attempt_id IS NULL)
           OR (operation_kind = 'refund' AND NEW.refund_allocation_id IS NULL)
           OR (operation_kind IN ('withdrawal_freeze', 'withdrawal_release', 'withdrawal_complete') AND NEW.withdrawal_id IS NULL)
           OR (operation_kind IN ('gift', 'adjustment') AND num_nonnulls(
@@ -672,13 +723,34 @@ export const tradeFoundationMigration: Migration = {
             SELECT 1 FROM payment_attempts AS attempt
             WHERE attempt.id = NEW.payment_attempt_id
               AND ((operation_kind = 'order_payment' AND attempt.wallet_operation_id = NEW.wallet_operation_id
-                  AND attempt.source = 'wallet')
+                  AND attempt.source = 'wallet' AND attempt.order_id = operation_order)
+                OR (operation_kind = 'order_payment_hold' AND attempt.wallet_hold_operation_id = NEW.wallet_operation_id
+                  AND attempt.source = 'external' AND attempt.order_id = operation_order)
+                OR (operation_kind = 'order_payment_settlement' AND attempt.wallet_operation_id = NEW.wallet_operation_id
+                  AND attempt.source = 'wallet' AND attempt.order_id = operation_order)
+                OR (operation_kind = 'order_payment_release' AND attempt.wallet_hold_operation_id = resolved_operation
+                  AND attempt.source = 'external' AND attempt.order_id = (
+                    SELECT hold.order_id FROM wallet_operations AS hold WHERE hold.id = resolved_operation
+                  ))
                 OR (operation_kind = 'top_up' AND attempt.source = 'external'
                   AND attempt.topup_customer_id = NEW.customer_id))
               AND NEW.bucket IN ('cash', 'gift')
           ) THEN
             RAISE EXCEPTION 'Wallet payment entry must match its payment attempt'
               USING ERRCODE = '23514', CONSTRAINT = 'wallet_ledger_payment_source';
+          END IF;
+          IF operation_kind IN ('order_payment_hold', 'order_payment_settlement', 'order_payment_release')
+            AND NOT EXISTS (
+              SELECT 1 FROM payment_attempts AS attempt
+              WHERE attempt.id = NEW.payment_attempt_id AND attempt.order_id = COALESCE(operation_order, (
+                SELECT hold.order_id FROM wallet_operations AS hold WHERE hold.id = resolved_operation
+              ))
+                AND attempt.source IN ('external', 'wallet')
+                AND EXISTS (SELECT 1 FROM orders AS parent
+                  WHERE parent.id = attempt.order_id AND parent.customer_id = NEW.customer_id)
+            ) THEN
+            RAISE EXCEPTION 'Order wallet entry must match the order customer and payment attempt'
+              USING ERRCODE = '23514', CONSTRAINT = 'wallet_ledger_order_payment_owner';
           END IF;
           IF operation_kind = 'top_up' AND (NEW.bucket <> 'cash' OR NEW.action <> 'credit_available'
             OR NOT EXISTS (
@@ -770,6 +842,9 @@ export const tradeFoundationMigration: Migration = {
         entry_count bigint;
         expected_amount numeric(18, 2);
         linked_attempt uuid;
+        linked_order uuid;
+        linked_resolution uuid;
+        receipt_amount numeric(18, 2);
       BEGIN
         SELECT count(*) INTO entry_count
         FROM wallet_ledger_entries WHERE wallet_operation_id = NEW.id;
@@ -792,18 +867,104 @@ export const tradeFoundationMigration: Migration = {
             RAISE EXCEPTION 'Top-up wallet operation must match one confirmed external settlement'
               USING ERRCODE = '23514', CONSTRAINT = 'wallet_top_up_ledger_match';
           END IF;
-        ELSIF NEW.operation_type = 'order_payment' THEN
+        ELSIF NEW.operation_type IN ('order_payment', 'order_payment_hold',
+            'order_payment_settlement', 'order_payment_release') THEN
           SELECT min(payment_attempt_id::text)::uuid, sum(amount) INTO linked_attempt, expected_amount
           FROM wallet_ledger_entries WHERE wallet_operation_id = NEW.id;
-          IF NOT EXISTS (
-            SELECT 1 FROM payment_attempts AS attempt
-            WHERE attempt.id = linked_attempt AND attempt.wallet_operation_id = NEW.id
-              AND attempt.source = 'wallet' AND attempt.amount = expected_amount
-              AND attempt.status = 'succeeded'
-          ) OR entry_count <> (SELECT count(*) FROM payment_receipts WHERE payment_attempt_id = linked_attempt)
-            OR expected_amount <> (SELECT COALESCE(sum(amount), 0) FROM payment_receipts WHERE payment_attempt_id = linked_attempt) THEN
-            RAISE EXCEPTION 'Wallet order payment must balance to its confirmed payment attempt receipts'
-              USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_payment_ledger_match';
+          IF entry_count > 2 OR EXISTS (
+            SELECT 1 FROM wallet_ledger_entries WHERE wallet_operation_id = NEW.id
+              AND payment_attempt_id IS DISTINCT FROM linked_attempt
+          ) THEN
+            RAISE EXCEPTION 'Order wallet operation must use one attempt and at most two balance legs'
+              USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_operation_legs';
+          END IF;
+
+          IF NEW.operation_type = 'order_payment' THEN
+            IF NOT EXISTS (
+              SELECT 1 FROM payment_attempts AS attempt JOIN orders AS parent ON parent.id = attempt.order_id
+              WHERE attempt.id = linked_attempt AND attempt.wallet_operation_id = NEW.id
+                AND attempt.source = 'wallet' AND attempt.amount = expected_amount
+                AND attempt.status = 'succeeded' AND attempt.order_id = NEW.order_id
+                AND parent.customer_id = NEW.customer_id AND parent.total_amount = expected_amount
+                AND NEW.requested_amount = parent.total_amount
+            ) THEN
+              RAISE EXCEPTION 'Direct wallet payment must settle the full sealed order amount'
+                USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_direct_payment_match';
+            END IF;
+            receipt_amount := (SELECT COALESCE(sum(amount), 0) FROM payment_receipts WHERE payment_attempt_id = linked_attempt);
+            IF entry_count <> (SELECT count(*) FROM payment_receipts WHERE payment_attempt_id = linked_attempt)
+              OR expected_amount <> receipt_amount
+              OR EXISTS (
+                SELECT 1 FROM wallet_ledger_entries AS entry
+                WHERE entry.wallet_operation_id = NEW.id AND (entry.action <> 'debit_available'
+                  OR NOT EXISTS (SELECT 1 FROM payment_receipts AS receipt
+                    WHERE receipt.payment_attempt_id = linked_attempt AND receipt.wallet_operation_id = NEW.id
+                      AND receipt.wallet_line_no = entry.line_no AND receipt.source_bucket = entry.bucket
+                      AND receipt.amount = entry.amount AND receipt.disposition = 'on_time'))
+              ) THEN
+              RAISE EXCEPTION 'Direct wallet payment ledger must match its immutable debit receipts'
+                USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_payment_ledger_match';
+            END IF;
+          ELSIF NEW.operation_type = 'order_payment_hold' THEN
+            SELECT operation.id INTO linked_resolution FROM wallet_operations AS operation
+            WHERE operation.resolves_operation_id = NEW.id;
+            IF NOT EXISTS (
+              SELECT 1 FROM payment_attempts AS attempt JOIN orders AS parent ON parent.id = attempt.order_id
+              WHERE attempt.id = linked_attempt AND attempt.wallet_hold_operation_id = NEW.id
+                AND attempt.source = 'external' AND attempt.order_id = NEW.order_id
+                AND parent.customer_id = NEW.customer_id
+                AND attempt.amount + expected_amount = parent.total_amount
+                AND NEW.requested_amount <= parent.total_amount
+            ) OR EXISTS (
+              SELECT 1 FROM wallet_ledger_entries AS entry
+              WHERE entry.wallet_operation_id = NEW.id AND entry.action <> 'freeze'
+            ) THEN
+              RAISE EXCEPTION 'Order wallet hold must match the external due and frozen wallet legs'
+                USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_hold_match';
+            END IF;
+          ELSIF NEW.operation_type = 'order_payment_settlement' THEN
+            SELECT order_id INTO linked_order FROM wallet_operations
+            WHERE id = NEW.resolves_operation_id AND customer_id = NEW.customer_id
+              AND operation_type = 'order_payment_hold';
+            IF linked_order IS DISTINCT FROM NEW.order_id OR NOT EXISTS (
+              SELECT 1 FROM payment_attempts AS attempt
+              WHERE attempt.id = linked_attempt AND attempt.wallet_operation_id = NEW.id
+                AND attempt.source = 'wallet' AND attempt.status = 'succeeded'
+                AND attempt.order_id = NEW.order_id AND attempt.amount = expected_amount
+            ) OR expected_amount <> (
+              SELECT COALESCE(sum(amount), 0) FROM wallet_ledger_entries
+              WHERE wallet_operation_id = NEW.resolves_operation_id AND action = 'freeze'
+            ) OR entry_count <> (SELECT count(*) FROM payment_receipts WHERE payment_attempt_id = linked_attempt)
+              OR expected_amount <> (SELECT COALESCE(sum(amount), 0) FROM payment_receipts WHERE payment_attempt_id = linked_attempt)
+              OR EXISTS (
+                SELECT 1 FROM wallet_ledger_entries AS entry
+                WHERE entry.wallet_operation_id = NEW.id AND (entry.action <> 'debit_frozen'
+                  OR NOT EXISTS (SELECT 1 FROM payment_receipts AS receipt
+                    WHERE receipt.payment_attempt_id = linked_attempt AND receipt.wallet_operation_id = NEW.id
+                      AND receipt.wallet_line_no = entry.line_no AND receipt.source_bucket = entry.bucket
+                      AND receipt.amount = entry.amount AND receipt.disposition = 'on_time'))
+              ) THEN
+              RAISE EXCEPTION 'Order wallet settlement must debit and receipt the matching frozen hold once'
+                USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_settlement_match';
+            END IF;
+          ELSE
+            SELECT order_id INTO linked_order FROM wallet_operations
+            WHERE id = NEW.resolves_operation_id AND customer_id = NEW.customer_id
+              AND operation_type = 'order_payment_hold';
+            IF linked_order IS NULL OR NOT EXISTS (
+              SELECT 1 FROM payment_attempts AS attempt
+              WHERE attempt.id = linked_attempt AND attempt.wallet_hold_operation_id = NEW.resolves_operation_id
+                AND attempt.source = 'external' AND attempt.order_id = linked_order
+            ) OR expected_amount <> (
+              SELECT COALESCE(sum(amount), 0) FROM wallet_ledger_entries
+              WHERE wallet_operation_id = NEW.resolves_operation_id AND action = 'freeze'
+            ) OR EXISTS (
+              SELECT 1 FROM wallet_ledger_entries AS entry
+              WHERE entry.wallet_operation_id = NEW.id AND entry.action <> 'unfreeze'
+            ) THEN
+              RAISE EXCEPTION 'Order wallet release must unfreeze the matching hold exactly once'
+                USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_release_match';
+            END IF;
           END IF;
         END IF;
         RETURN NULL;
@@ -811,6 +972,133 @@ export const tradeFoundationMigration: Migration = {
       $$
     `.execute(db)
     await sql`CREATE CONSTRAINT TRIGGER wallet_operations_require_entries AFTER INSERT ON wallet_operations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION assert_wallet_operation_entries()`.execute(db)
+
+    await sql`
+      CREATE FUNCTION resolve_order_wallet_hold(
+        hold_operation_uuid uuid,
+        resolution_kind varchar(24)
+      ) RETURNS void
+      LANGUAGE plpgsql AS $$
+      DECLARE
+        hold_operation wallet_operations%ROWTYPE;
+        external_attempt payment_attempts%ROWTYPE;
+        resolution_operation_uuid uuid;
+        settlement_attempt_uuid uuid;
+        held_amount numeric(18, 2);
+      BEGIN
+        IF resolution_kind NOT IN ('order_payment_settlement', 'order_payment_release') THEN
+          RAISE EXCEPTION 'Unsupported order wallet hold resolution'
+            USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_resolution_kind';
+        END IF;
+        SELECT * INTO hold_operation FROM wallet_operations
+        WHERE id = hold_operation_uuid AND operation_type = 'order_payment_hold';
+        IF NOT FOUND THEN
+          RAISE EXCEPTION 'Order wallet hold does not exist'
+            USING ERRCODE = '23503', CONSTRAINT = 'wallet_order_hold_fkey';
+        END IF;
+        PERFORM customer_id FROM wallet_accounts WHERE customer_id = hold_operation.customer_id FOR UPDATE;
+        IF EXISTS (SELECT 1 FROM wallet_operations WHERE resolves_operation_id = hold_operation_uuid) THEN
+          RETURN;
+        END IF;
+
+        SELECT * INTO external_attempt FROM payment_attempts
+        WHERE wallet_hold_operation_id = hold_operation_uuid AND source = 'external';
+        IF NOT FOUND THEN
+          RAISE EXCEPTION 'Order wallet hold is not attached to an external payment attempt'
+            USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_hold_attempt_required';
+        END IF;
+        SELECT COALESCE(sum(amount), 0) INTO held_amount
+        FROM wallet_ledger_entries WHERE wallet_operation_id = hold_operation_uuid AND action = 'freeze';
+        IF held_amount <= 0 THEN
+          RAISE EXCEPTION 'Order wallet hold has no frozen balance'
+            USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_hold_amount_required';
+        END IF;
+
+        resolution_operation_uuid := gen_random_uuid();
+        IF resolution_kind = 'order_payment_release' THEN
+          IF external_attempt.status NOT IN ('failed', 'expired', 'cancelled', 'late_succeeded', 'reconciliation_required')
+            AND (SELECT status FROM orders WHERE id = hold_operation.order_id) <> 'closed'
+            AND NOT EXISTS (
+              SELECT 1 FROM payment_receipts AS receipt
+              WHERE receipt.payment_attempt_id = external_attempt.id AND receipt.disposition <> 'on_time'
+            ) THEN
+            RAISE EXCEPTION 'An order wallet hold can only be released after failure, closure or reconciliation'
+              USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_release_requires_terminal_result';
+          END IF;
+          INSERT INTO wallet_operations (
+            id, customer_id, resolves_operation_id, operation_type, request_sha256
+          ) VALUES (
+            resolution_operation_uuid, hold_operation.customer_id,
+            hold_operation_uuid, 'order_payment_release', hold_operation.request_sha256
+          );
+          INSERT INTO wallet_ledger_entries (
+            id, wallet_operation_id, line_no, customer_id, bucket, action, amount, payment_attempt_id
+          ) SELECT gen_random_uuid(), resolution_operation_uuid, entry.line_no, hold_operation.customer_id,
+              entry.bucket, 'unfreeze', entry.amount, external_attempt.id
+            FROM wallet_ledger_entries AS entry
+            WHERE entry.wallet_operation_id = hold_operation_uuid AND entry.action = 'freeze'
+            ORDER BY entry.line_no;
+          RETURN;
+        END IF;
+
+        IF external_attempt.status <> 'succeeded' OR NOT EXISTS (
+          SELECT 1 FROM payment_receipts WHERE payment_attempt_id = external_attempt.id
+            AND source_bucket = 'external' AND disposition = 'on_time' AND amount = external_attempt.amount
+        ) OR (SELECT status FROM orders WHERE id = hold_operation.order_id) <> 'pending_payment' THEN
+          RAISE EXCEPTION 'Order wallet funds can only settle against an on-time external success'
+            USING ERRCODE = '23514', CONSTRAINT = 'wallet_order_settlement_requires_external_success';
+        END IF;
+
+        INSERT INTO wallet_operations (
+          id, customer_id, order_id, resolves_operation_id, operation_type, request_sha256
+        ) VALUES (
+          resolution_operation_uuid, hold_operation.customer_id, hold_operation.order_id,
+          hold_operation_uuid, 'order_payment_settlement', hold_operation.request_sha256
+        );
+        settlement_attempt_uuid := gen_random_uuid();
+        SELECT COALESCE(sum(amount), 0) INTO held_amount
+        FROM wallet_ledger_entries WHERE wallet_operation_id = hold_operation_uuid AND action = 'freeze';
+        INSERT INTO payment_attempts (
+          id, idempotency_key, request_sha256, order_id, topup_customer_id, source, amount,
+          provider, provider_payment_id, wallet_operation_id, wallet_hold_operation_id, expires_at, completed_at
+        ) VALUES (
+          settlement_attempt_uuid, resolution_operation_uuid, hold_operation.request_sha256,
+          hold_operation.order_id, NULL, 'wallet', held_amount, NULL, NULL,
+          resolution_operation_uuid, NULL, NULL, NULL
+        );
+        INSERT INTO wallet_ledger_entries (
+          id, wallet_operation_id, line_no, customer_id, bucket, action, amount, payment_attempt_id
+        ) SELECT gen_random_uuid(), resolution_operation_uuid, entry.line_no, hold_operation.customer_id,
+            entry.bucket, 'debit_frozen', entry.amount, settlement_attempt_uuid
+          FROM wallet_ledger_entries AS entry
+          WHERE entry.wallet_operation_id = hold_operation_uuid AND entry.action = 'freeze'
+          ORDER BY entry.line_no;
+        INSERT INTO payment_receipts (
+          id, payment_attempt_id, source_bucket, provider, provider_transaction_id,
+          wallet_operation_id, wallet_line_no, amount
+        ) SELECT gen_random_uuid(), settlement_attempt_uuid, entry.bucket, NULL, NULL,
+            resolution_operation_uuid, entry.line_no, entry.amount
+          FROM wallet_ledger_entries AS entry
+          WHERE entry.wallet_operation_id = hold_operation_uuid AND entry.action = 'freeze'
+          ORDER BY entry.line_no;
+      END;
+      $$
+    `.execute(db)
+
+    await sql`
+      CREATE FUNCTION release_failed_order_wallet_hold() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF OLD.status IS DISTINCT FROM NEW.status AND NEW.source = 'external'
+          AND NEW.wallet_hold_operation_id IS NOT NULL
+          AND NEW.status IN ('failed', 'expired', 'cancelled', 'late_succeeded', 'reconciliation_required') THEN
+          PERFORM resolve_order_wallet_hold(NEW.wallet_hold_operation_id, 'order_payment_release');
+        END IF;
+        RETURN NEW;
+      END;
+      $$
+    `.execute(db)
+    await sql`CREATE TRIGGER payment_attempts_release_failed_wallet_hold AFTER UPDATE OF status ON payment_attempts FOR EACH ROW EXECUTE FUNCTION release_failed_order_wallet_hold()`.execute(db)
 
     await sql`
       CREATE FUNCTION validate_new_order() RETURNS trigger
@@ -822,6 +1110,7 @@ export const tradeFoundationMigration: Migration = {
         session_revoked_at timestamptz;
       BEGIN
         SELECT * INTO policy FROM storefront_customer_policy WHERE singleton FOR SHARE;
+        NEW.items_sealed := false;
         IF NEW.customer_id IS NOT NULL THEN
           SELECT status INTO customer_status FROM customers WHERE id = NEW.customer_id FOR KEY SHARE;
           IF NOT FOUND OR customer_status <> 'active' THEN
@@ -864,7 +1153,11 @@ export const tradeFoundationMigration: Migration = {
       LANGUAGE plpgsql AS $$
       DECLARE
         paid_amount numeric;
+        refunded_amount numeric;
+        refund_reserved_amount numeric;
         has_unresolved boolean;
+        has_active_refund boolean;
+        has_inflight_fulfillment boolean;
         all_items_complete boolean;
       BEGIN
         IF ROW(NEW.id, NEW.customer_id, NEW.guest_order_session_id, NEW.idempotency_key,
@@ -877,6 +1170,12 @@ export const tradeFoundationMigration: Migration = {
             USING ERRCODE = '23514', CONSTRAINT = 'orders_identity_immutable';
         END IF;
 
+        IF NEW.items_sealed IS DISTINCT FROM OLD.items_sealed
+          AND (OLD.items_sealed OR NOT NEW.items_sealed) THEN
+          RAISE EXCEPTION 'Order items can only be sealed once'
+            USING ERRCODE = '23514', CONSTRAINT = 'orders_items_seal_transition';
+        END IF;
+
         IF OLD.status IS DISTINCT FROM NEW.status THEN
           IF NOT ((OLD.status = 'pending_payment' AND NEW.status IN ('processing', 'closed'))
             OR (OLD.status = 'processing' AND NEW.status IN ('completed', 'closed'))) THEN
@@ -884,13 +1183,45 @@ export const tradeFoundationMigration: Migration = {
               USING ERRCODE = '23514', CONSTRAINT = 'orders_status_transition';
           END IF;
           IF NEW.status = 'processing' AND OLD.status = 'pending_payment' THEN
-            SELECT COALESCE(sum(receipt.amount), 0), COALESCE(bool_or(receipt.disposition IN ('late', 'amount_mismatch', 'excess')), false)
+            SELECT COALESCE(sum(receipt.amount), 0),
+              COALESCE(bool_or(receipt.disposition <> 'on_time' OR attempt.status <> 'succeeded'), false)
               INTO paid_amount, has_unresolved FROM payment_receipts AS receipt
               JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
               WHERE attempt.order_id = OLD.id;
-            IF OLD.total_amount > 0 AND (paid_amount < OLD.total_amount OR has_unresolved) THEN
+            IF OLD.total_amount > 0 AND (paid_amount <> OLD.total_amount OR has_unresolved) THEN
               RAISE EXCEPTION 'An order requires confirmed on-time payment before processing'
                 USING ERRCODE = '23514', CONSTRAINT = 'orders_processing_requires_payment';
+            END IF;
+          END IF;
+          IF NEW.status = 'closed' THEN
+            SELECT COALESCE(sum(receipt.amount), 0), COALESCE(sum(receipt.refunded_amount), 0),
+              COALESCE(sum(receipt.refund_reserved_amount), 0)
+              INTO paid_amount, refunded_amount, refund_reserved_amount
+            FROM payment_receipts AS receipt
+            JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
+            WHERE attempt.order_id = OLD.id;
+            SELECT EXISTS (SELECT 1 FROM order_refunds AS refund
+              WHERE refund.order_id = OLD.id
+                AND refund.status IN ('requested', 'approved', 'processing', 'partially_succeeded'))
+              INTO has_active_refund;
+            SELECT EXISTS (
+              SELECT 1 FROM order_item_fulfillment_attempts AS attempt
+              JOIN order_items AS item ON item.id = attempt.order_item_id
+              WHERE item.order_id = OLD.id AND attempt.status IN ('processing', 'unknown')
+            ) OR EXISTS (SELECT 1 FROM order_items AS item
+              WHERE item.order_id = OLD.id AND item.fulfillment_reserved_quantity > 0)
+              INTO has_inflight_fulfillment;
+            IF refund_reserved_amount > 0 OR has_active_refund THEN
+              RAISE EXCEPTION 'Order cannot close while a refund is unresolved'
+                USING ERRCODE = '23514', CONSTRAINT = 'orders_close_refund_unresolved';
+            END IF;
+            IF paid_amount <> refunded_amount THEN
+              RAISE EXCEPTION 'Collected order funds must be fully refunded before closing'
+                USING ERRCODE = '23514', CONSTRAINT = 'orders_close_requires_full_refund';
+            END IF;
+            IF has_inflight_fulfillment THEN
+              RAISE EXCEPTION 'Order cannot close while fulfillment is processing or uncertain'
+                USING ERRCODE = '23514', CONSTRAINT = 'orders_close_fulfillment_unresolved';
             END IF;
           END IF;
           IF NEW.status = 'completed' THEN
@@ -922,6 +1253,7 @@ export const tradeFoundationMigration: Migration = {
       LANGUAGE plpgsql AS $$
       DECLARE
         order_state varchar(24);
+        order_items_sealed boolean;
         product_name varchar(200);
         product_type varchar(16);
         product_status varchar(16);
@@ -933,9 +1265,10 @@ export const tradeFoundationMigration: Migration = {
         fulfillment_method varchar(24);
         option_snapshot jsonb;
       BEGIN
-        SELECT status INTO order_state FROM orders WHERE id = NEW.order_id FOR UPDATE;
-        IF NOT FOUND OR order_state NOT IN ('pending_payment', 'processing') THEN
-          RAISE EXCEPTION 'Order items can only be added while an order is being created'
+        SELECT status, items_sealed INTO order_state, order_items_sealed
+        FROM orders WHERE id = NEW.order_id FOR UPDATE;
+        IF NOT FOUND OR order_state NOT IN ('pending_payment', 'processing') OR order_items_sealed THEN
+          RAISE EXCEPTION 'Order items can only be added before the creation transaction seals them'
             USING ERRCODE = '23514', CONSTRAINT = 'order_items_order_open_check';
         END IF;
         IF NEW.fulfillment_status <> 'pending' OR NEW.fulfilled_quantity <> 0
@@ -1038,6 +1371,7 @@ export const tradeFoundationMigration: Migration = {
         expected_amount numeric(18, 2);
         actual_amount numeric;
         item_count bigint;
+        order_items_sealed boolean;
         reservation_count bigint;
         reserve_event_count bigint;
         item_uuid uuid;
@@ -1054,7 +1388,12 @@ export const tradeFoundationMigration: Migration = {
           RETURN NULL;
         END IF;
 
-        SELECT total_amount INTO expected_amount FROM orders WHERE id = order_uuid;
+        SELECT total_amount, items_sealed INTO expected_amount, order_items_sealed
+        FROM orders WHERE id = order_uuid;
+        IF NOT order_items_sealed THEN
+          RAISE EXCEPTION 'An order must seal its item snapshots before commit'
+            USING ERRCODE = '23514', CONSTRAINT = 'orders_items_must_be_sealed';
+        END IF;
         SELECT COALESCE(sum(line_amount), 0), count(*) INTO actual_amount, item_count
         FROM order_items WHERE order_id = order_uuid;
         IF actual_amount <> expected_amount OR item_count = 0 THEN
@@ -1242,6 +1581,8 @@ export const tradeFoundationMigration: Migration = {
       DECLARE outstanding bigint;
       BEGIN
         IF OLD.status IS DISTINCT FROM NEW.status AND NEW.status = 'closed' THEN
+          UPDATE payment_attempts SET status = 'cancelled'
+          WHERE order_id = NEW.id AND status IN ('created', 'pending');
           FOR reservation_row IN
             SELECT reservation.id, reservation.quantity, item.fulfillment_reserved_quantity
             FROM order_inventory_reservations AS reservation
@@ -1309,7 +1650,7 @@ export const tradeFoundationMigration: Migration = {
           IF NEW.source = 'wallet' THEN
             SELECT id INTO owner_customer FROM wallet_operations
             WHERE id = NEW.wallet_operation_id AND customer_id = order_row.customer_id
-              AND operation_type = 'order_payment';
+              AND order_id = order_row.id AND operation_type IN ('order_payment', 'order_payment_settlement');
             IF NOT FOUND THEN
               RAISE EXCEPTION 'Wallet payment operation does not belong to the order customer'
                 USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_wallet_operation_owner';
@@ -1323,6 +1664,13 @@ export const tradeFoundationMigration: Migration = {
               RAISE EXCEPTION 'Wallet payment cannot exceed the remaining order amount'
                 USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_wallet_amount_exceeds_due';
             END IF;
+          ELSIF NEW.wallet_hold_operation_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM wallet_operations AS operation
+            WHERE operation.id = NEW.wallet_hold_operation_id AND operation.customer_id = order_row.customer_id
+              AND operation.order_id = order_row.id AND operation.operation_type = 'order_payment_hold'
+          ) THEN
+            RAISE EXCEPTION 'External payment hold must belong to the order customer and order'
+              USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_wallet_hold_owner';
           END IF;
         ELSE
           IF NEW.source <> 'external' THEN
@@ -1346,9 +1694,11 @@ export const tradeFoundationMigration: Migration = {
       LANGUAGE plpgsql AS $$
       BEGIN
         IF ROW(NEW.id, NEW.idempotency_key, NEW.request_sha256, NEW.order_id, NEW.topup_customer_id,
-               NEW.source, NEW.amount, NEW.provider, NEW.provider_payment_id, NEW.wallet_operation_id, NEW.created_at)
+               NEW.source, NEW.amount, NEW.provider, NEW.provider_payment_id, NEW.wallet_operation_id,
+               NEW.wallet_hold_operation_id, NEW.requested_wallet_amount, NEW.created_at)
           IS DISTINCT FROM ROW(OLD.id, OLD.idempotency_key, OLD.request_sha256, OLD.order_id, OLD.topup_customer_id,
-               OLD.source, OLD.amount, OLD.provider, OLD.provider_payment_id, OLD.wallet_operation_id, OLD.created_at) THEN
+               OLD.source, OLD.amount, OLD.provider, OLD.provider_payment_id, OLD.wallet_operation_id,
+               OLD.wallet_hold_operation_id, OLD.requested_wallet_amount, OLD.created_at) THEN
           RAISE EXCEPTION 'Payment attempt identity, source and expected amount are immutable'
             USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_identity_immutable';
         END IF;
@@ -1364,7 +1714,11 @@ export const tradeFoundationMigration: Migration = {
         IF NEW.status = 'succeeded' AND NOT EXISTS (
           SELECT 1 FROM payment_receipts AS receipt WHERE receipt.payment_attempt_id = NEW.id
           GROUP BY receipt.payment_attempt_id
-          HAVING sum(receipt.amount) = NEW.amount AND bool_and(receipt.disposition = 'on_time')
+          HAVING bool_and(receipt.disposition = 'on_time') AND (
+            (NEW.source = 'wallet' AND sum(receipt.amount) = NEW.amount)
+            OR (NEW.source = 'external' AND sum(receipt.amount) FILTER (WHERE receipt.source_bucket = 'external') = NEW.amount
+              AND count(*) FILTER (WHERE receipt.source_bucket = 'external') = 1)
+          )
         ) THEN
           RAISE EXCEPTION 'A successful payment attempt requires matching on-time receipt evidence'
             USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_success_requires_receipt';
@@ -1399,6 +1753,51 @@ export const tradeFoundationMigration: Migration = {
       $$
     `.execute(db)
     await sql`CREATE TRIGGER payment_attempts_guard BEFORE UPDATE ON payment_attempts FOR EACH ROW EXECUTE FUNCTION guard_payment_attempt_update()`.execute(db)
+
+    await sql`
+      CREATE FUNCTION close_expired_order_when_settled(order_uuid uuid) RETURNS void
+      LANGUAGE plpgsql AS $$
+      DECLARE
+        order_row orders%ROWTYPE;
+        collected_amount numeric(18, 2);
+        refunded_amount numeric(18, 2);
+        reserved_refund_amount numeric(18, 2);
+        has_active_refund boolean;
+        has_inflight_fulfillment boolean;
+      BEGIN
+        SELECT * INTO order_row FROM orders WHERE id = order_uuid FOR UPDATE;
+        IF NOT FOUND OR order_row.status <> 'pending_payment' OR order_row.unpaid_expires_at IS NULL
+          OR (order_row.unpaid_expires_at > clock_timestamp() AND NOT EXISTS (
+            SELECT 1 FROM payment_attempts AS attempt
+            WHERE attempt.order_id = order_uuid AND attempt.expires_at <= clock_timestamp()
+          )) THEN
+          RETURN;
+        END IF;
+
+        SELECT COALESCE(sum(receipt.amount), 0), COALESCE(sum(receipt.refunded_amount), 0),
+          COALESCE(sum(receipt.refund_reserved_amount), 0)
+          INTO collected_amount, refunded_amount, reserved_refund_amount
+        FROM payment_receipts AS receipt
+        JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
+        WHERE attempt.order_id = order_uuid;
+        SELECT EXISTS (SELECT 1 FROM order_refunds AS refund WHERE refund.order_id = order_uuid
+          AND refund.status IN ('requested', 'approved', 'processing', 'partially_succeeded'))
+          INTO has_active_refund;
+        SELECT EXISTS (
+          SELECT 1 FROM order_item_fulfillment_attempts AS attempt
+          JOIN order_items AS item ON item.id = attempt.order_item_id
+          WHERE item.order_id = order_uuid AND attempt.status IN ('processing', 'unknown')
+        ) OR EXISTS (SELECT 1 FROM order_items AS item
+          WHERE item.order_id = order_uuid AND item.fulfillment_reserved_quantity > 0)
+          INTO has_inflight_fulfillment;
+
+        IF collected_amount = refunded_amount AND reserved_refund_amount = 0
+          AND NOT has_active_refund AND NOT has_inflight_fulfillment THEN
+          UPDATE orders SET status = 'closed' WHERE id = order_uuid AND status = 'pending_payment';
+        END IF;
+      END;
+      $$
+    `.execute(db)
 
     await sql`
       CREATE FUNCTION lock_and_classify_payment_receipt() RETURNS trigger
@@ -1448,7 +1847,9 @@ export const tradeFoundationMigration: Migration = {
           END IF;
           SELECT amount INTO ledger_amount FROM wallet_ledger_entries
           WHERE wallet_operation_id = attempt.wallet_operation_id AND line_no = NEW.wallet_line_no
-            AND payment_attempt_id = attempt.id AND action = 'debit_available'
+            AND payment_attempt_id = attempt.id
+            AND action = CASE (SELECT operation_type FROM wallet_operations WHERE id = attempt.wallet_operation_id)
+              WHEN 'order_payment' THEN 'debit_available' ELSE 'debit_frozen' END
             AND bucket = NEW.source_bucket;
           IF NOT FOUND OR ledger_amount <> NEW.amount THEN
             RAISE EXCEPTION 'Wallet receipt must have an equal immutable debit ledger entry'
@@ -1468,8 +1869,8 @@ export const tradeFoundationMigration: Migration = {
         IF attempt.order_id IS NOT NULL THEN
           IF order_row.status = 'pending_payment'
             AND (order_row.unpaid_expires_at <= clock_timestamp() OR attempt.expires_at <= clock_timestamp()) THEN
-            UPDATE orders SET status = 'closed' WHERE id = order_row.id;
-            order_row.status := 'closed';
+            PERFORM close_expired_order_when_settled(order_row.id);
+            SELECT * INTO order_row FROM orders WHERE id = attempt.order_id;
           END IF;
           IF attempt.source = 'wallet' AND (order_row.status <> 'pending_payment'
             OR order_row.unpaid_expires_at <= clock_timestamp()) THEN
@@ -1488,6 +1889,8 @@ export const tradeFoundationMigration: Migration = {
               NEW.disposition := 'amount_mismatch';
             ELSIF prior_received + NEW.amount > order_row.total_amount THEN
               NEW.disposition := 'excess';
+            ELSIF order_row.unpaid_expires_at <= clock_timestamp() OR attempt.expires_at <= clock_timestamp() THEN
+              NEW.disposition := 'late';
             END IF;
           END IF;
         ELSIF NEW.amount <> attempt.amount THEN
@@ -1569,13 +1972,23 @@ export const tradeFoundationMigration: Migration = {
           );
         END IF;
 
+        IF attempt.source = 'external' AND attempt.order_id IS NOT NULL
+          AND attempt.wallet_hold_operation_id IS NOT NULL THEN
+          IF NEW.disposition = 'on_time' THEN
+            PERFORM resolve_order_wallet_hold(attempt.wallet_hold_operation_id, 'order_payment_settlement');
+          ELSE
+            PERFORM resolve_order_wallet_hold(attempt.wallet_hold_operation_id, 'order_payment_release');
+          END IF;
+        END IF;
+
         IF attempt.order_id IS NOT NULL AND NEW.disposition = 'on_time' THEN
-          SELECT COALESCE(sum(receipt.amount), 0), COALESCE(bool_or(receipt.disposition IN ('late', 'amount_mismatch', 'excess')), false)
+          SELECT COALESCE(sum(receipt.amount), 0),
+            COALESCE(bool_or(receipt.disposition <> 'on_time' OR source_attempt.status <> 'succeeded'), false)
             INTO received, unresolved
           FROM payment_receipts AS receipt
           JOIN payment_attempts AS source_attempt ON source_attempt.id = receipt.payment_attempt_id
           WHERE source_attempt.order_id = attempt.order_id;
-          IF received >= (SELECT total_amount FROM orders WHERE id = attempt.order_id) AND NOT unresolved
+          IF received = (SELECT total_amount FROM orders WHERE id = attempt.order_id) AND NOT unresolved
             AND (SELECT status FROM orders WHERE id = attempt.order_id) = 'pending_payment' THEN
             UPDATE orders SET status = 'processing' WHERE id = attempt.order_id;
           END IF;
@@ -1760,6 +2173,17 @@ export const tradeFoundationMigration: Migration = {
       $$
     `.execute(db)
     await sql`CREATE TRIGGER order_refunds_guard_update BEFORE INSERT OR UPDATE ON order_refunds FOR EACH ROW EXECUTE FUNCTION guard_order_refund_update()`.execute(db)
+
+    await sql`
+      CREATE FUNCTION close_expired_order_after_refund() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        PERFORM close_expired_order_when_settled(NEW.order_id);
+        RETURN NEW;
+      END;
+      $$
+    `.execute(db)
+    await sql`CREATE TRIGGER order_refunds_close_expired_order AFTER UPDATE OF status ON order_refunds FOR EACH ROW EXECUTE FUNCTION close_expired_order_after_refund()`.execute(db)
 
     await sql`
       CREATE FUNCTION assert_refund_allocation_total() RETURNS trigger
@@ -2250,12 +2674,12 @@ export const tradeFoundationMigration: Migration = {
     await sql`DROP TABLE order_status_events`.execute(db)
     await sql`DROP TABLE order_item_fulfillment_attempts`.execute(db)
     await sql`DROP TABLE withdrawal_payout_attempts`.execute(db)
-    await sql`DROP TABLE withdrawals`.execute(db)
     await sql`DROP TABLE wallet_ledger_entries`.execute(db)
     await sql`DROP TABLE order_refund_allocations`.execute(db)
     await sql`DROP TABLE order_refunds`.execute(db)
     await sql`DROP TABLE payment_receipts`.execute(db)
     await sql`DROP TABLE payment_attempts`.execute(db)
+    await sql`DROP TABLE withdrawals`.execute(db)
     await sql`DROP TABLE wallet_operations`.execute(db)
     await sql`DROP TABLE wallet_accounts`.execute(db)
     await sql`DROP TABLE order_inventory_events`.execute(db)
@@ -2283,6 +2707,10 @@ export const tradeFoundationMigration: Migration = {
     await sql`DROP FUNCTION finish_payment_receipt()`.execute(db)
     await sql`DROP FUNCTION protect_payment_receipt()`.execute(db)
     await sql`DROP FUNCTION lock_and_classify_payment_receipt()`.execute(db)
+    await sql`DROP FUNCTION close_expired_order_after_refund()`.execute(db)
+    await sql`DROP FUNCTION close_expired_order_when_settled(uuid)`.execute(db)
+    await sql`DROP FUNCTION release_failed_order_wallet_hold()`.execute(db)
+    await sql`DROP FUNCTION resolve_order_wallet_hold(uuid, varchar)`.execute(db)
     await sql`DROP FUNCTION validate_payment_attempt()`.execute(db)
     await sql`DROP FUNCTION record_order_status_event()`.execute(db)
     await sql`DROP FUNCTION release_order_inventory_on_close()`.execute(db)
@@ -2301,6 +2729,7 @@ export const tradeFoundationMigration: Migration = {
     await sql`DROP FUNCTION guard_reserved_inventory_write()`.execute(db)
     await sql`DROP FUNCTION guard_payment_attempt_update()`.execute(db)
     await sql`DROP FUNCTION prevent_customer_resurrection()`.execute(db)
+    await sql`DROP FUNCTION reset_customer_contact_verification()`.execute(db)
     await sql`DROP FUNCTION enforce_customer_policy()`.execute(db)
     await sql`DROP FUNCTION create_customer_wallet_account()`.execute(db)
     await sql`DROP FUNCTION forbid_ordered_product_type_change()`.execute(db)

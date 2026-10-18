@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { addUnitAmounts, allocateWalletSpend, multiplyUnitAmount, parseUnitAmount, settleAmount } from '../src/index.ts'
+import { addUnitAmounts, allocateWalletOrderPayment, allocateWalletSpend, multiplyUnitAmount, parseUnitAmount, settleAmount } from '../src/index.ts'
 
 describe('decimal monetary helpers', () => {
   it('adds decimal strings without binary floating point drift', () => {
@@ -55,5 +55,18 @@ describe('decimal monetary helpers', () => {
     expect(() => allocateWalletSpend('100.01', '20.00', '80.00')).toThrow(RangeError)
     expect(() => allocateWalletSpend('1.001', '2.00', '2.00')).toThrow(TypeError)
     expect(() => allocateWalletSpend('1', '1e2', '1')).toThrow(TypeError)
+  })
+
+  it('keeps an unavailable wallet contribution due through the external payment leg', () => {
+    expect(allocateWalletOrderPayment('100.00', '80.00', '30.00', '50.00')).toEqual({
+      giftAmount: '30.00', cashAmount: '50.00', externalAmount: '20.00',
+    })
+    expect(allocateWalletOrderPayment('100.00', '100.00', '30.00', '50.00')).toEqual({
+      giftAmount: '30.00', cashAmount: '50.00', externalAmount: '20.00',
+    })
+    expect(allocateWalletOrderPayment('100.00', '80.00', '10.00', '20.00')).toEqual({
+      giftAmount: '10.00', cashAmount: '20.00', externalAmount: '70.00',
+    })
+    expect(() => allocateWalletOrderPayment('10.00', '10.01', '1.00', '1.00')).toThrow(RangeError)
   })
 })

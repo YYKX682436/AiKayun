@@ -43,7 +43,10 @@ async function submitLogin() {
 </script>
 
 <template>
-  <div class="min-h-dvh bg-default">
+  <div
+    class="min-h-dvh bg-default"
+    :data-admin-login-ready="clientReady ? 'true' : 'false'"
+  >
     <header class="border-b border-default bg-elevated">
       <UContainer class="flex min-h-16 items-center justify-between gap-4 py-2">
         <NuxtLink

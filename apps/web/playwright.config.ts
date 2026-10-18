@@ -42,7 +42,10 @@ export default defineConfig({
     },
     {
       command: `pnpm --filter @aikayun/web exec nuxt dev --host 127.0.0.1 --port ${webPort}`,
-      url: baseURL,
+      // The storefront SSR route depends on migrated catalog tables. Probe the
+      // self-contained admin entry so the server can start before globalSetup
+      // initializes the disposable test database.
+      url: new URL('/admin/login', baseURL).toString(),
       reuseExistingServer: false,
       timeout: 120_000,
       env: { NUXT_API_INTERNAL_URL: `http://127.0.0.1:${apiPort}`, NUXT_PUBLIC_SITE_URL: baseURL },

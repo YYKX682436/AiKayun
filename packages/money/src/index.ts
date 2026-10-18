@@ -84,3 +84,32 @@ export function allocateWalletSpend(
   if (cashAmount.gt(cash)) throw new RangeError('Insufficient wallet balance')
   return { giftAmount: giftAmount.toFixed(2), cashAmount: cashAmount.toFixed(2) }
 }
+
+/**
+ * Splits an order between a requested wallet contribution and external payment.
+ * Available gift funds are used before cash; any unavailable requested wallet
+ * amount stays due externally. All arithmetic remains in Decimal.
+ */
+export function allocateWalletOrderPayment(
+  orderAmount: string,
+  requestedWalletAmount: string,
+  giftAvailable: string,
+  cashAvailable: string,
+): { giftAmount: string; cashAmount: string; externalAmount: string } {
+  const order = parseWalletAmount(orderAmount)
+  const requested = parseWalletAmount(requestedWalletAmount)
+  const gift = parseWalletAmount(giftAvailable)
+  const cash = parseWalletAmount(cashAvailable)
+  if (order.lte(0) || requested.lte(0) || requested.gt(order)) {
+    throw new RangeError('Wallet contribution must be greater than zero and no greater than the order amount')
+  }
+
+  const giftAmount = ExactDecimal.min(requested, gift)
+  const cashAmount = ExactDecimal.min(requested.minus(giftAmount), cash)
+  const externalAmount = order.minus(giftAmount).minus(cashAmount)
+  return {
+    giftAmount: giftAmount.toFixed(2),
+    cashAmount: cashAmount.toFixed(2),
+    externalAmount: externalAmount.toFixed(2),
+  }
+}
