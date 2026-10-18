@@ -3,30 +3,23 @@ import type { ApiSuccess, PublicInventorySummary, PublicProductDetail, PublicPro
 
 const route = useRoute()
 const siteUrl = usePublicSiteUrl()
+useUncachedPublicPage()
 const id = computed(() => String(route.params.id ?? ''))
 const asyncDataKey = computed(() => `public-product-detail-${id.value}`)
-const { data, error, status, refresh } = await useAsyncData(
+const { data: fetchedData, error, status, refresh } = await useAsyncData(
   asyncDataKey,
   async (_nuxtApp, { signal }) => {
     try {
       return (await $fetch<ApiSuccess<PublicProductDetail>>(`/api/v1/public/products/${encodeURIComponent(id.value)}`, { signal })).data
     }
     catch (cause) {
-      if (signal.aborted) throw cause
-      const upstream = cause as { statusCode?: unknown; status?: unknown }
-      const candidate = Number(upstream?.statusCode ?? upstream?.status)
-      const statusCode = Number.isInteger(candidate) && candidate >= 400 && candidate <= 599 ? candidate : 502
-      // FetchError.data contains the upstream body. Do not serialize it into
-      // Nuxt's SSR payload, where API details or stack traces would be public.
-      throw createError({
-        statusCode,
-        statusMessage: statusCode === 404 ? 'Not Found' : 'Product temporarily unavailable',
-      })
+      // FetchError.data contains the upstream body; keep it out of Nuxt payloads.
+      return throwSafePublicApiError(cause, signal)
     }
   },
   { default: () => null, deep: false, getCachedData: (key, nuxtApp) => nuxtApp.isHydrating ? nuxtApp.payload.data[key] : undefined },
 )
-const product = computed(() => data.value)
+const product = computed(() => fetchedData.value?.id === id.value ? fetchedData.value : null)
 const responseStatus = computed(() => Number((error.value as { statusCode?: number; status?: number } | null)?.statusCode ?? (error.value as { status?: number } | null)?.status ?? 0))
 const isValidProductId = computed(() => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(id.value))
 const notFound = computed(() => responseStatus.value === 404 || (!isValidProductId.value && Boolean(id.value)))
@@ -125,6 +118,7 @@ useSeoMeta({
   ogImage: computed(() => selectedImageItem.value ? siteUrl(selectedImageItem.value.url) : undefined),
   ogUrl: computed(() => siteUrl(`/products/${encodeURIComponent(id.value)}`)),
   twitterCard: 'summary_large_image',
+  robots: computed(() => product.value ? 'index, follow' : 'noindex, nofollow'),
 })
 useHead(() => ({
   link: [{ rel: 'canonical', href: siteUrl(`/products/${encodeURIComponent(id.value)}`) }],
@@ -138,7 +132,7 @@ else if (import.meta.server && notFound.value) {
   await navigateTo('/', { redirectCode: 302, replace: true })
 }
 else if (import.meta.server && error.value) {
-  setResponseStatus(502)
+  setPublicPageFailureStatus(error.value)
 }
 
 let handledMissingId = ''

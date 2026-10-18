@@ -4,6 +4,7 @@ import type { ApiSuccess, PublicProductPage } from '@aikayun/contracts'
 const route = useRoute()
 const router = useRouter()
 const siteUrl = usePublicSiteUrl()
+useUncachedPublicPage()
 const { data: categoriesResponse } = await usePublicCategories()
 const categories = computed(() => categoriesResponse.value?.data.categories ?? [])
 const queryText = computed(() => String(Array.isArray(route.query.q) ? route.query.q[0] ?? '' : route.query.q ?? ''))
@@ -36,10 +37,17 @@ function searchQuery() {
 
 const initial = await useAsyncData(
   'public-search-initial',
-  async (_nuxtApp, { signal }) => (await $fetch<ApiSuccess<PublicProductPage>>('/api/v1/public/search', {
-    query: searchQuery(),
-    signal,
-  })).data,
+  async (_nuxtApp, { signal }) => {
+    try {
+      return (await $fetch<ApiSuccess<PublicProductPage>>('/api/v1/public/search', {
+        query: searchQuery(),
+        signal,
+      })).data
+    }
+    catch (cause) {
+      return throwSafePublicApiError(cause, signal)
+    }
+  },
   { default: () => null, deep: false },
 )
 const results = shallowRef<PublicProductPage | null>(initial.data.value ?? null)
@@ -56,7 +64,6 @@ async function loadResults() {
   activeController = controller
   loading.value = true
   failure.value = false
-  results.value = null
   try {
     const response = await $fetch<ApiSuccess<PublicProductPage>>('/api/v1/public/search', {
       query: searchQuery(),
@@ -68,7 +75,6 @@ async function loadResults() {
   catch (error) {
     if (requestId !== latestRequest || controller.signal.aborted) return
     failure.value = true
-    results.value = null
     void error
   }
   finally {
@@ -94,7 +100,6 @@ function onSearchInput(value: string): void {
     activeController = undefined
     loading.value = true
     failure.value = false
-    results.value = null
     searchTimer = setTimeout(() => updateQuery({ q: value.trim() || undefined }, true), 260)
     return
   }
@@ -121,7 +126,6 @@ function updateQuery(patch: Record<string, string | number | undefined>, replace
   activeController = undefined
   loading.value = true
   failure.value = false
-  results.value = null
   if (replace) void router.replace({ query: next })
   else void router.push({ query: next })
 }
@@ -143,6 +147,7 @@ const sortOptions = [
   { label: '价格从高到低', value: 'price_desc' },
 ]
 const siteBrand = useStoreBrand()
+setPublicPageFailureStatus(initial.error.value)
 useSeoMeta({
   title: '搜索商品',
   description: `搜索并筛选 ${siteBrand.value.storeName} 当前公开的商品。`,

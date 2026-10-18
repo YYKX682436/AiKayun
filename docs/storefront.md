@@ -49,15 +49,15 @@ SKU 详情不返回 SKU ID、编码或组合键。规格组和值仍用 D2 的�
 
 ## 不可公开详情和服务器错误
 
-商品详情 URL 为 `/products/[id]`，商品名称变更不改变商品 UUID 路径。公开 API 对未知、下架、暂停、归档、永久删除商品一律返回通用 404。前台 SSR 对明确 API 404 使用 HTTP 302 临时跳转到 `/`；客户端导航遵循相同策略。API 5xx 不会被当作不存在商品，页面保留详情路由并显示可重试错误。上游 FetchError 响应体在进入 Nuxt SSR payload 前被剥离，避免数据库错误或堆栈序列化给匿名页面；不会渲染任何不可公开商品名称、价格或图文。
+商品详情 URL 为 `/products/[id]`，商品名称变更不改变商品 UUID 路径。公开 API 对未知、下架、暂停、归档、永久删除商品一律返回通用 404。前台 SSR 对明确 API 404 使用 HTTP 302 临时跳转到 `/`；客户端导航遵循相同策略。首页、分类、搜索和详情遇到公开 API 服务故障时统一显示安全的可重试错误并返回 HTTP 502；分类不可见或不存在返回 404。服务端错误不会作为 200，也不会被改写成 404。上游 FetchError 响应体在进入 Nuxt SSR payload 前被剥离，避免数据库错误或堆栈序列化给匿名页面。
 
 ## SSR、SEO 和站点域名
 
 首页、分类商品、搜索结果与商品详情都从页面服务端数据请求得到真实首屏 HTML，不依赖 `mounted` 后才填入商品数据。请求参数改变时，旧结果不能覆盖新结果。
 
-各页面设置独立标题、描述、canonical 与 OG 数据。详情 JSON-LD 仅包含商品的名称、描述、图片、分类路径和真实展示属性；没有评价、评分、交易资格或可确认可交付的库存时，不生成评论、Offers 或 `InStock`。搜索页为 `noindex, follow`。
+各页面设置独立标题、描述、canonical 与 OG 数据。首页第一页 canonical 为 `/`，后续分页保留有效 `page`；分类 canonical 保留有效 `page` 和非默认的受支持 `sort`，第一页省略 `page=1`。未知参数不进入 canonical。搜索固定为 `noindex, follow` 并 canonical 到 `/search`。缺失分类和不可用商品详情不进入 sitemap；商品详情明确 404 使用 302 首页策略。详情 JSON-LD 仅包含商品的名称、描述、图片、分类路径和真实展示属性；没有评价、评分、交易资格或可确认可交付的库存时，不生成评论、Offers 或 `InStock`。
 
-Nuxt `runtimeConfig.public.siteUrl` 从 `NUXT_PUBLIC_SITE_URL` 读取。必须设为公开 HTTP(S) origin；无效值回退到 localhost 开发 origin。应用不会把未经验证的 Host 请求头用于 canonical、OG 或 sitemap。`/sitemap.xml` 只列 active 商品和可见分类，超过 sitemap URL 上限时生成分片索引 `/sitemap-:page.xml`。状态/价格数据和 sitemap 不设置长期缓存。
+Nuxt `runtimeConfig.public.siteUrl` 从 `NUXT_PUBLIC_SITE_URL` 读取。必须设为公开 HTTP(S) origin；无效值回退到 localhost 开发 origin。应用不会把未经验证的 Host 请求头用于 canonical、OG 或 sitemap。`/sitemap.xml` 只列 active 商品和可见分类，超过 sitemap URL 上限时生成分片索引 `/sitemap-:page.xml`。四种商品页面和 sitemap 响应均为 `Cache-Control: no-store`，保证新请求读取最新状态、价格和库存；Caddy 不设置动态 HTML 缓存规则。Nuxt 静态资源及 D5 不可变图片继续使用各自的静态资源缓存策略，图片维持一年 immutable。
 
 ## 视觉和边界
 

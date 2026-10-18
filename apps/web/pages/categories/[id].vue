@@ -3,6 +3,7 @@ import type { ApiSuccess, PublicCategoryProductsResponse } from '@aikayun/contra
 
 const route = useRoute()
 const siteUrl = usePublicSiteUrl()
+useUncachedPublicPage()
 const id = computed(() => String(route.params.id ?? ''))
 const page = computed(() => {
   const value = Number(route.query.page)
@@ -13,35 +14,45 @@ const sort = computed(() => {
   return ['default', 'newest', 'price_asc', 'price_desc'].includes(value) ? value : 'default'
 })
 const asyncDataKey = computed(() => `public-category-products-${id.value}-${page.value}-${sort.value}`)
-const { data, error, status, refresh } = await useAsyncData(
+const { data: fetchedData, error, status, refresh } = await useAsyncData(
   asyncDataKey,
   async (_nuxtApp, { signal }) => {
-    const response = await $fetch<ApiSuccess<PublicCategoryProductsResponse>>(`/api/v1/public/categories/${encodeURIComponent(id.value)}/products`, {
-      query: { page: page.value, pageSize: 24, sort: sort.value },
-      signal,
-    })
-    return response.data
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(id.value)) {
+      throw createError({ statusCode: 404, statusMessage: 'Not Found' })
+    }
+    try {
+      const response = await $fetch<ApiSuccess<PublicCategoryProductsResponse>>(`/api/v1/public/categories/${encodeURIComponent(id.value)}/products`, {
+        query: { page: page.value, pageSize: 24, sort: sort.value },
+        signal,
+      })
+      return response.data
+    }
+    catch (cause) {
+      return throwSafePublicApiError(cause, signal)
+    }
   },
   { default: () => null, deep: false, getCachedData: (key, nuxtApp) => nuxtApp.isHydrating ? nuxtApp.payload.data[key] : undefined },
 )
 
+const data = computed(() => fetchedData.value?.category.id === id.value && fetchedData.value.products.page === page.value ? fetchedData.value : null)
 const category = computed(() => data.value?.category)
 const products = computed(() => data.value?.products.items ?? [])
-const notFound = computed(() => [400, 404].includes(Number((error.value as { statusCode?: number } | null)?.statusCode)))
+const notFound = computed(() => Number((error.value as { statusCode?: number } | null)?.statusCode) === 404)
 const title = computed(() => category.value?.name ?? '商品分类')
 const description = computed(() => category.value
   ? `浏览 ${category.value.name} 及其可见子分类中的商品。`
   : '浏览店铺当前公开的分类商品。')
+const canonical = computed(() => siteUrl(canonicalPagePath(`/categories/${encodeURIComponent(id.value)}`, page.value, sort.value, 'default')))
+setPublicPageFailureStatus(error.value)
 useSeoMeta({
   title,
   description,
   ogTitle: title,
   ogDescription: description,
-  ogUrl: computed(() => siteUrl(`/categories/${encodeURIComponent(id.value)}`)),
-  robots: 'index, follow',
+  ogUrl: canonical,
+  robots: computed(() => data.value ? 'index, follow' : 'noindex, nofollow'),
 })
-useHead(() => ({ link: [{ rel: 'canonical', href: siteUrl(`/categories/${encodeURIComponent(id.value)}`) }] }))
-if (import.meta.server && notFound.value) setResponseStatus(404)
+useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
 
 const routeQuery = computed(() => route.query)
 </script>

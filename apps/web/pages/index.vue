@@ -3,33 +3,42 @@ import type { ApiSuccess, PublicProductPage } from '@aikayun/contracts'
 
 const route = useRoute()
 const siteUrl = usePublicSiteUrl()
+useUncachedPublicPage()
 const page = computed(() => {
   const value = Number(route.query.page)
   return Number.isInteger(value) && value > 0 ? Math.min(value, 100_000) : 1
 })
 const asyncDataKey = computed(() => `public-storefront-home-${page.value}`)
-const { data, error, status, refresh } = await useAsyncData(
+const { data: fetchedData, error, status, refresh } = await useAsyncData(
   asyncDataKey,
   async (_nuxtApp, { signal }) => {
-    const response = await $fetch<ApiSuccess<PublicProductPage>>('/api/v1/public/products', {
-      query: { page: page.value, pageSize: 24, sort: 'newest' },
-      signal,
-    })
-    return response.data
+    try {
+      const response = await $fetch<ApiSuccess<PublicProductPage>>('/api/v1/public/products', {
+        query: { page: page.value, pageSize: 24, sort: 'newest' },
+        signal,
+      })
+      return response.data
+    }
+    catch (cause) {
+      return throwSafePublicApiError(cause, signal)
+    }
   },
   { default: () => null, deep: false, getCachedData: (key, nuxtApp) => nuxtApp.isHydrating ? nuxtApp.payload.data[key] : undefined },
 )
 
+const data = computed(() => fetchedData.value?.page === page.value ? fetchedData.value : null)
 const products = computed(() => data.value?.items ?? [])
 const siteBrand = useStoreBrand()
+setPublicPageFailureStatus(error.value)
+const canonical = computed(() => siteUrl(canonicalPagePath('/', page.value)))
 useSeoMeta({
   title: '全部商品',
   description: `浏览 ${siteBrand.value.storeName} 当前公开销售的商品。`,
   ogTitle: `${siteBrand.value.storeName} · 全部商品`,
   ogDescription: `浏览 ${siteBrand.value.storeName} 当前公开销售的商品。`,
-  ogUrl: siteUrl('/'),
+  ogUrl: canonical,
 })
-useHead({ link: [{ rel: 'canonical', href: siteUrl('/') }] })
+useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
 </script>
 
 <template>

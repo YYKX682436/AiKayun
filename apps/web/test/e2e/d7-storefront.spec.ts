@@ -145,6 +145,7 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
 
   const publicPage = await page.request.get('/')
   expect(publicPage.status()).toBe(200)
+  expect(publicPage.headers()['cache-control']).toBe('no-store')
   const publicHtml = await publicPage.text()
   expect(publicHtml).toContain(product.name)
   expect(publicHtml).toContain('19.90')
@@ -174,6 +175,7 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
 
   const categoryPage = await page.goto(`/categories/${root.id}`)
   expect(categoryPage?.status()).toBe(200)
+  expect(categoryPage?.headers()['cache-control']).toBe('no-store')
   await expect(page.getByRole('heading', { name: 'D7真实目录' })).toBeVisible()
   await expect(page.locator(`a[href="/products/${product.id}"]`)).toBeVisible()
   const categoryApi = await page.request.get(`/api/v1/public/categories/${root.id}/products`)
@@ -187,6 +189,7 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
 
   const detailRequest = await page.request.get(`/products/${product.id}`)
   expect(detailRequest.status()).toBe(200)
+  expect(detailRequest.headers()['cache-control']).toBe('no-store')
   const detailHtml = await detailRequest.text()
   expect(detailHtml).toContain('<title>D7真实中文商品')
   expect(detailHtml).toContain('name="description"')
@@ -300,7 +303,9 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
   await expect(page.getByText('¥30.00', { exact: true })).toBeVisible()
   await expect(page.locator('del')).toHaveCount(0)
 
-  await page.goto(`/search?q=${encodeURIComponent('中文目录检索')}`)
+  const searchPage = await page.goto(`/search?q=${encodeURIComponent('中文目录检索')}`)
+  expect(searchPage?.status()).toBe(200)
+  expect(searchPage?.headers()['cache-control']).toBe('no-store')
   await expect(page.getByRole('heading', { name: '搜索商品' })).toBeVisible()
   await expect(page.getByRole('link', { name: /D7真实中文商品/ })).toBeVisible()
   await expect(page.locator('[data-storefront-ready="true"]')).toBeAttached()

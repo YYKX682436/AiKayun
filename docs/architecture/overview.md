@@ -86,7 +86,7 @@ Fastify 的 `/api/v1/public/*` 接口与管理员接口分离，使用独立 Typ
 
 前台售价按 `enabled=true AND retired_at IS NULL` 且规格关系有效的 SKU 计算，SQL 聚合与明细价格都不使用 JavaScript `number`。划线价随同一 SKU 返回；全部销售 SKU 停用时商品仍可展示但无可选价格。数量库存仅公开 `stocked - reserved > 0` 的状态；resource pool/external 是 `not_ready`，unlimited 表示数量策略不限，null 为未配置。这些状态不是购买资格，也不公开精确库存、管理摘要或交付承诺。
 
-商品 UUID 为稳定详情 URL 身份。不可公开的有效 UUID 由公开 API 返回 404；SSR 详情收到明确 404 时以 302 临时返回首页，API/服务器 5xx 留在详情错误态，不当作不存在商品。页面 canonical、OG、结构化 Product 和 XML sitemap 使用 `NUXT_PUBLIC_SITE_URL` 配置的 HTTP(S) origin，不拼接未经验证的 Host。sitemap 只列当前 active 商品与可见分类，公开商品响应为 `no-store`；D5 图片 URL 保持长期 immutable。购买、购物车、订单、支付、卡密交付、评价和供应商采购均不属于 D7。
+商品 UUID 为稳定详情 URL 身份。不可公开的有效 UUID 由公开 API 返回 404；SSR 详情收到明确 404 时以 302 临时返回首页，首页、分类、搜索、详情遇到上游服务故障时均返回安全的 502 页面，不当作不存在商品。商品页面 HTML 和公开商品 API 为 `no-store`；Caddy 不设置动态 HTML 缓存，D5 图片 URL 仍保持长期 immutable。页面 canonical、OG、结构化 Product 和 XML sitemap 使用 `NUXT_PUBLIC_SITE_URL` 配置的 HTTP(S) origin，不拼接未经验证的 Host；首页和分类 canonical 保留有效分页，分类保留非默认受支持排序，搜索为 noindex 并 canonical 到 `/search`。sitemap 只列当前 active 商品与可见分类。购买、购物车、订单、支付、卡密交付、评价和供应商采购均不属于 D7。
 
 ## 管理员认证
 
