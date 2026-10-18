@@ -94,10 +94,10 @@ jobs:
           docker compose exec -T db psql -U aikayun -d aikayun -Atc 'SELECT marker FROM compose_persistence_check' | grep -qx persisted
           curl --fail --silent http://localhost:8080/api/v1/health/ready
           for attempt in $(seq 1 60); do
-            if curl --fail --silent http://localhost:8080/ | grep -q '暂无可展示的商品'; then break; fi
+            if curl --fail --silent http://localhost:8080/ | grep -q '全部商品'; then break; fi
             sleep 2
           done
-          curl --fail --silent http://localhost:8080/ | grep -q '暂无可展示的商品'
+          curl --fail --silent http://localhost:8080/ | grep -q '全部商品'
       - name: Remove CI containers and volumes
         if: always()
         run: docker compose down -v --remove-orphans
