@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { zh_cn } from '@nuxt/ui/locale'
+import zh_cn from '@nuxt/ui/runtime/locale/zh_cn.js'
 import { computed } from 'vue'
 import { createStorefrontThemeStyle } from '~/utils/store-brand'
 
