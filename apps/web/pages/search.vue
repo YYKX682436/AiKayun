@@ -9,7 +9,10 @@ const { data: categoriesResponse } = await usePublicCategories()
 const categories = computed(() => categoriesResponse.value?.data.categories ?? [])
 const queryText = computed(() => String(Array.isArray(route.query.q) ? route.query.q[0] ?? '' : route.query.q ?? ''))
 const categoryId = computed(() => String(Array.isArray(route.query.categoryId) ? route.query.categoryId[0] ?? '' : route.query.categoryId ?? ''))
-const productType = computed(() => String(Array.isArray(route.query.productType) ? route.query.productType[0] ?? '' : route.query.productType ?? ''))
+const productType = computed(() => {
+  const value = String(Array.isArray(route.query.productType) ? route.query.productType[0] ?? '' : route.query.productType ?? '')
+  return ['physical', 'digital', 'service'].includes(value) ? value : ''
+})
 const sort = computed(() => {
   const value = String(Array.isArray(route.query.sort) ? route.query.sort[0] ?? '' : route.query.sort ?? '')
   return ['newest', 'price_asc', 'price_desc'].includes(value) ? value : 'default'
@@ -18,76 +21,48 @@ const page = computed(() => {
   const value = Number(route.query.page)
   return Number.isInteger(value) && value > 0 ? Math.min(value, 100_000) : 1
 })
-const searchInput = ref(queryText.value)
 const allCategories = '__all_categories__'
 const allProductTypes = '__all_product_types__'
 const categorySelectValue = computed(() => categoryId.value || allCategories)
 const productTypeSelectValue = computed(() => productType.value || allProductTypes)
 
-function searchQuery() {
-  return {
-    q: queryText.value.trim() || undefined,
-    categoryId: categoryId.value || undefined,
-    productType: productType.value || undefined,
-    sort: sort.value,
-    page: page.value,
-    pageSize: 24,
-  }
-}
-
-const initial = await useAsyncData(
-  'public-search-initial',
+const requestQuery = computed(() => ({
+  q: queryText.value.trim() || undefined,
+  categoryId: categoryId.value || undefined,
+  productType: productType.value || undefined,
+  sort: sort.value,
+  page: page.value,
+  pageSize: 24,
+}))
+const requestIdentity = computed(() => JSON.stringify(requestQuery.value))
+const searchInput = ref(queryText.value)
+const { data: fetchedResult, error, status, refresh } = await useAsyncData(
+  computed(() => `public-search-${requestIdentity.value}`),
   async (_nuxtApp, { signal }) => {
+    const identity = requestIdentity.value
     try {
-      return (await $fetch<ApiSuccess<PublicProductPage>>('/api/v1/public/search', {
-        query: searchQuery(),
+      const response = await $fetch<ApiSuccess<PublicProductPage>>('/api/v1/public/search', {
+        query: requestQuery.value,
         signal,
-      })).data
+      })
+      return { identity, response: response.data }
     }
     catch (cause) {
       return throwSafePublicApiError(cause, signal)
     }
   },
-  { default: () => null, deep: false },
+  { default: () => null, deep: false, dedupe: 'cancel', getCachedData: (key, nuxtApp) => nuxtApp.isHydrating ? nuxtApp.payload.data[key] : undefined },
 )
-const results = shallowRef<PublicProductPage | null>(initial.data.value ?? null)
-const loading = ref(false)
-const failure = ref(Boolean(initial.error.value))
-let latestRequest = 0
-let activeController: AbortController | undefined
+const results = computed(() => fetchedResult.value?.identity === requestIdentity.value && searchInput.value.trim() === queryText.value.trim()
+  ? fetchedResult.value.response
+  : null)
+const inputPending = computed(() => searchInput.value.trim() !== queryText.value.trim())
+const loading = computed(() => status.value === 'pending' || inputPending.value)
+const failure = computed(() => status.value === 'error' && !inputPending.value)
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 
-async function loadResults() {
-  const requestId = ++latestRequest
-  activeController?.abort()
-  const controller = new AbortController()
-  activeController = controller
-  loading.value = true
-  failure.value = false
-  try {
-    const response = await $fetch<ApiSuccess<PublicProductPage>>('/api/v1/public/search', {
-      query: searchQuery(),
-      signal: controller.signal,
-    })
-    if (requestId !== latestRequest) return
-    results.value = response.data
-  }
-  catch (error) {
-    if (requestId !== latestRequest || controller.signal.aborted) return
-    failure.value = true
-    void error
-  }
-  finally {
-    if (requestId === latestRequest) {
-      loading.value = false
-      activeController = undefined
-    }
-  }
-}
-
-watch(() => route.fullPath, () => {
+watch(queryText, () => {
   if (searchInput.value !== queryText.value) searchInput.value = queryText.value
-  if (import.meta.client) void loadResults()
 }, { flush: 'post' })
 
 function onSearchInput(value: string): void {
@@ -95,16 +70,11 @@ function onSearchInput(value: string): void {
   if (!import.meta.client) return
   if (searchTimer) clearTimeout(searchTimer)
   if (value.trim() !== queryText.value.trim()) {
-    latestRequest += 1
-    activeController?.abort()
-    activeController = undefined
-    loading.value = true
-    failure.value = false
     searchTimer = setTimeout(() => updateQuery({ q: value.trim() || undefined }, true), 260)
     return
   }
   searchInput.value = queryText.value
-  if (!results.value && !loading.value) void loadResults()
+  if (status.value === 'error') void refresh()
 }
 
 function updateQuery(patch: Record<string, string | number | undefined>, replace = false) {
@@ -121,11 +91,6 @@ function updateQuery(patch: Record<string, string | number | undefined>, replace
   }
   const nextPath = router.resolve({ path: route.path, query: next }).fullPath
   if (nextPath === route.fullPath) return
-  latestRequest += 1
-  activeController?.abort()
-  activeController = undefined
-  loading.value = true
-  failure.value = false
   if (replace) void router.replace({ query: next })
   else void router.push({ query: next })
 }
@@ -147,7 +112,7 @@ const sortOptions = [
   { label: '价格从高到低', value: 'price_desc' },
 ]
 const siteBrand = useStoreBrand()
-setPublicPageFailureStatus(initial.error.value)
+setPublicPageFailureStatus(error.value)
 useSeoMeta({
   title: '搜索商品',
   description: `搜索并筛选 ${siteBrand.value.storeName} 当前公开的商品。`,
@@ -159,7 +124,6 @@ useHead({ link: [{ rel: 'canonical', href: siteUrl('/search') }] })
 
 onBeforeUnmount(() => {
   if (searchTimer) clearTimeout(searchTimer)
-  activeController?.abort()
 })
 </script>
 
@@ -246,7 +210,7 @@ onBeforeUnmount(() => {
         variant="subtle"
         title="搜索暂时失败"
         description="请检查网络后重试。"
-        :actions="[{ label: '重试', onClick: loadResults }]"
+        :actions="[{ label: '重试', onClick: () => refresh() }]"
         class="mt-4"
       />
       <template v-else-if="results?.items.length">

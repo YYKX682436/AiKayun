@@ -130,7 +130,7 @@ R1 管理端一致性规则：`mode: "all"` 的 `skuEnabledUpdates` 只携带明
 
 D7 前台路由、公开 Fastify API、字段安全规则、有效售价/库存规则、分类树、搜索、稀疏 SKU 选择、404/302 处理、富文本、SEO、缓存与验证路径详见[商城前台说明](storefront.md)。公开数据只经 `/api/v1/public/*` 读取，不调用管理员 ProductDetail；业务查询在 PostgreSQL 中先过滤 active 商品、可销售 SKU 和可见分类，再映射为公开 TypeBox 契约。Nuxt SSR 与同源 BFF 保持不变。
 
-Chromium D7 E2E 使用真实 `_test` PostgreSQL、Fastify、Nuxt BFF 和独立媒体目录。除页面和 SSR HTML 外，还通过真实后台 API 创建分类、SKU、图片和正文，校验首页/分类/详情、搜索 query 同步、缺失商品 302、客户端 API 500 不误跳转、sitemap、媒体 immutable 缓存、稀疏 SKU 组合与多个视口尺寸。独立 SSR HTTP 测试使用隔离的模拟 API 注入各公开接口 500，读取实际 HTTP 状态、响应头和 SSR HTML，验证四种页面的 200/404/502/302、错误正文脱敏、canonical 分页、noindex、伪造转发 Host 不影响绝对 URL，以及错误态保留重试操作。搜索交互断言等待控件完成客户端水合后执行；测试不会用 sleep 猜测页面就绪状态。
+Chromium D7 E2E 使用真实 `_test` PostgreSQL、Fastify、Nuxt BFF 和独立媒体目录。除页面和 SSR HTML 外，还通过真实后台 API 创建分类、SKU、图片和正文，校验首页/分类/详情、搜索 query 同步、分类排序请求身份、搜索离页重进及乱序响应、真实排序/筛选/分页/历史恢复、失败重试、缺失商品 302、客户端 API 500 不误跳转、sitemap、媒体 immutable 缓存、稀疏 SKU 组合与多个视口尺寸。独立 SSR HTTP 测试使用隔离的模拟 API 注入各公开接口 500，读取实际 HTTP 状态、响应头和 SSR HTML，验证四种页面的 200/404/502/302、错误正文脱敏、canonical 分页、noindex、伪造转发 Host 不影响绝对 URL，以及错误态保留重试操作。搜索交互断言等待控件完成客户端水合后执行；测试不会用 sleep 猜测页面就绪状态。
 
 D7 只提供商品浏览。购物车、订单、支付、库存预留、卡密/数字文件交付、第三方采购、评价及营销系统均留给后续阶段；页面明确提示购买功能尚未开放，不提供无效交易按钮。
 

@@ -42,12 +42,20 @@ async function csrfToken(page: Page): Promise<string> {
   return (await response.json()).data.csrfToken as string
 }
 
-async function createProduct(page: Page, name: string, description: string): Promise<ProductRecord> {
+async function createProduct(page: Page, name: string, description: string, salePrice = '19.90', productType: 'physical' | 'digital' | 'service' = 'digital'): Promise<ProductRecord> {
   const response = await page.request.post('/api/v1/admin/products', {
     headers: { 'x-csrf-token': await csrfToken(page), origin: new URL(page.url()).origin },
-    data: { name, description, productType: 'digital', defaultSku: { salePrice: '19.90' } },
+    data: { name, description, productType, defaultSku: { salePrice } },
   })
   return dataOf<ProductRecord>(response, 201)
+}
+
+async function assignProductCategory(page: Page, product: ProductRecord, categoryId: string): Promise<ProductRecord> {
+  const response = await page.request.put(`/api/v1/admin/products/${product.id}/categories`, {
+    headers: { 'x-csrf-token': await csrfToken(page), origin: new URL(page.url()).origin },
+    data: { expectedRevision: product.revision, assignments: [{ categoryId, isPrimary: true, sortOrder: 0 }] },
+  })
+  return dataOf<ProductRecord>(response, 200)
 }
 
 async function getAdminProduct(page: Page, productId: string): Promise<ProductRecord> {
@@ -77,6 +85,17 @@ async function expectTemporaryHomeRedirect(page: Page, product: ProductRecord): 
   expect(response.status()).toBe(302)
   expect(response.headers().location).toBe('/')
   expect(await response.text()).not.toContain(product.name)
+}
+
+async function navigateClient(page: Page, path: string): Promise<void> {
+  await page.evaluate(async (nextPath) => {
+    const root = document.querySelector('#__nuxt') as (HTMLElement & {
+      __vue_app__?: { config: { globalProperties: { $router?: { push: (location: string) => Promise<unknown> } } } }
+    }) | null
+    const router = root?.__vue_app__?.config.globalProperties.$router
+    if (!router) throw new Error('Nuxt client router is unavailable')
+    await router.push(nextPath)
+  }, path)
 }
 
 test('D7 serves a real SSR catalog, visible category path, safe media details, sparse SKU selection, and responsive search', async ({ page }) => {
@@ -139,6 +158,13 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
   product = await dataOf<ProductRecord>(categoryUpdate, 200)
   product = await setLifecycle(page, product, 'active')
 
+  const lowPriceProduct = await createProduct(page, 'D7价格排序低价测试商品', 'D7分类升降序回归。', '8.80')
+  await setLifecycle(page, await assignProductCategory(page, lowPriceProduct, root.id), 'active')
+  const highPriceProduct = await createProduct(page, 'D7价格排序高价测试商品', 'D7分类升降序回归。', '28.80')
+  await setLifecycle(page, await assignProductCategory(page, highPriceProduct, root.id), 'active')
+  const searchBProduct = await createProduct(page, 'R2搜索B专属商品', 'R2搜索结果身份回归。', '23.40')
+  await setLifecycle(page, await assignProductCategory(page, searchBProduct, root.id), 'active')
+
   const unpublished = await page.request.get(`/api/v1/public/products/${product.id}`)
   expect(unpublished.status()).toBe(200)
   expect(unpublished.headers()['cache-control']).toBe('no-store')
@@ -186,6 +212,45 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
   await expect(page.getByRole('heading', { name: 'D7二级分类' })).toBeVisible()
   await page.getByRole('navigation', { name: '面包屑' }).getByRole('link', { name: 'D7真实目录' }).click()
   await expect(page).toHaveURL(`/categories/${root.id}`)
+
+  const categoryNames = () => page.locator('ul > li h2').allTextContents()
+  await expect.poll(categoryNames).toContain('D7价格排序低价测试商品')
+  let signalOldSortStarted!: () => void
+  let releaseOldSort!: () => void
+  const oldSortStarted = new Promise<void>(resolve => signalOldSortStarted = resolve)
+  const oldSortGate = new Promise<void>(resolve => releaseOldSort = resolve)
+  await page.route(`**/api/v1/public/categories/${root.id}/products**`, async (requestRoute) => {
+    const url = new URL(requestRoute.request().url())
+    if (url.searchParams.get('sort') === 'price_asc') {
+      signalOldSortStarted()
+      await oldSortGate
+      try {
+        await requestRoute.continue()
+      }
+      catch {
+        // The ascending response is intentionally stale after descending is selected.
+      }
+      return
+    }
+    if (url.searchParams.get('sort') === 'newest') {
+      await requestRoute.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { message: 'PRIVATE_SORT_DATABASE_STACK' } }) })
+      return
+    }
+    await requestRoute.continue()
+  })
+  await navigateClient(page, `/categories/${root.id}?sort=price_asc`)
+  await oldSortStarted
+  await expect(page.locator('ul > li h2')).toHaveCount(0)
+  await navigateClient(page, `/categories/${root.id}?sort=price_desc`)
+  await expect.poll(categoryNames).toEqual(['D7价格排序高价测试商品', 'R2搜索B专属商品', 'D7真实中文商品', 'D7价格排序低价测试商品'])
+  releaseOldSort()
+  await expect.poll(categoryNames).toEqual(['D7价格排序高价测试商品', 'R2搜索B专属商品', 'D7真实中文商品', 'D7价格排序低价测试商品'])
+  await navigateClient(page, `/categories/${root.id}?sort=newest`)
+  await expect(page.getByText('分类暂时无法加载')).toBeVisible()
+  await expect(page.locator('ul > li h2')).toHaveCount(0)
+  await expect(page.getByText('PRIVATE_SORT_DATABASE_STACK')).toHaveCount(0)
+  await page.unroute(`**/api/v1/public/categories/${root.id}/products**`)
+  await page.goto(`/categories/${root.id}`)
 
   const detailRequest = await page.request.get(`/products/${product.id}`)
   expect(detailRequest.status()).toBe(200)
@@ -405,4 +470,146 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
   })
   await dataOf<{ productId: string; deleted: true }>(deleted, 200)
   expect((await page.request.get(`/products/${sparseArchived.id}`, { maxRedirects: 0 })).status()).toBe(302)
+})
+
+test('search re-entry never renders a previous query while the current URL is loading', async ({ page }) => {
+  await page.goto('/')
+  await authenticate(page)
+  let searchA = await createProduct(page, 'R2搜索A专属商品', '只匹配搜索关键词 A。')
+  searchA = await setLifecycle(page, searchA, 'active')
+  const searchB = await createProduct(page, 'R2搜索B重进专属商品', '只匹配搜索关键词 B。')
+  await setLifecycle(page, searchB, 'active')
+
+  const searchAResponse = await page.goto(`/search?q=${encodeURIComponent('R2搜索A')}`)
+  expect(searchAResponse?.status()).toBe(200)
+  await expect(page.getByRole('link', { name: /R2搜索A专属商品/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: /R2搜索B重进专属商品/ })).toHaveCount(0)
+  await page.getByRole('link', { name: /R2搜索A专属商品/ }).click()
+  await expect(page).toHaveURL(`/products/${searchA.id}`)
+
+  let signalSearchBStarted!: () => void
+  let releaseSearchB!: () => void
+  const searchBStarted = new Promise<void>(resolve => signalSearchBStarted = resolve)
+  const searchBGate = new Promise<void>(resolve => releaseSearchB = resolve)
+  await page.route('**/api/v1/public/search**', async (requestRoute) => {
+    if (new URL(requestRoute.request().url()).searchParams.get('q') === 'R2搜索B') {
+      signalSearchBStarted()
+      await searchBGate
+    }
+    await requestRoute.continue()
+  })
+  await page.getByRole('link', { name: '搜索商品' }).click()
+  await page.getByRole('searchbox', { name: '搜索商品名称或描述' }).fill('R2搜索B')
+  await expect(page).toHaveURL(`/search?q=${encodeURIComponent('R2搜索B')}`)
+  await searchBStarted
+  await expect(page.getByRole('link', { name: /R2搜索A专属商品/ })).toHaveCount(0)
+  releaseSearchB()
+  await expect(page.getByRole('link', { name: /R2搜索B重进专属商品/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: /R2搜索A专属商品/ })).toHaveCount(0)
+  await page.unroute('**/api/v1/public/search**')
+
+  let signalStaleSearchStarted!: () => void
+  let releaseStaleSearch!: () => void
+  const staleSearchStarted = new Promise<void>(resolve => signalStaleSearchStarted = resolve)
+  const staleSearchGate = new Promise<void>(resolve => releaseStaleSearch = resolve)
+  await page.route('**/api/v1/public/search**', async (requestRoute) => {
+    if (new URL(requestRoute.request().url()).searchParams.get('q') === 'R2搜索A') {
+      signalStaleSearchStarted()
+      await staleSearchGate
+    }
+    try {
+      await requestRoute.continue()
+    }
+    catch {
+      // The older search is intentionally allowed to finish after the current query.
+    }
+  })
+  await page.getByRole('searchbox', { name: '搜索商品名称或描述' }).fill('R2搜索A')
+  await staleSearchStarted
+  await page.getByRole('searchbox', { name: '搜索商品名称或描述' }).fill('R2搜索B')
+  await expect(page).toHaveURL(`/search?q=${encodeURIComponent('R2搜索B')}`)
+  await expect(page.getByRole('link', { name: /R2搜索B重进专属商品/ })).toBeVisible()
+  releaseStaleSearch()
+  await expect(page.getByRole('link', { name: /R2搜索B重进专属商品/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: /R2搜索A专属商品/ })).toHaveCount(0)
+  await page.unroute('**/api/v1/public/search**')
+})
+
+test('search URL identity restores real filters, ordering, pagination, history, and failure state', async ({ page }) => {
+  test.setTimeout(180_000)
+  await page.goto('/')
+  await authenticate(page)
+  const category = await createCategory(page, 'R2搜索筛选分类')
+
+  const products: ProductRecord[] = []
+  for (let index = 1; index <= 24; index++) {
+    const number = String(index).padStart(2, '0')
+    let product = await createProduct(page, `R2分页商品${number}`, `R2分页描述${number}`, `${index}.00`)
+    product = await setLifecycle(page, product, 'active')
+    products.push(product)
+  }
+  const physical = await createProduct(page, 'R2分类实物匹配商品', 'R2分页商品分类筛选样本', '30.00', 'physical')
+  await setLifecycle(page, await assignProductCategory(page, physical, category.id), 'active')
+
+  const searchPath = `/search?q=${encodeURIComponent('R2分页商品')}&sort=price_asc`
+  const initialResponse = await page.goto(searchPath)
+  expect(initialResponse?.status()).toBe(200)
+  await expect(page.getByText('找到 25 件商品')).toBeVisible()
+  const productLinks = page.locator('ul.grid > li')
+  await expect(productLinks.first()).toContainText('R2分页商品01')
+  await expect(productLinks.last()).toContainText('R2分页商品24')
+  await expect(page.locator('ul.grid > li').first()).toContainText('¥1.00')
+  await expect(page.locator('ul.grid > li')).toHaveCount(24)
+  await page.getByRole('link', { name: '下一页' }).click()
+  await expect(page).toHaveURL(/page=2/u)
+  await expect(page.locator('ul.grid > li').first()).toContainText('R2分类实物匹配商品')
+  await expect(page.locator('ul.grid > li')).toHaveCount(1)
+  await page.goBack()
+  await expect(page).toHaveURL(/sort=price_asc/u)
+  await expect(page.locator('ul.grid > li').first()).toContainText('R2分页商品01')
+  await page.goForward()
+  await expect(page).toHaveURL(/page=2/u)
+  await expect(page.locator('ul.grid > li').first()).toContainText('R2分类实物匹配商品')
+  await page.goBack()
+  await expect(page.locator('ul.grid > li').first()).toContainText('R2分页商品01')
+  await page.reload()
+  await expect(page.locator('ul.grid > li').first()).toContainText('R2分页商品01')
+
+  await page.getByRole('combobox', { name: '商品排序' }).click()
+  await page.getByRole('option', { name: '价格从高到低' }).click()
+  await expect(page).toHaveURL(/sort=price_desc/u)
+  await expect(page.locator('ul.grid > li').first()).toContainText('R2分类实物匹配商品')
+  await expect(page.locator('ul.grid > li').first()).toContainText('¥30.00')
+
+  await page.getByRole('combobox', { name: '按分类筛选' }).click()
+  await page.getByRole('option', { name: 'R2搜索筛选分类' }).click()
+  await expect(page).toHaveURL(new RegExp(`categoryId=${category.id}`, 'u'))
+  await expect(page.getByRole('link', { name: /R2分类实物匹配商品/u })).toBeVisible()
+  await expect(page.getByRole('link', { name: /R2分页商品/u })).toHaveCount(0)
+  await page.getByRole('combobox', { name: '按商品性质筛选' }).click()
+  await page.getByRole('option', { name: '实物商品' }).click()
+  await expect(page).toHaveURL(/productType=physical/u)
+  await expect(page.getByRole('link', { name: /R2分类实物匹配商品/u })).toBeVisible()
+  await expect(page.getByText('找到 1 件商品')).toBeVisible()
+
+  await page.getByRole('combobox', { name: '商品排序' }).click()
+  await page.getByRole('option', { name: '最新商品' }).click()
+  await expect(page).toHaveURL(/sort=newest/u)
+  await expect(page.locator('ul.grid > li').first()).toContainText('R2分类实物匹配商品')
+
+  await page.route('**/api/v1/public/search**', async (requestRoute) => {
+    if (new URL(requestRoute.request().url()).searchParams.get('sort') === 'default') {
+      await requestRoute.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { message: 'PRIVATE_SEARCH_STACK' } }) })
+      return
+    }
+    await requestRoute.continue()
+  })
+  await page.getByRole('combobox', { name: '商品排序' }).click()
+  await page.getByRole('option', { name: '默认排序' }).click()
+  await expect(page.getByText('搜索暂时失败')).toBeVisible()
+  await expect(page.getByRole('link', { name: /R2分类实物匹配商品/u })).toHaveCount(0)
+  await expect(page.getByText('PRIVATE_SEARCH_STACK')).toHaveCount(0)
+  await page.unroute('**/api/v1/public/search**')
+  await page.getByRole('button', { name: '重试' }).click()
+  await expect(page.getByRole('link', { name: /R2分类实物匹配商品/u })).toBeVisible()
 })

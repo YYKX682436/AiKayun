@@ -13,10 +13,12 @@ const sort = computed(() => {
   const value = String(route.query.sort ?? 'default')
   return ['default', 'newest', 'price_asc', 'price_desc'].includes(value) ? value : 'default'
 })
-const asyncDataKey = computed(() => `public-category-products-${id.value}-${page.value}-${sort.value}`)
+const requestIdentity = computed(() => JSON.stringify([id.value, page.value, sort.value]))
+const asyncDataKey = computed(() => `public-category-products-${requestIdentity.value}`)
 const { data: fetchedData, error, status, refresh } = await useAsyncData(
   asyncDataKey,
   async (_nuxtApp, { signal }) => {
+    const identity = requestIdentity.value
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(id.value)) {
       throw createError({ statusCode: 404, statusMessage: 'Not Found' })
     }
@@ -25,16 +27,16 @@ const { data: fetchedData, error, status, refresh } = await useAsyncData(
         query: { page: page.value, pageSize: 24, sort: sort.value },
         signal,
       })
-      return response.data
+      return { identity, response: response.data }
     }
     catch (cause) {
       return throwSafePublicApiError(cause, signal)
     }
   },
-  { default: () => null, deep: false, getCachedData: (key, nuxtApp) => nuxtApp.isHydrating ? nuxtApp.payload.data[key] : undefined },
+  { default: () => null, deep: false, dedupe: 'cancel', getCachedData: (key, nuxtApp) => nuxtApp.isHydrating ? nuxtApp.payload.data[key] : undefined },
 )
 
-const data = computed(() => fetchedData.value?.category.id === id.value && fetchedData.value.products.page === page.value ? fetchedData.value : null)
+const data = computed(() => fetchedData.value?.identity === requestIdentity.value ? fetchedData.value.response : null)
 const category = computed(() => data.value?.category)
 const products = computed(() => data.value?.products.items ?? [])
 const notFound = computed(() => Number((error.value as { statusCode?: number } | null)?.statusCode) === 404)
