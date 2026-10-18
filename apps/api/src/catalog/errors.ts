@@ -106,6 +106,7 @@ export function catalogDatabaseFailure(error: unknown): { status: number; code: 
       product_variant_combination_key_consistent: conflict('SKU_COMBINATION_INCONSISTENT', 'The SKU option references do not match its saved combination'),
       product_variant_active_combination_required: conflict('INVALID_SKU_MATRIX', 'Every enabled SKU must have one valid value for each active option group'),
       product_requires_sku: conflict('PRODUCT_SKU_REQUIRED', 'A product must retain at least one SKU'),
+      product_type_order_reference: conflict('PRODUCT_TYPE_CHANGE_BLOCKED', 'Product type cannot change after an order references the product'),
       product_variant_retired_immutable: conflict('SKU_PERMANENTLY_RETIRED', 'A permanently retired SKU cannot be reactivated, rewritten, or deleted'),
       product_variant_retired_options_immutable: conflict('SKU_PERMANENTLY_RETIRED', 'A permanently retired SKU must retain its specification references'),
       product_variant_option_values_truncate_forbidden: conflict('SKU_OPTION_TRUNCATE_FORBIDDEN', 'Use catalog operations to preserve SKU combinations and product revisions'),

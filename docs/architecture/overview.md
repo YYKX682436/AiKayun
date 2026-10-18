@@ -4,7 +4,7 @@
 
 AiKayun 是可独立部署、可通过商业授权销售的数字商品商城。系统采用 TypeScript 模块化单体：一个 Nuxt 前端工程通过同源 BFF 路由调用单一 Fastify API，API 与前端共用 TypeBox 契约。当前目录按可运行的技术边界拆分，不预先创建空业务模块。
 
-当前已实现商城基础、后台基础、管理员安全入口，以及阶段③-D1～D6 的商品管理 API/后台和 D7 顾客商品首页、分类、搜索、详情与公开读取 API。消费者账户、订单、支付和履约仍不在数据库范围内；卡密/账号资源池与第三方库存同步也尚未实现。后续按阶段推进，避免以插件名义引入没有明确边界的万能扩展框架。
+当前已实现商城基础、后台基础、管理员安全入口，以及阶段③-D1～D6 的商品管理 API/后台和 D7 顾客商品首页、分类、搜索、详情与公开读取 API。阶段④-1 增加了顾客身份、订单、库存预留、资金账本、支付/退款/提现关系及履约记录的数据基础和数据库状态约束；完整顾客认证、下单 API、支付适配器、超时调度、退款操作和发货引擎尚未实现。卡密/账号资源池与第三方库存同步也尚未实现。
 
 旧 MyShop 仓库只允许在后续需要时只读核对业务经验；本工程不复制其代码，不继承其数据库、API、配置或部署依赖，也不接入闲鱼系统。
 
@@ -18,7 +18,7 @@ AiKayun 是可独立部署、可通过商业授权销售的数字商品商城。
 
 ## 数据与迁移
 
-PostgreSQL 18 为唯一业务数据库。Kysely Migrator 以版本化 TypeScript 迁移管理 schema；API 不在进程启动时隐式改表。业务表包括管理员与会话、`products`、`product_variants`、分类、规格、属性关系表和独立商品操作审计表，另有 Kysely 自己的迁移元数据。商品、分类、规格组、规格值、商品属性和 SKU 均有独立 UUID 身份；商品名称与分类名称都不作为身份。商品创建时会生成真实默认 SKU，但默认 SKU 不是永久要求；数据库在事务提交时要求每个商品至少有一个 SKU，允许全部 SKU 暂停或退役。仍有商品时，数据库禁止对 SKU 表执行 `TRUNCATE`。
+PostgreSQL 18 为唯一业务数据库。Kysely Migrator 以版本化 TypeScript 迁移管理 schema；API 不在进程启动时隐式改表。业务表包括管理员与会话、商品目录与库存、商品操作审计，以及④-1新增的顾客、订单、支付、退款、钱包、提现和履约记录，另有 Kysely 自己的迁移元数据。商品、分类、规格组、规格值、商品属性和 SKU 均有独立 UUID 身份；商品名称与分类名称都不作为身份。商品创建时会生成真实默认 SKU，但默认 SKU 不是永久要求；数据库在事务提交时要求每个商品至少有一个 SKU，允许全部 SKU 暂停或退役。仍有商品时，数据库禁止对 SKU 表执行 `TRUNCATE`。
 
 `product_categories` 使用自关联 `parent_id`，数据库递归触发器验证循环和四级深度。分类树写事务先更新共享的 `product_category_tree_guard` 行；共同元组写冲突使 READ COMMITTED 等待后读取最新树状态，并使持有旧快照的 REPEATABLE READ 事务以序列化冲突失败。触发器也为直接数据库写入更新该行；单独的 advisory lock 不承担快照正确性。`product_category_assignments` 以 `(product_id, category_id)` 去重，部分唯一索引限制每商品一个主分类，延迟约束在事务提交时保证“有关联就必须恰有一个主分类”。关联行按商品保存分类内排序；分类和商品外键均避免删除分类时级联删除商品或关联。
 
@@ -94,9 +94,41 @@ Fastify 的 `/api/v1/public/*` 接口与管理员接口分离，使用独立 Typ
 
 变更请求要求同源 `Origin`、CSRF Cookie 与 `X-CSRF-Token` 三者匹配。CSRF 比较使用常量时间比较；登录路由有速率限制。生产环境强制 Secure Cookie，Caddy 是公开入口，API 容器只在 Compose 网络内可达。管理接口逐条执行服务端会话验证，前端路由守卫只提供导航体验，不构成权限边界。
 
-## 事务与未来业务
+## ④-1 交易数据架构与事务边界
 
-当前认证写入仅涉及单笔管理员或会话记录。后续订单、支付尝试、库存扣减和履约必须分别定义幂等键、状态转移与并发保护，关键跨表变化放在明确的数据库事务中；外部支付或发货适配器的网络调用不能包在长时间持有的数据库事务里。旧仓库只提供只读的事务设计参考，不能替代新项目自己的数据模型和测试。
+迁移 `202610180001_trade_foundation` 只新增交易基础数据，不回填或改写阶段③商品、SKU、数量库存与库存调整流水。新增 19 张表：`storefront_customer_policy`、`customers`、`guest_order_sessions`、`product_variant_fulfillment`、`orders`、`order_items`、`order_inventory_reservations`、`order_inventory_events`、`wallet_accounts`、`wallet_operations`、`wallet_ledger_entries`、`payment_attempts`、`payment_receipts`、`order_refunds`、`order_refund_allocations`、`withdrawals`、`withdrawal_payout_attempts`、`order_item_fulfillment_attempts`、`order_status_events`；并提供只读投影 `order_financial_status` 与 `customer_order_status`。迁移在既有 `products` 上加订单后商品性质不可变触发器，在 `product_variant_quantity_inventory` 上加 `reserved` 写入保护触发器；没有修改阶段③历史迁移。
+
+### 顾客身份与订单快照
+
+`admin_users` 与 `customers` 完全分离。注册顾客状态为 `active`、`disabled` 或 `deleted`；有效账户必须有用户名和密码哈希，用户名按小写唯一，邮箱按小写唯一，手机号唯一。商店策略默认邮箱/手机号均非必填、游客下单与游客免费领取关闭、未付款订单 15 分钟超时；策略只能保留一个数据库行，不能被删除或截断。配置要求邮箱/手机号时，顾客写入由触发器兜底检查。验证时间戳用于以后限制密码找回；注册、验证、恢复与找回 API 尚未实现。
+
+删除顾客是不可逆的匿名化：状态转为 `deleted` 时用户名、密码哈希、邮箱、手机号和验证时间必须清空；数据库保留顾客 UUID、钱包账户、资金流水和订单外键，不允许恢复该身份或物理删除相关记录。`guest_order_sessions` 只保存会话 token 的 SHA-256 摘要；订单恰好关联一名注册顾客或一个游客会话，游客会话不能获得独立顾客账户或钱包。
+
+`orders` 的 `(owner, idempotency_key)` 唯一索引阻止同一归属重复提交；重放请求的载荷摘要一致性由订单服务核对。`order_items` 按订单与 SKU 唯一，保存商品名、性质、SKU 编码、规格组/值名称和身份、库存模式、发货方式、单价、数量及行金额快照。数据库验证快照与创建时锁定的商品/SKU 一致；提交时延迟约束验证订单总额等于非空订单项金额之和。改名、改价和下架不改历史快照；商品性质在存在订单项后不可更改。商品及 SKU 外键为 `ON DELETE RESTRICT`，订单、订单项、库存与资金记录禁止危险级联删除。后台“删除订单历史”应只写入订单上的单向隐藏时间、管理员和原因，不能删除资金或库存凭证。
+
+### 库存预留和状态
+
+④-1复用阶段③ `product_variants` 与 `product_variant_quantity_inventory`。可售数量仍是 `stocked - reserved`。`quantity` 下单时在同一事务写订单项、订单级预留和初始 `reserve` 事件；事件触发器锁 SKU 后锁原数量库存行，校验可售量并递增既有 `inventory_revision`。管理员不能直接更新 `reserved`；预留只能由订单库存事件变动。每个事件有唯一 `operation_id`，每个 quantity 订单项恰好一个初始预留；重复释放在剩余量校验处失败。取消/超时释放未交付量；付款成功保留预留；履约成功才写 `consume`，同步减少 `stocked` 与 `reserved` 并递增 `inventory_revision`。`unlimited` 不创建数量预留；`resource_pool`、`external` 和 `NULL` 不满足下单快照检查，不能据此收款。
+
+多 SKU 下单服务必须按 `product_id`、再按 `product_variant_id` 的 UUID 升序取得全部商品/SKU 锁，再按相同顺序触及数量库存行，并在同一事务内写订单、订单项和预留。现有库存调整也遵循 SKU → 数量库存的锁顺序。订单支付与超时竞争先锁订单，再锁支付尝试并记录回执；关闭订单时按 SKU UUID 顺序释放剩余预留。付款回执在锁等待结束后以 PostgreSQL `clock_timestamp()` 判断订单/支付尝试截止时间，避免 `now()` 的事务开始时刻把超时后的回执误判为准时。若回执先成功，订单从 `pending_payment` 进入 `processing`，超时关闭只能对仍待付款订单生效；若关闭先提交，之后到账被记录为 `late`，订单保持关闭并留待退款/对账。数据库触发器、锁与状态检查已覆盖该竞态，但超时扫描任务尚未实现。
+
+订单状态仅为 `pending_payment → processing → completed`，未付款订单可关闭，处理中订单也可经业务取消关闭。零元订单在数据库中直接进入 `processing`，没有支付尝试或虚假第三方成功回执。支付尝试独立于订单：每次外部尝试有 UUID 和幂等键，支付回执唯一记录真实来源、通道交易号、金额与分类；仅有回执的状态转换才能确认支付。成功支付不能因后续发货失败恢复为未付款。支付尝试状态包括 `created`、`pending`、`succeeded`、`failed`、`expired`、`cancelled`、`late_succeeded` 和 `reconciliation_required`；回执分类包括准时、迟到、金额不符与超额。迟到、金额不符和超额收款保留原始金额，不能推动订单进入已付款履约状态。
+
+`order_item_fulfillment_attempts` 将幂等发货操作绑定到单个订单项；`processing/unknown` 保留待发货数量，明确失败可释放，成功必须带结果摘要并消费数量库存。不同订单项可有不同 `fulfillment_method_snapshot`。每个订单项独立记录 `pending/processing/partially_fulfilled/failed/unknown/completed` 和已完成/处理中数量；父订单只有全部订单项全量完成后才成为 `completed`。顾客展示投影依序映射为待付款、待发货、进行中、已完成、已退款或已关闭。部分退款、迟到支付、对账异常和履约失败仍保留各自业务状态，不覆盖订单或真实收款结果。
+
+### 余额、退款与提现
+
+`wallet_accounts` 分开保存现金/赠送的可用和冻结金额，全部为 `NUMERIC(18,2)`，四个余额都不得为负。账户由顾客行自动创建、不可删除；余额不能直接更新，只能由插入不可变 `wallet_ledger_entries` 触发变更。每个 `wallet_operations.id` 唯一，资金流水引用操作及支付回执、退款分配或提现；操作必须在事务提交时拥有匹配流水。`packages/money` 的 Decimal.js 函数以十进制字符串运算，消费顺序固定为赠送余额后现金余额；数据库账户行锁串行化并发消费。
+
+退款请求与每个资金来源的 `order_refund_allocations` 分离。分配先冻结可退金额；每个分配只能从 `reserved` 一次转为 `succeeded` 或 `released`，同一资金来源累计预留和成功金额不超过实际回执。原路退款要求与来源通道一致；余额退款仍回到来源桶，赠送余额只能回到赠送余额，禁止转成现金。退款状态单独表达申请、审核、处理中、部分成功、成功、失败或取消；“申请中”不等于退款已到账。
+
+`withdrawals` 保存人工审核/打款的提交金额、手续费、到账金额和私有收款信息快照，首次状态只能是 `pending_review`。冻结与解冻/扣减都写资金操作与账本流水。每次外部人工打款都有 `withdrawal_payout_attempts`；未知结果保留 `transfer_uncertain` 并由唯一活动尝试索引阻止重复启动。提现尝试只有在管理员记录结果审核身份和外部核实材料 SHA-256 摘要后，才能转为明确成功或失败。只有明确失败才能回到待打款并新建尝试，明确成功才完成提现并扣除冻结现金。人工转账不与数据库共享事务，阶段④-2 后的管理界面必须在结果未知时保持阻断，不自动重试或假定成功。收款资料不是公开商品媒体，也未建立公开访问路径。
+
+### 阶段边界与部署恢复
+
+此阶段落地的是迁移、类型、钱包记账基础函数、数据库约束、状态投影和 PostgreSQL 集成测试；不提供顾客注册/下单 API、购物车、支付渠道/回调/主动查单、充值流程、退款审核执行、提现界面/人工打款、超时调度或卡密/文件/API 发货。实际支付补偿、对账和结果未知的人工处理闭环由后续阶段实现；上线前不得据此宣称交易接口已开放。
+
+部署前恢复方案沿用 [部署与恢复](../deployment.md)：先用 `scripts/backup-compose-data.sh` 同时保存 PostgreSQL custom dump 与商品媒体，再用隔离 Compose 项目、`_test` 数据库和项目专属媒体卷执行 `scripts/restore-test-compose-data.sh` 验证校验与恢复。若生产迁移失败，停止写入并从已验证的迁移前数据库/媒体备份恢复，再部署兼容版本；本次只在本机隔离 PostgreSQL 测试库验证前向升级，没有连接或迁移生产环境，也没有声称已完成生产备份恢复演练。
 
 ## 部署边界
 

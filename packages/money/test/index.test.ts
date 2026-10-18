@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { addUnitAmounts, multiplyUnitAmount, parseUnitAmount, settleAmount } from '../src/index.ts'
+import { addUnitAmounts, allocateWalletSpend, multiplyUnitAmount, parseUnitAmount, settleAmount } from '../src/index.ts'
 
 describe('decimal monetary helpers', () => {
   it('adds decimal strings without binary floating point drift', () => {
@@ -47,5 +47,13 @@ describe('decimal monetary helpers', () => {
     expect(addUnitAmounts('-2.50000', '1.25000')).toBe('-1.25000')
     expect(multiplyUnitAmount('-2.50000', 2)).toBe('-5.00000')
     expect(settleAmount('-1.005')).toBe('-1.01')
+  })
+
+  it('spends gift balance before cash using exact decimal strings', () => {
+    expect(allocateWalletSpend('50.00', '30', '80.00')).toEqual({ giftAmount: '30.00', cashAmount: '20.00' })
+    expect(allocateWalletSpend('0.01', '0.01', '0.01')).toEqual({ giftAmount: '0.01', cashAmount: '0.00' })
+    expect(() => allocateWalletSpend('100.01', '20.00', '80.00')).toThrow(RangeError)
+    expect(() => allocateWalletSpend('1.001', '2.00', '2.00')).toThrow(TypeError)
+    expect(() => allocateWalletSpend('1', '1e2', '1')).toThrow(TypeError)
   })
 })

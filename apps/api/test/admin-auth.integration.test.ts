@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeAll, afterAll, describe, expect, it } from 'vitest'
 import { sql } from 'kysely'
+import { multiplyUnitAmount, settleAmount } from '@aikayun/money'
 import sharp from 'sharp'
 import { Migrator } from 'kysely/migration'
 import type { FastifyInstance } from 'fastify'
@@ -222,6 +223,56 @@ async function changeProductLifecycle(
     method: 'PATCH', url: `/api/v1/admin/products/${productId}/lifecycle`,
     headers: productHeaders(auth), payload: body,
   })
+}
+
+async function createReservedOrderForTest(
+  auth: Awaited<ReturnType<typeof loginAdmin>>,
+  productId: string,
+  variantId: string,
+  quantity: number,
+): Promise<string> {
+  let current = (await app.inject({
+    method: 'GET', url: `/api/v1/admin/products/${productId}`, headers: { cookie: auth.sessionCookie },
+  })).json<{ data: ProductDetail }>().data
+  if (current.status !== 'active') {
+    const activated = await changeProductLifecycle(auth, productId, { expectedRevision: current.revision, status: 'active' })
+    expect(activated.statusCode).toBe(200)
+    current = activated.json<{ data: ProductDetail }>().data
+  }
+  const sku = current.variants.find((variant) => variant.id === variantId)
+  if (!sku) throw new Error(`Test SKU ${variantId} is missing`)
+  const customerId = randomUUID()
+  const orderId = randomUUID()
+  const itemId = randomUUID()
+  const unitPrice = settleAmount(sku.salePrice)
+  const lineAmount = settleAmount(multiplyUnitAmount(sku.salePrice, quantity))
+  await db.transaction().execute(async (trx) => {
+    await trx.insertInto('customers').values({
+      id: customerId, username: `reserved-${customerId.slice(0, 8)}`, password_hash: 'test-only-password-hash',
+      email: null, email_verified_at: null, phone: null, phone_verified_at: null, status: 'active',
+    }).execute()
+    await trx.selectFrom('products').select('id').where('id', '=', productId).forUpdate().executeTakeFirstOrThrow()
+    await trx.selectFrom('product_variants').select('id').where('id', '=', variantId).forUpdate().executeTakeFirstOrThrow()
+    await trx.insertInto('product_variant_fulfillment').values({
+      product_variant_id: variantId, method: 'manual',
+    }).onConflict((conflict) => conflict.column('product_variant_id').doNothing()).execute()
+    await trx.insertInto('orders').values({
+      id: orderId, customer_id: customerId, guest_order_session_id: null,
+      idempotency_key: randomUUID(), request_sha256: 'a'.repeat(64), total_amount: lineAmount,
+      unpaid_expires_at: new Date(Date.now() + 60_000), history_hidden_at: null,
+      history_hidden_by_admin_id: null, history_hidden_reason: null,
+    }).execute()
+    await trx.insertInto('order_items').values({
+      id: itemId, order_id: orderId, product_id: productId, product_variant_id: variantId,
+      product_name_snapshot: current.name, product_type_snapshot: current.productType,
+      sku_code_snapshot: sku.skuCode, sku_snapshot: '[]', inventory_mode_snapshot: 'quantity',
+      fulfillment_method_snapshot: 'manual', unit_price: unitPrice, quantity, line_amount: lineAmount,
+    }).execute()
+    await trx.insertInto('order_inventory_reservations').values({
+      id: randomUUID(), order_item_id: itemId, product_id: productId, product_variant_id: variantId, quantity,
+    }).execute()
+  })
+  return orderId
 }
 
 async function copyProduct(
@@ -869,12 +920,17 @@ describe('Fastify API with PostgreSQL 18', () => {
       order by tablename
     `.execute(db)
     expect(result.rows.map((row) => row.table_name)).toEqual([
-      'admin_product_creation_requests', 'admin_sessions', 'admin_users', 'product_attributes', 'product_categories',
-      'product_category_assignments', 'product_category_tree_guard', 'product_management_audit_events',
+      'admin_product_creation_requests', 'admin_sessions', 'admin_users', 'customers', 'guest_order_sessions',
+      'order_inventory_events', 'order_inventory_reservations', 'order_item_fulfillment_attempts', 'order_items',
+      'order_refund_allocations', 'order_refunds', 'order_status_events', 'orders', 'payment_attempts',
+      'payment_receipts', 'product_attributes', 'product_categories', 'product_category_assignments',
+      'product_category_tree_guard', 'product_management_audit_events',
       'product_media', 'product_media_references', 'product_media_variants',
       'product_option_groups', 'product_option_values',
-      'product_variant_inventory_adjustments', 'product_variant_option_values',
+      'product_variant_fulfillment', 'product_variant_inventory_adjustments', 'product_variant_option_values',
       'product_variant_quantity_inventory', 'product_variants', 'products',
+      'storefront_customer_policy', 'wallet_accounts', 'wallet_ledger_entries', 'wallet_operations',
+      'withdrawal_payout_attempts', 'withdrawals',
     ])
     const admin = await db.selectFrom('admin_users').select('email').where('email', '=', testEmail).executeTakeFirst()
     expect(admin?.email).toBe(testEmail)
@@ -2403,54 +2459,71 @@ describe('Fastify API with PostgreSQL 18', () => {
     })
     expect(decreased.statusCode).toBe(201)
     const afterDecrease = decreased.json<{ data: { inventoryRevision: number } }>().data
-    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 10 })
-      .where('product_variant_id', '=', sku.id).execute()
+    const firstReservedOrderId = await createReservedOrderForTest(auth, product.id, sku.id, 10)
+    modeState.productRevision = (await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie },
+    })).json<{ data: ProductDetail }>().data.revision
+    const firstReservedRevision = await db.selectFrom('product_variants').select('inventory_revision')
+      .where('id', '=', sku.id).executeTakeFirstOrThrow()
+    const pauseAfterReservation = await changeProductLifecycle(auth, product.id, {
+      expectedRevision: modeState.productRevision, status: 'paused',
+    })
+    expect(pauseAfterReservation.statusCode).toBe(200)
+    modeState.productRevision = pauseAfterReservation.json<{ data: ProductDetail }>().data.revision
     await expect(db.updateTable('product_variant_quantity_inventory').set({ reserved: 91 })
       .where('product_variant_id', '=', sku.id).execute()).rejects.toMatchObject({
-      code: '23514', constraint: 'product_variant_quantity_inventory_reserved_check',
+      code: '23514', constraint: 'inventory_reserved_requires_order_event',
     })
     const blockedByReservation = await setInventoryMode(auth, product.id, sku.id, {
       expectedRevision: modeState.productRevision,
       expectedSkuRevision: modeState.skuRevision,
-      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      expectedInventoryRevision: firstReservedRevision.inventory_revision,
       inventoryMode: 'external',
     })
     expect(blockedByReservation.statusCode).toBe(409)
     expect(blockedByReservation.json().error.code).toBe('INVENTORY_MODE_SWITCH_BLOCKED')
-    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 0 })
-      .where('product_variant_id', '=', sku.id).execute()
+    await db.updateTable('orders').set({ status: 'closed' }).where('id', '=', firstReservedOrderId).execute()
     await expect(db.updateTable('product_variant_quantity_inventory').set({ stocked: -1 })
       .where('product_variant_id', '=', sku.id).execute()).rejects.toMatchObject({
       code: '23514',
     })
-    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 10 })
-      .where('product_variant_id', '=', sku.id).execute()
+    const secondReservedOrderId = await createReservedOrderForTest(auth, product.id, sku.id, 10)
+    modeState.productRevision = (await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie },
+    })).json<{ data: ProductDetail }>().data.revision
+    const secondReservedRevision = await db.selectFrom('product_variants').select('inventory_revision')
+      .where('id', '=', sku.id).executeTakeFirstOrThrow()
+    const pauseWithSecondReservation = await changeProductLifecycle(auth, product.id, {
+      expectedRevision: modeState.productRevision, status: 'paused',
+    })
+    expect(pauseWithSecondReservation.statusCode).toBe(200)
+    modeState.productRevision = pauseWithSecondReservation.json<{ data: ProductDetail }>().data.revision
     const belowReserved = await adjustInventory(auth, product.id, sku.id, {
-      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      expectedInventoryRevision: secondReservedRevision.inventory_revision,
       operationId: randomUUID(), action: 'decrease', quantity: 81, reason: '超出可售库存',
     })
     expect(belowReserved.statusCode).toBe(409)
     expect(belowReserved.json().error.code).toBe('STOCK_BELOW_RESERVED_QUANTITY')
     const setBelowReserved = await adjustInventory(auth, product.id, sku.id, {
-      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      expectedInventoryRevision: secondReservedRevision.inventory_revision,
       operationId: randomUUID(), action: 'set', quantity: 9, reason: '错误目标值',
     })
     expect(setBelowReserved.statusCode).toBe(409)
     const overflow = await adjustInventory(auth, product.id, sku.id, {
-      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      expectedInventoryRevision: secondReservedRevision.inventory_revision,
       operationId: randomUUID(), action: 'increase', quantity: 2_147_483_647, reason: '超范围补货',
     })
     expect(overflow.statusCode).toBe(400)
     expect(overflow.json().error.code).toBe('INVENTORY_QUANTITY_OUT_OF_RANGE')
     const invalidInteger = await adjustInventory(auth, product.id, sku.id, {
-      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      expectedInventoryRevision: secondReservedRevision.inventory_revision,
       operationId: randomUUID(), action: 'increase', quantity: 2_147_483_648, reason: '超过整数上限',
     })
     expect(invalidInteger.statusCode).toBe(400)
     expect(invalidInteger.json().error.code).toBe('VALIDATION_ERROR')
 
     const atReserved = await adjustInventory(auth, product.id, sku.id, {
-      expectedInventoryRevision: afterDecrease.inventoryRevision,
+      expectedInventoryRevision: secondReservedRevision.inventory_revision,
       operationId: randomUUID(), action: 'decrease', quantity: 80, reason: '保留预留数量',
     })
     expect(atReserved.statusCode).toBe(201)
@@ -2475,10 +2548,11 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(staleRevision.statusCode).toBe(409)
     expect(staleRevision.json().error.code).toBe('INVENTORY_REVISION_CONFLICT')
 
-    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 0 })
-      .where('product_variant_id', '=', sku.id).execute()
+    await db.updateTable('orders').set({ status: 'closed' }).where('id', '=', secondReservedOrderId).execute()
+    const afterRelease = await db.selectFrom('product_variants').select('inventory_revision')
+      .where('id', '=', sku.id).executeTakeFirstOrThrow()
     const drained = await adjustInventory(auth, product.id, sku.id, {
-      expectedInventoryRevision: afterReserved.inventoryRevision,
+      expectedInventoryRevision: afterRelease.inventory_revision,
       operationId: randomUUID(), action: 'decrease', quantity: 10, reason: '清空库存',
     })
     expect(drained.statusCode).toBe(201)
@@ -2619,13 +2693,18 @@ describe('Fastify API with PostgreSQL 18', () => {
       expectedInventoryRevision: mode.inventoryRevision,
       operationId: randomUUID(), action: 'increase', quantity: 4, reason: '预留测试库存',
     })).statusCode).toBe(201)
-    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 2 })
-      .where('product_variant_id', '=', sku.id).execute()
+    await createReservedOrderForTest(auth, product.id, sku.id, 2)
+    const current = (await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}`, headers: { cookie: auth.sessionCookie },
+    })).json<{ data: ProductDetail }>().data
+    const paused = await changeProductLifecycle(auth, product.id, { expectedRevision: current.revision, status: 'paused' })
+    expect(paused.statusCode).toBe(200)
+    const pausedProduct = paused.json<{ data: ProductDetail }>().data
 
     const groupId = randomUUID()
     const valueId = randomUUID()
     const retirement = {
-      expectedRevision: mode.productRevision,
+      expectedRevision: pausedProduct.revision,
       mode: 'selected',
       groups: [optionGroup('替代方案', groupId, [{ id: valueId, name: '新方案' }])],
       combinations: [{ optionValueIds: [valueId], salePrice: '8.00', enabled: true }],
@@ -3830,12 +3909,23 @@ describe('Fastify API with PostgreSQL 18', () => {
       expectedRevision: withReservation.revision, expectedSkuRevision: reservedSku.revision,
       expectedInventoryRevision: 0, inventoryMode: 'quantity',
     })
-    await db.updateTable('product_variant_quantity_inventory').set({ stocked: 2, reserved: 1 })
-      .where('product_variant_id', '=', reservedSku.id).execute()
+    const reservedModeData = reservedMode.json<{ data: { productRevision: number; inventoryRevision: number } }>().data
+    expect((await adjustInventory(auth, withReservation.id, reservedSku.id, {
+      expectedInventoryRevision: reservedModeData.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 2, reason: '删除预留保护测试库存',
+    })).statusCode).toBe(201)
+    await createReservedOrderForTest(auth, withReservation.id, reservedSku.id, 1)
+    const reservedDetail = (await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${withReservation.id}`, headers: { cookie: auth.sessionCookie },
+    })).json<{ data: ProductDetail }>().data
+    const reservedPaused = await changeProductLifecycle(auth, withReservation.id, {
+      expectedRevision: reservedDetail.revision, status: 'paused',
+    })
+    expect(reservedPaused.statusCode).toBe(200)
     const reservedBlocked = await deleteProduct(auth, withReservation.id,
-      reservedMode.json<{ data: { productRevision: number } }>().data.productRevision)
+      reservedPaused.json<{ data: ProductDetail }>().data.revision)
     expect(reservedBlocked.statusCode).toBe(409)
-    expect(reservedBlocked.json().error.code).toBe('PRODUCT_HAS_INVENTORY')
+    expect(reservedBlocked.json().error.code).toBe('PRODUCT_HAS_ORDER_HISTORY')
 
     const withHistory = await createTestProduct(auth, '归档后仍有库存流水')
     const historySku = withHistory.variants[0]!
@@ -4736,14 +4826,14 @@ describe('D6 product management API additions', () => {
     const inStock = await app.inject(`/api/v1/public/products/${product.id}`)
     expect(inStock.json().data.variants[0].inventory).toMatchObject({ mode: 'quantity', status: 'in_stock' })
 
-    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 2 })
-      .where('product_variant_id', '=', variant.id).execute()
+    const reservedOrderId = await createReservedOrderForTest(auth, product.id, variant.id, 2)
     const fullyReserved = await app.inject(`/api/v1/public/products/${product.id}`)
     expect(fullyReserved.json().data.variants[0].inventory).toMatchObject({ mode: 'quantity', status: 'out_of_stock' })
-    await db.updateTable('product_variant_quantity_inventory').set({ reserved: 0 })
-      .where('product_variant_id', '=', variant.id).execute()
+    await db.updateTable('orders').set({ status: 'closed' }).where('id', '=', reservedOrderId).execute()
+    const afterOrderRelease = await db.selectFrom('product_variants').select('inventory_revision')
+      .where('id', '=', variant.id).executeTakeFirstOrThrow()
     const drained = await adjustInventory(auth, product.id, variant.id, {
-      expectedInventoryRevision: state.inventoryRevision,
+      expectedInventoryRevision: afterOrderRelease.inventory_revision,
       operationId: randomUUID(), action: 'decrease', quantity: 2, reason: 'D7 库存模式切换验收',
     })
     expect(drained.statusCode).toBe(201)

@@ -82,6 +82,12 @@ async function assertProductTypeCanChange(db: Kysely<Database>, product: LockedP
     throw new CatalogError(409, 'PRODUCT_TYPE_CHANGE_REQUIRES_DRAFT_OR_PAUSED', 'Take the product out of sale before changing its type')
   }
 
+  const orderReference = await db.selectFrom('order_items').select('id')
+    .where('product_id', '=', product.id).limit(1).executeTakeFirst()
+  if (orderReference) {
+    throw new CatalogError(409, 'PRODUCT_TYPE_CHANGE_BLOCKED', 'Product type cannot change after an order references the product')
+  }
+
   // Keep the same parent -> SKU -> inventory lock order as D2/D3 writers.
   const variants = await db.selectFrom('product_variants')
     .select(['id', 'retired_at', 'inventory_mode'])
@@ -639,6 +645,11 @@ async function deleteProduct(
     if (variants.length === 0) throw new CatalogError(409, 'PRODUCT_SKU_REQUIRED', 'The product has no SKU rows to delete safely')
     if (variants.some((variant) => variant.retired_at !== null)) {
       throw new CatalogError(409, 'PRODUCT_HAS_RETIRED_SKU', 'A product with permanently retired SKU identities cannot be deleted; archive it instead')
+    }
+    const orderReference = await trx.selectFrom('order_items').select('id')
+      .where('product_id', '=', productId).limit(1).executeTakeFirst()
+    if (orderReference) {
+      throw new CatalogError(409, 'PRODUCT_HAS_ORDER_HISTORY', 'A product referenced by an order cannot be deleted; archive it instead')
     }
     if (variants.some((variant) => variant.inventory_mode === 'resource_pool' || variant.inventory_mode === 'external')) {
       throw new CatalogError(409, 'PRODUCT_HAS_BUSINESS_RESOURCES', 'A product connected to a resource pool or external source cannot be deleted; archive it instead')

@@ -12,6 +12,18 @@ const unitAmountPattern = /^-?(?:0|[1-9]\d{0,12})(?:\.\d{1,5})?$/
 // 29 integer digits. Keep intermediate operations within that derived bound.
 const intermediateAmountPattern = /^-?(?:0|[1-9]\d{0,28})(?:\.\d{1,5})?$/
 const maxSettledIntegerDigits = 16
+const walletAmountPattern = /^(?:0|[1-9]\d{0,15})(?:\.\d{1,2})?$/
+
+function parseWalletAmount(value: string): Decimal {
+  if (!walletAmountPattern.test(value)) {
+    throw new TypeError('Wallet amounts must be non-negative decimal strings with up to 16 integer and 2 fractional digits')
+  }
+  return new ExactDecimal(value)
+}
+
+export function normalizeWalletAmount(value: string): string {
+  return parseWalletAmount(value).toFixed(2)
+}
 
 /**
  * Parses a signed NUMERIC(18,5) amount for generic accounting arithmetic.
@@ -54,4 +66,21 @@ export function settleAmount(value: string): string {
     throw new RangeError('Settlement amount exceeds NUMERIC(18,2)')
   }
   return rounded.toFixed(2)
+}
+
+/** Allocates an order wallet debit from gift funds first, then cash funds. */
+export function allocateWalletSpend(
+  amount: string,
+  giftAvailable: string,
+  cashAvailable: string,
+): { giftAmount: string; cashAmount: string } {
+  const requested = parseWalletAmount(amount)
+  const gift = parseWalletAmount(giftAvailable)
+  const cash = parseWalletAmount(cashAvailable)
+  if (requested.lte(0)) throw new RangeError('Wallet payment amount must be greater than zero')
+
+  const giftAmount = ExactDecimal.min(requested, gift)
+  const cashAmount = requested.minus(giftAmount)
+  if (cashAmount.gt(cash)) throw new RangeError('Insufficient wallet balance')
+  return { giftAmount: giftAmount.toFixed(2), cashAmount: cashAmount.toFixed(2) }
 }
