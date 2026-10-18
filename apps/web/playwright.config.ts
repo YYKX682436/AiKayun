@@ -8,6 +8,7 @@ const apiPort = process.env.AIKAYUN_TEST_API_PORT ?? '3001'
 const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3100'
 const webPort = new URL(baseURL).port || '3100'
 const useExternalServer = process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true'
+const useProductionBuild = process.env.PLAYWRIGHT_USE_PRODUCTION_SERVER === 'true'
 const mediaRoot = join(tmpdir(), 'aikayun-d7-playwright-media')
 
 export default defineConfig({
@@ -17,7 +18,12 @@ export default defineConfig({
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? 'github' : 'list',
-  testIgnore: ['**/brand-alt.spec.ts', '**/production-brand-runtime.spec.ts', '**/d7-ssr-error.spec.ts'],
+  testIgnore: [
+    '**/brand-alt.spec.ts',
+    '**/dev-preview.spec.ts',
+    '**/production-brand-runtime.spec.ts',
+    '**/d7-ssr-error.spec.ts',
+  ],
   use: {
     baseURL,
     trace: 'retain-on-failure',
@@ -41,14 +47,24 @@ export default defineConfig({
       },
     },
     {
-      command: `pnpm --filter @aikayun/web exec nuxt dev --host 127.0.0.1 --port ${webPort}`,
+      command: useProductionBuild
+        ? 'pnpm --filter @aikayun/web start'
+        : `pnpm --filter @aikayun/web exec nuxt dev --host 127.0.0.1 --port ${webPort}`,
       // The storefront SSR route depends on migrated catalog tables. Probe the
       // self-contained admin entry so the server can start before globalSetup
       // initializes the disposable test database.
       url: new URL('/admin/login', baseURL).toString(),
       reuseExistingServer: false,
       timeout: 120_000,
-      env: { NUXT_API_INTERNAL_URL: `http://127.0.0.1:${apiPort}`, NUXT_PUBLIC_SITE_URL: baseURL },
+      env: {
+        ...(useProductionBuild ? {
+          NODE_ENV: 'production',
+          NITRO_HOST: '127.0.0.1',
+          NITRO_PORT: webPort,
+        } : {}),
+        NUXT_API_INTERNAL_URL: `http://127.0.0.1:${apiPort}`,
+        NUXT_PUBLIC_SITE_URL: baseURL,
+      },
     },
   ],
   globalTeardown: './test/e2e/global-teardown.ts',

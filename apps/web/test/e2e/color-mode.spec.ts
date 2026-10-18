@@ -221,54 +221,6 @@ test('front and admin routes share the display preference and apply separate roo
   expect(admin.area).toBe('admin')
 })
 
-test('semantic status text keeps WCAG AA contrast in both themes', async ({ page }) => {
-  test.skip(process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true', '设计预览只在开发服务器中提供')
-  await page.goto('/dev-preview')
-
-  for (const mode of ['light', 'dark'] as const) {
-    await selectPreference(page, mode === 'light' ? '浅色' : '深色')
-    const samples = await page.evaluate(() => {
-      const canvas = document.createElement('canvas')
-      canvas.width = 1
-      canvas.height = 1
-      const context = canvas.getContext('2d')!
-      const bodyColor = getComputedStyle(document.body).backgroundColor
-
-      function renderedBackground(element: HTMLElement): string {
-        context.clearRect(0, 0, 1, 1)
-        context.fillStyle = bodyColor
-        context.fillRect(0, 0, 1, 1)
-        const ancestors: HTMLElement[] = []
-        for (let current: HTMLElement | null = element; current && current !== document.body; current = current.parentElement) {
-          ancestors.push(current)
-        }
-        for (const ancestor of ancestors.reverse()) {
-          const background = getComputedStyle(ancestor).backgroundColor
-          if (background !== 'transparent' && background !== 'rgba(0, 0, 0, 0)') {
-            context.fillStyle = background
-            context.fillRect(0, 0, 1, 1)
-          }
-        }
-        const [red, green, blue] = context.getImageData(0, 0, 1, 1).data
-        return `rgb(${red} ${green} ${blue})`
-      }
-
-      return [...document.querySelectorAll<HTMLElement>(
-        '#preview-main .text-success, #preview-main .text-warning, #preview-main .text-error, #preview-main .text-info',
-      )].map(element => ({
-        label: element.textContent?.trim() ?? '',
-        foreground: getComputedStyle(element).color,
-        background: renderedBackground(element),
-      }))
-    })
-
-    expect(samples.length).toBeGreaterThanOrEqual(4)
-    for (const sample of samples) {
-      expect(wcagContrast(sample.foreground, sample.background), `${mode} ${sample.label}`).toBeGreaterThanOrEqual(4.5)
-    }
-  }
-})
-
 test('reduced-motion preference shortens decorative transitions', async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'reduce' })
   await page.goto('/')

@@ -235,9 +235,17 @@ test('admin manages a real product through category, SKU, price, media, rich tex
   await editor.press('ControlOrMeta+End')
   await rich.getByRole('button', { name: '标题二级' }).click()
   await expect(editor.locator('h2')).toContainText('二级标题结构验收')
-  await editor.press('ControlOrMeta+End')
-  await editor.press('Shift+ArrowLeft')
-  await editor.press('Shift+ArrowLeft')
+  await editor.evaluate((element) => {
+    const textNode = element.querySelector('h2')?.firstChild
+    if (!(textNode instanceof Text)) throw new Error('Expected the heading to contain a text node')
+    const textLength = textNode.textContent?.length ?? 0
+    const range = element.ownerDocument.createRange()
+    range.setStart(textNode, textLength - 2)
+    range.setEnd(textNode, textLength)
+    const selection = element.ownerDocument.getSelection()
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+  })
   await expect.poll(() => editor.evaluate(element => element.ownerDocument.getSelection()?.toString())).toBe('验收')
   await rich.getByRole('button', { name: '加粗' }).click()
   await expect(editor.locator('h2 strong')).toContainText('验收')

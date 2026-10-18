@@ -244,21 +244,3 @@ test('login fields stay disabled until client hydration completes', async ({ pag
   await page.keyboard.press('Enter')
   await expect(page).toHaveURL(/\/admin\/login$/)
 })
-
-test('development design preview composes existing components without business actions', async ({ page }) => {
-  const response = await page.goto('/dev-preview')
-  if (process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true') {
-    expect(response?.status()).toBe(404)
-    expect(await response?.text()).not.toContain('品牌与语义颜色')
-    return
-  }
-
-  expect(response?.status()).toBe(200)
-  await expect(page).toHaveTitle('设计系统预览 · AiKayun 数字商城')
-  await expect(page.getByRole('heading', { name: '品牌与语义颜色' })).toBeVisible()
-  await expect(page.getByRole('heading', { name: '按钮与输入框' })).toBeVisible()
-  await expect(page.getByRole('heading', { name: '空状态样例' })).toBeVisible()
-  await expect(page.getByRole('button', { name: '提交中' })).toBeDisabled()
-  await expect(page.getByRole('button', { name: '不可用' })).toBeDisabled()
-  await expect(page.getByRole('link', { name: /购买|加入购物车/ })).toHaveCount(0)
-})
