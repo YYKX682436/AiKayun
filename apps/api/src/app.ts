@@ -19,6 +19,8 @@ import type { Kysely } from 'kysely'
 import type { AppConfig } from './config.js'
 import type { Database } from './db/types.js'
 import { registerAdminAuthRoutes } from './auth/admin.js'
+import { registerCustomerAuthRoutes } from './auth/customer.js'
+import { registerCustomerPolicyRoutes } from './auth/customer-policy.js'
 import { hashPassword } from './auth/password.js'
 import { registerAdminProductRoutes } from './catalog/admin-products.js'
 import { registerAdminProductManagementRoutes } from './catalog/admin-product-management.js'
@@ -52,6 +54,7 @@ export async function createApp(options: {
   }).withTypeProvider<TypeBoxTypeProvider>()
 
   app.decorateRequest('admin', null)
+  app.decorateRequest('customer', null)
   registerAjvFormats()
   app.setValidatorCompiler(TypeBoxValidatorCompiler)
 
@@ -63,6 +66,9 @@ export async function createApp(options: {
         { name: 'health', description: 'Service health checks' },
         { name: 'admin-auth', description: 'Administrator authentication' },
         { name: 'admin', description: 'Protected administrator APIs' },
+        { name: 'customer-auth', description: 'Storefront customer authentication' },
+        { name: 'customer', description: 'Protected storefront customer APIs' },
+        { name: 'public-storefront', description: 'Public storefront settings' },
         { name: 'catalog', description: 'Product and SKU administration' },
         { name: 'public-catalog', description: 'Public product and visible category reads' },
       ],
@@ -73,7 +79,9 @@ export async function createApp(options: {
   await app.register(swaggerUi, { routePrefix: '/api/docs' })
 
   app.addHook('onSend', async (request, reply, payload) => {
-    if (request.url.startsWith('/api/v1/public/')) reply.header('cache-control', 'no-store')
+    if (request.url.startsWith('/api/v1/public/') || request.url.startsWith('/api/v1/customer/')) {
+      reply.header('cache-control', 'no-store')
+    }
     return payload
   })
 
@@ -131,6 +139,8 @@ export async function createApp(options: {
 
   const dummyPasswordHash = await hashPassword(randomBytes(32).toString('base64url'))
   registerAdminAuthRoutes(app, db, config, dummyPasswordHash)
+  registerCustomerAuthRoutes(app, db, config, dummyPasswordHash)
+  registerCustomerPolicyRoutes(app, db, config)
   const identityFactory = options.productIdentityFactory ?? defaultProductIdentityFactory
   registerAdminProductRoutes(app, db, config, identityFactory)
   registerAdminProductManagementRoutes(app, db, config, identityFactory)

@@ -3,6 +3,18 @@ const storeBrand = useStoreBrand()
 const { data: categoriesResponse } = await usePublicCategories()
 const categories = computed(() => categoriesResponse.value?.data.categories ?? [])
 const storefrontReady = ref(false)
+const route = useRoute()
+const customerApi = useCustomerApi()
+
+if (!customerApi.sessionResolved.value) {
+  const sessionCookie = useCookie<string | null>('aikayun_customer_session')
+  if (import.meta.server && !sessionCookie.value) customerApi.sessionResolved.value = true
+  else await customerApi.refreshSession()
+}
+
+watch(() => route.path, () => {
+  if (customerApi.session.value && route.path !== '/account') void customerApi.refreshSession()
+})
 
 onMounted(() => {
   storefrontReady.value = true
@@ -47,6 +59,20 @@ onMounted(() => {
             <span class="hidden xl:inline">搜索商品</span>
           </UButton>
           <ThemeModeSelect />
+          <NuxtLink
+            :to="customerApi.session.value ? '/account' : '/login'"
+            class="flex min-h-11 min-w-10 items-center justify-center gap-1 rounded-lg px-2 text-sm font-medium text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:px-3"
+            :aria-label="customerApi.session.value ? `顾客账户，${customerApi.session.value.customer.username}` : '顾客登录'"
+          >
+            <UIcon
+              :name="customerApi.session.value ? 'i-lucide-user-round-check' : 'i-lucide-user-round'"
+              class="size-4 shrink-0"
+              aria-hidden="true"
+            />
+            <span class="hidden max-w-28 truncate sm:inline">
+              {{ customerApi.session.value?.customer.username ?? '登录' }}
+            </span>
+          </NuxtLink>
           <NuxtLink
             to="/admin/login"
             class="hidden min-h-11 items-center rounded-lg px-3 text-sm font-medium text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary lg:inline-flex"

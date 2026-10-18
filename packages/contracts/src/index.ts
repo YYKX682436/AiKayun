@@ -47,6 +47,83 @@ export const AdminOverviewSchema = Type.Object({
   status: Type.Literal('ready'),
 })
 
+export const CustomerUsernameSchema = Type.String({
+  minLength: 3,
+  maxLength: 32,
+  pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$',
+  description: '3-32 ASCII letters, digits, underscores, dots or hyphens; starts with a letter or digit',
+})
+export const CustomerPasswordSchema = Type.String({ minLength: 12, maxLength: 128 })
+export const CustomerEmailSchema = Type.String({ minLength: 3, maxLength: 254, format: 'email' })
+export const CustomerPhoneSchema = Type.String({
+  minLength: 7,
+  maxLength: 32,
+  pattern: '^\\+?[0-9][0-9 ()-]{5,30}[0-9]$',
+})
+
+export const CustomerRegisterBodySchema = Type.Object({
+  username: CustomerUsernameSchema,
+  password: CustomerPasswordSchema,
+  email: Type.Optional(CustomerEmailSchema),
+  phone: Type.Optional(CustomerPhoneSchema),
+}, { additionalProperties: false })
+
+export const CustomerLoginBodySchema = Type.Object({
+  username: CustomerUsernameSchema,
+  password: Type.String({ minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false })
+
+export const CustomerSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  username: CustomerUsernameSchema,
+})
+
+export const CustomerSessionSchema = Type.Object({
+  customer: CustomerSchema,
+  expiresAt: Type.String({ format: 'date-time' }),
+})
+
+export const CustomerProfileSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  username: CustomerUsernameSchema,
+  email: Type.Union([CustomerEmailSchema, Type.Null()]),
+  emailVerifiedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  phone: Type.Union([CustomerPhoneSchema, Type.Null()]),
+  phoneVerifiedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+
+export const UpdateCustomerProfileBodySchema = Type.Object({
+  email: Type.Optional(Type.Union([CustomerEmailSchema, Type.Null()])),
+  phone: Type.Optional(Type.Union([CustomerPhoneSchema, Type.Null()])),
+}, { additionalProperties: false, minProperties: 1 })
+
+export const ChangeCustomerPasswordBodySchema = Type.Object({
+  currentPassword: Type.String({ minLength: 1, maxLength: 128 }),
+  newPassword: CustomerPasswordSchema,
+}, { additionalProperties: false })
+
+export const CustomerPasswordChangedSchema = Type.Object({
+  passwordChanged: Type.Literal(true),
+  expiresAt: Type.String({ format: 'date-time' }),
+})
+export const CustomerLogoutSchema = Type.Object({ loggedOut: Type.Literal(true) })
+
+export const StorefrontCustomerPolicySchema = Type.Object({
+  requireEmail: Type.Boolean(),
+  requirePhone: Type.Boolean(),
+  guestCheckoutEnabled: Type.Boolean(),
+  guestFreeClaimEnabled: Type.Boolean(),
+  updatedAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+
+export const UpdateStorefrontCustomerPolicyBodySchema = Type.Object({
+  requireEmail: Type.Boolean(),
+  requirePhone: Type.Boolean(),
+  guestCheckoutEnabled: Type.Boolean(),
+  guestFreeClaimEnabled: Type.Boolean(),
+}, { additionalProperties: false })
+
 export const ProductTypeSchema = Type.Union([
   Type.Literal('physical'),
   Type.Literal('digital'),
@@ -915,6 +992,17 @@ export type Admin = Static<typeof AdminSchema>
 export type AdminSession = Static<typeof AdminSessionSchema>
 export type AdminLogout = Static<typeof AdminLogoutSchema>
 export type AdminOverview = Static<typeof AdminOverviewSchema>
+export type CustomerRegisterBody = Static<typeof CustomerRegisterBodySchema>
+export type CustomerLoginBody = Static<typeof CustomerLoginBodySchema>
+export type Customer = Static<typeof CustomerSchema>
+export type CustomerSession = Static<typeof CustomerSessionSchema>
+export type CustomerProfile = Static<typeof CustomerProfileSchema>
+export type UpdateCustomerProfileBody = Static<typeof UpdateCustomerProfileBodySchema>
+export type ChangeCustomerPasswordBody = Static<typeof ChangeCustomerPasswordBodySchema>
+export type CustomerPasswordChanged = Static<typeof CustomerPasswordChangedSchema>
+export type CustomerLogout = Static<typeof CustomerLogoutSchema>
+export type StorefrontCustomerPolicy = Static<typeof StorefrontCustomerPolicySchema>
+export type UpdateStorefrontCustomerPolicyBody = Static<typeof UpdateStorefrontCustomerPolicyBodySchema>
 export type ProductType = Static<typeof ProductTypeSchema>
 export type ProductStatus = Static<typeof ProductStatusSchema>
 export type ProductSalePrice = Static<typeof ProductSalePriceSchema>

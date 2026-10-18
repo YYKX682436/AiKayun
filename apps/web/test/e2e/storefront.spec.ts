@@ -107,7 +107,7 @@ test('renders real server-side storefront products or the honest empty state wit
   }
   await expect(page.getByRole('banner').getByRole('link', { name: '管理入口' })).toHaveAttribute('href', '/admin/login')
   await expect(page.getByRole('link', { name: '搜索商品' })).toHaveAttribute('href', '/search')
-  await expect(page.getByRole('link', { name: '登录' })).toHaveCount(0)
+  await expect(page.getByRole('banner').getByRole('link', { name: '顾客登录' })).toHaveAttribute('href', '/login')
   await expect(page.getByRole('link', { name: '注册' })).toHaveCount(0)
   await expect(page.getByRole('search')).toHaveCount(0)
   await expect(page.locator('input[type="search"], a[href="/api/docs"], a[href="/cart"]')).toHaveCount(0)

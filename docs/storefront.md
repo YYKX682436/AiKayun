@@ -1,4 +1,4 @@
-# D7 商城商品前台
+# D7 商城商品前台与④-2顾客账户
 
 本阶段为顾客提供真实商品浏览。页面通过 Nuxt 4 SSR 和同源 BFF 读取 Fastify 的独立公开目录 API；查询投影在 PostgreSQL 中过滤并计算公开数据，再用 `packages/contracts` 的专用 TypeBox 响应契约返回。前台不调用管理员商品详情 API，也不把管理员响应下发后再隐藏敏感字段。
 
@@ -32,6 +32,14 @@
 | `null` | `not_configured` | 库存尚未配置 |
 
 前台不公开精确库存量。所有摘要都不是下单资格或付款承诺；D7 不提供购物车、订单、支付、预留、卡密/文件交付、供应商采购、评价、销量或促销。
+
+## ④-2 顾客账户入口
+
+当前顾客账户页面为 `/register`、`/login` 和 `/account`。商城导航通过同源 BFF 查询 `/api/v1/customer/session`，SSR 首屏及刷新会显示有效用户名；未登录时显示登录和注册入口。注册表单读取 `GET /api/v1/public/storefront/customer-policy`，只有管理员开启时才要求新顾客填写邮箱或手机号。账户页允许修改邮箱/手机号和密码；修改联系方式会清除相应验证时间。个人资料查询/更新从 Cookie 会话绑定的顾客 ID 推导，不接受客户端指定顾客 ID。
+
+顾客注册、登录、退出、个人资料修改和改密接口分别位于 `/api/v1/customer/auth/*`、`/api/v1/customer/profile` 和 `/api/v1/customer/password`。注册/登录失败使用一致的用户名或密码错误响应；写请求有独立顾客 CSRF Cookie、同源 Origin 检查和 IP 限流。前端不会读取或保存会话令牌，浏览器只持有 HttpOnly 会话 Cookie。
+
+管理员在 `/admin/storefront/customer-policy` 管理新注册邮箱/手机号要求、游客下单和游客免费领取设置。设置从 `storefront_customer_policy` 真实读取并写回。游客开关目前只是策略数据，不会开放下单、领取、购物车、支付或履约接口。邮箱/手机号验证、密码找回、OAuth 以及顾客管理后台尚未实现。
 
 ## 分类与检索
 

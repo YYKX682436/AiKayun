@@ -10,6 +10,7 @@ import { productManagementMigration } from './migrations/202610170002_product_ma
 import { productMediaAndRichContentMigration } from './migrations/202610170003_product_media_and_rich_content.js'
 import { productCreationIdempotencyMigration } from './migrations/202610170004_product_creation_idempotency.js'
 import { tradeFoundationMigration } from './migrations/202610180001_trade_foundation.js'
+import { customerSessionsMigration } from './migrations/202610190001_customer_sessions.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -25,6 +26,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610170003_product_media_and_rich_content': productMediaAndRichContentMigration,
       '202610170004_product_creation_idempotency': productCreationIdempotencyMigration,
       '202610180001_trade_foundation': tradeFoundationMigration,
+      '202610190001_customer_sessions': customerSessionsMigration,
     }
   }
 }

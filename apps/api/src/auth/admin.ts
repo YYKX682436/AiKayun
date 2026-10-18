@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import type { FastifyInstance, preHandlerHookHandler } from 'fastify'
 import type { Kysely } from 'kysely'
 import {
@@ -16,6 +16,15 @@ import type { AdminLoginBody } from '@aikayun/contracts'
 import type { AppConfig } from '../config.js'
 import type { Database } from '../db/types.js'
 import { verifyPassword } from './password.js'
+import {
+  clearCsrfCookie,
+  clearSessionCookie,
+  createOpaqueToken,
+  hashToken,
+  setCsrfCookie,
+  setSessionCookie,
+  verifyDoubleSubmitCsrf,
+} from './security.js'
 
 export const SESSION_COOKIE = 'aikayun_admin_session'
 export const CSRF_COOKIE = 'aikayun_admin_csrf'
@@ -32,26 +41,8 @@ declare module 'fastify' {
   }
 }
 
-function hashToken(token: string): string {
-  return createHash('sha256').update(token).digest('hex')
-}
-
-function constantTimeEqual(left: string | undefined, right: string | undefined): boolean {
-  if (!left || !right) return false
-  const leftBuffer = Buffer.from(left)
-  const rightBuffer = Buffer.from(right)
-  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer)
-}
-
 export function verifyCsrf(config: AppConfig): preHandlerHookHandler {
-  return async (request, reply) => {
-    const csrfCookie = request.cookies[CSRF_COOKIE]
-    const csrfHeader = request.headers['x-csrf-token']
-    const headerToken = Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader
-    if (request.headers.origin !== config.publicOrigin || !constantTimeEqual(csrfCookie, headerToken)) {
-      return reply.code(403).send(failure('CSRF_INVALID', 'The request could not be verified', request.id))
-    }
-  }
+  return verifyDoubleSubmitCsrf(config, CSRF_COOKIE)
 }
 
 export function requireAdmin(db: Kysely<Database>, config: AppConfig): preHandlerHookHandler {
@@ -76,7 +67,7 @@ export function requireAdmin(db: Kysely<Database>, config: AppConfig): preHandle
       .executeTakeFirst()
 
     if (!session) {
-      reply.clearCookie(SESSION_COOKIE, { path: '/', secure: config.cookieSecure, sameSite: 'lax' })
+      clearSessionCookie(reply, SESSION_COOKIE, config)
       return reply.code(401).send(failure('UNAUTHORIZED', 'Administrator authentication is required', request.id))
     }
 
@@ -100,14 +91,8 @@ export function registerAdminAuthRoutes(
       response: { 200: ApiSuccessSchemaOf(CsrfTokenSchema) },
     },
   }, async (request, reply) => {
-    const csrfToken = randomBytes(32).toString('base64url')
-    reply.setCookie(CSRF_COOKIE, csrfToken, {
-      httpOnly: false,
-      secure: config.cookieSecure,
-      sameSite: 'strict',
-      path: '/',
-      maxAge: config.sessionTtlSeconds,
-    })
+    const csrfToken = createOpaqueToken()
+    setCsrfCookie(reply, CSRF_COOKIE, csrfToken, config)
     return success({ csrfToken }, request.id)
   })
 
@@ -139,7 +124,7 @@ export function registerAdminAuthRoutes(
       return reply.code(401).send(failure('INVALID_CREDENTIALS', 'Email or password is incorrect', request.id))
     }
 
-    const sessionToken = randomBytes(32).toString('base64url')
+    const sessionToken = createOpaqueToken()
     const sessionId = randomUUID()
     const expiresAt = new Date(Date.now() + config.sessionTtlSeconds * 1000)
     await db.insertInto('admin_sessions').values({
@@ -150,13 +135,7 @@ export function registerAdminAuthRoutes(
       revoked_at: null,
     }).execute()
 
-    reply.setCookie(SESSION_COOKIE, sessionToken, {
-      httpOnly: true,
-      secure: config.cookieSecure,
-      sameSite: 'lax',
-      path: '/',
-      maxAge: config.sessionTtlSeconds,
-    })
+    setSessionCookie(reply, SESSION_COOKIE, sessionToken, config)
     return success({
       admin: { id: admin.id, email: admin.email },
       expiresAt: expiresAt.toISOString(),
@@ -203,8 +182,8 @@ export function registerAdminAuthRoutes(
         .where('revoked_at', 'is', null)
         .execute()
     }
-    reply.clearCookie(SESSION_COOKIE, { path: '/', secure: config.cookieSecure, sameSite: 'lax' })
-    reply.clearCookie(CSRF_COOKIE, { path: '/', secure: config.cookieSecure, sameSite: 'strict' })
+    clearSessionCookie(reply, SESSION_COOKIE, config)
+    clearCsrfCookie(reply, CSRF_COOKIE, config)
     return success({ loggedOut: true }, request.id)
   })
 

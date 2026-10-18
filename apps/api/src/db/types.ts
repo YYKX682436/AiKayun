@@ -98,6 +98,15 @@ export interface CustomersTable {
   updated_at: Generated<Date>
 }
 
+export interface CustomerSessionsTable {
+  id: string
+  customer_id: string
+  token_hash: string
+  created_at: Generated<Date>
+  expires_at: ColumnType<Date, Date | string, Date | string>
+  revoked_at: Date | null
+}
+
 export interface GuestOrderSessionsTable {
   id: string
   token_hash: string
@@ -499,6 +508,7 @@ export interface Database {
   product_media_references: ProductMediaReferencesTable
   storefront_customer_policy: StorefrontCustomerPolicyTable
   customers: CustomersTable
+  customer_sessions: CustomerSessionsTable
   guest_order_sessions: GuestOrderSessionsTable
   product_variant_fulfillment: ProductVariantFulfillmentTable
   orders: OrdersTable
