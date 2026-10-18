@@ -70,14 +70,17 @@ async function getCsrf(target: FastifyInstance = app): Promise<{ token: string; 
   return { token: body.data.csrfToken, cookie: cookieFrom(response, 'aikayun_admin_csrf') }
 }
 
-async function loginAdmin(target: FastifyInstance = app): Promise<{ sessionCookie: string; csrf: { token: string; cookie: string } }> {
+async function loginAdmin(
+  target: FastifyInstance = app,
+  credentials: { email: string; password: string } = { email: testEmail, password: testPassword },
+): Promise<{ sessionCookie: string; csrf: { token: string; cookie: string } }> {
   const csrf = await getCsrf(target)
   const login = await target.inject({
     method: 'POST',
     url: '/api/v1/admin/auth/login',
     remoteAddress: `192.0.2.${nextTestClient++}`,
     headers: { origin: testOrigin, cookie: csrf.cookie, 'x-csrf-token': csrf.token },
-    payload: { email: testEmail, password: testPassword },
+    payload: credentials,
   })
   expect(login.statusCode).toBe(200)
   return { sessionCookie: cookieFrom(login, 'aikayun_admin_session'), csrf }
@@ -4388,6 +4391,22 @@ describe('D6 product management API additions', () => {
     })
     expect(changed.statusCode).toBe(409)
     expect(changed.json().error.code).toBe('PRODUCT_CREATION_KEY_CONFLICT')
+
+    const concurrentKey = randomUUID()
+    const concurrentBody = productBody('D8 concurrent idempotent draft')
+    const concurrentHeaders = { ...productHeaders(auth), 'idempotency-key': concurrentKey }
+    const concurrentCreates = await Promise.all([
+      app.inject({ method: 'POST', url: '/api/v1/admin/products', headers: concurrentHeaders, payload: concurrentBody }),
+      app.inject({ method: 'POST', url: '/api/v1/admin/products', headers: concurrentHeaders, payload: concurrentBody }),
+    ])
+    expect(concurrentCreates.map((response) => response.statusCode).sort()).toEqual([200, 201])
+    const concurrentProductIds = concurrentCreates.map((response) => response.json<{ data: ProductDetail }>().data.id)
+    expect(concurrentProductIds[0]).toBe(concurrentProductIds[1])
+    expect(await db.selectFrom('products').select('id').where('id', '=', concurrentProductIds[0]!).execute())
+      .toHaveLength(1)
+    expect(await db.selectFrom('product_management_audit_events').select('id')
+      .where('product_id', '=', concurrentProductIds[0]!).where('operation', '=', 'created').execute())
+      .toHaveLength(1)
   })
 
   it('pages and atomically updates SKU prices with revision checks', async () => {
@@ -4761,5 +4780,321 @@ describe('D6 product management API additions', () => {
 
     expect((await app.inject('/api/v1/public/products')).headers['cache-control']).toBe('no-store')
     expect((await app.inject('/api/v1/public/categories')).headers['cache-control']).toBe('no-store')
+  }, 30_000)
+})
+
+describe('D8 cross-module PostgreSQL concurrency acceptance', () => {
+  it('returns serialization conflicts as 409 and keeps database deadlocks as redacted server errors', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, 'D8 deadlock classification probe')
+    await sql`CREATE FUNCTION d8_raise_deadlock() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF OLD.name = 'D8 deadlock classification probe' THEN
+          RAISE EXCEPTION 'synthetic PostgreSQL deadlock' USING ERRCODE = '40P01';
+        END IF;
+        RETURN NEW;
+      END; $$`.execute(db)
+    await sql`CREATE TRIGGER d8_raise_deadlock BEFORE UPDATE OF name ON products
+      FOR EACH ROW EXECUTE FUNCTION d8_raise_deadlock()`.execute(db)
+    let response: Awaited<ReturnType<typeof editProduct>> | undefined
+    try {
+      response = await editProduct(auth, product.id, {
+        expectedRevision: product.revision, name: 'This update must fail closed',
+      })
+    } finally {
+      await sql`DROP TRIGGER d8_raise_deadlock ON products`.execute(db)
+      await sql`DROP FUNCTION d8_raise_deadlock()`.execute(db)
+    }
+    expect(response!.statusCode).toBe(500)
+    expect(response!.json().error).toMatchObject({ code: 'INTERNAL_ERROR', message: 'An unexpected error occurred' })
+    expect(response!.body).not.toContain('synthetic PostgreSQL deadlock')
+    expect((await getAdminProduct(auth, product.id)).json<{ data: ProductDetail }>().data.name)
+      .toBe('D8 deadlock classification probe')
+  })
+
+  it('serializes edits from two independent administrator sessions by product revision', async () => {
+    const firstAdmin = await loginAdmin()
+    const secondEmail = `d8-${randomUUID()}@example.com`
+    const secondPassword = 'Second-Admin-Only-Password-2026!'
+    await db.insertInto('admin_users').values({
+      id: randomUUID(), email: secondEmail, password_hash: await hashPassword(secondPassword), is_active: true,
+    }).execute()
+    const secondAdmin = await loginAdmin(app, { email: secondEmail, password: secondPassword })
+    const product = await createTestProduct(firstAdmin, 'D8 双管理员修订竞争')
+
+    const results = await Promise.all([
+      editProduct(firstAdmin, product.id, { expectedRevision: product.revision, name: '双管理员编辑甲' }),
+      editProduct(secondAdmin, product.id, { expectedRevision: product.revision, name: '双管理员编辑乙' }),
+    ])
+    expect(results.map((response) => response.statusCode).sort()).toEqual([200, 409])
+    expect(results.find((response) => response.statusCode === 409)?.json().error.code)
+      .toBe('PRODUCT_REVISION_CONFLICT')
+
+    const current = (await getAdminProduct(firstAdmin, product.id)).json<{ data: ProductDetail }>().data
+    expect(['双管理员编辑甲', '双管理员编辑乙']).toContain(current.name)
+    expect(current.revision).toBe(product.revision + 1)
+    const winningIndex = results.findIndex((response) => response.statusCode === 200)
+    const winningEmail = winningIndex === 0 ? testEmail : secondEmail
+    const winningAdmin = await db.selectFrom('admin_users').select('id')
+      .where('email', '=', winningEmail).executeTakeFirstOrThrow()
+    const editEvents = await db.selectFrom('product_management_audit_events')
+      .select(['administrator_id', 'operation']).where('product_id', '=', product.id).execute()
+    expect(editEvents).toHaveLength(2)
+    expect(editEvents.map((event) => event.administrator_id)).toContain(winningAdmin.id)
+  })
+
+  it('serializes archive against SKU matrix and rich-content edits', async () => {
+    const auth = await loginAdmin()
+    const matrixProduct = await createTestProduct(auth, 'D8 归档与 SKU 矩阵竞争')
+    const matrixGroupId = randomUUID()
+    const matrixValueId = randomUUID()
+    const [archive, matrix] = await Promise.all([
+      changeProductLifecycle(auth, matrixProduct.id, {
+        expectedRevision: matrixProduct.revision, status: 'archived',
+      }),
+      saveMatrix(auth, matrixProduct.id, {
+        expectedRevision: matrixProduct.revision,
+        mode: 'selected',
+        groups: [optionGroup('授权期限', matrixGroupId, [{ id: matrixValueId, name: '年度' }])],
+        combinations: [{ optionValueIds: [matrixValueId], salePrice: '38.00', enabled: true }],
+      }),
+    ])
+    expect([archive.statusCode, matrix.statusCode].sort()).toEqual([200, 409])
+    const matrixConflict = matrix.json().error
+    expect(matrix.statusCode === 409 ? matrixConflict.code : archive.json().error.code)
+      .toBe('PRODUCT_REVISION_CONFLICT')
+    const matrixFinal = (await getAdminProduct(auth, matrixProduct.id)).json<{ data: ProductDetail }>().data
+    if (archive.statusCode === 200) {
+      expect(matrixFinal.status).toBe('archived')
+      expect(matrixFinal.optionGroups).toHaveLength(0)
+    } else {
+      expect(matrixFinal.status).toBe('draft')
+      expect(matrixFinal.optionGroups).toHaveLength(1)
+      expect(matrixFinal.variants[0]?.salePrice).toBe('38.00')
+    }
+
+    const richProduct = await createTestProduct(auth, 'D8 归档与富文本竞争')
+    const richDocument = {
+      type: 'doc',
+      content: [{ type: 'paragraph', content: [{ type: 'text', text: '归档竞争中的真实商品正文' }] }],
+    }
+    const [richArchive, richSave] = await Promise.all([
+      changeProductLifecycle(auth, richProduct.id, {
+        expectedRevision: richProduct.revision, status: 'archived',
+      }),
+      saveRichContent(auth, richProduct.id, richProduct.revision, richDocument),
+    ])
+    expect([richArchive.statusCode, richSave.statusCode].sort()).toEqual([200, 409])
+    const richFinal = (await getAdminProduct(auth, richProduct.id)).json<{ data: ProductDetail }>().data
+    if (richArchive.statusCode === 200) {
+      expect(richFinal.status).toBe('archived')
+      expect(JSON.stringify(richFinal.richContent)).not.toContain('归档竞争中的真实商品正文')
+    } else {
+      expect(richFinal.status).toBe('draft')
+      expect(richFinal.richContent).toEqual(richDocument)
+    }
+  })
+
+  it('serializes SKU retirement against inventory deduction and deduplicates retried deductions', async () => {
+    const auth = await loginAdmin()
+    const product = await createTestProduct(auth, 'D8 SKU 退役与扣减竞争')
+    const sku = product.variants[0]!
+    const modeResponse = await setInventoryMode(auth, product.id, sku.id, {
+      expectedRevision: product.revision,
+      expectedSkuRevision: sku.revision,
+      expectedInventoryRevision: 0,
+      inventoryMode: 'quantity',
+    })
+    const mode = modeResponse.json<{ data: { productRevision: number; inventoryRevision: number } }>().data
+    const replenished = await adjustInventory(auth, product.id, sku.id, {
+      expectedInventoryRevision: mode.inventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 5, reason: 'D8 退役竞争预置库存',
+    })
+    const replenishedRevision = replenished.json<{ data: { inventoryRevision: number } }>().data.inventoryRevision
+    const groupId = randomUUID()
+    const valueId = randomUUID()
+    const retirementBody = {
+      expectedRevision: mode.productRevision,
+      mode: 'selected',
+      groups: [optionGroup('交付周期', groupId, [{ id: valueId, name: '一季' }])],
+      combinations: [{ optionValueIds: [valueId], salePrice: '19.00', enabled: true }],
+      retireSkuIds: [sku.id],
+    }
+    const [deduction, retirement] = await Promise.all([
+      adjustInventory(auth, product.id, sku.id, {
+        expectedInventoryRevision: replenishedRevision,
+        operationId: randomUUID(), action: 'decrease', quantity: 5, reason: 'D8 与 SKU 退役同时扣减',
+      }),
+      saveMatrix(auth, product.id, retirementBody),
+    ])
+    const finalInventory = (await getInventorySummary(auth, product.id))
+      .json<{ data: { variants: Array<{ skuId: string; retiredAt: string | null; inventory: { stocked: number } }> } }>()
+      .data.variants.find((variant) => variant.skuId === sku.id)!
+    expect(deduction.statusCode).toBe(201)
+    if (retirement.statusCode === 200) {
+      expect(finalInventory).toMatchObject({ retiredAt: expect.any(String), inventory: { stocked: 0 } })
+    } else {
+      expect(retirement.statusCode).toBe(409)
+      expect(retirement.json().error.code).toBe('SKU_STOCK_NOT_CLEARED')
+      expect(finalInventory).toMatchObject({ retiredAt: null, inventory: { stocked: 0 } })
+    }
+
+    const retryProduct = await createTestProduct(auth, 'D8 扣减请求安全重放')
+    const retrySku = retryProduct.variants[0]!
+    const retryMode = await setInventoryMode(auth, retryProduct.id, retrySku.id, {
+      expectedRevision: retryProduct.revision,
+      expectedSkuRevision: retrySku.revision,
+      expectedInventoryRevision: 0,
+      inventoryMode: 'quantity',
+    })
+    const retryInventoryRevision = retryMode.json<{ data: { inventoryRevision: number } }>().data.inventoryRevision
+    const refill = await adjustInventory(auth, retryProduct.id, retrySku.id, {
+      expectedInventoryRevision: retryInventoryRevision,
+      operationId: randomUUID(), action: 'increase', quantity: 3, reason: 'D8 扣减幂等预置',
+    })
+    const operation = {
+      expectedInventoryRevision: refill.json<{ data: { inventoryRevision: number } }>().data.inventoryRevision,
+      operationId: randomUUID(), action: 'decrease', quantity: 3, reason: 'D8 幂等扣减重放',
+    }
+    const retries = await Promise.all([
+      adjustInventory(auth, retryProduct.id, retrySku.id, operation),
+      adjustInventory(auth, retryProduct.id, retrySku.id, operation),
+    ])
+    expect(retries.map((response) => response.statusCode).sort()).toEqual([200, 201])
+    expect(retries[0]!.json().data.id).toBe(retries[1]!.json().data.id)
+    const history = await app.inject({
+      method: 'GET',
+      url: `/api/v1/admin/products/${retryProduct.id}/variants/${retrySku.id}/inventory/adjustments?operationId=${operation.operationId}`,
+      headers: { cookie: auth.sessionCookie },
+    })
+    expect(history.json().data.adjustments).toHaveLength(1)
+    expect((await getInventorySummary(auth, retryProduct.id)).json().data.variants[0].inventory.stocked).toBe(0)
+  }, 30_000)
+
+  it('serializes concurrent category moves through the public API and shared PostgreSQL tree guard', async () => {
+    const auth = await loginAdmin()
+    const createCategory = async (name: string) => {
+      const response = await app.inject({
+        method: 'POST', url: '/api/v1/admin/categories', headers: productHeaders(auth), payload: { name },
+      })
+      expect(response.statusCode).toBe(201)
+      return response.json<{ data: { id: string; revision: number } }>().data
+    }
+    const left = await createCategory('D8 并发分类左')
+    const right = await createCategory('D8 并发分类右')
+    const moving = await createCategory('D8 并发移动目标')
+    const results = await Promise.all([
+      app.inject({
+        method: 'PATCH', url: `/api/v1/admin/categories/${moving.id}`, headers: productHeaders(auth),
+        payload: { expectedRevision: moving.revision, parentId: left.id },
+      }),
+      app.inject({
+        method: 'PATCH', url: `/api/v1/admin/categories/${moving.id}`, headers: productHeaders(auth),
+        payload: { expectedRevision: moving.revision, parentId: right.id },
+      }),
+    ])
+    expect(results.map((response) => response.statusCode).sort()).toEqual([200, 409])
+    expect(results.find((response) => response.statusCode === 409)?.json().error.code)
+      .toBe('CATEGORY_REVISION_CONFLICT')
+    const current = (await app.inject({ method: 'GET', url: '/api/v1/admin/categories', headers: { cookie: auth.sessionCookie } }))
+      .json<{ data: { categories: Array<{ id: string; parentId: string | null }> } }>().data.categories
+      .find((category) => category.id === moving.id)
+    expect([left.id, right.id]).toContain(current?.parentId)
+  })
+
+  it('serializes batched SKU price changes against an ordinary product edit without partial prices', async () => {
+    const auth = await loginAdmin()
+    const created = await createTestProduct(auth, 'D8 批量价格与普通编辑竞争')
+    const groupId = randomUUID()
+    const valueIds = [randomUUID(), randomUUID()]
+    const matrix = await saveMatrix(auth, created.id, {
+      expectedRevision: created.revision,
+      mode: 'selected',
+      groups: [optionGroup('批量规格', groupId, [
+        { id: valueIds[0]!, name: '入门' }, { id: valueIds[1]!, name: '完整' },
+      ])],
+      combinations: [
+        { optionValueIds: [valueIds[0]!], salePrice: '10.00', enabled: true },
+        { optionValueIds: [valueIds[1]!], salePrice: '20.00', enabled: true },
+      ],
+    })
+    const product = matrix.json<{ data: { product: ProductDetail } }>().data.product
+    const batch = app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/prices/batch`, headers: productHeaders(auth),
+      payload: {
+        expectedRevision: product.revision,
+        updates: product.variants.map((variant, index) => ({
+          skuId: variant.id,
+          expectedSkuRevision: variant.revision,
+          salePrice: index === 0 ? '12.00' : '22.00',
+        })),
+      },
+    })
+    const ordinaryEdit = editProduct(auth, product.id, {
+      expectedRevision: product.revision, name: 'D8 普通资料编辑胜出',
+    })
+    const [batchResult, editResult] = await Promise.all([batch, ordinaryEdit])
+    expect([batchResult.statusCode, editResult.statusCode].sort()).toEqual([200, 409])
+    const final = (await getAdminProduct(auth, product.id)).json<{ data: ProductDetail }>().data
+    if (batchResult.statusCode === 200) {
+      expect(editResult.json().error.code).toBe('PRODUCT_REVISION_CONFLICT')
+      expect(final.name).toBe(product.name)
+      expect(final.variants.map((variant) => variant.salePrice).sort()).toEqual(['12.00', '22.00'])
+    } else {
+      expect(batchResult.json().error.code).toBe('PRODUCT_REVISION_CONFLICT')
+      expect(final.name).toBe('D8 普通资料编辑胜出')
+      expect(final.variants.map((variant) => variant.salePrice).sort()).toEqual(['10.00', '20.00'])
+    }
+  })
+
+  it('copies a consistent source snapshot while specification changes compete for the same product lock', async () => {
+    const auth = await loginAdmin()
+    const created = await createTestProduct(auth, 'D8 复制与规格变更竞争')
+    const groupId = randomUUID()
+    const valueIds = [randomUUID(), randomUUID()]
+    const initial = await saveMatrix(auth, created.id, {
+      expectedRevision: created.revision,
+      mode: 'selected',
+      groups: [optionGroup('初始方案', groupId, [
+        { id: valueIds[0]!, name: '月度' }, { id: valueIds[1]!, name: '年度' },
+      ])],
+      combinations: [
+        { optionValueIds: [valueIds[0]!], salePrice: '9.00', enabled: true },
+        { optionValueIds: [valueIds[1]!], salePrice: '49.00', enabled: true },
+      ],
+    })
+    const source = initial.json<{ data: { product: ProductDetail } }>().data.product
+    const changedSpecifications = {
+      expectedRevision: source.revision,
+      mode: 'selected',
+      groups: [optionGroup('更新方案', groupId, [
+        { id: valueIds[0]!, name: '月卡' }, { id: valueIds[1]!, name: '年卡' },
+      ])],
+      combinations: source.variants.map((variant) => ({
+        skuId: variant.id,
+        optionValueIds: variant.options.map((option) => option.valueId),
+        salePrice: variant.salePrice,
+        enabled: variant.enabled,
+      })),
+    }
+    const [copy, matrix] = await Promise.all([
+      copyProduct(auth, source.id, source.revision),
+      saveMatrix(auth, source.id, changedSpecifications),
+    ])
+    expect(matrix.statusCode).toBe(200)
+    expect([201, 409]).toContain(copy.statusCode)
+    const updatedSource = matrix.json<{ data: { product: ProductDetail } }>().data.product
+    expect(updatedSource.optionGroups[0]?.name).toBe('更新方案')
+    expect(updatedSource.variants.map((variant) => variant.options[0]?.valueName).sort()).toEqual(['年卡', '月卡'])
+    if (copy.statusCode === 201) {
+      const clone = copy.json<{ data: ProductDetail }>().data
+      expect(clone.id).not.toBe(source.id)
+      expect(clone.optionGroups[0]?.name).toBe('初始方案')
+      expect(clone.variants.map((variant) => variant.options[0]?.valueName).sort()).toEqual(['年度', '月度'])
+      expect(clone.variants.every((variant) => !source.variants.some((original) => original.id === variant.id))).toBe(true)
+    } else {
+      expect(copy.json().error.code).toBe('PRODUCT_REVISION_CONFLICT')
+      expect(await db.selectFrom('products').select('id').where('name', '=', source.name).execute()).toHaveLength(1)
+    }
   }, 30_000)
 })

@@ -32,7 +32,7 @@ const route = useRoute()
 const router = useRouter()
 const { request, upload } = useAdminApi()
 const productId = computed(() => String(route.params.id))
-const product = ref<ProductDetail | null>(null)
+const product = shallowRef<ProductDetail | null>(null)
 const categories = ref<AdminProductCategory[]>([])
 const loading = ref(true)
 const loadError = ref('')
@@ -62,7 +62,7 @@ const pricePageNumber = ref(1)
 const priceDraft = reactive<Record<string, { salePrice: string; compareAtPrice: string; costPrice: string }>>({})
 const bulkSalePrice = ref('')
 
-const inventorySummary = ref<AdminProductInventorySummary | null>(null)
+const inventorySummary = shallowRef<AdminProductInventorySummary | null>(null)
 const inventoryPageNumber = ref(1)
 const inventoryPageSize = 20
 const historySkuId = ref('')
@@ -158,10 +158,14 @@ const allCombinations = computed<MatrixCombination[]>(() => {
   }
   const variants = product.value?.variants ?? []
   const keyFor = (ids: string[]) => ids.length ? `v1:${[...ids].map(id => id.toLowerCase()).sort().join('.')}` : ''
+  const variantsByKey = new Map(variants.map(variant => [
+    keyFor(variant.options.map(option => option.valueId)),
+    variant,
+  ]))
   return combinations.map(values => {
     const valueIds = values.map(value => value.id)
     const key = keyFor(valueIds)
-    const matching = variants.find(variant => keyFor(variant.options.map(option => option.valueId)) === key)
+    const matching = variantsByKey.get(key)
     return {
       key,
       valueIds,
@@ -171,9 +175,10 @@ const allCombinations = computed<MatrixCombination[]>(() => {
     }
   })
 })
+const selectedMatrixKeySet = computed(() => new Set(selectedMatrixKeys.value))
 const selectedCombinationCount = computed(() => matrixMode.value === 'all'
   ? allCombinations.value.length
-  : allCombinations.value.filter(combination => selectedMatrixKeys.value.includes(combination.key)).length)
+  : allCombinations.value.filter(combination => selectedMatrixKeySet.value.has(combination.key)).length)
 const matrixCombinationLimitExceeded = computed(() => allCombinations.value.length > 1000)
 const visibleSkuRows = computed(() => {
   const rows = product.value?.variants ?? []
@@ -689,7 +694,7 @@ function matrixBody(): ProductVariantMatrixBody {
     }
   }
   const requestedCombinations = allCombinations.value
-    .filter(combination => matrixMode.value === 'all' || selectedMatrixKeys.value.includes(combination.key))
+    .filter(combination => matrixMode.value === 'all' || selectedMatrixKeySet.value.has(combination.key))
   const combinations = requestedCombinations
     .map(combination => combination.sku
       ? {
@@ -1157,7 +1162,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 </UBadge>
                 <span class="font-mono text-xs text-dimmed">{{ product.id }}</span>
               </div>
-              <h1 class="mt-2 truncate text-2xl font-semibold tracking-tight text-highlighted sm:text-3xl">
+              <h1 class="mt-2 break-words text-2xl font-semibold tracking-tight text-highlighted sm:text-3xl">
                 {{ product.name }}
               </h1>
               <p class="mt-1 text-sm text-muted">
@@ -1961,7 +1966,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                       class="flex min-h-12 items-center gap-3 px-3 py-2"
                     >
                       <UCheckbox
-                        :model-value="selectedMatrixKeys.includes(combination.key)"
+                        :model-value="selectedMatrixKeySet.has(combination.key)"
                         :disabled="isArchived || Boolean(combination.retired)"
                         :aria-label="`保留组合 ${combination.optionNames.join(' / ') || '默认 SKU'}`"
                         @update:model-value="value => toggleMatrixCombination(combination, Boolean(value))"

@@ -21,7 +21,7 @@ export function catalogDatabaseFailure(error: unknown): { status: number; code: 
   const databaseError = error as { code?: string; constraint?: string }
   const constraint = databaseError.constraint ?? ''
 
-  if (databaseError.code === '40001' || databaseError.code === '40P01') {
+  if (databaseError.code === '40001') {
     return conflict('CATALOG_CONCURRENT_MODIFICATION', 'The catalog changed concurrently; reload it and retry')
   }
   if (databaseError.code === '23001' && databaseError.constraint === 'product_media_references_media_fkey') {

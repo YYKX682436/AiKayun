@@ -499,7 +499,11 @@ test('search re-entry never renders a previous query while the current URL is lo
     await requestRoute.continue()
   })
   await page.getByRole('link', { name: '搜索商品' }).click()
-  await page.getByRole('searchbox', { name: '搜索商品名称或描述' }).fill('R2搜索B')
+  await expect(page).toHaveURL('/search')
+  await expect(page.locator('ul.grid > li').first()).toBeVisible()
+  const searchbox = page.getByRole('searchbox', { name: '搜索商品名称或描述' })
+  await searchbox.fill('R2搜索B')
+  await expect(searchbox).toHaveValue('R2搜索B')
   await expect(page).toHaveURL(`/search?q=${encodeURIComponent('R2搜索B')}`)
   await searchBStarted
   await expect(page.getByRole('link', { name: /R2搜索A专属商品/ })).toHaveCount(0)

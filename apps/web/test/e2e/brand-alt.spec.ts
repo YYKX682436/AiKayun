@@ -51,12 +51,14 @@ test('an alternate deployment applies its logo and purple primary, then isolates
 
   await page.getByRole('button', { name: '显示模式' }).click()
   await page.getByRole('option', { name: '深色' }).click()
+  await expect(page.locator('html')).toHaveClass(/dark/)
+  await addBrandContrastProbe(page)
+  await expect(page.locator('#brand-color-text-probe')).toBeAttached()
   const storefrontContrast = await page.evaluate(() => {
     const text = document.querySelector<HTMLElement>('#brand-color-text-probe')!
     return { background: getComputedStyle(document.body).backgroundColor, foreground: getComputedStyle(text).color }
   })
   expect(wcagContrast(storefrontContrast.foreground, storefrontContrast.background)).toBeGreaterThanOrEqual(4.5)
-  await expect(page.locator('html')).toHaveClass(/dark/)
   await page.screenshot({ path: testInfo.outputPath('brand-purple-dark.png'), fullPage: true, animations: 'disabled' })
 
   await page.route('**/broken-configured-logo.svg', route => route.abort())
