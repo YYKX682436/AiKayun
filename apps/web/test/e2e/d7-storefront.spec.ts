@@ -320,7 +320,7 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
   expect(detailHtml).toContain('<title>D7真实中文商品')
   expect(detailHtml).toContain('name="description"')
   expect(detailHtml).toContain('rel="canonical"')
-  expect(detailHtml).toContain(`href="http://127.0.0.1:3100/products/${product.id}"`)
+  expect(detailHtml).toContain(`href="${new URL(page.url()).origin}/products/${product.id}"`)
   expect(detailHtml).toContain('property="og:image"')
   expect(detailHtml).toContain('D7安全详情')
   expect(detailHtml).toContain('真实结构化商品说明')

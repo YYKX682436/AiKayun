@@ -72,6 +72,7 @@ test('an alternate deployment applies its logo and purple primary, then isolates
   await page.goto('/admin/login')
   await expect(page.locator('html')).toHaveAttribute('data-aikayun-area', 'admin')
   await expect(page).toHaveTitle('管理员登录 · AiKayun')
+  await expect(page.locator('[data-admin-login-ready="true"]')).toBeVisible()
   const adminTheme = await page.evaluate(() => ({
     primary: getComputedStyle(document.documentElement).getPropertyValue('--ui-color-primary-600').trim(),
     preference: localStorage.getItem('aikayun-color-mode'),

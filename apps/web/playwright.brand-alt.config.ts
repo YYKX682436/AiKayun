@@ -40,17 +40,21 @@ export default defineConfig({
       },
     },
     {
-      command: 'pnpm --filter @aikayun/web exec nuxt dev --host 127.0.0.1 --port 3002',
-      url: baseURL,
+      command: 'node .output/server/index.mjs',
+      // The homepage queries catalog tables before globalSetup migrates the
+      // isolated test database. The admin entry is independent of that data.
+      url: new URL('/admin/login', baseURL).toString(),
       reuseExistingServer: false,
       timeout: 120_000,
       env: {
+        NODE_ENV: 'production',
+        NITRO_HOST: '127.0.0.1',
+        NITRO_PORT: '3002',
         NUXT_API_INTERNAL_URL: `http://127.0.0.1:${apiPort}`,
         NUXT_PUBLIC_SITE_URL: baseURL,
         NUXT_PUBLIC_STORE_NAME: '青屿数字商店',
         NUXT_PUBLIC_STORE_LOGO_URL: '/configured-logo.svg',
         NUXT_PUBLIC_STORE_BRAND_COLOR: '#7C3AED',
-        AIKAYUN_E2E_BUILD_DIR: '.nuxt/brand-alt',
       },
     },
   ],
