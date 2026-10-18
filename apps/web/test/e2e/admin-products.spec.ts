@@ -1,10 +1,15 @@
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { expect, test } from '@playwright/test'
+import { captureBrowserDiagnostics, expectClientMounted } from './browser-diagnostics'
 
 const adminEmail = 'browser-test@example.com'
 const adminPassword = 'Only-For-E2E-Tests-2026!!'
 let authenticatedCookies: Awaited<ReturnType<import('@playwright/test').BrowserContext['storageState']>>['cookies'] | null = null
+
+test.beforeEach(async ({ page }) => {
+  captureBrowserDiagnostics(page)
+})
 
 async function signIn(page: import('@playwright/test').Page) {
   if (authenticatedCookies) {
@@ -14,7 +19,7 @@ async function signIn(page: import('@playwright/test').Page) {
     return
   }
   await page.goto('/admin/login')
-  await expect(page.locator('[data-admin-login-ready="true"]')).toBeAttached()
+  await expectClientMounted(page, '[data-admin-login-ready="true"]')
   await expect(page.getByLabel('管理员邮箱')).toBeEnabled()
   await page.getByLabel('管理员邮箱').fill(adminEmail)
   await page.getByLabel('密码').fill(adminPassword)
