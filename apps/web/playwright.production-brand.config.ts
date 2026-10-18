@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 const baseURL = 'http://127.0.0.1:3010'
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
   ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
+const apiPort = process.env.AIKAYUN_TEST_API_PORT ?? '3001'
 const mediaRoot = join(tmpdir(), 'aikayun-d7-playwright-media')
 
 export default defineConfig({
@@ -26,11 +27,12 @@ export default defineConfig({
   webServer: [
     {
       command: 'pnpm --filter @aikayun/api dev',
-      url: 'http://127.0.0.1:3001/api/v1/health/live',
+      url: `http://127.0.0.1:${apiPort}/api/v1/health/live`,
       reuseExistingServer: false,
       timeout: 120_000,
       env: {
         DATABASE_URL: testDatabaseUrl,
+        API_PORT: apiPort,
         NODE_ENV: 'test',
         PUBLIC_ORIGIN: baseURL,
         MEDIA_ROOT: mediaRoot,
@@ -46,7 +48,7 @@ export default defineConfig({
         NODE_ENV: 'production',
         NITRO_HOST: '127.0.0.1',
         NITRO_PORT: '3010',
-        NUXT_API_INTERNAL_URL: 'http://127.0.0.1:3001',
+        NUXT_API_INTERNAL_URL: `http://127.0.0.1:${apiPort}`,
         NUXT_PUBLIC_SITE_URL: baseURL,
         NUXT_PUBLIC_STORE_NAME: '生产运行时商店',
         NUXT_PUBLIC_STORE_LOGO_URL: '',

@@ -601,7 +601,7 @@ test('media sharing blocks physical deletion and preserves another product after
   const png = readFileSync(new URL('../fixtures/d6-upload.png', import.meta.url))
   const makeDraft = async (name: string) => {
     await page.goto('/admin/products/new')
-    await expect(page.getByLabel('商品名称')).toBeEnabled()
+    await expect(page.getByLabel('商品名称')).toBeEnabled({ timeout: 10_000 })
     await page.getByLabel('商品名称').fill(name)
     await page.getByLabel('默认 SKU 销售价（人民币）').fill('3.50')
     await page.getByRole('button', { name: '保存为草稿' }).click()

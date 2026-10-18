@@ -5,6 +5,7 @@ import { expect, test, type APIRequestContext, type Page } from '@playwright/tes
 type ProductRecord = {
   id: string
   name: string
+  description: string
   revision: number
   status: 'draft' | 'active' | 'paused' | 'archived'
   variants: Array<{ id: string; revision: number; salePrice: string; options: Array<{ groupName: string; valueName: string }> }>
@@ -137,6 +138,7 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
         content: [
           { type: 'heading', attrs: { level: 2 }, content: [{ type: 'text', text: 'D7安全详情' }] },
           { type: 'paragraph', content: [{ type: 'text', text: '真实结构化商品说明。' }] },
+          { type: 'paragraph', content: [{ type: 'text', text: '<script>alert(1)</script>' }] },
           { type: 'image', attrs: { mediaId: mediaIds[0], alt: '真实商品图' } },
         ],
       },
@@ -263,6 +265,20 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
   expect(detailHtml).toContain('property="og:image"')
   expect(detailHtml).toContain('D7安全详情')
   expect(detailHtml).toContain('真实结构化商品说明')
+  expect(detailHtml).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
+  expect(detailHtml).not.toContain('<script>alert(1)</script>')
+  const structuredDataMatch = detailHtml.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/u)
+  expect(structuredDataMatch?.[1]).toBeTruthy()
+  const structuredData = JSON.parse(structuredDataMatch![1]!) as Record<string, unknown>
+  expect(structuredData).toMatchObject({
+    '@context': 'https://schema.org',
+    '@type': 'Product',
+    name: product.name,
+    description: product.description,
+    category: 'D7真实目录',
+  })
+  expect(structuredData.image).toHaveLength(2)
+  expect(structuredData).not.toHaveProperty('offers')
   expect(detailHtml).not.toContain('"offers"')
   expect(detailHtml).toContain('购买功能尚未开放')
   expect(detailHtml).not.toContain('立即购买')
@@ -500,6 +516,7 @@ test('search re-entry never renders a previous query while the current URL is lo
   })
   await page.getByRole('link', { name: '搜索商品' }).click()
   await expect(page).toHaveURL('/search')
+  await expect(page.locator('[data-storefront-ready="true"]')).toBeAttached()
   await expect(page.locator('ul.grid > li').first()).toBeVisible()
   const searchbox = page.getByRole('searchbox', { name: '搜索商品名称或描述' })
   await searchbox.fill('R2搜索B')

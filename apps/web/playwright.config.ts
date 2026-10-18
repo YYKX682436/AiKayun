@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
   ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
+const apiPort = process.env.AIKAYUN_TEST_API_PORT ?? '3001'
 const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3100'
 const webPort = new URL(baseURL).port || '3100'
 const useExternalServer = process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true'
@@ -27,11 +28,12 @@ export default defineConfig({
   webServer: useExternalServer ? undefined : [
     {
       command: 'pnpm --filter @aikayun/api dev',
-      url: 'http://127.0.0.1:3001/api/v1/health/live',
+      url: `http://127.0.0.1:${apiPort}/api/v1/health/live`,
       reuseExistingServer: false,
       timeout: 120_000,
       env: {
         DATABASE_URL: testDatabaseUrl,
+        API_PORT: apiPort,
         NODE_ENV: 'test',
         PUBLIC_ORIGIN: baseURL,
         MEDIA_ROOT: mediaRoot,
@@ -43,7 +45,7 @@ export default defineConfig({
       url: baseURL,
       reuseExistingServer: false,
       timeout: 120_000,
-      env: { NUXT_API_INTERNAL_URL: 'http://127.0.0.1:3001', NUXT_PUBLIC_SITE_URL: baseURL },
+      env: { NUXT_API_INTERNAL_URL: `http://127.0.0.1:${apiPort}`, NUXT_PUBLIC_SITE_URL: baseURL },
     },
   ],
   globalTeardown: './test/e2e/global-teardown.ts',
