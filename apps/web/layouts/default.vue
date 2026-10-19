@@ -116,7 +116,7 @@ onMounted(() => {
           </NuxtLink>
           <NuxtLink
             to="/admin/login"
-            class="hidden min-h-11 items-center rounded-lg px-3 text-sm font-medium text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary lg:inline-flex"
+            class="hidden min-h-11 items-center rounded-lg px-3 text-sm font-medium text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary xl:inline-flex"
           >
             管理入口
           </NuxtLink>

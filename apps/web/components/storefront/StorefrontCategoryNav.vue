@@ -27,8 +27,8 @@ function navItem(category: PublicCategory): NavigationMenuItem {
 }
 
 const desktopItems = computed<NavigationMenuItem[]>(() => {
-  const visible = roots.value.slice(0, 5).map(navItem)
-  const remaining = roots.value.slice(5).map(navItem)
+  const visible = roots.value.slice(0, 3).map(navItem)
+  const remaining = roots.value.slice(3).map(navItem)
   if (remaining.length > 0) visible.push({ label: '更多分类', children: remaining })
   return visible
 })
@@ -39,7 +39,7 @@ const desktopItems = computed<NavigationMenuItem[]>(() => {
     v-if="desktopItems.length"
     :items="desktopItems"
     aria-label="商品分类"
-    class="hidden min-w-0 lg:flex"
+    class="hidden min-w-0 max-w-[24rem] xl:flex"
   />
 
   <UButton
@@ -48,7 +48,7 @@ const desktopItems = computed<NavigationMenuItem[]>(() => {
     variant="ghost"
     icon="i-lucide-list-tree"
     aria-label="浏览商品分类"
-    class="min-h-11 min-w-9 px-1.5 lg:hidden"
+    class="min-h-11 min-w-9 px-1.5 xl:hidden"
     @click="drawerOpen = true"
   />
 
