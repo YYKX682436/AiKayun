@@ -3,6 +3,70 @@ import type { Migration } from 'kysely/migration'
 
 export const ordersMigration: Migration = {
   async up(db) {
+    // `created` may already have a provider-side payment in flight. Treat it
+    // like `pending` until a provider deadline has elapsed or a terminal result
+    // is confirmed. Legacy NULL deadlines remain valid records, but never make
+    // an attempt look safely expired.
+    await sql`
+      CREATE FUNCTION order_has_unresolved_payment_attempts(order_uuid uuid) RETURNS boolean
+      LANGUAGE sql VOLATILE AS $$
+        SELECT EXISTS (
+          SELECT 1 FROM payment_attempts AS attempt
+          WHERE attempt.order_id = order_uuid
+            AND (
+              (attempt.status IN ('created', 'pending')
+                AND (attempt.expires_at IS NULL OR attempt.expires_at > clock_timestamp()))
+              OR (attempt.status IN ('succeeded', 'late_succeeded', 'reconciliation_required')
+                AND NOT EXISTS (
+                  SELECT 1 FROM payment_receipts AS receipt
+                  WHERE receipt.payment_attempt_id = attempt.id
+                ))
+            )
+        )
+      $$
+    `.execute(db)
+    await sql`
+      CREATE FUNCTION guard_payment_attempt_deadline_r1() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      DECLARE
+        order_status varchar(24);
+        order_expires_at timestamptz;
+      BEGIN
+        IF TG_OP = 'UPDATE' AND OLD.status = 'pending' AND NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN
+          RAISE EXCEPTION 'A pending payment attempt deadline is immutable'
+            USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_pending_deadline_immutable';
+        END IF;
+        IF NEW.status = 'pending' THEN
+          IF NEW.expires_at IS NULL OR NEW.expires_at <= clock_timestamp() THEN
+            RAISE EXCEPTION 'A pending payment attempt requires a future provider deadline'
+              USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_pending_deadline_required';
+          END IF;
+        END IF;
+        IF NEW.order_id IS NOT NULL AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status) THEN
+          -- Serialize cross-table payment transitions with order closure. This
+          -- is an advisory lock so it does not invert the order -> attempt row
+          -- lock sequence used by receipts and inventory release.
+          PERFORM pg_advisory_xact_lock(hashtextextended(NEW.order_id::text, 0));
+          IF NEW.status = 'pending' THEN
+            SELECT status, unpaid_expires_at INTO order_status, order_expires_at
+            FROM orders WHERE id = NEW.order_id;
+            IF NOT FOUND OR order_status <> 'pending_payment'
+              OR order_expires_at IS NULL OR order_expires_at <= clock_timestamp() THEN
+              RAISE EXCEPTION 'A payment attempt cannot become pending for a closed or expired order'
+                USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_order_payable';
+            END IF;
+          END IF;
+        END IF;
+        RETURN NEW;
+      END;
+      $$
+    `.execute(db)
+    await sql`
+      CREATE TRIGGER payment_attempts_deadline_r1
+      BEFORE INSERT OR UPDATE ON payment_attempts
+      FOR EACH ROW EXECUTE FUNCTION guard_payment_attempt_deadline_r1()
+    `.execute(db)
+
     await sql`
       ALTER TABLE product_variant_fulfillment
         ADD COLUMN manual_delivery_ready boolean NOT NULL DEFAULT false
@@ -124,8 +188,57 @@ export const ordersMigration: Migration = {
       FOR EACH STATEMENT EXECUTE FUNCTION protect_immutable_trade_history()
     `.execute(db)
 
-    // The frozen ④-1 close guard checked collected and refunded amounts, but did
-    // not block an active or uncertain payment attempt with no receipt yet.
+    // A late receipt can arrive after the order deadline while its attempt is
+    // still active (including a legacy NULL deadline). Keep the order open for
+    // reconciliation; the receipt trigger will record the money as late.
+    await sql`
+      CREATE OR REPLACE FUNCTION close_expired_order_when_settled(order_uuid uuid) RETURNS void
+      LANGUAGE plpgsql AS $$
+      DECLARE
+        order_row orders%ROWTYPE;
+        collected_amount numeric(18, 2);
+        refunded_amount numeric(18, 2);
+        reserved_refund_amount numeric(18, 2);
+        has_active_refund boolean;
+        has_inflight_fulfillment boolean;
+      BEGIN
+        SELECT * INTO order_row FROM orders WHERE id = order_uuid FOR UPDATE;
+        IF NOT FOUND OR order_row.status <> 'pending_payment' OR order_row.unpaid_expires_at IS NULL
+          OR order_has_unresolved_payment_attempts(order_uuid)
+          OR (order_row.unpaid_expires_at > clock_timestamp() AND NOT EXISTS (
+            SELECT 1 FROM payment_attempts AS attempt
+            WHERE attempt.order_id = order_uuid AND attempt.expires_at <= clock_timestamp()
+          )) THEN
+          RETURN;
+        END IF;
+
+        SELECT COALESCE(sum(receipt.amount), 0), COALESCE(sum(receipt.refunded_amount), 0),
+          COALESCE(sum(receipt.refund_reserved_amount), 0)
+          INTO collected_amount, refunded_amount, reserved_refund_amount
+        FROM payment_receipts AS receipt
+        JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
+        WHERE attempt.order_id = order_uuid;
+        SELECT EXISTS (SELECT 1 FROM order_refunds AS refund WHERE refund.order_id = order_uuid
+          AND refund.status IN ('requested', 'approved', 'processing', 'partially_succeeded'))
+          INTO has_active_refund;
+        SELECT EXISTS (
+          SELECT 1 FROM order_item_fulfillment_attempts AS attempt
+          JOIN order_items AS item ON item.id = attempt.order_item_id
+          WHERE item.order_id = order_uuid AND attempt.status IN ('processing', 'unknown')
+        ) OR EXISTS (SELECT 1 FROM order_items AS item
+          WHERE item.order_id = order_uuid AND item.fulfillment_reserved_quantity > 0)
+          INTO has_inflight_fulfillment;
+
+        IF collected_amount = refunded_amount AND reserved_refund_amount = 0
+          AND NOT has_active_refund AND NOT has_inflight_fulfillment THEN
+          UPDATE orders SET status = 'closed' WHERE id = order_uuid AND status = 'pending_payment';
+        END IF;
+      END;
+      $$
+    `.execute(db)
+
+    // API cancellation, timeout closure, receipt-triggered expiration and the
+    // database guard all share one payment-attempt state predicate.
     await sql`
       CREATE OR REPLACE FUNCTION guard_order_update() RETURNS trigger
       LANGUAGE plpgsql AS $$
@@ -171,20 +284,17 @@ export const ordersMigration: Migration = {
             END IF;
           END IF;
           IF NEW.status = 'closed' THEN
+            -- Pair with payment_attempts_deadline_r1 before checking payment
+            -- rows. The lock is shared by every state transition for this
+            -- order, without taking payment-attempt row locks in reverse order.
+            PERFORM pg_advisory_xact_lock(hashtextextended(OLD.id::text, 0));
             SELECT COALESCE(sum(receipt.amount), 0), COALESCE(sum(receipt.refunded_amount), 0),
               COALESCE(sum(receipt.refund_reserved_amount), 0)
               INTO paid_amount, refunded_amount, refund_reserved_amount
             FROM payment_receipts AS receipt
             JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
             WHERE attempt.order_id = OLD.id;
-            SELECT EXISTS (
-              SELECT 1 FROM payment_attempts AS attempt
-              WHERE attempt.order_id = OLD.id
-                AND ((attempt.status = 'pending' AND attempt.expires_at > clock_timestamp())
-                  OR (attempt.status = 'reconciliation_required' AND NOT EXISTS (
-                    SELECT 1 FROM payment_receipts AS receipt WHERE receipt.payment_attempt_id = attempt.id
-                  )))
-            ) INTO has_unresolved_payment;
+            SELECT order_has_unresolved_payment_attempts(OLD.id) INTO has_unresolved_payment;
             SELECT EXISTS (SELECT 1 FROM order_refunds AS refund
               WHERE refund.order_id = OLD.id
                 AND refund.status IN ('requested', 'approved', 'processing', 'partially_succeeded'))
@@ -357,5 +467,52 @@ export const ordersMigration: Migration = {
       END;
       $$
     `.execute(db)
+    await sql`
+      CREATE OR REPLACE FUNCTION close_expired_order_when_settled(order_uuid uuid) RETURNS void
+      LANGUAGE plpgsql AS $$
+      DECLARE
+        order_row orders%ROWTYPE;
+        collected_amount numeric(18, 2);
+        refunded_amount numeric(18, 2);
+        reserved_refund_amount numeric(18, 2);
+        has_active_refund boolean;
+        has_inflight_fulfillment boolean;
+      BEGIN
+        SELECT * INTO order_row FROM orders WHERE id = order_uuid FOR UPDATE;
+        IF NOT FOUND OR order_row.status <> 'pending_payment' OR order_row.unpaid_expires_at IS NULL
+          OR (order_row.unpaid_expires_at > clock_timestamp() AND NOT EXISTS (
+            SELECT 1 FROM payment_attempts AS attempt
+            WHERE attempt.order_id = order_uuid AND attempt.expires_at <= clock_timestamp()
+          )) THEN
+          RETURN;
+        END IF;
+
+        SELECT COALESCE(sum(receipt.amount), 0), COALESCE(sum(receipt.refunded_amount), 0),
+          COALESCE(sum(receipt.refund_reserved_amount), 0)
+          INTO collected_amount, refunded_amount, reserved_refund_amount
+        FROM payment_receipts AS receipt
+        JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
+        WHERE attempt.order_id = order_uuid;
+        SELECT EXISTS (SELECT 1 FROM order_refunds AS refund WHERE refund.order_id = order_uuid
+          AND refund.status IN ('requested', 'approved', 'processing', 'partially_succeeded'))
+          INTO has_active_refund;
+        SELECT EXISTS (
+          SELECT 1 FROM order_item_fulfillment_attempts AS attempt
+          JOIN order_items AS item ON item.id = attempt.order_item_id
+          WHERE item.order_id = order_uuid AND attempt.status IN ('processing', 'unknown')
+        ) OR EXISTS (SELECT 1 FROM order_items AS item
+          WHERE item.order_id = order_uuid AND item.fulfillment_reserved_quantity > 0)
+          INTO has_inflight_fulfillment;
+
+        IF collected_amount = refunded_amount AND reserved_refund_amount = 0
+          AND NOT has_active_refund AND NOT has_inflight_fulfillment THEN
+          UPDATE orders SET status = 'closed' WHERE id = order_uuid AND status = 'pending_payment';
+        END IF;
+      END;
+      $$
+    `.execute(db)
+    await sql`DROP TRIGGER payment_attempts_deadline_r1 ON payment_attempts`.execute(db)
+    await sql`DROP FUNCTION guard_payment_attempt_deadline_r1()`.execute(db)
+    await sql`DROP FUNCTION order_has_unresolved_payment_attempts(uuid)`.execute(db)
   },
 }

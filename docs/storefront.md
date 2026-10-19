@@ -39,7 +39,7 @@
 
 顾客注册、登录、退出、个人资料修改和改密接口分别位于 `/api/v1/customer/auth/*`、`/api/v1/customer/profile` 和 `/api/v1/customer/password`。注册/登录失败使用一致的用户名或密码错误响应；写请求有独立顾客 CSRF Cookie、同源 Origin 检查和 IP 限流。前端不会读取或保存会话令牌，浏览器只持有 HttpOnly 会话 Cookie。
 
-管理员在 `/admin/storefront/customer-policy` 管理新注册邮箱/手机号要求、游客下单和游客免费领取设置。设置从 `storefront_customer_policy` 真实读取并写回。顾客管理页面位于 `/admin/customers` 和 `/admin/customers/:id`，支持服务端筛选分页、资料修改、状态维护、临时密码重置、只读历史订单和不可逆匿名化；权限与删除约束见[顾客管理 API](customer-management.md)。游客开关目前只是策略数据，不会开放下单、领取、购物车、支付或履约接口。邮箱/手机号验证、密码找回和 OAuth 尚未实现。
+管理员在 `/admin/storefront/customer-policy` 管理新注册邮箱/手机号要求、游客下单和游客免费领取设置。设置从 `storefront_customer_policy` 真实读取并写回。顾客管理页面位于 `/admin/customers` 和 `/admin/customers/:id`，支持服务端筛选分页、资料修改、状态维护、临时密码重置、只读历史订单和不可逆匿名化；权限与删除约束见[顾客管理 API](customer-management.md)。游客下单与免费领取开关分别控制游客正价订单和零元订单；允许时，服务端创建安全订单会话并将下单绑定到 HttpOnly Cookie。真实支付渠道尚未开放；只有明确启用的数字商品 SKU 可使用人工交付。邮箱/手机号验证、密码找回和 OAuth 尚未实现。
 
 ## 分类与检索
 

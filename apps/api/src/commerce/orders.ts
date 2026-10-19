@@ -493,16 +493,10 @@ async function getOwnedOrder(
 }
 
 async function orderHasCloseProtection(trx: Transaction<Database>, orderId: string): Promise<boolean> {
+  await sql`SELECT pg_advisory_xact_lock(hashtextextended(${orderId}::text, 0))`.execute(trx)
   const result = await sql<{ protected: boolean }>`
     SELECT
-      EXISTS (
-        SELECT 1 FROM payment_attempts AS attempt
-        WHERE attempt.order_id = ${orderId}::uuid
-          AND ((attempt.status = 'pending' AND attempt.expires_at > clock_timestamp())
-            OR (attempt.status = 'reconciliation_required' AND NOT EXISTS (
-              SELECT 1 FROM payment_receipts AS receipt WHERE receipt.payment_attempt_id = attempt.id
-            )))
-      )
+      order_has_unresolved_payment_attempts(${orderId}::uuid)
       OR EXISTS (
         SELECT 1 FROM payment_receipts AS receipt
         JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
@@ -552,14 +546,7 @@ export async function expireDueUnpaidOrders(
     const due = await sql<{ id: string }>`
       SELECT id FROM orders
       WHERE status = 'pending_payment' AND unpaid_expires_at <= ${now}
-        AND NOT EXISTS (
-          SELECT 1 FROM payment_attempts AS attempt
-          WHERE attempt.order_id = orders.id
-            AND ((attempt.status = 'pending' AND attempt.expires_at > clock_timestamp())
-              OR (attempt.status = 'reconciliation_required' AND NOT EXISTS (
-                SELECT 1 FROM payment_receipts AS receipt WHERE receipt.payment_attempt_id = attempt.id
-              )))
-        )
+        AND NOT order_has_unresolved_payment_attempts(orders.id)
         AND NOT EXISTS (
           SELECT 1 FROM payment_receipts AS receipt
           JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id

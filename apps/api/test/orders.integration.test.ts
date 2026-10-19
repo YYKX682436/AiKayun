@@ -199,6 +199,27 @@ async function createOrder(
   })
 }
 
+async function attachPendingPaymentWithoutExpiry(orderId: string, amount: string): Promise<string> {
+  const attemptId = randomUUID()
+  await db.insertInto('payment_attempts').values({
+    id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+    topup_customer_id: null, source: 'external', amount, status: 'created', provider: 'integration',
+    provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+    requested_wallet_amount: null, expires_at: null, completed_at: null,
+  }).execute()
+  // Simulate a row that was valid under the frozen ④-1 schema before the
+  // ④-5 deadline guard was introduced.
+  await db.transaction().execute(async (trx) => {
+    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+    try {
+      await trx.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+    } finally {
+      await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+    }
+  })
+  return attemptId
+}
+
 beforeAll(async () => {
   if (!testDatabaseUrl) throw new Error('TEST_DATABASE_URL must point to a dedicated PostgreSQL database ending in _test')
   const databaseUrl = new URL(testDatabaseUrl)
@@ -231,6 +252,313 @@ afterAll(async () => {
 })
 
 describe('real order creation and lifecycle on PostgreSQL', () => {
+  it('does not let a legacy pending payment with NULL expiry be cancelled by its owner', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    await attachPendingPaymentWithoutExpiry(orderId, '1.20')
+
+    const cancelled = await inject({
+      method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
+    })
+    expect(cancelled.statusCode).toBe(409)
+    expect(cancelled.json().error.code).toBe('ORDER_HAS_UNRESOLVED_OBLIGATION')
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(1)
+  })
+
+  it('does not let the timeout worker close a legacy pending payment with NULL expiry', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    await attachPendingPaymentWithoutExpiry(orderId, '1.20')
+
+    expect(await expireDueUnpaidOrders(db, new Date(Date.now() + 60 * 60_000))).toBe(0)
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('pending_payment')
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(1)
+  })
+
+  it('blocks direct database closure while a legacy pending payment has NULL expiry', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    await attachPendingPaymentWithoutExpiry(orderId, '1.20')
+
+    await expect(db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute())
+      .rejects.toMatchObject({ constraint: 'orders_close_payment_unresolved' })
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(1)
+  })
+
+  it('requires a live provider deadline before pending and treats created attempts as unresolved', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const attemptId = randomUUID()
+    await db.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+      topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
+      provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+      requested_wallet_amount: null, expires_at: null, completed_at: null,
+    }).execute()
+
+    const createdCancel = await inject({
+      method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
+    })
+    expect(createdCancel.statusCode).toBe(409)
+    await expect(db.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute())
+      .rejects.toMatchObject({ constraint: 'payment_attempts_pending_deadline_required' })
+    await db.updateTable('payment_attempts').set({
+      status: 'pending', expires_at: new Date(Date.now() + 60_000),
+    }).where('id', '=', attemptId).execute()
+    await expect(db.updateTable('payment_attempts').set({ expires_at: new Date(Date.now() + 120_000) })
+      .where('id', '=', attemptId).execute())
+      .rejects.toMatchObject({ constraint: 'payment_attempts_pending_deadline_immutable' })
+    const pendingCancel = await inject({
+      method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
+    })
+    expect(pendingCancel.statusCode).toBe(409)
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(1)
+  })
+
+  it('rejects pending attempts inserted without a deadline and serializes payment updates against cancellation', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const attemptId = randomUUID()
+    await expect(db.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+      topup_customer_id: null, source: 'external', amount: '1.20', status: 'pending', provider: 'integration',
+      provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+      requested_wallet_amount: null, expires_at: null, completed_at: null,
+    }).execute()).rejects.toMatchObject({ constraint: 'payment_attempts_pending_deadline_required' })
+
+    await db.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+      topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
+      provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+      requested_wallet_amount: null, expires_at: new Date(Date.now() + 250), completed_at: null,
+    }).execute()
+    await new Promise(resolve => setTimeout(resolve, 300))
+
+    let release!: () => void
+    let updated!: () => void
+    const waiting = new Promise<void>((resolve) => { updated = resolve })
+    const hold = new Promise<void>((resolve) => { release = resolve })
+    const paymentTransition = db.transaction().execute(async (trx) => {
+      await trx.updateTable('payment_attempts').set({
+        status: 'pending', expires_at: new Date(Date.now() + 60_000),
+      }).where('id', '=', attemptId).execute()
+      updated()
+      await hold
+    })
+    await waiting
+    const cancellation = inject({
+      method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
+    })
+    try {
+      await new Promise(resolve => setTimeout(resolve, 100))
+    } finally {
+      release()
+    }
+    await paymentTransition
+    const cancelled = await cancellation
+
+    expect(cancelled.statusCode).toBe(409)
+    expect(cancelled.json().error.code).toBe('ORDER_HAS_UNRESOLVED_OBLIGATION')
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('pending_payment')
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(1)
+  })
+
+  it('allows confirmed failed, expired, or cancelled payment attempts to release stock', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 4 })
+    await enableManual(catalog, admin)
+    const terminalStates = ['failed', 'expired', 'cancelled'] as const
+
+    for (const status of terminalStates) {
+      const items = [{ skuId: catalog.skuId, quantity: 1 }]
+      const quoteResult = await quote(items, customer)
+      const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+      const orderId = created.json().data.order.id as string
+      const attemptId = randomUUID()
+      await db.insertInto('payment_attempts').values({
+        id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+        topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
+        provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+        requested_wallet_amount: null, expires_at: new Date(Date.now() + 60_000), completed_at: null,
+      }).execute()
+      await db.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+      await db.updateTable('payment_attempts').set({ status }).where('id', '=', attemptId).execute()
+
+      const cancelled = await inject({
+        method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
+      })
+      expect(cancelled.statusCode).toBe(200)
+      expect(cancelled.json().data.status).toBe('closed')
+    }
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(0)
+  })
+
+  it('keeps reconciliation receipts and unresolved refunds from closing an order', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const attemptId = randomUUID()
+    await db.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+      topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
+      provider_payment_id: `mismatch-${attemptId}`, wallet_operation_id: null, wallet_hold_operation_id: null,
+      requested_wallet_amount: null, expires_at: new Date(Date.now() + 60_000), completed_at: null,
+    }).execute()
+    await db.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+    await db.insertInto('payment_receipts').values({
+      id: randomUUID(), payment_attempt_id: attemptId, source_bucket: 'external', provider: 'integration',
+      provider_transaction_id: `mismatch-receipt-${attemptId}`, wallet_operation_id: null, wallet_line_no: null,
+      amount: '0.80',
+    }).execute()
+    expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status)
+      .toBe('reconciliation_required')
+    await expect(db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute())
+      .rejects.toMatchObject({ constraint: 'orders_close_requires_full_refund' })
+    const cancelled = await inject({
+      method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
+    })
+    expect(cancelled.statusCode).toBe(409)
+
+    await db.insertInto('order_refunds').values({
+      id: randomUUID(), order_id: orderId, idempotency_key: randomUUID(), request_sha256: digest, amount: '0.80',
+    }).execute()
+    await expect(db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute())
+      .rejects.toMatchObject({ constraint: 'orders_close_refund_unresolved' })
+  })
+
+  it('records a late receipt while timeout work skips the locked order and never releases twice', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const attemptId = randomUUID()
+    await db.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+      topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
+      provider_payment_id: `timeout-race-${attemptId}`, wallet_operation_id: null, wallet_hold_operation_id: null,
+      requested_wallet_amount: null, expires_at: new Date(Date.now() + 350), completed_at: null,
+    }).execute()
+    await db.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
+    try {
+      await sql`UPDATE orders SET unpaid_expires_at = clock_timestamp() - interval '1 second' WHERE id = ${orderId}::uuid`.execute(db)
+    } finally {
+      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+    }
+    await new Promise(resolve => setTimeout(resolve, 450))
+
+    let unlock!: () => void
+    let acquired!: () => void
+    const locked = new Promise<void>((resolve) => { acquired = resolve })
+    const hold = new Promise<void>((resolve) => { unlock = resolve })
+    const receiptInsert = db.transaction().execute(async (trx) => {
+      await sql`SELECT id FROM orders WHERE id = ${orderId}::uuid FOR UPDATE`.execute(trx)
+      acquired()
+      await hold
+      await trx.insertInto('payment_receipts').values({
+        id: randomUUID(), payment_attempt_id: attemptId, source_bucket: 'external', provider: 'integration',
+        provider_transaction_id: `late-race-${attemptId}`, wallet_operation_id: null, wallet_line_no: null,
+        amount: '1.20',
+      }).execute()
+    })
+    await locked
+    expect(await expireDueUnpaidOrders(db, new Date(Date.now() + 60 * 60_000))).toBe(0)
+    unlock()
+    await receiptInsert
+
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('closed')
+    expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status)
+      .toBe('late_succeeded')
+    expect(await db.selectFrom('payment_receipts').select('disposition').where('payment_attempt_id', '=', attemptId).execute())
+      .toEqual([{ disposition: 'late' }])
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(0)
+    expect(await db.selectFrom('order_inventory_events as event')
+      .innerJoin('order_inventory_reservations as reservation', 'reservation.id', 'event.reservation_id')
+      .where('reservation.product_variant_id', '=', catalog.skuId).select('event.action').execute())
+      .toEqual([{ action: 'reserve' }, { action: 'release' }])
+    expect(await expireDueUnpaidOrders(db, new Date(Date.now() + 60 * 60_000))).toBe(0)
+  })
+
+  it('skips a NULL-deadline payment order and processes a later due order in the same worker batch', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 4 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const protectedQuote = await quote(items, customer)
+    const protectedOrder = await createOrder(items, protectedQuote.json().data.quoteToken, customer)
+    const protectedId = protectedOrder.json().data.order.id as string
+    await attachPendingPaymentWithoutExpiry(protectedId, '1.20')
+    const dueQuote = await quote(items, customer)
+    const dueOrder = await createOrder(items, dueQuote.json().data.quoteToken, customer)
+    const dueId = dueOrder.json().data.order.id as string
+    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
+    try {
+      await sql`UPDATE orders SET unpaid_expires_at = clock_timestamp() - interval '1 second'
+        WHERE id IN (${protectedId}::uuid, ${dueId}::uuid)`.execute(db)
+    } finally {
+      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+    }
+
+    expect(await expireDueUnpaidOrders(db, new Date(Date.now() + 60 * 60_000), 1)).toBe(1)
+    expect((await db.selectFrom('orders').select('status').where('id', '=', protectedId).executeTakeFirstOrThrow()).status)
+      .toBe('pending_payment')
+    expect((await db.selectFrom('orders').select('status').where('id', '=', dueId).executeTakeFirstOrThrow()).status)
+      .toBe('closed')
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(1)
+  })
+
   it('creates multi-SKU customer orders from locked snapshots, reserves quantity stock, and makes idempotency owner-scoped', async () => {
     const admin = await createAdmin()
     const owner = await createCustomer()

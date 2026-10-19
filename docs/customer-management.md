@@ -22,7 +22,7 @@
 
 列表每行包含用户名、邮箱、手机号、账户状态、注册及更新时间。详情额外返回邮箱和手机号的 `emailVerifiedAt` / `phoneVerifiedAt`。联系方式值为 `null` 表示未填写；验证时间为 `null` 表示未验证。
 
-订单摘要基于④-1的 `orders`、`customer_order_status` 和 `order_financial_status`，只读显示订单状态、顾客可见状态、支付状态、退款状态、金额、币种和时间。当前未开放订单创建，所以真实顾客可能没有订单；空列表不是演示数据。
+订单摘要基于 `orders`、`customer_order_status` 和 `order_financial_status`，只读显示真实订单状态、顾客可见状态、支付状态、退款状态、金额、币种和时间。新顾客可能没有历史订单；空列表不是演示数据。
 
 ## 写操作
 
