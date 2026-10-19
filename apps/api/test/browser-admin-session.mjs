@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { pathToFileURL } from 'node:url'
 import { Pool } from 'pg'
 
 /** Creates a real admin session for UI fixture setup without consuming the login rate limit. */
@@ -29,5 +30,15 @@ export async function createBrowserAdminSession() {
   }
   finally {
     await pool.end()
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    process.stdout.write(`${await createBrowserAdminSession()}\n`)
+  }
+  catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : 'Could not create the E2E admin session'}\n`)
+    process.exitCode = 1
   }
 }

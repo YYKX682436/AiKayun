@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { expect, test, type Page } from '@playwright/test'
-import { createBrowserAdminSession } from '../../../api/test/browser-admin-session.mjs'
+import { createBrowserAdminSession } from './browser-admin-session'
 import { captureBrowserDiagnostics, expectClientMounted } from './browser-diagnostics'
 
 type Product = {
