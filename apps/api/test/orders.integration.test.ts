@@ -220,6 +220,151 @@ async function attachPendingPaymentWithoutExpiry(orderId: string, amount: string
   return attemptId
 }
 
+async function attachExpiredPendingPayment(orderId: string, amount: string): Promise<string> {
+  const attemptId = randomUUID()
+  await db.transaction().execute(async (trx) => {
+    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+    try {
+      await trx.insertInto('payment_attempts').values({
+        id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+        topup_customer_id: null, source: 'external', amount, status: 'created', provider: 'integration',
+        provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+        requested_wallet_amount: null, created_at: new Date(Date.now() - 2 * 60 * 60_000),
+        expires_at: new Date(Date.now() - 60 * 60_000), completed_at: null,
+      }).execute()
+      await trx.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+    } finally {
+      await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+    }
+  })
+  return attemptId
+}
+
+async function attachExpiredCreatedPayment(orderId: string, amount: string): Promise<string> {
+  const attemptId = randomUUID()
+  await db.insertInto('payment_attempts').values({
+    id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+    topup_customer_id: null, source: 'external', amount, status: 'created', provider: 'integration',
+    provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+    requested_wallet_amount: null, created_at: new Date(Date.now() - 2 * 60 * 60_000),
+    expires_at: new Date(Date.now() - 60 * 60_000), completed_at: null,
+  }).execute()
+  return attemptId
+}
+
+async function attachExpiredWalletHold(options: {
+  orderId: string
+  customerId: string
+  adminId: string
+  externalAmount: string
+  walletAmount: string
+}): Promise<string> {
+  const attemptId = randomUUID()
+  const holdOperationId = randomUUID()
+  const creditOperationId = randomUUID()
+  await db.transaction().execute(async (trx) => {
+    await trx.insertInto('wallet_operations').values({
+      id: creditOperationId, customer_id: options.customerId, operation_type: 'gift',
+      request_sha256: digest, actor_admin_id: options.adminId,
+    }).execute()
+    await trx.insertInto('wallet_ledger_entries').values({
+      id: randomUUID(), wallet_operation_id: creditOperationId, line_no: 1,
+      customer_id: options.customerId, bucket: 'gift', action: 'credit_available', amount: options.walletAmount,
+      payment_attempt_id: null, refund_allocation_id: null, withdrawal_id: null,
+    }).execute()
+    await trx.insertInto('wallet_operations').values({
+      id: holdOperationId, customer_id: options.customerId, order_id: options.orderId,
+      requested_amount: options.walletAmount, operation_type: 'order_payment_hold',
+      request_sha256: digest, actor_admin_id: null,
+    }).execute()
+    await trx.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: options.orderId,
+      topup_customer_id: null, source: 'external', amount: options.externalAmount, status: 'created',
+      provider: 'integration', provider_payment_id: null, wallet_operation_id: null,
+      wallet_hold_operation_id: holdOperationId, requested_wallet_amount: options.walletAmount,
+      created_at: new Date(Date.now() - 2 * 60 * 60_000),
+      expires_at: new Date(Date.now() - 60 * 60_000), completed_at: null,
+    }).execute()
+    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+    try {
+      await trx.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+    } finally {
+      await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+    }
+    await trx.insertInto('wallet_ledger_entries').values({
+      id: randomUUID(), wallet_operation_id: holdOperationId, line_no: 1,
+      customer_id: options.customerId, bucket: 'gift', action: 'freeze', amount: options.walletAmount,
+      payment_attempt_id: attemptId, refund_allocation_id: null, withdrawal_id: null,
+    }).execute()
+  })
+  return attemptId
+}
+
+async function waitForPostgresLockWait(applicationName: string): Promise<{
+  holdsAdvisory: boolean
+  holdsTransactionId: boolean
+  blockerPids: number[]
+  waitEvent: string | null
+}> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const activity = await sql<{
+      wait_event_type: string | null
+      wait_event: string | null
+      blocker_pids: number[]
+      holds_advisory: boolean
+      holds_transaction_id: boolean
+    }>`
+      SELECT activity.wait_event_type, activity.wait_event, pg_blocking_pids(activity.pid) AS blocker_pids,
+        EXISTS (SELECT 1 FROM pg_locks WHERE pid = activity.pid AND locktype = 'advisory' AND granted)
+          AS holds_advisory,
+        EXISTS (SELECT 1 FROM pg_locks WHERE pid = activity.pid AND locktype = 'transactionid'
+          AND mode = 'ExclusiveLock' AND granted) AS holds_transaction_id
+      FROM pg_stat_activity AS activity WHERE activity.application_name = ${applicationName}
+    `.execute(db)
+    const waiting = activity.rows.find(row => row.wait_event_type === 'Lock' && row.blocker_pids.length > 0)
+    if (waiting) return {
+      holdsAdvisory: waiting.holds_advisory,
+      holdsTransactionId: waiting.holds_transaction_id,
+      blockerPids: waiting.blocker_pids,
+      waitEvent: waiting.wait_event,
+    }
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`PostgreSQL session ${applicationName} did not enter an observable lock wait`)
+}
+
+async function waitForQueryBlockedBy(queryFragment: string, blockerPid: number): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const activity = await sql<{ blocker_pids: number[] }>`
+      SELECT pg_blocking_pids(pid) AS blocker_pids
+      FROM pg_stat_activity
+      WHERE datname = current_database() AND application_name = 'aikayun-api'
+        AND state = 'active' AND wait_event_type = 'Lock' AND query ILIKE ${`%${queryFragment}%`}
+    `.execute(db)
+    if (activity.rows.some(row => row.blocker_pids.includes(blockerPid))) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`PostgreSQL query containing ${queryFragment} did not block on PID ${blockerPid}`)
+}
+
+async function waitForOrderAdvisoryLockWait(): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const activity = await sql<{ pid: number; blocker_pids: number[] }>`
+      SELECT pid, pg_blocking_pids(pid) AS blocker_pids
+      FROM pg_stat_activity
+      WHERE datname = current_database() AND application_name = 'aikayun-api'
+        AND state = 'active' AND wait_event_type = 'Lock' AND wait_event = 'advisory'
+        AND query ILIKE '%pg_advisory_xact_lock%'
+    `.execute(db)
+    if (activity.rows.some(row => row.blocker_pids.length > 0)) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error('No expiry worker was observed waiting for the held order advisory lock')
+}
+
 beforeAll(async () => {
   if (!testDatabaseUrl) throw new Error('TEST_DATABASE_URL must point to a dedicated PostgreSQL database ending in _test')
   const databaseUrl = new URL(testDatabaseUrl)
@@ -252,6 +397,279 @@ afterAll(async () => {
 })
 
 describe('real order creation and lifecycle on PostgreSQL', () => {
+  it('keeps payment-attempt insertion in order-first lock order against timeout closure', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const closeApplicationName = `r2-insert-close-${randomUUID()}`
+    const insertApplicationName = `r2-insert-attempt-${randomUUID()}`
+
+    let releaseClose!: () => void
+    let closeHasOrderRow!: () => void
+    const closeGate = new Promise<void>((resolve) => { releaseClose = resolve })
+    const orderRowAcquired = new Promise<void>((resolve) => { closeHasOrderRow = resolve })
+    const closing = db.transaction().execute(async (trx) => {
+      await sql`SELECT set_config('application_name', ${closeApplicationName}, true)`.execute(trx)
+      await sql`SET LOCAL deadlock_timeout = '100ms'`.execute(trx)
+      await sql`SET LOCAL statement_timeout = '5s'`.execute(trx)
+      await sql`SELECT id FROM orders WHERE id = ${orderId}::uuid FOR UPDATE`.execute(trx)
+      closeHasOrderRow()
+      await closeGate
+      await trx.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute()
+    })
+    await orderRowAcquired
+
+    const attemptId = randomUUID()
+    const insertion = db.transaction().execute(async (trx) => {
+      await sql`SELECT set_config('application_name', ${insertApplicationName}, true)`.execute(trx)
+      await sql`SET LOCAL statement_timeout = '5s'`.execute(trx)
+      await trx.insertInto('payment_attempts').values({
+        id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+        topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
+        provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+        requested_wallet_amount: null, expires_at: new Date(Date.now() + 60 * 60_000), completed_at: null,
+      }).execute()
+    })
+    let outcomes: PromiseSettledResult<unknown>[] = []
+    let insertionWait: { holdsAdvisory: boolean; waitEvent: string | null } | undefined
+    try {
+      insertionWait = await waitForPostgresLockWait(insertApplicationName)
+      releaseClose()
+      outcomes = await Promise.allSettled([closing, insertion])
+    } finally {
+      releaseClose()
+      if (outcomes.length === 0) outcomes = await Promise.allSettled([closing, insertion])
+    }
+
+    expect(insertionWait?.holdsAdvisory).toBe(false)
+    expect(insertionWait?.waitEvent).toBe('transactionid')
+    expect(outcomes[0]?.status).toBe('fulfilled')
+    expect(outcomes[1]).toMatchObject({
+      status: 'rejected', reason: { code: '23514', constraint: 'payment_attempts_order_payable' },
+    })
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('closed')
+    expect(await db.selectFrom('payment_attempts').select('id').where('id', '=', attemptId).execute()).toHaveLength(0)
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(0)
+  })
+
+  it('serializes expired payment completion with order closure without a lock cycle', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const attemptId = await attachExpiredPendingPayment(orderId, '1.20')
+    const closeApplicationName = `r2-close-${randomUUID()}`
+    const paymentApplicationName = `r2-payment-${randomUUID()}`
+
+    let releaseClose!: () => void
+    let closeHasAdvisory!: () => void
+    const closeGate = new Promise<void>((resolve) => { releaseClose = resolve })
+    const advisoryAcquired = new Promise<void>((resolve) => { closeHasAdvisory = resolve })
+    const closing = db.transaction().execute(async (trx) => {
+      await sql`SELECT set_config('application_name', ${closeApplicationName}, true)`.execute(trx)
+      await sql`SET LOCAL deadlock_timeout = '100ms'`.execute(trx)
+      await sql`SET LOCAL statement_timeout = '5s'`.execute(trx)
+      await sql`SELECT id FROM orders WHERE id = ${orderId}::uuid FOR UPDATE`.execute(trx)
+      await sql`SELECT pg_advisory_xact_lock(hashtextextended(${orderId}::text, 0))`.execute(trx)
+      closeHasAdvisory()
+      await closeGate
+      await trx.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute()
+    })
+    await advisoryAcquired
+
+    const paymentTransition = db.transaction().execute(async (trx) => {
+      await sql`SELECT set_config('application_name', ${paymentApplicationName}, true)`.execute(trx)
+      await sql`SET LOCAL statement_timeout = '5s'`.execute(trx)
+      await trx.updateTable('payment_attempts').set({ status: 'failed' }).where('id', '=', attemptId).execute()
+    })
+    let outcomes: PromiseSettledResult<unknown>[] = []
+    try {
+      const paymentWait = await waitForPostgresLockWait(paymentApplicationName)
+      expect(paymentWait.holdsTransactionId).toBe(true)
+      expect(paymentWait.waitEvent).toBe('advisory')
+      releaseClose()
+      outcomes = await Promise.allSettled([closing, paymentTransition])
+    } finally {
+      releaseClose()
+      if (outcomes.length === 0) outcomes = await Promise.allSettled([closing, paymentTransition])
+    }
+
+    const deadlocks = outcomes.filter((outcome): outcome is PromiseRejectedResult =>
+      outcome.status === 'rejected' && typeof outcome.reason === 'object'
+        && outcome.reason !== null && 'code' in outcome.reason && outcome.reason.code === '40P01')
+    expect(deadlocks).toHaveLength(0)
+    expect(outcomes.filter(outcome => outcome.status === 'fulfilled')).toHaveLength(2)
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('closed')
+    expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status)
+      .toBe('failed')
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(0)
+    expect(await db.selectFrom('order_inventory_events as event')
+      .innerJoin('order_inventory_reservations as reservation', 'reservation.id', 'event.reservation_id')
+      .where('reservation.product_variant_id', '=', catalog.skuId)
+      .select('event.action').execute()).toEqual([{ action: 'reserve' }, { action: 'release' }])
+  })
+
+  it('closes an expired created attempt through the worker while its cancellation waits safely', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const attemptId = await attachExpiredCreatedPayment(orderId, '1.20')
+    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
+    try {
+      await sql`UPDATE orders SET unpaid_expires_at = clock_timestamp() - interval '1 second'
+        WHERE id = ${orderId}::uuid`.execute(db)
+    } finally {
+      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+    }
+    await sql`CREATE TABLE r2_test_close_gate (id integer PRIMARY KEY)`.execute(db)
+    await sql`INSERT INTO r2_test_close_gate (id) VALUES (1)`.execute(db)
+    await sql`
+      CREATE FUNCTION r2_test_pause_closed_order() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF OLD.status IS DISTINCT FROM NEW.status AND NEW.status = 'closed' THEN
+          PERFORM id FROM r2_test_close_gate WHERE id = 1 FOR UPDATE;
+        END IF;
+        RETURN NEW;
+      END;
+      $$
+    `.execute(db)
+    await sql`CREATE TRIGGER zz_r2_test_pause_closed_order BEFORE UPDATE OF status ON orders
+      FOR EACH ROW EXECUTE FUNCTION r2_test_pause_closed_order()`.execute(db)
+
+    let releaseGate!: () => void
+    let gateLocked!: (pid: number) => void
+    const gate = new Promise<void>((resolve) => { releaseGate = resolve })
+    const gateReady = new Promise<number>((resolve) => { gateLocked = resolve })
+    const gateHolder = db.transaction().execute(async (trx) => {
+      const pid = await sql<{ pid: number }>`SELECT pg_backend_pid() AS pid`.execute(trx)
+      await sql`SELECT id FROM r2_test_close_gate WHERE id = 1 FOR UPDATE`.execute(trx)
+      gateLocked(pid.rows[0]!.pid)
+      await gate
+    })
+    const gatePid = await gateReady
+    const worker = expireDueUnpaidOrders(db, new Date(Date.now() + 60 * 60_000), 1)
+    let paymentTransition: Promise<unknown> | undefined
+    let outcomes: PromiseSettledResult<unknown>[] | undefined
+    try {
+      await waitForQueryBlockedBy('update "orders"', gatePid)
+      const paymentApplicationName = `r2-created-${randomUUID()}`
+      paymentTransition = db.transaction().execute(async (trx) => {
+        await sql`SELECT set_config('application_name', ${paymentApplicationName}, true)`.execute(trx)
+        await sql`SET LOCAL statement_timeout = '5s'`.execute(trx)
+        await trx.updateTable('payment_attempts').set({ status: 'cancelled' }).where('id', '=', attemptId).execute()
+      })
+      const paymentWait = await waitForPostgresLockWait(paymentApplicationName)
+      expect(paymentWait.holdsTransactionId).toBe(true)
+      expect(paymentWait.blockerPids.length).toBeGreaterThan(0)
+      expect(paymentWait.waitEvent).toBe('advisory')
+      releaseGate()
+      outcomes = await Promise.allSettled([worker, paymentTransition])
+    } finally {
+      releaseGate()
+      await gateHolder
+      if (!outcomes) {
+        outcomes = await Promise.allSettled([worker, ...(paymentTransition ? [paymentTransition] : [])])
+      }
+      await sql`DROP TRIGGER IF EXISTS zz_r2_test_pause_closed_order ON orders`.execute(db)
+      await sql`DROP FUNCTION IF EXISTS r2_test_pause_closed_order()`.execute(db)
+      await sql`DROP TABLE IF EXISTS r2_test_close_gate`.execute(db)
+    }
+
+    expect(outcomes?.every(outcome => outcome.status === 'fulfilled')).toBe(true)
+    expect(outcomes?.[0]).toMatchObject({ status: 'fulfilled', value: 1 })
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('closed')
+    expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status)
+      .toBe('cancelled')
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(0)
+    expect(await db.selectFrom('order_inventory_events as event')
+      .innerJoin('order_inventory_reservations as reservation', 'reservation.id', 'event.reservation_id')
+      .where('reservation.product_variant_id', '=', catalog.skuId)
+      .select('event.action').execute()).toEqual([{ action: 'reserve' }, { action: 'release' }])
+  })
+
+  it('lets concurrent expiry workers skip a locked payment order and close the next safe order once', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 4 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const firstQuote = await quote(items, customer)
+    const firstOrder = await createOrder(items, firstQuote.json().data.quoteToken, customer)
+    const firstOrderId = firstOrder.json().data.order.id as string
+    const attemptId = await attachExpiredPendingPayment(firstOrderId, '1.20')
+    const nextQuote = await quote(items, customer)
+    const nextOrder = await createOrder(items, nextQuote.json().data.quoteToken, customer)
+    const nextOrderId = nextOrder.json().data.order.id as string
+    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
+    try {
+      await sql`UPDATE orders SET unpaid_expires_at = CASE
+        WHEN id = ${firstOrderId}::uuid THEN clock_timestamp() - interval '2 minutes'
+        ELSE clock_timestamp() - interval '1 minute' END
+        WHERE id IN (${firstOrderId}::uuid, ${nextOrderId}::uuid)`.execute(db)
+    } finally {
+      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+    }
+
+    let releaseAdvisory!: () => void
+    let advisoryAcquired!: () => void
+    const advisoryGate = new Promise<void>((resolve) => { releaseAdvisory = resolve })
+    const acquired = new Promise<void>((resolve) => { advisoryAcquired = resolve })
+    const advisoryHolder = db.transaction().execute(async (trx) => {
+      await sql`SELECT pg_advisory_xact_lock(hashtextextended(${firstOrderId}::text, 0))`.execute(trx)
+      advisoryAcquired()
+      await advisoryGate
+    })
+    await acquired
+    const firstWorker = expireDueUnpaidOrders(db, new Date(), 1)
+    let nextWorkerCount: number
+    let firstWorkerCount: number
+    try {
+      await waitForOrderAdvisoryLockWait()
+      nextWorkerCount = await expireDueUnpaidOrders(db, new Date(), 1)
+      expect(nextWorkerCount).toBe(1)
+      expect((await db.selectFrom('orders').select('status').where('id', '=', nextOrderId).executeTakeFirstOrThrow()).status)
+        .toBe('closed')
+    } finally {
+      releaseAdvisory()
+      await advisoryHolder
+      firstWorkerCount = await firstWorker
+    }
+
+    expect(firstWorkerCount).toBe(1)
+    expect((await db.selectFrom('orders').select('status').where('id', '=', firstOrderId).executeTakeFirstOrThrow()).status)
+      .toBe('closed')
+    expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status)
+      .toBe('pending')
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(0)
+    expect(await db.selectFrom('order_inventory_events as event')
+      .innerJoin('order_inventory_reservations as reservation', 'reservation.id', 'event.reservation_id')
+      .where('reservation.product_variant_id', '=', catalog.skuId)
+      .select(['reservation.order_item_id', 'event.action']).execute()).toHaveLength(4)
+    expect(await expireDueUnpaidOrders(db, new Date(), 10)).toBe(0)
+  })
+
   it('does not let a legacy pending payment with NULL expiry be cancelled by its owner', async () => {
     const admin = await createAdmin()
     const customer = await createCustomer()
@@ -365,15 +783,15 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
       id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
       topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
       provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
-      requested_wallet_amount: null, expires_at: new Date(Date.now() + 250), completed_at: null,
+      requested_wallet_amount: null, expires_at: new Date(Date.now() + 60_000), completed_at: null,
     }).execute()
-    await new Promise(resolve => setTimeout(resolve, 300))
 
     let release!: () => void
     let updated!: () => void
     const waiting = new Promise<void>((resolve) => { updated = resolve })
     const hold = new Promise<void>((resolve) => { release = resolve })
     const paymentTransition = db.transaction().execute(async (trx) => {
+      await sql`SELECT set_config('application_name', ${`r2-pending-${randomUUID()}`}, true)`.execute(trx)
       await trx.updateTable('payment_attempts').set({
         status: 'pending', expires_at: new Date(Date.now() + 60_000),
       }).where('id', '=', attemptId).execute()
@@ -385,7 +803,7 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
       method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
     })
     try {
-      await new Promise(resolve => setTimeout(resolve, 100))
+      await waitForOrderAdvisoryLockWait()
     } finally {
       release()
     }
@@ -470,6 +888,95 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
       .rejects.toMatchObject({ constraint: 'orders_close_refund_unresolved' })
   })
 
+  it('blocks closure while an expired external attempt still has an unresolved wallet hold', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '5.00', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const attemptId = await attachExpiredWalletHold({
+      orderId, customerId: customer.id, adminId: admin.id, externalAmount: '4.00', walletAmount: '1.00',
+    })
+    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
+    try {
+      await sql`UPDATE orders SET unpaid_expires_at = clock_timestamp() - interval '1 second'
+        WHERE id = ${orderId}::uuid`.execute(db)
+    } finally {
+      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+    }
+
+    expect(await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()).toEqual({
+      gift_available: '0.00', gift_frozen: '1.00',
+    })
+    expect(await expireDueUnpaidOrders(db, new Date(Date.now() + 60 * 60_000))).toBe(0)
+    await expect(db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute())
+      .rejects.toMatchObject({ constraint: 'orders_close_payment_unresolved' })
+    const rejectedCancel = await inject({
+      method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
+    })
+    expect(rejectedCancel.statusCode).toBe(409)
+    expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status)
+      .toBe('pending')
+
+    await db.updateTable('payment_attempts').set({ status: 'failed' }).where('id', '=', attemptId).execute()
+    expect(await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()).toEqual({
+      gift_available: '1.00', gift_frozen: '0.00',
+    })
+    const allowedCancel = await inject({
+      method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
+    })
+    expect(allowedCancel.statusCode).toBe(200)
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('closed')
+  })
+
+  it('records a late receipt instead of losing it while an expired payment still has a wallet hold', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '5.00', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const attemptId = await attachExpiredWalletHold({
+      orderId, customerId: customer.id, adminId: admin.id, externalAmount: '4.00', walletAmount: '1.00',
+    })
+    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
+    try {
+      await sql`UPDATE orders SET unpaid_expires_at = clock_timestamp() - interval '1 second'
+        WHERE id = ${orderId}::uuid`.execute(db)
+    } finally {
+      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+    }
+
+    const receiptId = randomUUID()
+    await db.insertInto('payment_receipts').values({
+      id: receiptId, payment_attempt_id: attemptId, source_bucket: 'external', provider: 'integration',
+      provider_transaction_id: `late-wallet-hold-${receiptId}`, wallet_operation_id: null,
+      wallet_line_no: null, amount: '4.00',
+    }).execute()
+
+    expect((await db.selectFrom('payment_receipts').select('disposition').where('id', '=', receiptId)
+      .executeTakeFirstOrThrow()).disposition).toBe('late')
+    expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId)
+      .executeTakeFirstOrThrow()).status).toBe('late_succeeded')
+    expect(await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()).toEqual({
+      gift_available: '1.00', gift_frozen: '0.00',
+    })
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('pending_payment')
+    expect(await expireDueUnpaidOrders(db, new Date(Date.now() + 60 * 60_000))).toBe(0)
+    await expect(db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute())
+      .rejects.toMatchObject({ constraint: 'orders_close_requires_full_refund' })
+  })
+
   it('records a late receipt while timeout work skips the locked order and never releases twice', async () => {
     const admin = await createAdmin()
     const customer = await createCustomer()
@@ -479,21 +986,13 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     const quoteResult = await quote(items, customer)
     const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
     const orderId = created.json().data.order.id as string
-    const attemptId = randomUUID()
-    await db.insertInto('payment_attempts').values({
-      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
-      topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
-      provider_payment_id: `timeout-race-${attemptId}`, wallet_operation_id: null, wallet_hold_operation_id: null,
-      requested_wallet_amount: null, expires_at: new Date(Date.now() + 350), completed_at: null,
-    }).execute()
-    await db.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+    const attemptId = await attachExpiredPendingPayment(orderId, '1.20')
     await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
     try {
       await sql`UPDATE orders SET unpaid_expires_at = clock_timestamp() - interval '1 second' WHERE id = ${orderId}::uuid`.execute(db)
     } finally {
       await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
     }
-    await new Promise(resolve => setTimeout(resolve, 450))
 
     let unlock!: () => void
     let acquired!: () => void

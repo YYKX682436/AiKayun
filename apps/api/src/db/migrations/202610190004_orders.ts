@@ -23,6 +23,16 @@ export const ordersMigration: Migration = {
                 ))
             )
         )
+        OR EXISTS (
+          SELECT 1 FROM payment_attempts AS attempt
+          JOIN wallet_operations AS hold ON hold.id = attempt.wallet_hold_operation_id
+          WHERE attempt.order_id = order_uuid AND hold.operation_type = 'order_payment_hold'
+            AND NOT EXISTS (
+              SELECT 1 FROM wallet_operations AS resolution
+              WHERE resolution.resolves_operation_id = hold.id
+                AND resolution.operation_type IN ('order_payment_settlement', 'order_payment_release')
+            )
+        )
       $$
     `.execute(db)
     await sql`
@@ -42,10 +52,14 @@ export const ordersMigration: Migration = {
               USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_pending_deadline_required';
           END IF;
         END IF;
-        IF NEW.order_id IS NOT NULL AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status) THEN
-          -- Serialize cross-table payment transitions with order closure. This
-          -- is an advisory lock so it does not invert the order -> attempt row
-          -- lock sequence used by receipts and inventory release.
+        IF NEW.order_id IS NOT NULL AND TG_OP = 'UPDATE'
+          AND OLD.status IS DISTINCT FROM NEW.status THEN
+          -- UPDATE has already locked its payment_attempts row before this
+          -- trigger runs. Keep that row -> advisory order for state changes.
+          -- INSERT deliberately does not take this lock: the frozen
+          -- payment_attempts_validate trigger locks the order row first.
+          -- Order closure must never update payment_attempts from its AFTER
+          -- trigger, or it would invert these row/advisory locks.
           PERFORM pg_advisory_xact_lock(hashtextextended(NEW.order_id::text, 0));
           IF NEW.status = 'pending' THEN
             SELECT status, unpaid_expires_at INTO order_status, order_expires_at
@@ -56,6 +70,42 @@ export const ordersMigration: Migration = {
                 USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_order_payable';
             END IF;
           END IF;
+        END IF;
+        RETURN NEW;
+      END;
+      $$
+    `.execute(db)
+
+    // The frozen ④-1 close trigger synchronously cancelled payment attempts.
+    // That takes a payment row after order -> advisory locks and can deadlock
+    // with payment_attempts_deadline_r1, which reaches advisory after the
+    // UPDATE has locked its payment row. Keep attempts intact after closure so
+    // a later provider receipt can still be recorded and classified as late.
+    // The shared close predicate protects unresolved attempts and wallet holds.
+    await sql`
+      CREATE OR REPLACE FUNCTION release_order_inventory_on_close() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      DECLARE reservation_row record;
+      DECLARE outstanding bigint;
+      BEGIN
+        IF OLD.status IS DISTINCT FROM NEW.status AND NEW.status = 'closed' THEN
+          FOR reservation_row IN
+            SELECT reservation.id, reservation.quantity, item.fulfillment_reserved_quantity
+            FROM order_inventory_reservations AS reservation
+            JOIN order_items AS item ON item.id = reservation.order_item_id
+            WHERE item.order_id = NEW.id
+            ORDER BY reservation.product_variant_id, reservation.id
+          LOOP
+            SELECT COALESCE(sum(quantity) FILTER (WHERE action = 'reserve'), 0)
+              - COALESCE(sum(quantity) FILTER (WHERE action IN ('release', 'consume')), 0)
+              INTO outstanding
+            FROM order_inventory_events WHERE reservation_id = reservation_row.id;
+            outstanding := outstanding - reservation_row.fulfillment_reserved_quantity;
+            IF outstanding > 0 THEN
+              INSERT INTO order_inventory_events (id, reservation_id, operation_id, action, quantity)
+              VALUES (gen_random_uuid(), reservation_row.id, gen_random_uuid(), 'release', outstanding::integer);
+            END IF;
+          END LOOP;
         END IF;
         RETURN NEW;
       END;
@@ -371,6 +421,39 @@ export const ordersMigration: Migration = {
     `.execute(db)
     await sql`ALTER TABLE product_variant_fulfillment DROP COLUMN manual_delivery_ready`.execute(db)
 
+    // Restore the frozen ④-1 inventory-close trigger implementation on rollback.
+    await sql`
+      CREATE OR REPLACE FUNCTION release_order_inventory_on_close() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      DECLARE reservation_row record;
+      DECLARE outstanding bigint;
+      BEGIN
+        IF OLD.status IS DISTINCT FROM NEW.status AND NEW.status = 'closed' THEN
+          UPDATE payment_attempts SET status = 'cancelled'
+          WHERE order_id = NEW.id AND status IN ('created', 'pending');
+          FOR reservation_row IN
+            SELECT reservation.id, reservation.quantity, item.fulfillment_reserved_quantity
+            FROM order_inventory_reservations AS reservation
+            JOIN order_items AS item ON item.id = reservation.order_item_id
+            WHERE item.order_id = NEW.id
+            ORDER BY reservation.product_variant_id, reservation.id
+          LOOP
+            SELECT COALESCE(sum(quantity) FILTER (WHERE action = 'reserve'), 0)
+              - COALESCE(sum(quantity) FILTER (WHERE action IN ('release', 'consume')), 0)
+              INTO outstanding
+            FROM order_inventory_events WHERE reservation_id = reservation_row.id;
+            outstanding := outstanding - reservation_row.fulfillment_reserved_quantity;
+            IF outstanding > 0 THEN
+              INSERT INTO order_inventory_events (id, reservation_id, operation_id, action, quantity)
+              VALUES (gen_random_uuid(), reservation_row.id, gen_random_uuid(), 'release', outstanding::integer);
+            END IF;
+          END LOOP;
+        END IF;
+        RETURN NEW;
+      END;
+      $$
+    `.execute(db)
+
     // Restore the frozen ④-1 close guard when rolling this migration back.
     await sql`
       CREATE OR REPLACE FUNCTION guard_order_update() RETURNS trigger
@@ -511,6 +594,7 @@ export const ordersMigration: Migration = {
       END;
       $$
     `.execute(db)
+
     await sql`DROP TRIGGER payment_attempts_deadline_r1 ON payment_attempts`.execute(db)
     await sql`DROP FUNCTION guard_payment_attempt_deadline_r1()`.execute(db)
     await sql`DROP FUNCTION order_has_unresolved_payment_attempts(uuid)`.execute(db)

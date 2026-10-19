@@ -148,7 +148,7 @@ Fastify 的 `/api/v1/public/*` 接口与管理员接口分离，使用独立 Typ
 
 多 SKU 下单服务必须按 `product_id`、再按 `product_variant_id` 的 UUID 升序取得全部商品/SKU 锁，再按相同顺序触及数量库存行，并在同一事务内写订单、订单项和预留。现有库存调整也遵循 SKU → 数量库存的锁顺序。付款回执、顾客取消和超时 worker 在 PostgreSQL 订单行锁上串行；worker 以 `FOR UPDATE SKIP LOCKED` 跳过被回执事务锁定的订单。付款回执在锁等待结束后以 PostgreSQL `clock_timestamp()` 判断订单/支付尝试截止时间。若准时回执先提交，订单从 `pending_payment` 进入 `processing`；若订单关闭先提交，后续真实到账仍记为 `late` 并保留资金事实，不会重开订单。阶段④-5已实现启动恢复和每分钟批量超时 worker，受保护订单会被过滤出批次。
 
-④-5 的 `order_has_unresolved_payment_attempts(order_id)` 是取消 API、超时 worker、回执触发的过期处理和数据库订单 guard 共用的支付阻断规则。`created` 不能证明支付尚未发起；`created/pending` 的 `expires_at` 为 `NULL` 或未来时都阻止关闭。进入 `pending` 前 PostgreSQL 要求支付尝试有未来有效期，且该期限在 `pending` 状态下不可变；旧的 `pending + NULL` 数据仍按未决支付保护。支付状态写入与订单关闭通过同一订单哈希的事务级 advisory lock 串行，避免并发检查遗漏刚进入 `pending` 的支付尝试。只有 `failed`、`cancelled`、`expired` 等已结束尝试，在不存在未退款实收、退款预留、活动退款和履约义务时，才允许关闭。到期不是第三方失败证明；迟到、金额不符、超额或对账回执仍保留原始凭证并进入退款/对账处理。
+④-5 的 `order_has_unresolved_payment_attempts(order_id)` 是取消 API、超时 worker、回执触发的过期处理和数据库订单 guard 共用的支付阻断规则。`created` 不能证明支付尚未发起；`created/pending` 的 `expires_at` 为 `NULL` 或未来时都阻止关闭。进入 `pending` 前 PostgreSQL 要求支付尝试有未来有效期，且该期限在 `pending` 状态下不可变；旧的 `pending + NULL` 数据仍按未决支付保护。订单关闭持有订单行后取得同订单 advisory lock；支付尝试状态 `UPDATE` 已先锁支付行，再取得该 advisory lock。④-1 插入校验先锁订单行，所以尝试 `INSERT` 不取 advisory lock。关闭后的库存触发器不更新支付尝试，避免与状态 `UPDATE` 的支付行→advisory 顺序形成死锁；原始尝试保留，以便迟到回执继续记录。未解决的组合钱包冻结也属于阻断义务；只有 `failed`、`cancelled`、`expired` 等已结束尝试且其冻结已由④-1流水解冻，在不存在未退款实收、退款预留、活动退款和履约义务时，才允许关闭。到期不是第三方失败证明；迟到、金额不符、超额或对账回执仍保留原始凭证并进入退款/对账处理。
 
 混合钱包付款在外部支付成功以前保持钱包冻结；失败、取消或迟到回执只允许把冻结额解冻一次。已收到但尚未成功全额退款的款项会阻止订单关闭；全额退款且没有未决退款/不确定履约后才可关闭。`succeeded`、`late_succeeded` 或 `reconciliation_required` 若缺少回执证据也按未决状态保护，避免状态与资金事实不一致时释放订单库存。
 
