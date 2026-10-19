@@ -109,6 +109,142 @@ export const CustomerPasswordChangedSchema = Type.Object({
 })
 export const CustomerLogoutSchema = Type.Object({ loggedOut: Type.Literal(true) })
 
+export const AdminCustomerStatusSchema = Type.Union([
+  Type.Literal('active'),
+  Type.Literal('disabled'),
+  Type.Literal('deleted'),
+])
+export const AdminCustomerListQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  search: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  status: Type.Optional(Type.Union([
+    Type.Literal('all'),
+    Type.Literal('active'),
+    Type.Literal('disabled'),
+    Type.Literal('deleted'),
+  ])),
+  sortOrder: Type.Optional(Type.Union([Type.Literal('asc'), Type.Literal('desc')])),
+}, { additionalProperties: false })
+export const AdminCustomerOrdersQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+}, { additionalProperties: false })
+export const AdminCustomerIdParamsSchema = Type.Object({ id: Type.String({ format: 'uuid' }) })
+export const AdminCustomerListItemSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  username: Type.Union([CustomerUsernameSchema, Type.Null()]),
+  email: Type.Union([CustomerEmailSchema, Type.Null()]),
+  phone: Type.Union([CustomerPhoneSchema, Type.Null()]),
+  status: AdminCustomerStatusSchema,
+  createdAt: Type.String({ format: 'date-time' }),
+  updatedAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const AdminCustomerListSchema = Type.Object({
+  items: Type.Array(AdminCustomerListItemSchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const AdminCustomerDetailSchema = Type.Object({
+  customer: Type.Intersect([
+    AdminCustomerListItemSchema,
+    Type.Object({
+      emailVerifiedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+      phoneVerifiedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+    }),
+  ]),
+}, { additionalProperties: false })
+export const AdminCustomerProfileUpdateBodySchema = Type.Object({
+  username: Type.Optional(CustomerUsernameSchema),
+  email: Type.Optional(Type.Union([CustomerEmailSchema, Type.Null()])),
+  phone: Type.Optional(Type.Union([CustomerPhoneSchema, Type.Null()])),
+}, { additionalProperties: false, minProperties: 1 })
+export const AdminCustomerStatusBodySchema = Type.Object({
+  status: Type.Union([Type.Literal('active'), Type.Literal('disabled')]),
+}, { additionalProperties: false })
+export const AdminCustomerPasswordResetBodySchema = Type.Object({
+  temporaryPassword: CustomerPasswordSchema,
+}, { additionalProperties: false })
+export const AdminCustomerStatusResultSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  status: AdminCustomerStatusSchema,
+  updatedAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const AdminCustomerPasswordResetResultSchema = Type.Object({
+  passwordReset: Type.Literal(true),
+  revokedSessionCount: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const AdminCustomerDeleteResultSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  deleted: Type.Literal(true),
+}, { additionalProperties: false })
+export const AdminCustomerOrderStatusSchema = Type.Union([
+  Type.Literal('pending_payment'),
+  Type.Literal('processing'),
+  Type.Literal('completed'),
+  Type.Literal('closed'),
+])
+export const AdminCustomerOrderSummarySchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  status: AdminCustomerOrderStatusSchema,
+  customerStatus: Type.Union([
+    Type.Literal('refunded'), Type.Literal('closed'), Type.Literal('completed'),
+    Type.Literal('pending_payment'), Type.Literal('awaiting_fulfillment'), Type.Literal('in_progress'),
+  ]),
+  paymentStatus: Type.Union([
+    Type.Literal('not_required'), Type.Literal('refunded'), Type.Literal('partially_refunded'),
+    Type.Literal('late_paid'), Type.Literal('requires_reconciliation'), Type.Literal('unpaid'),
+    Type.Literal('overpaid'), Type.Literal('partially_paid'), Type.Literal('paid'),
+  ]),
+  refundStatus: Type.Union([
+    Type.Literal('refunded'), Type.Literal('processing'), Type.Literal('partially_refunded'),
+    Type.Literal('requested_or_processing'), Type.Literal('none'),
+  ]),
+  totalAmount: Type.String({ pattern: '^(?:0|[1-9]\\d{0,15})\\.\\d{2}$' }),
+  currency: Type.Literal('CNY'),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const AdminCustomerOrderPageSchema = Type.Object({
+  items: Type.Array(AdminCustomerOrderSummarySchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const CustomerManagementAuditActionSchema = Type.Union([
+  Type.Literal('username_updated'),
+  Type.Literal('contact_updated'),
+  Type.Literal('password_reset'),
+  Type.Literal('disabled'),
+  Type.Literal('restored'),
+  Type.Literal('deleted'),
+])
+export const CustomerManagementAuditSummarySchema = Type.Object({
+  changedFields: Type.Optional(Type.Array(Type.String())),
+  clearedFields: Type.Optional(Type.Array(Type.String())),
+  previousStatus: Type.Optional(AdminCustomerStatusSchema),
+  newStatus: Type.Optional(AdminCustomerStatusSchema),
+  revokedSessionCount: Type.Optional(Type.Integer({ minimum: 0 })),
+}, { additionalProperties: false })
+export const AdminCustomerAuditEventSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  administratorId: Type.String({ format: 'uuid' }),
+  administratorEmail: Type.String({ format: 'email' }),
+  customerId: Type.String({ format: 'uuid' }),
+  action: CustomerManagementAuditActionSchema,
+  summary: CustomerManagementAuditSummarySchema,
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const AdminCustomerAuditPageSchema = Type.Object({
+  items: Type.Array(AdminCustomerAuditEventSchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+
 export const StorefrontCustomerPolicySchema = Type.Object({
   requireEmail: Type.Boolean(),
   requirePhone: Type.Boolean(),
@@ -1001,6 +1137,24 @@ export type UpdateCustomerProfileBody = Static<typeof UpdateCustomerProfileBodyS
 export type ChangeCustomerPasswordBody = Static<typeof ChangeCustomerPasswordBodySchema>
 export type CustomerPasswordChanged = Static<typeof CustomerPasswordChangedSchema>
 export type CustomerLogout = Static<typeof CustomerLogoutSchema>
+export type AdminCustomerStatus = Static<typeof AdminCustomerStatusSchema>
+export type AdminCustomerListQuery = Static<typeof AdminCustomerListQuerySchema>
+export type AdminCustomerOrdersQuery = Static<typeof AdminCustomerOrdersQuerySchema>
+export type AdminCustomerListItem = Static<typeof AdminCustomerListItemSchema>
+export type AdminCustomerList = Static<typeof AdminCustomerListSchema>
+export type AdminCustomerDetail = Static<typeof AdminCustomerDetailSchema>
+export type AdminCustomerProfileUpdateBody = Static<typeof AdminCustomerProfileUpdateBodySchema>
+export type AdminCustomerStatusBody = Static<typeof AdminCustomerStatusBodySchema>
+export type AdminCustomerPasswordResetBody = Static<typeof AdminCustomerPasswordResetBodySchema>
+export type AdminCustomerStatusResult = Static<typeof AdminCustomerStatusResultSchema>
+export type AdminCustomerPasswordResetResult = Static<typeof AdminCustomerPasswordResetResultSchema>
+export type AdminCustomerDeleteResult = Static<typeof AdminCustomerDeleteResultSchema>
+export type AdminCustomerOrderSummary = Static<typeof AdminCustomerOrderSummarySchema>
+export type AdminCustomerOrderPage = Static<typeof AdminCustomerOrderPageSchema>
+export type CustomerManagementAuditAction = Static<typeof CustomerManagementAuditActionSchema>
+export type CustomerManagementAuditSummary = Static<typeof CustomerManagementAuditSummarySchema>
+export type AdminCustomerAuditEvent = Static<typeof AdminCustomerAuditEventSchema>
+export type AdminCustomerAuditPage = Static<typeof AdminCustomerAuditPageSchema>
 export type StorefrontCustomerPolicy = Static<typeof StorefrontCustomerPolicySchema>
 export type UpdateStorefrontCustomerPolicyBody = Static<typeof UpdateStorefrontCustomerPolicyBodySchema>
 export type ProductType = Static<typeof ProductTypeSchema>

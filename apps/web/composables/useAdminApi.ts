@@ -14,6 +14,14 @@ export class AdminApiError extends Error {
 type ApiErrorBody = { error?: { code?: string; message?: string } }
 type RequestOptions = Parameters<typeof $fetch>[1]
 const conflictMessages: Record<string, string> = {
+  USERNAME_TAKEN: '该用户名已被其他顾客使用，请调整后重试。',
+  CUSTOMER_DELETED: '该顾客身份已删除，不能再修改或恢复。',
+  CUSTOMER_HAS_WALLET_BALANCE: '顾客账户仍有可用或冻结余额，处理完余额后才能删除。',
+  CUSTOMER_HAS_UNFINISHED_ORDERS: '顾客存在未完成订单，订单结清后才能删除。',
+  CUSTOMER_HAS_PENDING_PAYMENT: '顾客存在待处理支付或对账义务，处理完成后才能删除。',
+  CUSTOMER_HAS_PENDING_REFUND: '顾客存在待处理退款，处理完成后才能删除。',
+  CUSTOMER_HAS_PENDING_WITHDRAWAL: '顾客存在待处理提现或打款，处理完成后才能删除。',
+  CUSTOMER_HAS_UNRESOLVED_FULFILLMENT: '顾客存在未完成的履约义务，处理完成后才能删除。',
   PRODUCT_REVISION_CONFLICT: '商品已被其他管理员修改，请重新读取并选择如何处理本地修改。',
   PRODUCT_ARCHIVED: '商品已归档；请先恢复为草稿，再修改经营配置。',
   PRODUCT_HAS_RETIRED_SKU: '商品含永久退役 SKU，不能永久删除；归档可保留 SKU 身份与历史。',

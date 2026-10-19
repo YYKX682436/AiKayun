@@ -21,6 +21,7 @@ import type { Database } from './db/types.js'
 import { registerAdminAuthRoutes } from './auth/admin.js'
 import { registerCustomerAuthRoutes } from './auth/customer.js'
 import { registerCustomerPolicyRoutes } from './auth/customer-policy.js'
+import { registerAdminCustomerRoutes } from './customers/admin.js'
 import { hashPassword } from './auth/password.js'
 import { registerAdminProductRoutes } from './catalog/admin-products.js'
 import { registerAdminProductManagementRoutes } from './catalog/admin-product-management.js'
@@ -70,6 +71,7 @@ export async function createApp(options: {
         { name: 'customer', description: 'Protected storefront customer APIs' },
         { name: 'public-storefront', description: 'Public storefront settings' },
         { name: 'catalog', description: 'Product and SKU administration' },
+        { name: 'customers', description: 'Protected customer administration and audit' },
         { name: 'public-catalog', description: 'Public product and visible category reads' },
       ],
     },
@@ -79,7 +81,9 @@ export async function createApp(options: {
   await app.register(swaggerUi, { routePrefix: '/api/docs' })
 
   app.addHook('onSend', async (request, reply, payload) => {
-    if (request.url.startsWith('/api/v1/public/') || request.url.startsWith('/api/v1/customer/')) {
+    if (request.url.startsWith('/api/v1/public/')
+      || request.url.startsWith('/api/v1/customer/')
+      || request.url.startsWith('/api/v1/admin/')) {
       reply.header('cache-control', 'no-store')
     }
     return payload
@@ -141,6 +145,7 @@ export async function createApp(options: {
   registerAdminAuthRoutes(app, db, config, dummyPasswordHash)
   registerCustomerAuthRoutes(app, db, config, dummyPasswordHash)
   registerCustomerPolicyRoutes(app, db, config)
+  registerAdminCustomerRoutes(app, db, config)
   const identityFactory = options.productIdentityFactory ?? defaultProductIdentityFactory
   registerAdminProductRoutes(app, db, config, identityFactory)
   registerAdminProductManagementRoutes(app, db, config, identityFactory)

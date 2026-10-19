@@ -406,12 +406,44 @@ export function registerCustomerAuthRoutes(
     if (Object.hasOwn(body, 'email')) updates.email = body.email ? normalizeEmail(body.email) : null
     if (Object.hasOwn(body, 'phone')) updates.phone = body.phone ? normalizePhone(body.phone) : null
 
-    const profile = await db.transaction().execute(async (trx) => trx.updateTable('customers')
-      .set(updates)
-      .where('id', '=', request.customer!.id)
-      .where('status', '=', 'active')
-      .returning(['id', 'username', 'email', 'email_verified_at', 'phone', 'phone_verified_at', 'created_at'])
-      .executeTakeFirst())
+    let profile
+    try {
+      profile = await db.transaction().execute(async (trx) => {
+        const lockedCustomer = await trx.selectFrom('customers')
+          .select('id')
+          .where('id', '=', request.customer!.id)
+          .where('status', '=', 'active')
+          .forUpdate()
+          .executeTakeFirst()
+        if (!lockedCustomer) {
+          throw new CustomerRouteError(401, 'UNAUTHORIZED', 'Customer authentication is required')
+        }
+
+        const activeSession = await trx.selectFrom('customer_sessions')
+          .select('id')
+          .where('id', '=', request.customer!.sessionId)
+          .where('customer_id', '=', request.customer!.id)
+          .where('revoked_at', 'is', null)
+          .where('expires_at', '>', new Date())
+          .forUpdate()
+          .executeTakeFirst()
+        if (!activeSession) {
+          throw new CustomerRouteError(401, 'UNAUTHORIZED', 'Customer authentication is required')
+        }
+
+        return trx.updateTable('customers')
+          .set(updates)
+          .where('id', '=', request.customer!.id)
+          .where('status', '=', 'active')
+          .returning(['id', 'username', 'email', 'email_verified_at', 'phone', 'phone_verified_at', 'created_at'])
+          .executeTakeFirst()
+      })
+    } catch (error) {
+      if (error instanceof CustomerRouteError) {
+        return reply.code(401).send(failure(error.code, error.message, request.id))
+      }
+      throw error
+    }
     if (!profile) return reply.code(401).send(failure('UNAUTHORIZED', 'Customer authentication is required', request.id))
 
     reply.header('cache-control', 'no-store')

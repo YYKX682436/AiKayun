@@ -13,6 +13,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     to: '/admin/products',
   },
   {
+    label: '顾客管理',
+    icon: 'i-lucide-users-round',
+    to: '/admin/customers',
+  },
+  {
     label: '顾客设置',
     icon: 'i-lucide-user-round-cog',
     to: '/admin/storefront/customer-policy',

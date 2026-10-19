@@ -107,6 +107,15 @@ export interface CustomerSessionsTable {
   revoked_at: Date | null
 }
 
+export interface CustomerManagementAuditTable {
+  id: string
+  administrator_id: string
+  customer_id: string
+  action: 'username_updated' | 'contact_updated' | 'password_reset' | 'disabled' | 'restored' | 'deleted'
+  summary: ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>
+  created_at: Generated<Date>
+}
+
 export interface GuestOrderSessionsTable {
   id: string
   token_hash: string
@@ -509,6 +518,7 @@ export interface Database {
   storefront_customer_policy: StorefrontCustomerPolicyTable
   customers: CustomersTable
   customer_sessions: CustomerSessionsTable
+  customer_management_audit: CustomerManagementAuditTable
   guest_order_sessions: GuestOrderSessionsTable
   product_variant_fulfillment: ProductVariantFulfillmentTable
   orders: OrdersTable

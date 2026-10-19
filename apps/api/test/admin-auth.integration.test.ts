@@ -921,7 +921,8 @@ describe('Fastify API with PostgreSQL 18', () => {
       order by tablename
     `.execute(db)
     expect(result.rows.map((row) => row.table_name)).toEqual([
-      'admin_product_creation_requests', 'admin_sessions', 'admin_users', 'customer_sessions', 'customers', 'guest_order_sessions',
+      'admin_product_creation_requests', 'admin_sessions', 'admin_users', 'customer_management_audit',
+      'customer_sessions', 'customers', 'guest_order_sessions',
       'order_inventory_events', 'order_inventory_reservations', 'order_item_fulfillment_attempts', 'order_items',
       'order_refund_allocations', 'order_refunds', 'order_status_events', 'orders', 'payment_attempts',
       'payment_receipts', 'product_attributes', 'product_categories', 'product_category_assignments',

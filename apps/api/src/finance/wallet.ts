@@ -31,6 +31,13 @@ export async function recordWalletOrderPayment(
   input: WalletOrderPaymentInput,
 ): Promise<WalletOrderPaymentResult> {
   const requestedAmount = normalizeWalletAmount(input.amount)
+  // Keep the customer row first in the customer -> order -> wallet lock order.
+  // This lets account disable and anonymization serialize against a payment
+  // already in flight and rejects a payment that starts after either change.
+  const customer = await trx.selectFrom('customers').select(['id', 'status'])
+    .where('id', '=', input.customerId).forKeyShare().executeTakeFirst()
+  if (!customer || customer.status !== 'active') throw new Error('CUSTOMER_NOT_ACTIVE')
+
   const order = await trx.selectFrom('orders').select(['customer_id', 'status', 'total_amount', 'unpaid_expires_at'])
     .where('id', '=', input.orderId).forUpdate().executeTakeFirst()
   if (!order) throw new Error('ORDER_NOT_FOUND')

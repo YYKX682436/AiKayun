@@ -1239,6 +1239,9 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
         .where('product_variant_id', '=', variantId).execute()).toEqual(before.adjustments)
 
       const rollbackMigrator = new Migrator({ db, provider: new AppMigrationProvider() })
+      const customerManagementRollback = await rollbackMigrator.migrateDown()
+      if (customerManagementRollback.error) throw customerManagementRollback.error
+      expect(customerManagementRollback.results?.map((result) => result.migrationName)).toContain('202610190002_customer_management')
       const customerSessionRollback = await rollbackMigrator.migrateDown()
       if (customerSessionRollback.error) throw customerSessionRollback.error
       expect(customerSessionRollback.results?.map((result) => result.migrationName)).toContain('202610190001_customer_sessions')
