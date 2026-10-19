@@ -145,6 +145,7 @@ export type FulfillmentMethod = 'manual' | 'code_pool' | 'fixed_content' | 'link
 export interface ProductVariantFulfillmentTable {
   product_variant_id: string
   method: FulfillmentMethod
+  manual_delivery_ready: Generated<boolean>
   updated_at: Generated<Date>
 }
 
@@ -379,10 +380,21 @@ export interface OrderItemFulfillmentAttemptsTable {
   order_item_id: string
   operation_id: string
   quantity: number
+  started_by_admin_id: string | null
   status: Generated<FulfillmentAttemptStatus>
   result_sha256: string | null
   created_at: Generated<Date>
   completed_at: Date | null
+}
+
+export interface OrderItemFulfillmentDeliveriesTable {
+  id: string
+  fulfillment_attempt_id: string
+  started_by_admin_id: string
+  unit_index: number
+  content: string
+  content_sha256: string
+  created_at: Generated<Date>
 }
 
 export interface OrderStatusEventsTable {
@@ -553,5 +565,6 @@ export interface Database {
   withdrawals: WithdrawalsTable
   withdrawal_payout_attempts: WithdrawalPayoutAttemptsTable
   order_item_fulfillment_attempts: OrderItemFulfillmentAttemptsTable
+  order_item_fulfillment_deliveries: OrderItemFulfillmentDeliveriesTable
   order_status_events: OrderStatusEventsTable
 }

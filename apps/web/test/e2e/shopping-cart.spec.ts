@@ -219,8 +219,8 @@ test('guest cart persists locally, merges safely into accounts, and stays privat
     // Immediate purchase quotes the requested SKU and quantity without changing local cart contents.
     const localBeforeBuy = await page.evaluate(key => localStorage.getItem(key), guestCartKey)
     await page.getByRole('button', { name: '立即购买' }).click()
-    await expect(page.getByRole('heading', { name: '结算报价预览' })).toBeVisible()
-    await expect(page.getByText('尚未创建订单')).toBeVisible()
+    await expect(page.getByRole('heading', { name: '确认订单' })).toBeVisible()
+    await expect(page.getByText('下单前会重新验证')).toBeVisible()
     await expect(page.getByText('¥39.80').first()).toBeVisible()
     expect(await page.evaluate(key => localStorage.getItem(key), guestCartKey)).toBe(localBeforeBuy)
     await page.getByRole('link', { name: '返回购物车', exact: true }).click()
@@ -254,10 +254,10 @@ test('guest cart persists locally, merges safely into accounts, and stays privat
     await expect(selectB).not.toBeChecked()
     await expect(page.getByText('¥39.80').first()).toBeVisible()
     await page.getByRole('link', { name: '查看结算报价' }).click()
-    await expect(page.getByRole('heading', { name: '结算报价预览' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: '确认订单' })).toBeVisible()
     await expect(page.getByRole('heading', { name: productAName })).toBeVisible()
     await expect(page.getByRole('heading', { name: productBName })).toHaveCount(0)
-    await expect(page.getByText('尚未创建订单')).toBeVisible()
+    await expect(page.getByText('下单前会重新验证')).toBeVisible()
     await page.getByRole('link', { name: '返回购物车', exact: true }).click()
 
     for (const width of [320, 390, 768, 1440]) await noHorizontalOverflow(page, width)

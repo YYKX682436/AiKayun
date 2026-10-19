@@ -17,24 +17,15 @@ import {
 } from '@aikayun/contracts'
 import type {
   CartSkuQuantity,
-  CheckoutQuote,
-  CheckoutQuoteItem,
-  CheckoutQuoteReason,
   CustomerCart,
   CustomerCartMergeBody,
   CustomerCartMutation,
 } from '@aikayun/contracts'
-import {
-  addSettlementAmounts,
-  multiplyUnitAmount,
-  parseUnitAmount,
-  settleAmount,
-} from '@aikayun/money'
 import type { AppConfig } from '../config.js'
-import type { Database, ProductInventoryMode, ProductStatus } from '../db/types.js'
+import type { Database } from '../db/types.js'
 import { optionalCustomer, requireCustomer, type AuthenticatedCustomer, CUSTOMER_CSRF_COOKIE } from '../auth/customer.js'
 import { verifyDoubleSubmitCsrf } from '../auth/security.js'
-import { variantOptionCombinationValid } from '../catalog/public-products.js'
+import { quoteCheckoutItems, normalizeCheckoutItems, CheckoutQuoteError } from './checkout-quote.js'
 
 const maxCartLines = 50
 const maxLineQuantity = 99
@@ -51,191 +42,6 @@ class CartError extends Error {
 }
 
 type Db = Kysely<Database> | Transaction<Database>
-
-type QuoteSkuRow = {
-  sku_id: string
-  quantity: number
-  product_id: string | null
-  product_name: string | null
-  product_status: ProductStatus | null
-  sku_code: string | null
-  sale_price: string | null
-  sku_enabled: boolean | null
-  retired_at: Date | null
-  inventory_mode: ProductInventoryMode | null
-  inventory_row_exists: boolean
-  available_quantity: number | null
-  fulfillment_method: string | null
-  combination_valid: boolean | null
-  options: CheckoutQuoteItem['options']
-  guest_checkout_enabled: boolean
-  guest_free_claim_enabled: boolean
-}
-
-function normalizeItems(items: CartSkuQuantity[]): CartSkuQuantity[] {
-  const quantities = new Map<string, number>()
-  for (const item of items) {
-    const quantity = (quantities.get(item.skuId) ?? 0) + item.quantity
-    if (quantity > maxLineQuantity) {
-      throw new CartError(400, 'CART_QUANTITY_LIMIT', `同一 SKU 的数量不能超过 ${maxLineQuantity}。`)
-    }
-    quantities.set(item.skuId, quantity)
-  }
-  return [...quantities].sort(([left], [right]) => left.localeCompare(right))
-    .map(([skuId, quantity]) => ({ skuId, quantity }))
-}
-
-function formatSalePrice(value: string): string {
-  const amount = parseUnitAmount(value)
-  if (amount.isNegative() || amount.decimalPlaces() > 2) {
-    throw new Error('Stored product sale price violates the storefront amount contract')
-  }
-  return amount.toFixed(2)
-}
-
-function optionCombinationValidity(alias: string) {
-  return variantOptionCombinationValid(alias)
-}
-
-function reasonForSku(row: QuoteSkuRow): CheckoutQuoteReason | null {
-  if (!row.product_id || !row.product_status) return 'sku_not_found'
-  if (row.product_status !== 'active') return 'product_not_active'
-  if (row.retired_at) return 'sku_retired'
-  if (!row.sku_enabled) return 'sku_disabled'
-  if (!row.combination_valid) return 'specification_invalid'
-  if (!row.inventory_mode) return 'inventory_not_configured'
-  if (row.inventory_mode === 'resource_pool' || row.inventory_mode === 'external') return 'inventory_not_ready'
-  if (row.inventory_mode === 'quantity') {
-    if (!row.inventory_row_exists || row.available_quantity === null) return 'inventory_not_configured'
-    if (row.available_quantity < row.quantity) return 'insufficient_inventory'
-  }
-  // A configured method name is only intent. This repository has no execution
-  // path for manual, code-pool, fixed-content, link, file, or API delivery yet.
-  if (row.fulfillment_method !== null) return 'fulfillment_not_ready'
-  return 'fulfillment_not_ready'
-}
-
-async function quoteItems(
-  db: Db,
-  inputItems: CartSkuQuantity[],
-  customerAuthenticated: boolean,
-): Promise<CheckoutQuote> {
-  const items = normalizeItems(inputItems)
-  if (items.length > maxCartLines) {
-    throw new CartError(400, 'CART_ITEM_LIMIT', `一次报价最多包含 ${maxCartLines} 个 SKU。`)
-  }
-  const skuIds = items.map(item => item.skuId)
-  const quantities = items.map(item => item.quantity)
-  const combinationValid = optionCombinationValidity('variant')
-  const rows = await sql<QuoteSkuRow>`
-    SELECT
-      requested.sku_id,
-      requested.quantity,
-      variant.product_id,
-      product.name AS product_name,
-      product.status AS product_status,
-      variant.sku_code,
-      variant.sale_price::text AS sale_price,
-      variant.enabled AS sku_enabled,
-      variant.retired_at,
-      variant.inventory_mode,
-      (inventory.product_variant_id IS NOT NULL) AS inventory_row_exists,
-      CASE WHEN variant.inventory_mode = 'quantity'
-        THEN COALESCE(inventory.stocked - inventory.reserved, 0)::integer
-        ELSE NULL
-      END AS available_quantity,
-      fulfillment.method AS fulfillment_method,
-      ${combinationValid} AS combination_valid,
-      COALESCE((
-        SELECT jsonb_agg(jsonb_build_object(
-          'groupId', option_group.id,
-          'groupName', option_group.name,
-          'valueId', option_value.id,
-          'valueName', option_value.name
-        ) ORDER BY option_group.sort_order, option_value.sort_order, option_group.id, option_value.id)
-        FROM product_variant_option_values AS selected
-        JOIN product_option_groups AS option_group
-          ON option_group.product_id = selected.product_id AND option_group.id = selected.option_group_id
-        JOIN product_option_values AS option_value
-          ON option_value.product_id = selected.product_id
-          AND option_value.option_group_id = selected.option_group_id
-          AND option_value.id = selected.option_value_id
-        WHERE selected.product_id = variant.product_id
-          AND selected.product_variant_id = variant.id
-      ), '[]'::jsonb) AS options,
-      policy.guest_checkout_enabled,
-      policy.guest_free_claim_enabled
-    FROM unnest(${skuIds}::uuid[], ${quantities}::integer[]) AS requested(sku_id, quantity)
-    LEFT JOIN product_variants AS variant ON variant.id = requested.sku_id
-    LEFT JOIN products AS product ON product.id = variant.product_id
-    LEFT JOIN product_variant_quantity_inventory AS inventory
-      ON inventory.product_id = variant.product_id AND inventory.product_variant_id = variant.id
-    LEFT JOIN product_variant_fulfillment AS fulfillment ON fulfillment.product_variant_id = variant.id
-    CROSS JOIN storefront_customer_policy AS policy
-    WHERE policy.singleton
-    ORDER BY requested.sku_id
-  `.execute(db)
-
-  if (rows.rows.length !== items.length) throw new Error('The storefront customer policy row is missing')
-
-  let subtotal = '0.00'
-  const policyReasons = new Set<'guest_checkout_disabled' | 'guest_free_claim_disabled'>()
-  const quoteLines: CheckoutQuoteItem[] = rows.rows.map((row) => {
-    const unitPrice = row.sale_price === null ? null : formatSalePrice(row.sale_price)
-    const lineTotal = unitPrice === null
-      ? null
-      : settleAmount(multiplyUnitAmount(unitPrice, row.quantity))
-    if (lineTotal !== null) subtotal = addSettlementAmounts(subtotal, lineTotal)
-
-    const item: CheckoutQuoteItem = {
-      skuId: row.sku_id,
-      productId: row.product_id,
-      productName: row.product_name,
-      productStatus: row.product_status,
-      skuCode: row.sku_code,
-      options: row.options ?? [],
-      unitPrice,
-      quantity: row.quantity,
-      lineTotal,
-      inventoryMode: row.inventory_mode,
-      availableQuantity: row.available_quantity,
-      identityValid: row.product_id !== null && row.product_status !== null,
-      canPurchase: false,
-      reason: null,
-    }
-    let reason = reasonForSku(row)
-    if (!customerAuthenticated && unitPrice !== null) {
-      if (unitPrice === '0.00' && !row.guest_free_claim_enabled) {
-        policyReasons.add('guest_free_claim_disabled')
-        reason ??= 'guest_free_claim_disabled'
-      } else if (unitPrice !== '0.00' && !row.guest_checkout_enabled) {
-        policyReasons.add('guest_checkout_disabled')
-        reason ??= 'guest_checkout_disabled'
-      }
-    }
-    item.reason = reason
-    item.canPurchase = reason === null
-    return item
-  })
-
-  const totalComplete = quoteLines.every(item => item.lineTotal !== null)
-  const pricedSubtotal = subtotal
-  const guestCheckoutEnabled = rows.rows[0]?.guest_checkout_enabled ?? false
-  const guestFreeClaimEnabled = rows.rows[0]?.guest_free_claim_enabled ?? false
-  return {
-    quotedAt: new Date().toISOString(),
-    currency: 'CNY',
-    items: quoteLines,
-    pricedSubtotal,
-    totalAmount: totalComplete ? pricedSubtotal : null,
-    totalComplete,
-    canContinue: totalComplete && quoteLines.length > 0 && quoteLines.every(item => item.canPurchase),
-    customerAuthenticated,
-    guestCheckoutEnabled,
-    guestFreeClaimEnabled,
-    policyReasons: [...policyReasons].sort(),
-  }
-}
 
 function emptyCart(): CustomerCart {
   return {
@@ -261,7 +67,7 @@ async function cartSnapshot(db: Db, customerId: string): Promise<CustomerCart> {
     .execute()
   if (!saved.length) return emptyCart()
 
-  const quote = await quoteItems(db, saved.map(row => ({ skuId: row.sku_id, quantity: row.quantity })), true)
+  const quote = await quoteCheckoutItems(db, saved.map(row => ({ skuId: row.sku_id, quantity: row.quantity })), true)
   return {
     items: quote.items,
     itemCount: saved.length,
@@ -318,7 +124,7 @@ function mergeDigest(items: CartSkuQuantity[]): string {
 }
 
 function mapError(error: unknown, reply: FastifyReply, requestId: string) {
-  if (error instanceof CartError) {
+  if (error instanceof CartError || error instanceof CheckoutQuoteError) {
     return reply.code(error.status).send(failure(error.code, error.message, requestId))
   }
   if (error instanceof RangeError || error instanceof TypeError) {
@@ -515,7 +321,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
   }, async (request, reply) => {
     try {
       const body = request.body as CustomerCartMergeBody
-      const normalized = normalizeItems(body.items)
+      const normalized = normalizeCheckoutItems(body.items)
       const digest = mergeDigest(normalized)
       const result = await db.transaction().execute(async (trx) => {
         const customer = request.customer!
@@ -605,7 +411,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
       const items = (request.body as { items: CartSkuQuantity[] }).items
       const quote = await db.transaction().execute(async (trx) => {
         if (request.customer) await lockCustomer(trx, request.customer, false)
-        return quoteItems(trx, items, request.customer !== null)
+        return quoteCheckoutItems(trx, items, request.customer !== null)
       })
       reply.header('cache-control', 'no-store')
       return success(quote, request.id)

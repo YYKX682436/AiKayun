@@ -111,17 +111,28 @@ async function logout() {
             查看并更新基础资料和登录密码。
           </p>
         </div>
-        <UButton
-          color="neutral"
-          variant="outline"
-          icon="i-lucide-log-out"
-          :loading="logoutBusy"
-          :disabled="logoutBusy || !clientReady"
-          class="min-h-11 shrink-0"
-          @click="logout"
-        >
-          退出登录
-        </UButton>
+        <div class="flex flex-wrap gap-2">
+          <UButton
+            to="/orders"
+            color="primary"
+            variant="outline"
+            icon="i-lucide-receipt-text"
+            class="min-h-11 shrink-0"
+          >
+            我的订单
+          </UButton>
+          <UButton
+            color="neutral"
+            variant="outline"
+            icon="i-lucide-log-out"
+            :loading="logoutBusy"
+            :disabled="logoutBusy || !clientReady"
+            class="min-h-11 shrink-0"
+            @click="logout"
+          >
+            退出登录
+          </UButton>
+        </div>
       </div>
 
       <UAlert

@@ -55,7 +55,7 @@ async function assertMobileAdminNavigation(page: import('@playwright/test').Page
   await expect(drawer).toBeVisible()
   await expect(drawer).toHaveAttribute('aria-labelledby', /.+/)
   await expect(drawer.getByRole('link', { name: 'AiKayun' })).toBeVisible()
-  await expect(drawer.locator('[aria-disabled="true"]')).toHaveCount(2)
+  await expect(drawer.locator('[aria-disabled="true"]')).toHaveCount(1)
   await expect.poll(() => drawer.evaluate(element => element.contains(document.activeElement))).toBe(true)
   await page.keyboard.press('Escape')
   await expect(drawer).toBeHidden()

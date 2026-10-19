@@ -87,6 +87,18 @@ onMounted(() => {
               {{ shoppingCart.currentQuantity.value > 99 ? '99+' : shoppingCart.currentQuantity.value }}
             </UBadge>
           </NuxtLink>
+          <NuxtLink
+            to="/orders"
+            class="hidden min-h-11 min-w-10 items-center justify-center rounded-lg px-2 text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary min-[360px]:flex"
+            aria-label="我的订单"
+            title="我的订单"
+          >
+            <UIcon
+              name="i-lucide-receipt-text"
+              class="size-4"
+              aria-hidden="true"
+            />
+          </NuxtLink>
           <ThemeModeSelect />
           <NuxtLink
             :to="customerApi.session.value ? '/account' : '/login'"
@@ -117,12 +129,23 @@ onMounted(() => {
     <footer class="border-t border-default bg-elevated">
       <UContainer class="flex flex-wrap items-center justify-between gap-2 py-5 text-sm text-muted">
         <span>{{ storeBrand.storeName }}</span>
-        <NuxtLink
-          to="/admin/login"
-          class="min-h-11 content-center rounded-lg px-2 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+        <nav
+          aria-label="商城辅助导航"
+          class="flex flex-wrap items-center gap-2"
         >
-          管理入口
-        </NuxtLink>
+          <NuxtLink
+            to="/orders"
+            class="min-h-11 content-center rounded-lg px-2 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+          >
+            订单查询
+          </NuxtLink>
+          <NuxtLink
+            to="/admin/login"
+            class="min-h-11 content-center rounded-lg px-2 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+          >
+            管理入口
+          </NuxtLink>
+        </nav>
       </UContainer>
     </footer>
   </div>

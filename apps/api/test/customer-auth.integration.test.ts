@@ -576,6 +576,7 @@ describe('customer authentication and storefront policy with PostgreSQL', () => 
       requirePhone: true,
       guestCheckoutEnabled: true,
       guestFreeClaimEnabled: true,
+      unpaidOrderTimeoutMinutes: 15,
     }
     const badOrigin = await app.inject({
       method: 'PUT',
@@ -607,6 +608,6 @@ describe('customer authentication and storefront policy with PostgreSQL', () => 
     expect(legacyLogin.statusCode).toBe(200)
     const newAccountWithoutContacts = await register({ username: 'new-policy-owner', password: oldPassword })
     expect(newAccountWithoutContacts.statusCode).toBe(400)
-    expect((await app.inject('/api/v1/customer/orders')).statusCode).toBe(404)
+    expect((await app.inject('/api/v1/customer/orders')).statusCode).toBe(401)
   })
 })

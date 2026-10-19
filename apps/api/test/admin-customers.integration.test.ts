@@ -97,7 +97,9 @@ async function createCatalog() {
     }).execute()
     await trx.updateTable('product_variants').set({ inventory_mode: 'unlimited', inventory_revision: 1 })
       .where('id', '=', variantId).execute()
-    await trx.insertInto('product_variant_fulfillment').values({ product_variant_id: variantId, method: 'manual' }).execute()
+    await trx.insertInto('product_variant_fulfillment').values({
+      product_variant_id: variantId, method: 'manual', manual_delivery_ready: true,
+    }).execute()
   })
   return { productId, variantId, productName, skuCode: `SKU-${variantId.slice(0, 8)}` }
 }
@@ -140,7 +142,11 @@ async function completePaidOrder(customerId: string) {
   const fulfillmentId = randomUUID()
   await db.insertInto('order_item_fulfillment_attempts').values({
     id: fulfillmentId, order_item_id: order.itemId, operation_id: randomUUID(), quantity: 1,
-    status: 'processing', result_sha256: null, completed_at: null,
+    started_by_admin_id: adminId, status: 'processing', result_sha256: null, completed_at: null,
+  }).execute()
+  await db.insertInto('order_item_fulfillment_deliveries').values({
+    id: randomUUID(), fulfillment_attempt_id: fulfillmentId, started_by_admin_id: adminId,
+    unit_index: 1, content: 'integration-test-private-delivery', content_sha256: digest,
   }).execute()
   await db.updateTable('order_item_fulfillment_attempts').set({ status: 'succeeded', result_sha256: digest })
     .where('id', '=', fulfillmentId).execute()

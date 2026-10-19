@@ -17,6 +17,7 @@ function toPolicy(policy: {
   require_phone: boolean
   guest_checkout_enabled: boolean
   guest_free_claim_enabled: boolean
+  unpaid_order_timeout_minutes: number
   updated_at: Date
 }) {
   return {
@@ -24,6 +25,7 @@ function toPolicy(policy: {
     requirePhone: policy.require_phone,
     guestCheckoutEnabled: policy.guest_checkout_enabled,
     guestFreeClaimEnabled: policy.guest_free_claim_enabled,
+    unpaidOrderTimeoutMinutes: policy.unpaid_order_timeout_minutes as 5 | 15 | 30,
     updatedAt: policy.updated_at.toISOString(),
   }
 }
@@ -37,7 +39,7 @@ export function registerCustomerPolicyRoutes(app: FastifyInstance, db: Kysely<Da
     },
   }, async (request, reply) => {
     const policy = await db.selectFrom('storefront_customer_policy')
-      .select(['require_email', 'require_phone', 'guest_checkout_enabled', 'guest_free_claim_enabled', 'updated_at'])
+      .select(['require_email', 'require_phone', 'guest_checkout_enabled', 'guest_free_claim_enabled', 'unpaid_order_timeout_minutes', 'updated_at'])
       .where('singleton', '=', true)
       .executeTakeFirstOrThrow()
     reply.header('cache-control', 'no-store')
@@ -59,7 +61,7 @@ export function registerCustomerPolicyRoutes(app: FastifyInstance, db: Kysely<Da
     },
   }, async (request, reply) => {
     const policy = await db.selectFrom('storefront_customer_policy')
-      .select(['require_email', 'require_phone', 'guest_checkout_enabled', 'guest_free_claim_enabled', 'updated_at'])
+      .select(['require_email', 'require_phone', 'guest_checkout_enabled', 'guest_free_claim_enabled', 'unpaid_order_timeout_minutes', 'updated_at'])
       .where('singleton', '=', true)
       .executeTakeFirstOrThrow()
     reply.header('cache-control', 'no-store')
@@ -87,10 +89,11 @@ export function registerCustomerPolicyRoutes(app: FastifyInstance, db: Kysely<Da
         require_phone: body.requirePhone,
         guest_checkout_enabled: body.guestCheckoutEnabled,
         guest_free_claim_enabled: body.guestFreeClaimEnabled,
+        unpaid_order_timeout_minutes: body.unpaidOrderTimeoutMinutes,
         updated_at: new Date(),
       })
       .where('singleton', '=', true)
-      .returning(['require_email', 'require_phone', 'guest_checkout_enabled', 'guest_free_claim_enabled', 'updated_at'])
+      .returning(['require_email', 'require_phone', 'guest_checkout_enabled', 'guest_free_claim_enabled', 'unpaid_order_timeout_minutes', 'updated_at'])
       .executeTakeFirstOrThrow())
     reply.header('cache-control', 'no-store')
     return success(toPolicy(policy), request.id)

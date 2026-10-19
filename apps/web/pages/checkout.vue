@@ -1,13 +1,19 @@
 <script setup lang="ts">
 import type { CartSkuQuantity, CheckoutQuote, CheckoutQuoteItem } from '@aikayun/contracts'
+import type { CreateOrderResult } from '@aikayun/contracts'
+import { CheckoutConflictError, CustomerApiError } from '~/composables/useCustomerApi'
 
 const route = useRoute()
 const customerApi = useCustomerApi()
 const shoppingCart = useShoppingCart()
 const quote = ref<CheckoutQuote | null>(null)
 const busy = ref(false)
+const submitting = ref(false)
 const errorMessage = ref('')
+const submitError = ref('')
 let requestSequence = 0
+
+useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 
 useSeoMeta({ title: '结算报价预览', description: '查看所选商品的当前结算报价。', robots: 'noindex, nofollow' })
 
@@ -74,11 +80,82 @@ async function loadQuote(items = requestedItems.value) {
   }
 }
 
+function canonicalItems(items: CartSkuQuantity[]): CartSkuQuantity[] {
+  const counts = new Map<string, number>()
+  for (const item of items) counts.set(item.skuId, (counts.get(item.skuId) ?? 0) + item.quantity)
+  return [...counts].sort(([left], [right]) => left.localeCompare(right)).map(([skuId, quantity]) => ({ skuId, quantity }))
+}
+
+function orderIntentKey(items: CartSkuQuantity[], ownerId: string): string {
+  if (!import.meta.client) throw new Error('请在浏览器中继续创建订单。')
+  const fingerprint = JSON.stringify(canonicalItems(items))
+  const storageKey = `aikayun-order-intent-v1:${ownerId}:${fingerprint}`
+  let existing: string | null
+  try {
+    existing = sessionStorage.getItem(storageKey)
+  } catch {
+    throw new Error('浏览器暂时无法保存安全的提交标识。请启用会话存储后重试。')
+  }
+  if (existing && /^[0-9a-f-]{36}$/iu.test(existing)) return existing
+  const key = crypto.randomUUID()
+  try {
+    sessionStorage.setItem(storageKey, key)
+  } catch {
+    throw new Error('浏览器暂时无法保存安全的提交标识。请启用会话存储后重试。')
+  }
+  return key
+}
+
+function removeOrderIntent(items: CartSkuQuantity[], ownerId: string): void {
+  const storageKey = `aikayun-order-intent-v1:${ownerId}:${JSON.stringify(canonicalItems(items))}`
+  try { sessionStorage.removeItem(storageKey) } catch { /* The completed order remains available through order history. */ }
+}
+
+async function createOrder() {
+  const items = requestedItems.value
+  const currentQuote = quote.value
+  if (submitting.value || !items || !currentQuote?.canContinue || !currentQuote.quoteToken) return
+  const identityAtStart = customerApi.identityVersion.value
+  const ownerId = customerApi.session.value?.customer.id ?? 'guest'
+  const identityIsCurrent = () => identityAtStart === customerApi.identityVersion.value
+  submitting.value = true
+  submitError.value = ''
+  try {
+    if (ownerId === 'guest') await customerApi.request<{ expiresAt: string }>('/api/v1/guest/session', { method: 'POST' })
+    if (!identityIsCurrent()) return
+    const idempotencyKey = orderIntentKey(items, ownerId)
+    const result = await customerApi.request<CreateOrderResult>('/api/v1/checkout/orders', {
+      method: 'POST',
+      body: { idempotencyKey, quoteToken: currentQuote.quoteToken, items },
+    })
+    if (!identityIsCurrent()) return
+    const orderPath = `/orders/${result.order.id}`
+    await navigateTo(orderPath)
+    if (identityIsCurrent() && route.path === orderPath) removeOrderIntent(items, ownerId)
+  } catch (error) {
+    if (!identityIsCurrent()) return
+    if (error instanceof CheckoutConflictError) {
+      quote.value = error.currentQuote
+      submitError.value = `${error.message} 已显示最新报价，请再次确认后重新提交。`
+    } else {
+      submitError.value = error instanceof CustomerApiError || error instanceof Error
+        ? error.message
+        : '订单暂时未能创建。请稍后重试，重复提交会返回同一订单。'
+    }
+  } finally {
+    submitting.value = false
+  }
+}
+
 watch(
   [requestedItems, () => customerApi.identityVersion.value],
   ([items]) => { if (import.meta.client) void loadQuote(items) },
   { immediate: true, flush: 'sync' },
 )
+
+watch(() => customerApi.identityVersion.value, () => {
+  submitError.value = ''
+}, { flush: 'sync' })
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
@@ -97,10 +174,10 @@ function formatDate(value: string): string {
             购物车
           </p>
           <h1 class="mt-1 text-2xl font-semibold tracking-tight text-highlighted sm:text-3xl">
-            结算报价预览
+            确认订单
           </h1>
           <p class="mt-2 text-sm text-muted">
-            这是查询时刻的报价，不锁定售价或库存。
+            提交时会在数据库事务中重新核对价格、购买资格并预留数量库存。
           </p>
         </div>
         <NuxtLink
@@ -118,11 +195,11 @@ function formatDate(value: string): string {
 
       <UAlert
         class="mt-6"
-        color="warning"
+        color="info"
         variant="subtle"
-        icon="i-lucide-info"
-        title="尚未创建订单"
-        description="本阶段只提供结算报价预览，不会预留库存、扣款、发起支付宝或微信支付，也不会创建发货记录。"
+        icon="i-lucide-shield-check"
+        title="下单前会重新验证"
+        description="报价用于预览；只有商家明确开启人工数字交付的商品可以下单。下单会原子创建订单并预留数量库存。当前正价订单只会进入待付款，支付宝和微信支付尚未开放。"
       />
 
       <UAlert
@@ -175,6 +252,16 @@ function formatDate(value: string): string {
           v-for="index in 2"
           :key="index"
           class="h-24 animate-pulse rounded-xl border border-default bg-elevated motion-reduce:animate-none"
+        />
+
+        <UAlert
+          v-if="submitError"
+          class="mt-4"
+          color="error"
+          variant="soft"
+          :title="submitError"
+          role="alert"
+          aria-live="assertive"
         />
       </div>
 
@@ -235,7 +322,7 @@ function formatDate(value: string): string {
           <dl class="grid gap-2 text-sm">
             <div class="flex justify-between gap-4">
               <dt class="text-muted">
-                可计价商品小计
+                商品金额
               </dt><dd class="tabular-nums text-highlighted">
                 ¥{{ quote.pricedSubtotal }}
               </dd>
@@ -280,6 +367,16 @@ function formatDate(value: string): string {
             variant="soft"
           >
             返回购物车调整
+          </UButton>
+          <UButton
+            v-if="quote.canContinue"
+            color="primary"
+            icon="i-lucide-lock-keyhole"
+            :loading="submitting"
+            :disabled="submitting || busy"
+            @click="createOrder"
+          >
+            {{ submitting ? '正在安全创建订单' : '提交订单' }}
           </UButton>
         </div>
       </section>

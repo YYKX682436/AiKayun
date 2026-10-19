@@ -18,6 +18,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     to: '/admin/customers',
   },
   {
+    label: '订单管理',
+    icon: 'i-lucide-receipt',
+    to: '/admin/orders',
+  },
+  {
     label: '顾客设置',
     icon: 'i-lucide-user-round-cog',
     to: '/admin/storefront/customer-policy',
@@ -25,7 +30,6 @@ const navigationItems: NavigationMenuItem[][] = [[
 ]]
 
 const unavailableModules = [
-  { label: '订单管理', icon: 'i-lucide-receipt' },
   { label: '经营数据', icon: 'i-lucide-chart-no-axes-column-increasing' },
 ]
 </script>

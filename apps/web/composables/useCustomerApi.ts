@@ -1,6 +1,7 @@
 import type {
   ApiSuccess,
   ChangeCustomerPasswordBody,
+  CheckoutQuote,
   CsrfToken,
   CustomerLoginBody,
   CustomerProfile,
@@ -22,7 +23,14 @@ export class CustomerApiError extends Error {
   }
 }
 
-type ApiErrorBody = { error?: { code?: string; message?: string } }
+export class CheckoutConflictError extends CustomerApiError {
+  constructor(status: number, code: string, message: string, readonly currentQuote: CheckoutQuote) {
+    super(status, code, message)
+    this.name = 'CheckoutConflictError'
+  }
+}
+
+type ApiErrorBody = { error?: { code?: string; message?: string; currentQuote?: CheckoutQuote } }
 type RequestOptions = Parameters<typeof $fetch>[1]
 const customerIdentityLockName = 'aikayun:customer-identity:v1'
 const customerIdentityRevisionKey = 'aikayun-customer-identity-revision-v1'
@@ -39,6 +47,9 @@ function normalizeError(error: unknown): CustomerApiError {
     ?? (error as { response?: { _data?: ApiErrorBody } } | null)?.response?._data
   const code = body?.error?.code ?? 'REQUEST_FAILED'
   const serverMessage = body?.error?.message
+  if (status === 409 && body?.error?.currentQuote) {
+    return new CheckoutConflictError(status, code, serverMessage ?? '报价已变化，请核对最新内容后继续。', body.error.currentQuote)
+  }
   const message = code === 'INVALID_CREDENTIALS'
     ? '用户名或密码不正确。'
     : code === 'USERNAME_TAKEN'
@@ -81,12 +92,18 @@ export function useCustomerApi() {
   }
 
   function identitySensitivePath(path: string): boolean {
-    return path.includes('/api/v1/customer/') || path === '/api/v1/checkout/quote'
+    return path.includes('/api/v1/customer/')
+      || path === '/api/v1/checkout/quote'
+      || path.startsWith('/api/v1/checkout/orders')
+      || path.startsWith('/api/v1/guest/')
   }
 
   function requiresCurrentSessionProbe(path: string): boolean {
     return path.includes('/api/v1/customer/cart')
-      || (path === '/api/v1/checkout/quote' && session.value !== null)
+      || path.includes('/api/v1/customer/orders')
+      || path === '/api/v1/checkout/quote'
+      || path.startsWith('/api/v1/checkout/orders')
+      || path.startsWith('/api/v1/guest/')
   }
 
   function readIdentityRevision(): { ok: boolean; value: string | null } {

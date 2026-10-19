@@ -250,6 +250,7 @@ export const StorefrontCustomerPolicySchema = Type.Object({
   requirePhone: Type.Boolean(),
   guestCheckoutEnabled: Type.Boolean(),
   guestFreeClaimEnabled: Type.Boolean(),
+  unpaidOrderTimeoutMinutes: Type.Union([Type.Literal(5), Type.Literal(15), Type.Literal(30)]),
   updatedAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
 
@@ -258,6 +259,7 @@ export const UpdateStorefrontCustomerPolicyBodySchema = Type.Object({
   requirePhone: Type.Boolean(),
   guestCheckoutEnabled: Type.Boolean(),
   guestFreeClaimEnabled: Type.Boolean(),
+  unpaidOrderTimeoutMinutes: Type.Union([Type.Literal(5), Type.Literal(15), Type.Literal(30)]),
 }, { additionalProperties: false })
 
 export const ProductTypeSchema = Type.Union([
@@ -879,6 +881,7 @@ export const CheckoutQuoteItemSchema = Type.Object({
   skuId: Type.String({ format: 'uuid' }),
   productId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   productName: Type.Union([Type.String({ minLength: 1, maxLength: 200 }), Type.Null()]),
+  productType: Type.Union([ProductTypeSchema, Type.Null()]),
   productStatus: Type.Union([ProductStatusSchema, Type.Null()]),
   skuCode: Type.Union([Type.String({ minLength: 1, maxLength: 64 }), Type.Null()]),
   options: Type.Array(CartOptionSchema, { maxItems: 5 }),
@@ -894,6 +897,7 @@ export const CheckoutQuoteItemSchema = Type.Object({
 
 export const CheckoutQuoteSchema = Type.Object({
   quotedAt: Type.String({ format: 'date-time' }),
+  quoteToken: Type.String({ pattern: '^[0-9a-f]{64}$' }),
   currency: Type.Literal('CNY'),
   items: Type.Array(CheckoutQuoteItemSchema, { minItems: 1, maxItems: 50 }),
   pricedSubtotal: SettlementAmountSchema,
@@ -906,6 +910,190 @@ export const CheckoutQuoteSchema = Type.Object({
   policyReasons: Type.Array(Type.Union([
     Type.Literal('guest_checkout_disabled'), Type.Literal('guest_free_claim_disabled'),
   ]), { maxItems: 2 }),
+}, { additionalProperties: false })
+
+export const CreateOrderBodySchema = Type.Object({
+  idempotencyKey: Type.String({ format: 'uuid' }),
+  quoteToken: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+  items: Type.Array(CartSkuQuantitySchema, { minItems: 1, maxItems: 50 }),
+}, { additionalProperties: false })
+
+export const OrderStatusSchema = Type.Union([
+  Type.Literal('pending_payment'), Type.Literal('processing'),
+  Type.Literal('completed'), Type.Literal('closed'),
+])
+export const OrderPaymentStatusSchema = Type.Union([
+  Type.Literal('not_required'), Type.Literal('unpaid'), Type.Literal('paid'),
+])
+export const OrderFulfillmentStatusSchema = Type.Union([
+  Type.Literal('pending'), Type.Literal('processing'), Type.Literal('partially_fulfilled'),
+  Type.Literal('failed'), Type.Literal('unknown'), Type.Literal('completed'),
+])
+export const OrderDeliverySchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  unitIndex: Type.Integer({ minimum: 1 }),
+  content: Type.String({ minLength: 1, maxLength: 512 }),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const OrderItemSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  productId: Type.String({ format: 'uuid' }),
+  skuId: Type.String({ format: 'uuid' }),
+  productName: Type.String({ minLength: 1, maxLength: 200 }),
+  productType: ProductTypeSchema,
+  skuCode: Type.String({ minLength: 1, maxLength: 64 }),
+  options: Type.Array(CartOptionSchema, { maxItems: 5 }),
+  inventoryMode: Type.Union([Type.Literal('quantity'), Type.Literal('unlimited')]),
+  fulfillmentMethod: Type.String({ minLength: 1, maxLength: 24 }),
+  unitPrice: SettlementAmountSchema,
+  quantity: Type.Integer({ minimum: 1 }),
+  lineAmount: SettlementAmountSchema,
+  fulfillmentStatus: OrderFulfillmentStatusSchema,
+  fulfilledQuantity: Type.Integer({ minimum: 0 }),
+  fulfillmentReservedQuantity: Type.Integer({ minimum: 0 }),
+  deliveries: Type.Array(OrderDeliverySchema),
+}, { additionalProperties: false })
+export const OrderStatusEventSchema = Type.Object({
+  previousStatus: OrderStatusSchema,
+  nextStatus: OrderStatusSchema,
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const OrderSummarySchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  status: OrderStatusSchema,
+  paymentStatus: OrderPaymentStatusSchema,
+  totalAmount: SettlementAmountSchema,
+  currency: Type.Literal('CNY'),
+  itemCount: Type.Integer({ minimum: 1 }),
+  createdAt: Type.String({ format: 'date-time' }),
+  unpaidExpiresAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+}, { additionalProperties: false })
+export const OrderPageSchema = Type.Object({
+  items: Type.Array(OrderSummarySchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const OrderDetailSchema = Type.Intersect([
+  OrderSummarySchema,
+  Type.Object({
+    itemsSealed: Type.Literal(true),
+    items: Type.Array(OrderItemSchema, { minItems: 1, maxItems: 50 }),
+    statusEvents: Type.Array(OrderStatusEventSchema),
+  }, { additionalProperties: false }),
+])
+export const CreateOrderResultSchema = Type.Object({
+  created: Type.Boolean(),
+  order: OrderDetailSchema,
+}, { additionalProperties: false })
+export const CheckoutConflictSchema = Type.Object({
+  error: Type.Object({
+    code: Type.String(),
+    message: Type.String(),
+    currentQuote: CheckoutQuoteSchema,
+  }),
+  meta: RequestMetaSchema,
+})
+export const CheckoutOrderErrorSchema = Type.Object({
+  error: Type.Object({
+    code: Type.String(),
+    message: Type.String(),
+    currentQuote: Type.Optional(CheckoutQuoteSchema),
+  }, { additionalProperties: false }),
+  meta: RequestMetaSchema,
+})
+export const OrderIdParamsSchema = Type.Object({ id: Type.String({ format: 'uuid' }) })
+export const AdminOrderItemParamsSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  itemId: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+export const AdminProductIdParamsSchema = Type.Object({ id: Type.String({ format: 'uuid' }) })
+export const AdminProductVariantParamsSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  variantId: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+export const OrderListQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+}, { additionalProperties: false })
+export const AdminOrderListQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  status: Type.Optional(Type.Union([OrderStatusSchema, Type.Literal('all')])),
+}, { additionalProperties: false })
+export const AdminOrderSummarySchema = Type.Intersect([
+  OrderSummarySchema,
+  Type.Object({
+    ownerType: Type.Union([Type.Literal('customer'), Type.Literal('guest')]),
+    customerId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+    customerUsername: Type.Union([CustomerUsernameSchema, Type.Null()]),
+  }, { additionalProperties: false }),
+])
+export const AdminOrderPageSchema = Type.Object({
+  items: Type.Array(AdminOrderSummarySchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const AdminOrderInventoryEventSchema = Type.Object({
+  action: Type.Union([Type.Literal('reserve'), Type.Literal('release'), Type.Literal('consume')]),
+  quantity: Type.Integer({ minimum: 1 }),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const AdminOrderItemInventorySchema = Type.Object({
+  orderItemId: Type.String({ format: 'uuid' }),
+  reservationId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  reservedQuantity: Type.Integer({ minimum: 0 }),
+  events: Type.Array(AdminOrderInventoryEventSchema),
+}, { additionalProperties: false })
+export const AdminFulfillmentAttemptSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  orderItemId: Type.String({ format: 'uuid' }),
+  administratorId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  quantity: Type.Integer({ minimum: 1 }),
+  status: Type.Union([Type.Literal('processing'), Type.Literal('unknown'), Type.Literal('succeeded'), Type.Literal('failed')]),
+  resultSha256: Type.Union([Type.String({ pattern: '^[0-9a-f]{64}$' }), Type.Null()]),
+  createdAt: Type.String({ format: 'date-time' }),
+  completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  deliveryCount: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const AdminOrderDetailSchema = Type.Object({
+  order: OrderDetailSchema,
+  owner: Type.Object({
+    type: Type.Union([Type.Literal('customer'), Type.Literal('guest')]),
+    customerId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+    customerUsername: Type.Union([CustomerUsernameSchema, Type.Null()]),
+    guestSessionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  }, { additionalProperties: false }),
+  inventory: Type.Array(AdminOrderItemInventorySchema),
+  fulfillmentAttempts: Type.Array(AdminFulfillmentAttemptSchema),
+}, { additionalProperties: false })
+export const UpdateManualFulfillmentBodySchema = Type.Object({
+  enabled: Type.Boolean(),
+}, { additionalProperties: false })
+export const ManualFulfillmentConfigSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  skuId: Type.String({ format: 'uuid' }),
+  productType: ProductTypeSchema,
+  method: Type.Union([Type.Literal('manual'), Type.Null()]),
+  enabled: Type.Boolean(),
+  updatedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+}, { additionalProperties: false })
+export const ManualFulfillmentConfigPageSchema = Type.Array(ManualFulfillmentConfigSchema)
+export const GuestOrderSessionSchema = Type.Object({
+  expiresAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const ManualFulfillmentDeliveryBodySchema = Type.Object({
+  operationId: Type.String({ format: 'uuid' }),
+  deliveries: Type.Array(Type.Object({
+    content: Type.String({ minLength: 1, maxLength: 512, pattern: '.*\\S.*' }),
+  }, { additionalProperties: false }), { minItems: 1, maxItems: 20 }),
+}, { additionalProperties: false })
+export const ManualFulfillmentResultSchema = Type.Object({
+  repeated: Type.Boolean(),
+  order: OrderDetailSchema,
 }, { additionalProperties: false })
 
 export const CustomerCartSchema = Type.Object({
@@ -1323,6 +1511,21 @@ export type CheckoutQuoteBody = Static<typeof CheckoutQuoteBodySchema>
 export type CheckoutQuoteReason = Static<typeof CheckoutQuoteReasonSchema>
 export type CheckoutQuoteItem = Static<typeof CheckoutQuoteItemSchema>
 export type CheckoutQuote = Static<typeof CheckoutQuoteSchema>
+export type CreateOrderBody = Static<typeof CreateOrderBodySchema>
+export type CreateOrderResult = Static<typeof CreateOrderResultSchema>
+export type OrderStatus = Static<typeof OrderStatusSchema>
+export type OrderSummary = Static<typeof OrderSummarySchema>
+export type OrderItem = Static<typeof OrderItemSchema>
+export type OrderDetail = Static<typeof OrderDetailSchema>
+export type OrderPage = Static<typeof OrderPageSchema>
+export type AdminOrderPage = Static<typeof AdminOrderPageSchema>
+export type AdminOrderDetail = Static<typeof AdminOrderDetailSchema>
+export type UpdateManualFulfillmentBody = Static<typeof UpdateManualFulfillmentBodySchema>
+export type ManualFulfillmentConfig = Static<typeof ManualFulfillmentConfigSchema>
+export type ManualFulfillmentConfigPage = Static<typeof ManualFulfillmentConfigPageSchema>
+export type ManualFulfillmentResult = Static<typeof ManualFulfillmentResultSchema>
+export type GuestOrderSession = Static<typeof GuestOrderSessionSchema>
+export type ManualFulfillmentDeliveryBody = Static<typeof ManualFulfillmentDeliveryBodySchema>
 export type CustomerCart = Static<typeof CustomerCartSchema>
 export type CustomerCartMutation = Static<typeof CustomerCartMutationSchema>
 export type PublicProductCategoryAssignment = Static<typeof PublicProductCategoryAssignmentSchema>

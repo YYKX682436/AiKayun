@@ -35,6 +35,7 @@ import { registerAdminInventoryRoutes } from './catalog/admin-inventory.js'
 import { registerProductMediaRoutes } from './media/admin.js'
 import { registerPublicProductRoutes } from './catalog/public-products.js'
 import { registerCustomerCartRoutes } from './commerce/customer-cart.js'
+import { registerOrderRoutes } from './commerce/orders.js'
 
 export async function createApp(options: {
   db: Kysely<Database>
@@ -85,6 +86,7 @@ export async function createApp(options: {
     if (request.url.startsWith('/api/v1/public/')
       || request.url.startsWith('/api/v1/customer/')
       || request.url.startsWith('/api/v1/checkout/')
+      || request.url.startsWith('/api/v1/guest/')
       || request.url.startsWith('/api/v1/admin/')) {
       reply.header('cache-control', 'no-store')
     }
@@ -147,6 +149,7 @@ export async function createApp(options: {
   registerAdminAuthRoutes(app, db, config, dummyPasswordHash)
   registerCustomerAuthRoutes(app, db, config, dummyPasswordHash)
   registerCustomerCartRoutes(app, db, config)
+  registerOrderRoutes(app, db, config)
   registerCustomerPolicyRoutes(app, db, config)
   registerAdminCustomerRoutes(app, db, config)
   const identityFactory = options.productIdentityFactory ?? defaultProductIdentityFactory

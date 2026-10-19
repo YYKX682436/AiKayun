@@ -119,6 +119,7 @@ async function createCatalog(options: {
     await trx.insertInto('product_variant_fulfillment').values({
       product_variant_id: variantId,
       method: fulfillmentMethod,
+      manual_delivery_ready: fulfillmentMethod === 'manual',
     }).execute()
   })
 
@@ -778,7 +779,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
     }
   })
 
-  it('unfreezes wallet funds atomically when a pending order is closed', async () => {
+  it('protects an active external payment before releasing its wallet hold and closing', async () => {
     const customerId = await createCustomer('wallet-hold-close')
     await addWalletCredit(customerId, 'gift', '15.00')
     const catalog = await createCatalog({ name: '关闭时释放冻结', salePrice: '20.00', stock: 2 })
@@ -787,6 +788,12 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
     const wallet = await db.transaction().execute((trx) => recordWalletOrderPayment(trx, {
       customerId, orderId: order.id, operationId, requestSha256: digest, amount: '15.00', externalProvider: 'epay-compatible',
     }))
+    await expect(db.updateTable('orders').set({ status: 'closed' }).where('id', '=', order.id).execute()).rejects.toBeDefined()
+    expect(await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customerId).executeTakeFirstOrThrow()).toEqual({ gift_available: '0.00', gift_frozen: '15.00' })
+    expect(await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.variantId).executeTakeFirstOrThrow()).toEqual({ reserved: 1 })
+    await db.updateTable('payment_attempts').set({ status: 'failed' }).where('id', '=', wallet.paymentAttemptId).execute()
     await db.updateTable('orders').set({ status: 'closed' }).where('id', '=', order.id).execute()
     expect(await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
       .where('customer_id', '=', customerId).executeTakeFirstOrThrow()).toEqual({ gift_available: '15.00', gift_frozen: '0.00' })
@@ -1239,6 +1246,9 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
         .where('product_variant_id', '=', variantId).execute()).toEqual(before.adjustments)
 
       const rollbackMigrator = new Migrator({ db, provider: new AppMigrationProvider() })
+      const ordersRollback = await rollbackMigrator.migrateDown()
+      if (ordersRollback.error) throw ordersRollback.error
+      expect(ordersRollback.results?.map((result) => result.migrationName)).toContain('202610190004_orders')
       const customerCartRollback = await rollbackMigrator.migrateDown()
       if (customerCartRollback.error) throw customerCartRollback.error
       expect(customerCartRollback.results?.map((result) => result.migrationName)).toContain('202610190003_customer_cart')

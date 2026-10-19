@@ -254,8 +254,10 @@ async function createReservedOrderForTest(
     await trx.selectFrom('products').select('id').where('id', '=', productId).forUpdate().executeTakeFirstOrThrow()
     await trx.selectFrom('product_variants').select('id').where('id', '=', variantId).forUpdate().executeTakeFirstOrThrow()
     await trx.insertInto('product_variant_fulfillment').values({
-      product_variant_id: variantId, method: 'manual',
-    }).onConflict((conflict) => conflict.column('product_variant_id').doNothing()).execute()
+      product_variant_id: variantId, method: 'manual', manual_delivery_ready: true,
+    }).onConflict((conflict) => conflict.column('product_variant_id').doUpdateSet({
+      method: 'manual', manual_delivery_ready: true,
+    })).execute()
     await trx.insertInto('orders').values({
       id: orderId, customer_id: customerId, guest_order_session_id: null,
       idempotency_key: randomUUID(), request_sha256: 'a'.repeat(64), total_amount: lineAmount,
@@ -924,7 +926,8 @@ describe('Fastify API with PostgreSQL 18', () => {
       'admin_product_creation_requests', 'admin_sessions', 'admin_users', 'customer_cart_items',
       'customer_cart_merge_requests', 'customer_management_audit',
       'customer_sessions', 'customers', 'guest_order_sessions',
-      'order_inventory_events', 'order_inventory_reservations', 'order_item_fulfillment_attempts', 'order_items',
+      'order_inventory_events', 'order_inventory_reservations', 'order_item_fulfillment_attempts',
+      'order_item_fulfillment_deliveries', 'order_items',
       'order_refund_allocations', 'order_refunds', 'order_status_events', 'orders', 'payment_attempts',
       'payment_receipts', 'product_attributes', 'product_categories', 'product_category_assignments',
       'product_category_tree_guard', 'product_management_audit_events',

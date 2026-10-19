@@ -7,6 +7,8 @@ import type {
   AdminProductVariantPricesPage,
   CreateInventoryAdjustmentBody,
   InventoryAdjustmentPage,
+  ManualFulfillmentConfig,
+  ManualFulfillmentConfigPage,
   ProductDetail,
   ProductGalleryImage,
   ProductInventoryMode,
@@ -63,6 +65,8 @@ const priceDraft = reactive<Record<string, { salePrice: string; compareAtPrice: 
 const bulkSalePrice = ref('')
 
 const inventorySummary = shallowRef<AdminProductInventorySummary | null>(null)
+const manualFulfillment = ref<ManualFulfillmentConfigPage>([])
+const manualFulfillmentLoading = ref(false)
 const inventoryPageNumber = ref(1)
 const inventoryPageSize = 20
 const historySkuId = ref('')
@@ -251,6 +255,68 @@ async function loadInventory() {
   inventorySummary.value = await request<AdminProductInventorySummary>(`/api/v1/admin/products/${productId.value}/inventory`)
 }
 
+async function loadManualFulfillment() {
+  manualFulfillmentLoading.value = true
+  try {
+    manualFulfillment.value = await request<ManualFulfillmentConfigPage>(`/api/v1/admin/products/${productId.value}/manual-fulfillment`)
+  } finally {
+    manualFulfillmentLoading.value = false
+  }
+}
+
+function manualFulfillmentForSku(skuId: string): ManualFulfillmentConfig | undefined {
+  return manualFulfillment.value.find(row => row.skuId === skuId)
+}
+
+function canEnableManualFulfillment(skuId: string): boolean {
+  const row = inventorySummary.value?.variants.find(variant => variant.skuId === skuId)
+  return product.value?.productType === 'digital'
+    && Boolean(row?.enabled && !row.retiredAt
+      && (row.inventory.mode === 'quantity' || row.inventory.mode === 'unlimited'))
+}
+
+function manualFulfillmentReadinessText(row: AdminProductVariantInventory): string {
+  if (product.value?.productType !== 'digital') return '仅数字商品支持人工数字交付。'
+  if (row.retiredAt) return '此 SKU 已退役，不能开启人工交付。'
+  if (!row.enabled) return '此 SKU 未启用，不能开启人工交付。'
+  if (row.inventory.mode === 'quantity') return `按数量管理 · 当前可售 ${row.inventory.available} 件；需单独开启人工交付。`
+  if (row.inventory.mode === 'unlimited') return '不限数量 · 需单独开启人工交付。'
+  if (row.inventory.mode === 'resource_pool') return '资源池供货尚未就绪，不能开启人工交付。'
+  if (row.inventory.mode === 'external') return '外部供应商尚未接入，不能开启人工交付。'
+  return '请先配置按数量管理或不限数量库存，再开启人工交付。'
+}
+
+async function setManualFulfillment(skuId: string, enabled: boolean) {
+  if (!product.value || saving.value || manualFulfillmentLoading.value) return
+  const variant = product.value.variants.find(row => row.id === skuId)
+  if (!variant) return
+  if (enabled && !canEnableManualFulfillment(skuId)) {
+    sectionErrors.inventory = '只有启用且未退役、库存模式为按数量或不限数量的数字商品 SKU 才能开启人工交付。'
+    return
+  }
+  if (enabled && !window.confirm(`确认开启 SKU ${variant.skuCode} 的人工数字交付？请确保商家后台有人能为此商品实际录入并核对交付内容。`)) return
+  clearSectionStatus('inventory')
+  saving.value = `manual-fulfillment-${skuId}`
+  try {
+    const result = await request<ManualFulfillmentConfig>(`/api/v1/admin/products/${productId.value}/variants/${skuId}/manual-fulfillment`, {
+      method: 'PUT',
+      body: { enabled },
+    })
+    manualFulfillment.value = [
+      ...manualFulfillment.value.filter(row => row.skuId !== skuId),
+      result,
+    ].sort((left, right) => left.skuId.localeCompare(right.skuId))
+    sectionSuccess.inventory = enabled
+      ? `SKU ${variant.skuCode} 已明确开启人工数字交付。顾客现在可以下单，商家需在订单后台实际录入交付内容。`
+      : `SKU ${variant.skuCode} 已关闭人工数字交付。`
+  } catch (error) {
+    await handleSectionError('inventory', error)
+    await loadManualFulfillment().catch(() => undefined)
+  } finally {
+    saving.value = ''
+  }
+}
+
 async function loadCategories() {
   const result = await request<{ categories: AdminProductCategory[] }>('/api/v1/admin/categories')
   categories.value = result.categories
@@ -276,7 +342,7 @@ async function loadProduct() {
     } catch {
       // Leave malformed recovery state for the create page to handle explicitly.
     }
-    const results = await Promise.allSettled([loadCategories(), loadPricePage(1), loadInventory()])
+    const results = await Promise.allSettled([loadCategories(), loadPricePage(1), loadInventory(), loadManualFulfillment()])
     const failed = results.find(result => result.status === 'rejected')
     if (failed?.status === 'rejected') loadError.value = failed.reason instanceof Error ? failed.reason.message : '部分商品配置暂时不可用。'
     const pending = sessionStorage.getItem(`aikayun-admin-inventory-operation:${productId.value}`)
@@ -838,7 +904,7 @@ function inventorySummaryText(row: AdminProductVariantInventory) {
   if (inventory.mode === 'quantity') return `实际 ${inventory.stocked} · 预留 ${inventory.reserved} · 可售 ${inventory.available}`
   if (inventory.mode === 'resource_pool') return '资源池未就绪，暂不可确认可售数量。'
   if (inventory.mode === 'external') return '供应商尚未接入，暂不可确认可售数量。'
-  if (inventory.mode === 'unlimited') return '不限数量；系统尚未具备自动交付能力。'
+  if (inventory.mode === 'unlimited') return '不限数量；需单独开启并人工完成数字交付。'
   return '库存尚未配置。'
 }
 async function changeInventoryMode(row: AdminProductVariantInventory, value: string) {
@@ -2498,6 +2564,90 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     </UButton>
                   </div>
                 </template>
+
+                <section
+                  class="mt-6 rounded-xl border border-primary/25 bg-primary/5 p-4 sm:p-5"
+                  aria-labelledby="manual-delivery-title"
+                >
+                  <div class="flex flex-wrap items-start justify-between gap-3">
+                    <div class="min-w-0">
+                      <h3
+                        id="manual-delivery-title"
+                        class="font-semibold text-highlighted"
+                      >
+                        人工数字交付资格
+                      </h3>
+                      <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
+                        默认关闭。只有商家确认此数字商品有可实际提供的内容，并且后台人员能在订单详情页录入交付内容后，才为对应 SKU 开启。开启后顾客即可下单；未配置的 SKU 仍不可购买。
+                      </p>
+                    </div>
+                    <UBadge
+                      v-if="product?.productType === 'digital'"
+                      color="primary"
+                      variant="soft"
+                    >
+                      数字商品
+                    </UBadge>
+                    <UBadge
+                      v-else
+                      color="warning"
+                      variant="soft"
+                    >
+                      仅限数字商品
+                    </UBadge>
+                  </div>
+                  <div
+                    v-if="manualFulfillmentLoading"
+                    class="mt-4 text-sm text-muted"
+                    aria-busy="true"
+                  >
+                    正在读取交付资格…
+                  </div>
+                  <ul
+                    v-else-if="inventorySummary"
+                    class="mt-4 divide-y divide-default rounded-lg border border-default bg-elevated"
+                  >
+                    <li
+                      v-for="row in visibleInventoryRows"
+                      :key="`fulfillment-${row.skuId}`"
+                      class="flex min-w-0 flex-col gap-3 p-3 sm:flex-row sm:items-center sm:justify-between"
+                    >
+                      <div class="min-w-0">
+                        <p class="truncate font-mono text-sm font-medium text-highlighted">
+                          {{ row.skuCode }}
+                        </p>
+                        <p class="mt-1 text-xs text-muted">
+                          {{ manualFulfillmentReadinessText(row) }}
+                        </p>
+                      </div>
+                      <div class="flex flex-wrap items-center gap-2 sm:justify-end">
+                        <UBadge
+                          :color="manualFulfillmentForSku(row.skuId)?.enabled ? 'success' : 'neutral'"
+                          variant="soft"
+                        >
+                          {{ manualFulfillmentForSku(row.skuId)?.enabled ? '人工交付已就绪' : '未开启' }}
+                        </UBadge>
+                        <UButton
+                          size="sm"
+                          :color="manualFulfillmentForSku(row.skuId)?.enabled ? 'neutral' : 'primary'"
+                          :variant="manualFulfillmentForSku(row.skuId)?.enabled ? 'outline' : 'solid'"
+                          :disabled="Boolean(saving) || manualFulfillmentLoading || (product?.productType !== 'digital') || (!manualFulfillmentForSku(row.skuId)?.enabled && !canEnableManualFulfillment(row.skuId))"
+                          :loading="saving === `manual-fulfillment-${row.skuId}`"
+                          :aria-pressed="manualFulfillmentForSku(row.skuId)?.enabled ?? false"
+                          @click="setManualFulfillment(row.skuId, !manualFulfillmentForSku(row.skuId)?.enabled)"
+                        >
+                          {{ manualFulfillmentForSku(row.skuId)?.enabled ? '关闭资格' : '明确开启' }}
+                        </UButton>
+                      </div>
+                    </li>
+                  </ul>
+                  <p
+                    v-if="inventorySummary && inventorySummary.variants.length > inventoryPageSize"
+                    class="mt-2 text-xs text-muted"
+                  >
+                    请使用上方库存分页逐页配置 SKU。资格切换会立即保存。
+                  </p>
+                </section>
 
                 <section
                   v-if="historySkuId"

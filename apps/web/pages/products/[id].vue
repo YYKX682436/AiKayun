@@ -454,7 +454,7 @@ async function buySelectedNow() {
                 variant="subtle"
                 icon="i-lucide-info"
                 title="当前仅提供结算报价预览"
-                description="商品与库存会在进入报价时重新校验。当前不会创建订单，也不会预留库存、发起支付或交付商品。"
+                description="商品、库存和人工数字交付资格会在报价及下单事务中重新校验。正价订单当前仅创建为待付款，不显示未接入的支付操作。"
                 class="mt-5"
               />
             </div>

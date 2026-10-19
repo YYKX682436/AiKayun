@@ -16,6 +16,7 @@ const settings = reactive({
   requirePhone: policyResponse.value?.data.requirePhone ?? false,
   guestCheckoutEnabled: policyResponse.value?.data.guestCheckoutEnabled ?? false,
   guestFreeClaimEnabled: policyResponse.value?.data.guestFreeClaimEnabled ?? false,
+  unpaidOrderTimeoutMinutes: policyResponse.value?.data.unpaidOrderTimeoutMinutes ?? 15,
 })
 const busy = ref(false)
 const errorMessage = ref('')
@@ -141,7 +142,7 @@ async function saveSettings() {
                   游客策略
                 </h2>
                 <p class="mt-1 text-sm leading-6 text-muted">
-                  设置会保存供后续阶段读取；当前没有下单或免费领取接口。
+                  游客下单与免费领取分别按商品金额执行。超时期限只影响之后创建的待付款订单。
                 </p>
               </div>
             </template>
@@ -159,6 +160,26 @@ async function saveSettings() {
                   v-model="settings.guestFreeClaimEnabled"
                   label="允许游客领取免费商品"
                   description="仅保存策略，不会开放领取、订单或支付接口。"
+                  :disabled="busy || pending || !policyResponse"
+                />
+              </UFormField>
+            </div>
+            <div class="mt-6 max-w-sm">
+              <UFormField
+                label="未付款订单关闭时间"
+                description="已创建订单的过期时间保持不变。"
+                name="unpaidOrderTimeoutMinutes"
+              >
+                <USelect
+                  id="unpaid-order-timeout"
+                  v-model="settings.unpaidOrderTimeoutMinutes"
+                  :items="[
+                    { label: '5 分钟', value: 5 },
+                    { label: '15 分钟', value: 15 },
+                    { label: '30 分钟', value: 30 },
+                  ]"
+                  value-key="value"
+                  class="w-full"
                   :disabled="busy || pending || !policyResponse"
                 />
               </UFormField>
