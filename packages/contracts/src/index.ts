@@ -475,6 +475,57 @@ export const ProductVariantIdParamsSchema = Type.Object({
 }, { additionalProperties: false })
 export const ProductCategoryIdParamsSchema = ProductIdParamsSchema
 
+const ProductPerOrderPurchaseLimitSchema = Type.Union([
+  Type.Integer({ minimum: 1, maximum: 4950 }),
+  Type.Null(),
+])
+const SkuPerOrderPurchaseLimitSchema = Type.Union([
+  Type.Integer({ minimum: 1, maximum: 99 }),
+  Type.Null(),
+])
+const AccountPurchaseLimitSchema = Type.Union([
+  Type.Integer({ minimum: 1, maximum: 2_147_483_647 }),
+  Type.Null(),
+])
+
+export const PurchaseLimitSettingsSchema = Type.Object({
+  perOrder: ProductPerOrderPurchaseLimitSchema,
+  lifetime: AccountPurchaseLimitSchema,
+  rolling24Hours: AccountPurchaseLimitSchema,
+}, { additionalProperties: false })
+export const SkuPurchaseLimitSettingsSchema = Type.Object({
+  perOrder: SkuPerOrderPurchaseLimitSchema,
+  lifetime: AccountPurchaseLimitSchema,
+  rolling24Hours: AccountPurchaseLimitSchema,
+}, { additionalProperties: false })
+
+export const UpdateProductPurchaseLimitsBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  purchaseLimits: PurchaseLimitSettingsSchema,
+}, { additionalProperties: false })
+
+export const UpdateSkuPurchaseLimitsBodySchema = Type.Object({
+  expectedProductRevision: Type.Integer({ minimum: 1 }),
+  expectedSkuRevision: Type.Integer({ minimum: 1 }),
+  purchaseLimits: SkuPurchaseLimitSettingsSchema,
+}, { additionalProperties: false })
+
+export const PurchaseLimitStatusSchema = Type.Object({
+  perOrderLimit: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+  lifetimeLimit: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+  rolling24HourLimit: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+  lifetimePurchased: Type.Union([Type.Integer({ minimum: 0, maximum: 2_147_483_647 }), Type.Null()]),
+  rolling24HoursPurchased: Type.Union([Type.Integer({ minimum: 0, maximum: 2_147_483_647 }), Type.Null()]),
+  maxAvailable: Type.Union([Type.Integer({ minimum: 0, maximum: 2_147_483_647 }), Type.Null()]),
+  exceeded: Type.Boolean(),
+}, { additionalProperties: false })
+
+export const CheckoutPurchaseLimitsSchema = Type.Object({
+  product: PurchaseLimitStatusSchema,
+  sku: PurchaseLimitStatusSchema,
+  requiresLogin: Type.Boolean(),
+}, { additionalProperties: false })
+
 export const ProductVariantSchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
   productId: Type.String({ format: 'uuid' }),
@@ -483,6 +534,7 @@ export const ProductVariantSchema = Type.Object({
   currency: Type.Literal('CNY'),
   enabled: Type.Boolean(),
   retiredAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  purchaseLimits: SkuPurchaseLimitSettingsSchema,
   isDefault: Type.Boolean(),
   options: Type.Array(Type.Object({
     groupId: Type.String({ format: 'uuid' }),
@@ -662,6 +714,7 @@ export const ProductDetailSchema = Type.Object({
   description: Type.String({ maxLength: 20_000 }),
   productType: ProductTypeSchema,
   status: ProductStatusSchema,
+  purchaseLimits: PurchaseLimitSettingsSchema,
   revision: Type.Integer({ minimum: 1 }),
   createdAt: Type.String({ format: 'date-time' }),
   updatedAt: Type.String({ format: 'date-time' }),
@@ -831,6 +884,7 @@ export const PublicProductVariantSchema = Type.Object({
   }, { additionalProperties: false }), { maxItems: 5 }),
   salePrice: ProductSalePriceSchema,
   compareAtPrice: Type.Union([ProductSalePriceSchema, Type.Null()]),
+  purchaseLimits: SkuPurchaseLimitSettingsSchema,
   inventory: PublicInventorySummarySchema,
 }, { additionalProperties: false })
 
@@ -875,6 +929,8 @@ export const CheckoutQuoteReasonSchema = Type.Union([
   Type.Literal('fulfillment_not_ready'),
   Type.Literal('guest_checkout_disabled'),
   Type.Literal('guest_free_claim_disabled'),
+  Type.Literal('purchase_limit_exceeded'),
+  Type.Literal('login_required_for_purchase_limit'),
 ])
 
 export const CheckoutQuoteItemSchema = Type.Object({
@@ -891,6 +947,7 @@ export const CheckoutQuoteItemSchema = Type.Object({
   inventoryMode: Type.Union([NullableProductInventoryModeSchema, Type.Null()]),
   availableQuantity: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
   identityValid: Type.Boolean(),
+  purchaseLimits: CheckoutPurchaseLimitsSchema,
   canPurchase: Type.Boolean(),
   reason: Type.Union([CheckoutQuoteReasonSchema, Type.Null()]),
 }, { additionalProperties: false })
@@ -1136,6 +1193,7 @@ export const PublicProductDetailSchema = Type.Object({
   name: Type.String({ minLength: 1, maxLength: 200 }),
   description: Type.String({ maxLength: 20_000 }),
   productType: ProductTypeSchema,
+  purchaseLimits: PurchaseLimitSettingsSchema,
   priceRange: Type.Union([PublicProductPriceRangeSchema, Type.Null()]),
   selectionStatus: Type.Union([Type.Literal('available'), Type.Literal('none')]),
   gallery: Type.Array(PublicProductImageSchema, { maxItems: 20 }),
@@ -1467,6 +1525,12 @@ export type CreateProductBody = Static<typeof CreateProductBodySchema>
 export type ProductIdParams = Static<typeof ProductIdParamsSchema>
 export type ProductVariantIdParams = Static<typeof ProductVariantIdParamsSchema>
 export type ProductVariant = Static<typeof ProductVariantSchema>
+export type PurchaseLimitSettings = Static<typeof PurchaseLimitSettingsSchema>
+export type SkuPurchaseLimitSettings = Static<typeof SkuPurchaseLimitSettingsSchema>
+export type UpdateProductPurchaseLimitsBody = Static<typeof UpdateProductPurchaseLimitsBodySchema>
+export type UpdateSkuPurchaseLimitsBody = Static<typeof UpdateSkuPurchaseLimitsBodySchema>
+export type PurchaseLimitStatus = Static<typeof PurchaseLimitStatusSchema>
+export type CheckoutPurchaseLimits = Static<typeof CheckoutPurchaseLimitsSchema>
 export type ProductOptionValue = Static<typeof ProductOptionValueSchema>
 export type ProductOptionGroup = Static<typeof ProductOptionGroupSchema>
 export type ProductCategoryAssignment = Static<typeof ProductCategoryAssignmentSchema>

@@ -66,6 +66,9 @@ type PublicVariantRow = {
   id: string
   sale_price: string
   compare_at_price: string | null
+  purchase_limit_per_order: number | null
+  purchase_limit_lifetime: number | null
+  purchase_limit_24h: number | null
   inventory_mode: ProductInventoryMode | null
   available_quantity: number | null
 }
@@ -359,6 +362,9 @@ async function loadPublicVariants(db: KyselyDatabase<Database>, productId: strin
       variant.id,
       variant.sale_price::text AS sale_price,
       variant.compare_at_price::text AS compare_at_price,
+      variant.purchase_limit_per_order,
+      variant.purchase_limit_lifetime,
+      variant.purchase_limit_24h,
       variant.inventory_mode,
       CASE WHEN variant.inventory_mode = 'quantity'
         THEN COALESCE(inventory.stocked - inventory.reserved, 0)::integer
@@ -403,6 +409,11 @@ async function loadPublicVariants(db: KyselyDatabase<Database>, productId: strin
     options: optionsByVariant.get(row.id) ?? [],
     salePrice: formatSalePrice(row.sale_price),
     compareAtPrice: row.compare_at_price === null ? null : formatSalePrice(row.compare_at_price),
+    purchaseLimits: {
+      perOrder: row.purchase_limit_per_order,
+      lifetime: row.purchase_limit_lifetime,
+      rolling24Hours: row.purchase_limit_24h,
+    },
     inventory: inventorySummary(row.inventory_mode, row.available_quantity),
   }))
 }
@@ -495,7 +506,10 @@ async function loadPublicProductDetail(
 ): Promise<PublicProductDetail | undefined> {
   return db.transaction().setIsolationLevel('repeatable read').execute(async (trx) => {
     const product = await trx.selectFrom('products')
-      .select(['id', 'name', 'description', 'product_type', 'rich_content', 'updated_at'])
+      .select([
+        'id', 'name', 'description', 'product_type', 'rich_content', 'updated_at',
+        'purchase_limit_per_order', 'purchase_limit_lifetime', 'purchase_limit_24h',
+      ])
       .where('id', '=', productId)
       .where('status', '=', 'active')
       .executeTakeFirst()
@@ -541,6 +555,11 @@ async function loadPublicProductDetail(
       name: product.name,
       description: product.description,
       productType: product.product_type,
+      purchaseLimits: {
+        perOrder: product.purchase_limit_per_order,
+        lifetime: product.purchase_limit_lifetime,
+        rolling24Hours: product.purchase_limit_24h,
+      },
       priceRange: publicPriceRange(variants),
       selectionStatus: variants.length > 0 ? 'available' : 'none',
       gallery: gallery.map((image) => ({

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { sql, type Kysely } from 'kysely'
+import { sql, type Kysely, type Transaction } from 'kysely'
 import { Migrator } from 'kysely/migration'
 import type { FastifyInstance, InjectOptions } from 'fastify'
 import { createApp } from '../src/app.js'
@@ -21,7 +21,7 @@ let app: FastifyInstance
 let db: Kysely<Database>
 let nextIp = 1
 
-type Customer = { id: string; cookie: string; csrfToken: string; csrfCookie: string }
+type Customer = { id: string; username: string; cookie: string; csrfToken: string; csrfCookie: string }
 type Admin = { id: string; cookie: string; csrfToken: string; csrfCookie: string }
 type Catalog = { productId: string; skuId: string; name: string; price: string; mode: ProductInventoryMode }
 
@@ -53,14 +53,33 @@ async function customerCsrf() {
 
 async function createCustomer(): Promise<Customer> {
   const csrf = await customerCsrf()
+  const username = `order-${randomUUID().replaceAll('-', '').slice(0, 20)}`
   const response = await inject({
     method: 'POST', url: '/api/v1/customer/auth/register',
     headers: { origin: testOrigin, cookie: csrf.cookie, 'x-csrf-token': csrf.token },
-    payload: { username: `order-${randomUUID().replaceAll('-', '').slice(0, 20)}`, password },
+    payload: { username, password },
   })
   expect(response.statusCode).toBe(201)
   return {
     id: response.json().data.customer.id as string,
+    username,
+    cookie: cookieFrom(response, 'aikayun_customer_session'),
+    csrfToken: csrf.token,
+    csrfCookie: csrf.cookie,
+  }
+}
+
+async function loginCustomerSession(customer: Customer): Promise<Customer> {
+  const csrf = await customerCsrf()
+  const response = await inject({
+    method: 'POST', url: '/api/v1/customer/auth/login',
+    headers: { origin: testOrigin, cookie: csrf.cookie, 'x-csrf-token': csrf.token },
+    payload: { username: customer.username, password },
+  })
+  expect(response.statusCode).toBe(200)
+  return {
+    id: customer.id,
+    username: customer.username,
     cookie: cookieFrom(response, 'aikayun_customer_session'),
     csrfToken: csrf.token,
     csrfCookie: csrf.cookie,
@@ -141,6 +160,153 @@ async function createCatalog(options: {
     }).execute()
   })
   return { productId, skuId, name, price, mode }
+}
+
+async function addSiblingSku(catalog: Catalog): Promise<string> {
+  const groupId = randomUUID()
+  const firstValueId = randomUUID()
+  const secondValueId = randomUUID()
+  const skuId = randomUUID()
+  await db.transaction().execute(async (trx) => {
+    await trx.insertInto('product_option_groups').values({
+      id: groupId, product_id: catalog.productId, name: '颜色', sort_order: 0, enabled: true,
+    }).execute()
+    await trx.insertInto('product_option_values').values([
+      { id: firstValueId, product_id: catalog.productId, option_group_id: groupId, name: '黑色', sort_order: 0, enabled: true },
+      { id: secondValueId, product_id: catalog.productId, option_group_id: groupId, name: '白色', sort_order: 1, enabled: true },
+    ]).execute()
+    await trx.insertInto('product_variant_option_values').values({
+      product_id: catalog.productId, product_variant_id: catalog.skuId,
+      option_group_id: groupId, option_value_id: firstValueId,
+    }).execute()
+    await trx.updateTable('product_variants').set({ combination_key: `v1:${firstValueId}` })
+      .where('id', '=', catalog.skuId).execute()
+    await trx.insertInto('product_variants').values({
+      id: skuId, product_id: catalog.productId, sku_code: `ORD-${skuId.slice(0, 8)}`,
+      combination_key: `v1:${secondValueId}`, sale_price: catalog.price, enabled: true,
+      retired_at: null, inventory_mode: catalog.mode,
+    }).execute()
+    await trx.insertInto('product_variant_option_values').values({
+      product_id: catalog.productId, product_variant_id: skuId,
+      option_group_id: groupId, option_value_id: secondValueId,
+    }).execute()
+    if (catalog.mode === 'quantity') {
+      await trx.insertInto('product_variant_quantity_inventory').values({
+        product_id: catalog.productId, product_variant_id: skuId, stocked: 5, reserved: 0,
+      }).execute()
+    }
+    await trx.insertInto('product_variant_fulfillment').values({
+      product_variant_id: skuId, method: 'manual', manual_delivery_ready: true,
+    }).execute()
+  })
+  return skuId
+}
+
+async function setProductPurchaseLimits(productId: string, values: {
+  perOrder?: number | null
+  lifetime?: number | null
+  rolling24Hours?: number | null
+}) {
+  await db.updateTable('products').set({
+    ...(values.perOrder !== undefined ? { purchase_limit_per_order: values.perOrder } : {}),
+    ...(values.lifetime !== undefined ? { purchase_limit_lifetime: values.lifetime } : {}),
+    ...(values.rolling24Hours !== undefined ? { purchase_limit_24h: values.rolling24Hours } : {}),
+  }).where('id', '=', productId).execute()
+}
+
+async function setSkuPurchaseLimits(skuId: string, values: {
+  perOrder?: number | null
+  lifetime?: number | null
+  rolling24Hours?: number | null
+}) {
+  await db.updateTable('product_variants').set({
+    ...(values.perOrder !== undefined ? { purchase_limit_per_order: values.perOrder } : {}),
+    ...(values.lifetime !== undefined ? { purchase_limit_lifetime: values.lifetime } : {}),
+    ...(values.rolling24Hours !== undefined ? { purchase_limit_24h: values.rolling24Hours } : {}),
+  }).where('id', '=', skuId).execute()
+}
+
+async function setOrderCreatedAt(orderId: string, createdAt: Date) {
+  await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
+  try {
+    await db.updateTable('orders').set({ created_at: createdAt }).where('id', '=', orderId).execute()
+  } finally {
+    await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+  }
+}
+
+async function settleAndRefundExternally(orderId: string, amount: string): Promise<void> {
+  const attemptId = randomUUID()
+  const receiptId = randomUUID()
+  const refundId = randomUUID()
+  const allocationId = randomUUID()
+  await db.insertInto('payment_attempts').values({
+    id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+    topup_customer_id: null, source: 'external', amount, status: 'created', provider: 'integration',
+    provider_payment_id: `purchase-limit-${attemptId}`, wallet_operation_id: null, wallet_hold_operation_id: null,
+    requested_wallet_amount: null, expires_at: new Date(Date.now() + 60 * 60_000), completed_at: null,
+  }).execute()
+  await db.insertInto('payment_receipts').values({
+    id: receiptId, payment_attempt_id: attemptId, source_bucket: 'external', provider: 'integration',
+    provider_transaction_id: `purchase-limit-receipt-${receiptId}`, wallet_operation_id: null,
+    wallet_line_no: null, amount,
+  }).execute()
+  await db.insertInto('order_refunds').values({
+    id: refundId, order_id: orderId, idempotency_key: randomUUID(), request_sha256: digest, amount,
+  }).execute()
+  await db.updateTable('order_refunds').set({ status: 'approved' }).where('id', '=', refundId).execute()
+  await db.insertInto('order_refund_allocations').values({
+    id: allocationId, refund_id: refundId, source_payment_receipt_id: receiptId,
+    operation_id: randomUUID(), request_sha256: digest, destination: 'original_source', amount,
+  }).execute()
+  await db.updateTable('order_refunds').set({ status: 'processing' }).where('id', '=', refundId).execute()
+  await db.updateTable('order_refund_allocations').set({
+    status: 'succeeded', provider: 'integration', provider_refund_id: `refund-${allocationId}`,
+  }).where('id', '=', allocationId).execute()
+  await db.updateTable('order_refunds').set({ status: 'succeeded' }).where('id', '=', refundId).execute()
+}
+
+async function insertDirectPurchaseOrder(
+  trx: Transaction<Database>,
+  customerId: string,
+  catalog: Catalog,
+  orderId: string,
+) {
+  await trx.insertInto('orders').values({
+    id: orderId, customer_id: customerId, guest_order_session_id: null,
+    idempotency_key: randomUUID(), request_sha256: digest, total_amount: catalog.price,
+    unpaid_expires_at: new Date(Date.now() + 60 * 60_000),
+    history_hidden_at: null, history_hidden_by_admin_id: null, history_hidden_reason: null,
+  }).execute()
+  await sql`
+    INSERT INTO order_items (
+      id, order_id, product_id, product_variant_id, product_name_snapshot, product_type_snapshot,
+      sku_code_snapshot, sku_snapshot, inventory_mode_snapshot, fulfillment_method_snapshot,
+      unit_price, quantity, line_amount
+    )
+    SELECT gen_random_uuid(), ${orderId}::uuid, product.id, variant.id, product.name,
+      product.product_type, variant.sku_code,
+      COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'groupId', option_group.id, 'groupName', option_group.name,
+          'valueId', option_value.id, 'valueName', option_value.name
+        ) ORDER BY option_group.sort_order, option_value.sort_order, option_group.id, option_value.id)
+        FROM product_variant_option_values AS selected
+        JOIN product_option_groups AS option_group
+          ON option_group.product_id = selected.product_id AND option_group.id = selected.option_group_id
+        JOIN product_option_values AS option_value
+          ON option_value.product_id = selected.product_id
+          AND option_value.option_group_id = selected.option_group_id
+          AND option_value.id = selected.option_value_id
+        WHERE selected.product_id = variant.product_id AND selected.product_variant_id = variant.id
+      ), '[]'::jsonb), variant.inventory_mode, fulfillment.method,
+      variant.sale_price, 1, variant.sale_price
+    FROM products AS product
+    JOIN product_variants AS variant ON variant.product_id = product.id
+    JOIN product_variant_fulfillment AS fulfillment ON fulfillment.product_variant_id = variant.id
+    WHERE product.id = ${catalog.productId}::uuid AND variant.id = ${catalog.skuId}::uuid
+  `.execute(trx)
+  await trx.updateTable('orders').set({ items_sealed: true }).where('id', '=', orderId).execute()
 }
 
 async function enableManual(catalog: Catalog, admin: Admin): Promise<void> {
@@ -340,6 +506,22 @@ async function waitForPostgresLockWait(applicationName: string): Promise<{
     await new Promise(resolve => setTimeout(resolve, 10))
   }
   throw new Error(`PostgreSQL session ${applicationName} did not enter an observable lock wait`)
+}
+
+async function waitForLockWaitCount(applicationName: string, expectedCount: number, queryFragment: string): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const activity = await sql<{ waiting: number }>`
+      SELECT count(*)::integer AS waiting
+      FROM pg_stat_activity
+      WHERE application_name = ${applicationName}
+        AND wait_event_type = 'Lock'
+        AND query ILIKE ${`%${queryFragment}%`}
+    `.execute(db)
+    if ((activity.rows[0]?.waiting ?? 0) >= expectedCount) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Expected ${expectedCount} PostgreSQL lock waits for ${queryFragment}`)
 }
 
 async function waitForQueryBlockedBy(queryFragment: string, blockerPid: number): Promise<void> {
@@ -1615,5 +1797,564 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     } finally {
       await stopWorker()
     }
+  })
+})
+
+describe('purchase limit acceptance on PostgreSQL', () => {
+  it('keeps unlimited checkout working, applies per-order limits to guests, and requires an account for account limits', async () => {
+    const admin = await createAdmin()
+    const catalog = await createCatalog({ price: '1.00', mode: 'quantity', stock: 5 })
+    await enableManual(catalog, admin)
+    await db.updateTable('storefront_customer_policy').set({
+      guest_checkout_enabled: true, guest_free_claim_enabled: true,
+    }).where('singleton', '=', true).execute()
+    const guest = await newGuestSession()
+
+    const unlimited = await quote([{ skuId: catalog.skuId, quantity: 2 }], undefined, guest.cookie)
+    expect(unlimited.json().data.canContinue).toBe(true)
+    expect(unlimited.json().data.items[0].purchaseLimits.requiresLogin).toBe(false)
+
+    await setSkuPurchaseLimits(catalog.skuId, { perOrder: 2 })
+    const withinLimit = await quote([{ skuId: catalog.skuId, quantity: 2 }], undefined, guest.cookie)
+    expect(withinLimit.json().data.canContinue).toBe(true)
+    const guestOrder = await createOrder(
+      [{ skuId: catalog.skuId, quantity: 2 }], withinLimit.json().data.quoteToken, guest,
+    )
+    expect(guestOrder.statusCode).toBe(201)
+    const overLimit = await quote([{ skuId: catalog.skuId, quantity: 3 }], undefined, guest.cookie)
+    expect(overLimit.json().data.items[0].reason).toBe('purchase_limit_exceeded')
+    expect(overLimit.json().data.items[0].purchaseLimits.sku.maxAvailable).toBe(2)
+
+    await setSkuPurchaseLimits(catalog.skuId, { lifetime: 5 })
+    const accountOnly = await quote([{ skuId: catalog.skuId, quantity: 1 }], undefined, guest.cookie)
+    expect(accountOnly.json().data.items[0].reason).toBe('login_required_for_purchase_limit')
+    expect(accountOnly.json().data.items[0].purchaseLimits.sku.lifetimePurchased).toBeNull()
+    expect(accountOnly.json().data.canContinue).toBe(false)
+  })
+
+  it('combines product and SKU per-order rules across all selected SKUs', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
+    await enableManual(catalog, admin)
+    const secondSkuId = await addSiblingSku(catalog)
+    await setProductPurchaseLimits(catalog.productId, { perOrder: 3 })
+    await setSkuPurchaseLimits(catalog.skuId, { perOrder: 1 })
+
+    const bothRules = await quote([
+      { skuId: catalog.skuId, quantity: 2 },
+      { skuId: secondSkuId, quantity: 2 },
+    ], customer)
+    expect(bothRules.json().data.canContinue).toBe(false)
+    expect(bothRules.json().data.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ skuId: catalog.skuId, purchaseLimits: expect.objectContaining({ product: expect.objectContaining({ exceeded: true }), sku: expect.objectContaining({ exceeded: true }) }) }),
+      expect.objectContaining({ skuId: secondSkuId, purchaseLimits: expect.objectContaining({ product: expect.objectContaining({ exceeded: true }), sku: expect.objectContaining({ exceeded: false }) }) }),
+    ]))
+
+    await setProductPurchaseLimits(catalog.productId, { perOrder: null })
+    const skuOnly = await quote([{ skuId: catalog.skuId, quantity: 2 }], customer)
+    expect(skuOnly.json().data.items[0].purchaseLimits.product.exceeded).toBe(false)
+    expect(skuOnly.json().data.items[0].purchaseLimits.sku.exceeded).toBe(true)
+  })
+
+  it('counts pending cross-SKU orders toward product and SKU lifetime caps', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
+    await enableManual(catalog, admin)
+    const secondSkuId = await addSiblingSku(catalog)
+    await setProductPurchaseLimits(catalog.productId, { lifetime: 5 })
+    await setSkuPurchaseLimits(catalog.skuId, { lifetime: 2 })
+
+    const firstItems = [{ skuId: catalog.skuId, quantity: 2 }]
+    const firstQuote = await quote(firstItems, customer)
+    expect(firstQuote.json().data.canContinue).toBe(true)
+    expect((await createOrder(firstItems, firstQuote.json().data.quoteToken, customer)).statusCode).toBe(201)
+
+    const otherSkuItems = [{ skuId: secondSkuId, quantity: 3 }]
+    const otherSkuQuote = await quote(otherSkuItems, customer)
+    expect(otherSkuQuote.json().data.canContinue).toBe(true)
+    expect(otherSkuQuote.json().data.items[0].purchaseLimits.product.lifetimePurchased).toBe(2)
+    expect((await createOrder(otherSkuItems, otherSkuQuote.json().data.quoteToken, customer)).statusCode).toBe(201)
+
+    const productExhausted = await quote([{ skuId: secondSkuId, quantity: 1 }], customer)
+    expect(productExhausted.json().data.items[0].reason).toBe('purchase_limit_exceeded')
+    expect(productExhausted.json().data.items[0].purchaseLimits.product.lifetimePurchased).toBe(5)
+    const skuExhausted = await quote([{ skuId: catalog.skuId, quantity: 1 }], customer)
+    expect(skuExhausted.json().data.items[0].purchaseLimits.sku.lifetimePurchased).toBe(2)
+    expect(skuExhausted.json().data.items[0].purchaseLimits.sku.maxAvailable).toBe(0)
+  })
+
+  it('releases an unpaid closed order, but idempotent replay does not reserve a second quota', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.00', mode: 'quantity', stock: 3 })
+    await enableManual(catalog, admin)
+    await setProductPurchaseLimits(catalog.productId, { lifetime: 1 })
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const current = await quote(items, customer)
+    const idempotencyKey = randomUUID()
+    const created = await createOrder(items, current.json().data.quoteToken, customer, idempotencyKey)
+    expect(created.statusCode).toBe(201)
+    const orderId = created.json().data.order.id as string
+    const replay = await createOrder(items, current.json().data.quoteToken, customer, idempotencyKey)
+    expect(replay.statusCode).toBe(200)
+    expect(replay.json().data).toMatchObject({ created: false, order: { id: orderId } })
+    expect(await db.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()).toHaveLength(1)
+    expect((await quote(items, customer)).json().data.items[0].purchaseLimits.product.maxAvailable).toBe(0)
+
+    const cancelled = await inject({
+      method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
+    })
+    expect(cancelled.statusCode).toBe(200)
+    expect(cancelled.json().data.status).toBe('closed')
+    const afterClose = await quote(items, customer)
+    expect(afterClose.json().data.canContinue).toBe(true)
+    expect(afterClose.json().data.items[0].purchaseLimits.product.lifetimePurchased).toBe(0)
+  })
+
+  it('keeps paid and refunded history counted after a fully refunded order closes', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.25', mode: 'unlimited' })
+    await enableManual(catalog, admin)
+    await setSkuPurchaseLimits(catalog.skuId, { lifetime: 1 })
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const current = await quote(items, customer)
+    const created = await createOrder(items, current.json().data.quoteToken, customer)
+    expect(created.statusCode).toBe(201)
+    const orderId = created.json().data.order.id as string
+    await settleAndRefundExternally(orderId, '1.25')
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('processing')
+    await db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute()
+    expect((await sql<{ counts: boolean }>`SELECT order_counts_as_purchase(${orderId}::uuid) AS counts`.execute(db)).rows[0]?.counts)
+      .toBe(true)
+
+    const afterRefund = await quote(items, customer)
+    expect(afterRefund.json().data.items[0].purchaseLimits.sku.lifetimePurchased).toBe(1)
+    expect(afterRefund.json().data.items[0].purchaseLimits.sku.maxAvailable).toBe(0)
+    expect(afterRefund.json().data.canContinue).toBe(false)
+  })
+
+  it('uses database order time and a strict rolling 24-hour boundary', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
+    await enableManual(catalog, admin)
+    await setSkuPurchaseLimits(catalog.skuId, { rolling24Hours: 1 })
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const current = await quote(items, customer)
+    const created = await createOrder(items, current.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const generatedTime = (await db.selectFrom('orders').select('created_at').where('id', '=', orderId).executeTakeFirstOrThrow()).created_at
+    expect(Math.abs(generatedTime.getTime() - Date.now())).toBeLessThan(5_000)
+
+    const exactBoundary = await sql<{ quantity: string }>`
+      SELECT prior_purchase_quantity(${customer.id}::uuid, ${catalog.productId}::uuid,
+        ${catalog.skuId}::uuid, created_at, NULL)::text AS quantity
+      FROM orders WHERE id = ${orderId}::uuid
+    `.execute(db)
+    expect(exactBoundary.rows[0]?.quantity).toBe('0')
+
+    await setOrderCreatedAt(orderId, new Date(Date.now() - 24 * 60 * 60_000 - 2_000))
+    const outsideWindow = await quote(items, customer)
+    expect(outsideWindow.json().data.canContinue).toBe(true)
+    expect(outsideWindow.json().data.items[0].purchaseLimits.sku.rolling24HoursPurchased).toBe(0)
+
+    await setOrderCreatedAt(orderId, new Date(Date.now() - 24 * 60 * 60_000 + 2_000))
+    const insideWindow = await quote(items, customer)
+    expect(insideWindow.json().data.canContinue).toBe(false)
+    expect(insideWindow.json().data.items[0].purchaseLimits.sku.rolling24HoursPurchased).toBe(1)
+  })
+
+  it('counts zero-value processing orders toward the same purchase limits', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '0.00', mode: 'unlimited' })
+    await enableManual(catalog, admin)
+    await setProductPurchaseLimits(catalog.productId, { lifetime: 1 })
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const current = await quote(items, customer)
+    const created = await createOrder(items, current.json().data.quoteToken, customer)
+    expect(created.statusCode).toBe(201)
+    expect(created.json().data.order.status).toBe('processing')
+    const afterFreeClaim = await quote(items, customer)
+    expect(afterFreeClaim.json().data.items[0].purchaseLimits.product.lifetimePurchased).toBe(1)
+    expect(afterFreeClaim.json().data.canContinue).toBe(false)
+  })
+
+  it('returns a fresh limit quote when two customer sessions race to use one account quota', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const secondDevice = await loginCustomerSession(customer)
+    const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
+    await enableManual(catalog, admin)
+    await setSkuPurchaseLimits(catalog.skuId, { lifetime: 1 })
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const current = await quote(items, customer)
+
+    let releaseOwner!: () => void
+    let signalLocked!: () => void
+    const gate = new Promise<void>((resolve) => { releaseOwner = resolve })
+    const ownerLocked = new Promise<void>((resolve) => { signalLocked = resolve })
+    const blocker = db.transaction().execute(async (trx) => {
+      await sql`SELECT id FROM customers WHERE id = ${customer.id}::uuid FOR UPDATE`.execute(trx)
+      signalLocked()
+      await gate
+    })
+    await ownerLocked
+    const first = createOrder(items, current.json().data.quoteToken, customer)
+    const second = createOrder(items, current.json().data.quoteToken, secondDevice)
+    try {
+      await waitForLockWaitCount('aikayun-api', 2, 'customers')
+    } finally {
+      releaseOwner()
+    }
+    await blocker
+    const results = await Promise.all([first, second])
+    expect(results.map(result => result.statusCode).sort()).toEqual([201, 409])
+    expect(results.find(result => result.statusCode === 409)?.json().error.code).toBe('CHECKOUT_QUOTE_CHANGED')
+    expect(await db.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()).toHaveLength(1)
+    const latest = await quote(items, customer)
+    expect(latest.json().data.items[0].purchaseLimits.sku.lifetimePurchased).toBe(1)
+    expect(latest.json().data.items[0].purchaseLimits.sku.maxAvailable).toBe(0)
+  })
+
+  it('serializes same-product different-SKU orders against the shared product quota', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const secondDevice = await loginCustomerSession(customer)
+    const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
+    await enableManual(catalog, admin)
+    const otherSkuId = await addSiblingSku(catalog)
+    await setProductPurchaseLimits(catalog.productId, { lifetime: 1 })
+    const firstItems = [{ skuId: catalog.skuId, quantity: 1 }]
+    const secondItems = [{ skuId: otherSkuId, quantity: 1 }]
+    const [firstQuote, secondQuote] = await Promise.all([quote(firstItems, customer), quote(secondItems, secondDevice)])
+    expect(firstQuote.json().data.canContinue).toBe(true)
+    expect(secondQuote.json().data.canContinue).toBe(true)
+
+    let releaseOwner!: () => void
+    let signalLocked!: () => void
+    const gate = new Promise<void>(resolve => { releaseOwner = resolve })
+    const ownerLocked = new Promise<void>(resolve => { signalLocked = resolve })
+    const blocker = db.transaction().execute(async trx => {
+      await sql`SELECT id FROM customers WHERE id = ${customer.id}::uuid FOR UPDATE`.execute(trx)
+      signalLocked()
+      await gate
+    })
+    await ownerLocked
+    const first = createOrder(firstItems, firstQuote.json().data.quoteToken, customer)
+    const second = createOrder(secondItems, secondQuote.json().data.quoteToken, secondDevice)
+    try {
+      await waitForLockWaitCount('aikayun-api', 2, 'customers')
+    } finally {
+      releaseOwner()
+    }
+    await blocker
+    const results = await Promise.all([first, second])
+    expect(results.map(result => result.statusCode).sort()).toEqual([201, 409])
+    expect(await db.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()).toHaveLength(1)
+    const remaining = await quote([{ skuId: catalog.skuId, quantity: 1 }], customer)
+    expect(remaining.json().data.items[0].purchaseLimits.product).toMatchObject({ lifetimePurchased: 1, maxAvailable: 0 })
+  })
+
+  it('checks a multi-SKU order atomically against a concurrent single-SKU order', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const secondDevice = await loginCustomerSession(customer)
+    const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
+    await enableManual(catalog, admin)
+    const otherSkuId = await addSiblingSku(catalog)
+    await setProductPurchaseLimits(catalog.productId, { lifetime: 2 })
+    const combinedItems = [{ skuId: catalog.skuId, quantity: 1 }, { skuId: otherSkuId, quantity: 1 }]
+    const singleItems = [{ skuId: catalog.skuId, quantity: 1 }]
+    const [combinedQuote, singleQuote] = await Promise.all([quote(combinedItems, customer), quote(singleItems, secondDevice)])
+    expect(combinedQuote.json().data.canContinue).toBe(true)
+    expect(singleQuote.json().data.canContinue).toBe(true)
+
+    let releaseOwner!: () => void
+    let signalLocked!: () => void
+    const gate = new Promise<void>(resolve => { releaseOwner = resolve })
+    const ownerLocked = new Promise<void>(resolve => { signalLocked = resolve })
+    const blocker = db.transaction().execute(async trx => {
+      await sql`SELECT id FROM customers WHERE id = ${customer.id}::uuid FOR UPDATE`.execute(trx)
+      signalLocked()
+      await gate
+    })
+    await ownerLocked
+    const combined = createOrder(combinedItems, combinedQuote.json().data.quoteToken, customer)
+    const single = createOrder(singleItems, singleQuote.json().data.quoteToken, secondDevice)
+    try {
+      await waitForLockWaitCount('aikayun-api', 2, 'customers')
+    } finally {
+      releaseOwner()
+    }
+    await blocker
+    const results = await Promise.all([combined, single])
+    expect(results.map(result => result.statusCode).sort()).toEqual([201, 409])
+    const orders = await db.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()
+    expect(orders).toHaveLength(1)
+    const createdOrder = results.find(result => result.statusCode === 201)!.json().data.order
+    const expectedQuantity = createdOrder.items.reduce((total: number, item: { quantity: number }) => total + item.quantity, 0)
+    const purchased = await sql<{ quantity: string }>`
+      SELECT prior_purchase_quantity(${customer.id}::uuid, ${catalog.productId}::uuid, NULL, NULL, NULL)::text AS quantity
+    `.execute(db)
+    expect(purchased.rows[0]?.quantity).toBe(String(expectedQuantity))
+    expect([1, 2]).toContain(expectedQuantity)
+  })
+
+  it('rechecks stock and limit together and rolls back an ineligible order without a reservation', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.00', mode: 'quantity', stock: 1 })
+    await enableManual(catalog, admin)
+    await setSkuPurchaseLimits(catalog.skuId, { lifetime: 1 })
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const firstQuote = await quote(items, customer)
+    const created = await createOrder(items, firstQuote.json().data.quoteToken, customer)
+    expect(created.statusCode).toBe(201)
+
+    const blockedQuote = await quote(items, customer)
+    expect(blockedQuote.json().data.items[0]).toMatchObject({
+      canPurchase: false,
+      reason: 'insufficient_inventory',
+      availableQuantity: 0,
+      purchaseLimits: { sku: { exceeded: true, maxAvailable: 0 } },
+    })
+    const denied = await createOrder(items, blockedQuote.json().data.quoteToken, customer)
+    expect(denied.statusCode).toBe(409)
+    expect(denied.json().error.code).toBe('PURCHASE_LIMIT_EXCEEDED')
+    expect(await db.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()).toHaveLength(1)
+    expect(await db.selectFrom('order_inventory_reservations').select('id').where('product_variant_id', '=', catalog.skuId).execute()).toHaveLength(1)
+    expect((await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow())).toEqual({ stocked: 1, reserved: 1 })
+  })
+
+  it('rejects an old quote when a concurrent configuration edit commits before catalog locks', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 2 }]
+    const current = await quote(items, customer)
+    expect(current.json().data.canContinue).toBe(true)
+
+    let releaseEdit!: () => void
+    let signalEditLocked!: () => void
+    const gate = new Promise<void>(resolve => { releaseEdit = resolve })
+    const editLocked = new Promise<void>(resolve => { signalEditLocked = resolve })
+    const editor = db.transaction().execute(async trx => {
+      await sql`SELECT id FROM products WHERE id = ${catalog.productId}::uuid FOR UPDATE`.execute(trx)
+      await trx.updateTable('product_variants').set({ purchase_limit_lifetime: 1 })
+        .where('id', '=', catalog.skuId).execute()
+      signalEditLocked()
+      await gate
+    })
+    await editLocked
+    const pending = createOrder(items, current.json().data.quoteToken, customer)
+    try {
+      await waitForLockWaitCount('aikayun-api', 1, 'products')
+    } finally {
+      releaseEdit()
+    }
+    await editor
+    const rejected = await pending
+    expect(rejected.statusCode).toBe(409)
+    expect(rejected.json().error).toMatchObject({
+      code: 'CHECKOUT_QUOTE_CHANGED',
+      currentQuote: { items: [{ purchaseLimits: { sku: { exceeded: true, maxAvailable: 1 } } }] },
+    })
+    expect(await db.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()).toHaveLength(0)
+  })
+
+  it('enforces quota in PostgreSQL for direct writers and deterministically serializes concurrent inserts', async () => {
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
+    await setSkuPurchaseLimits(catalog.skuId, { lifetime: 1 })
+    await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true })
+      .where('product_variant_id', '=', catalog.skuId).execute()
+    const firstOrderId = randomUUID()
+    const secondOrderId = randomUUID()
+    const firstApplication = `limit-direct-first-${randomUUID()}`
+    const secondApplication = `limit-direct-second-${randomUUID()}`
+    let releaseFirst!: () => void
+    let signalFirstInserted!: () => void
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve })
+    const firstInserted = new Promise<void>((resolve) => { signalFirstInserted = resolve })
+    const first = db.transaction().execute(async (trx) => {
+      await sql`SELECT set_config('application_name', ${firstApplication}, true)`.execute(trx)
+      await insertDirectPurchaseOrder(trx, customer.id, catalog, firstOrderId)
+      signalFirstInserted()
+      await gate
+    })
+    await Promise.race([firstInserted, first.then(() => { throw new Error('First direct order ended before reaching its lock gate') })])
+    const second = db.transaction().execute(async (trx) => {
+      await sql`SELECT set_config('application_name', ${secondApplication}, true)`.execute(trx)
+      await insertDirectPurchaseOrder(trx, customer.id, catalog, secondOrderId)
+    })
+    try {
+      const waiting = await waitForPostgresLockWait(secondApplication)
+      expect(waiting.blockerPids.length).toBeGreaterThan(0)
+    } finally {
+      releaseFirst()
+    }
+    await first
+    await expect(second).rejects.toMatchObject({ constraint: 'order_purchase_limit_exceeded' })
+    expect(await db.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()).toHaveLength(1)
+    expect(await db.selectFrom('orders').select('id').where('id', '=', secondOrderId).execute()).toHaveLength(0)
+  })
+
+  it('aborts a stale repeatable-read direct writer after the account quota fence changes', async () => {
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
+    await setSkuPurchaseLimits(catalog.skuId, { lifetime: 1 })
+    await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true })
+      .where('product_variant_id', '=', catalog.skuId).execute()
+    const firstOrderId = randomUUID()
+    const secondOrderId = randomUUID()
+    const firstApplication = `limit-rr-first-${randomUUID()}`
+    const secondApplication = `limit-rr-second-${randomUUID()}`
+    let releaseFirst!: () => void
+    let signalFirstInserted!: () => void
+    let signalSecondSnapshot!: () => void
+    const gate = new Promise<void>(resolve => { releaseFirst = resolve })
+    const firstInserted = new Promise<void>(resolve => { signalFirstInserted = resolve })
+    const secondSnapshot = new Promise<void>(resolve => { signalSecondSnapshot = resolve })
+    const first = db.transaction().execute(async trx => {
+      await sql`SELECT set_config('application_name', ${firstApplication}, true)`.execute(trx)
+      await insertDirectPurchaseOrder(trx, customer.id, catalog, firstOrderId)
+      signalFirstInserted()
+      await gate
+    })
+    await Promise.race([firstInserted, first.then(() => { throw new Error('First direct order ended before reaching its lock gate') })])
+    const second = db.transaction().setIsolationLevel('repeatable read').execute(async trx => {
+      await sql`SELECT set_config('application_name', ${secondApplication}, true)`.execute(trx)
+      await trx.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()
+      signalSecondSnapshot()
+      await insertDirectPurchaseOrder(trx, customer.id, catalog, secondOrderId)
+    })
+    await secondSnapshot
+    try {
+      const waiting = await waitForPostgresLockWait(secondApplication)
+      expect(waiting.blockerPids.length).toBeGreaterThan(0)
+    } finally {
+      releaseFirst()
+    }
+    await first
+    await expect(second).rejects.toMatchObject({ code: '40001' })
+    expect(await db.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()).toHaveLength(1)
+    expect(await db.selectFrom('orders').select('id').where('id', '=', secondOrderId).execute()).toHaveLength(0)
+  })
+
+  it('retains refunded purchase history under the anonymized identity without assigning it to a new account', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.25', mode: 'unlimited' })
+    await enableManual(catalog, admin)
+    await setSkuPurchaseLimits(catalog.skuId, { lifetime: 1 })
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const current = await quote(items, customer)
+    const created = await createOrder(items, current.json().data.quoteToken, customer)
+    expect(created.statusCode).toBe(201)
+    const orderId = created.json().data.order.id as string
+    await settleAndRefundExternally(orderId, '1.25')
+    await db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute()
+
+    const deleted = await inject({ method: 'DELETE', url: `/api/v1/admin/customers/${customer.id}`, headers: adminHeaders(admin) })
+    expect(deleted.statusCode).toBe(200)
+    expect((await db.selectFrom('orders').select('customer_id').where('id', '=', orderId).executeTakeFirstOrThrow()).customer_id)
+      .toBe(customer.id)
+    expect((await db.selectFrom('customers').select(['status', 'username']).where('id', '=', customer.id).executeTakeFirstOrThrow()))
+      .toEqual({ status: 'deleted', username: null })
+    const historical = await sql<{ quantity: string }>`
+      SELECT prior_purchase_quantity(${customer.id}::uuid, ${catalog.productId}::uuid,
+        ${catalog.skuId}::uuid, NULL, NULL)::text AS quantity
+    `.execute(db)
+    expect(historical.rows[0]?.quantity).toBe('1')
+
+    const csrf = await customerCsrf()
+    const recreated = await inject({
+      method: 'POST', url: '/api/v1/customer/auth/register',
+      headers: { origin: testOrigin, cookie: csrf.cookie, 'x-csrf-token': csrf.token },
+      payload: { username: customer.username, password },
+    })
+    expect(recreated.statusCode).toBe(201)
+    const newCustomer: Customer = {
+      id: recreated.json().data.customer.id,
+      username: customer.username,
+      cookie: cookieFrom(recreated, 'aikayun_customer_session'),
+      csrfToken: csrf.token,
+      csrfCookie: csrf.cookie,
+    }
+    expect(newCustomer.id).not.toBe(customer.id)
+    const newAccountQuote = await quote(items, newCustomer)
+    expect(newAccountQuote.json().data.items[0].purchaseLimits.sku).toMatchObject({ lifetimePurchased: 0, maxAvailable: 1 })
+  })
+
+  it('audits guarded merchant rule edits, rejects invalid values, and rejects stale revisions', async () => {
+    const admin = await createAdmin()
+    const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
+    const secondProduct = await createCatalog({ price: '1.00', mode: 'unlimited' })
+    const initial = await db.selectFrom('products').select('revision').where('id', '=', catalog.productId).executeTakeFirstOrThrow()
+    const saved = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/purchase-limits`,
+      headers: adminHeaders(admin), payload: {
+        expectedRevision: initial.revision,
+        purchaseLimits: { perOrder: 10, lifetime: 20, rolling24Hours: null },
+      },
+    })
+    expect(saved.statusCode).toBe(200)
+    expect(saved.json().data.purchaseLimits).toEqual({ perOrder: 10, lifetime: 20, rolling24Hours: null })
+    const skuRevision = await db.selectFrom('product_variants').select('revision').where('id', '=', catalog.skuId).executeTakeFirstOrThrow()
+    const skuUpdated = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/purchase-limits`,
+      headers: adminHeaders(admin), payload: {
+        expectedProductRevision: saved.json().data.revision,
+        expectedSkuRevision: skuRevision.revision,
+        purchaseLimits: { perOrder: 2, lifetime: null, rolling24Hours: 3 },
+      },
+    })
+    expect(skuUpdated.statusCode).toBe(200)
+    expect(skuUpdated.json().data.variants.find((row: { id: string }) => row.id === catalog.skuId).purchaseLimits)
+      .toEqual({ perOrder: 2, lifetime: null, rolling24Hours: 3 })
+    expect(await db.selectFrom('product_management_audit_events').select('id').where('product_id', '=', catalog.productId).execute())
+      .toHaveLength(2)
+
+    const invalid = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/purchase-limits`,
+      headers: adminHeaders(admin), payload: {
+        expectedRevision: skuUpdated.json().data.revision,
+        purchaseLimits: { perOrder: 0, lifetime: null, rolling24Hours: null },
+      },
+    })
+    expect(invalid.statusCode).toBe(400)
+    const wrongOwnerSku = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/variants/${secondProduct.skuId}/purchase-limits`,
+      headers: adminHeaders(admin), payload: {
+        expectedProductRevision: skuUpdated.json().data.revision,
+        expectedSkuRevision: 1,
+        purchaseLimits: { perOrder: 1, lifetime: null, rolling24Hours: null },
+      },
+    })
+    expect(wrongOwnerSku.statusCode).toBe(404)
+    const noCsrf = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/purchase-limits`,
+      headers: adminHeaders(admin, testOrigin, false), payload: {
+        expectedRevision: skuUpdated.json().data.revision,
+        purchaseLimits: { perOrder: 1, lifetime: null, rolling24Hours: null },
+      },
+    })
+    expect(noCsrf.statusCode).toBe(403)
+    const stale = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/purchase-limits`,
+      headers: adminHeaders(admin), payload: {
+        expectedRevision: initial.revision,
+        purchaseLimits: { perOrder: null, lifetime: null, rolling24Hours: null },
+      },
+    })
+    expect(stale.statusCode).toBe(409)
+    expect(stale.json().error.code).toBe('PRODUCT_REVISION_CONFLICT')
   })
 })

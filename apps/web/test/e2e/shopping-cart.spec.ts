@@ -7,7 +7,15 @@ type Product = {
   id: string
   name: string
   revision: number
-  variants: Array<{ id: string }>
+  variants: Array<{ id: string; skuCode?: string }>
+}
+
+type CustomerPolicy = {
+  requireEmail: boolean
+  requirePhone: boolean
+  guestCheckoutEnabled: boolean
+  guestFreeClaimEnabled: boolean
+  unpaidOrderTimeoutMinutes: 5 | 15 | 30
 }
 
 const guestCartKey = 'aikayun-guest-cart-v2'
@@ -66,11 +74,67 @@ async function createProduct(page: Page, name: string, price: string): Promise<P
 }
 
 async function deleteProduct(page: Page, product: Product): Promise<void> {
+  const latest = await page.request.get(`/api/v1/admin/products/${product.id}`)
+  expect(latest.status()).toBe(200)
+  const currentRevision = (await latest.json()).data.revision as number
   const response = await page.request.delete(`/api/v1/admin/products/${product.id}`, {
     headers: await adminHeaders(page),
-    data: { expectedRevision: product.revision },
+    data: { expectedRevision: currentRevision },
   })
   expect(response.status()).toBe(200)
+}
+
+async function makeProductPurchasable(page: Page, product: Product): Promise<void> {
+  const response = await page.request.get(`/api/v1/admin/products/${product.id}/inventory`)
+  expect(response.status()).toBe(200)
+  const inventory = (await response.json()).data as {
+    productRevision: number
+    variants: Array<{ skuId: string; skuRevision: number; inventoryRevision: number }>
+  }
+  const variant = inventory.variants.find(row => row.skuId === product.variants[0]?.id)
+  expect(variant).toBeTruthy()
+  const mode = await page.request.put(`/api/v1/admin/products/${product.id}/variants/${variant!.skuId}/inventory-mode`, {
+    headers: await adminHeaders(page),
+    data: {
+      expectedRevision: inventory.productRevision,
+      expectedSkuRevision: variant!.skuRevision,
+      expectedInventoryRevision: variant!.inventoryRevision,
+      inventoryMode: 'unlimited',
+    },
+  })
+  expect(mode.status()).toBe(200)
+  const fulfillment = await page.request.put(`/api/v1/admin/products/${product.id}/variants/${variant!.skuId}/manual-fulfillment`, {
+    headers: await adminHeaders(page),
+    data: { enabled: true },
+  })
+  expect(fulfillment.status()).toBe(200)
+}
+
+async function setGuestCheckout(page: Page, enabled: boolean): Promise<CustomerPolicy> {
+  const current = await page.request.get('/api/v1/admin/storefront/customer-policy')
+  expect(current.status()).toBe(200)
+  const response = (await current.json()).data as CustomerPolicy & { updatedAt: string }
+  const previous: CustomerPolicy = {
+    requireEmail: response.requireEmail,
+    requirePhone: response.requirePhone,
+    guestCheckoutEnabled: response.guestCheckoutEnabled,
+    guestFreeClaimEnabled: response.guestFreeClaimEnabled,
+    unpaidOrderTimeoutMinutes: response.unpaidOrderTimeoutMinutes,
+  }
+  const updated = await page.request.put('/api/v1/admin/storefront/customer-policy', {
+    headers: await adminHeaders(page),
+    data: { ...previous, guestCheckoutEnabled: enabled },
+  })
+  expect(updated.status()).toBe(200)
+  return previous
+}
+
+async function restoreCustomerPolicy(page: Page, policy: CustomerPolicy): Promise<void> {
+  const restored = await page.request.put('/api/v1/admin/storefront/customer-policy', {
+    headers: await adminHeaders(page),
+    data: policy,
+  })
+  expect(restored.status()).toBe(200)
 }
 
 async function registerCustomer(page: Page, username: string): Promise<void> {
@@ -195,13 +259,16 @@ test('guest cart persists locally, merges safely into accounts, and stays privat
   const firstUsername = `cart-${randomUUID().replaceAll('-', '').slice(0, 20)}`
   const secondUsername = `cart-${randomUUID().replaceAll('-', '').slice(0, 20)}`
   const createdProducts: Product[] = []
+  let originalPolicy: CustomerPolicy | undefined
 
   await page.setViewportSize({ width: 390, height: 844 })
   await attachBrowserAdmin(page)
 
   try {
+    originalPolicy = await setGuestCheckout(page, true)
     const productA = await createProduct(page, productAName, '19.90')
     createdProducts.push(productA)
+    await makeProductPurchasable(page, productA)
     const productB = await createProduct(page, productBName, '25.00')
     createdProducts.push(productB)
 
@@ -324,6 +391,7 @@ test('guest cart persists locally, merges safely into accounts, and stays privat
   }
   finally {
     for (const product of createdProducts) await deleteProduct(page, product)
+    if (originalPolicy) await restoreCustomerPolicy(page, originalPolicy)
   }
 })
 
@@ -982,5 +1050,60 @@ test('a failed localStorage write never sends an unpersisted merge request', asy
       await page.unroute('**/api/v1/customer/cart/merge')
       if (product) await deleteProduct(page, product)
     }
+  }
+})
+
+test('purchase limits save by product and SKU, prompt guests to log in, and fit narrow screens', async ({ page }) => {
+  test.setTimeout(120_000)
+  captureBrowserDiagnostics(page)
+  const productName = `购买限制浏览器验收-${randomUUID().slice(0, 8)}`
+  let product: Product | undefined
+
+  try {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await attachBrowserAdmin(page)
+    product = await createProduct(page, productName, '3.25')
+    await page.goto(`/admin/products/${product.id}`)
+    await expect(page.getByRole('heading', { name: productName })).toBeVisible()
+
+    const productLimits = page.locator('#purchase-limits')
+    await productLimits.getByLabel('每账号累计最多购买').fill('5')
+    await productLimits.getByLabel('每账号滚动 24 小时最多购买').fill('4')
+    await productLimits.getByRole('button', { name: '保存商品限制' }).click()
+    await expect(productLimits.getByRole('status')).toContainText('新报价立即使用此规则')
+
+    const skuCode = product.variants[0]?.skuCode
+    expect(skuCode).toBeTruthy()
+    const skuRow = page.locator('#variants li').filter({ hasText: skuCode! })
+    const skuDetails = skuRow.locator('details')
+    await skuDetails.locator('summary').click()
+    await skuDetails.getByLabel('每账号累计最多购买').fill('2')
+    await skuDetails.getByLabel('每账号滚动 24 小时最多购买').fill('1')
+    await skuDetails.getByRole('button', { name: '保存此 SKU 限制' }).click()
+    await expect(skuDetails.getByRole('status')).toContainText('新报价立即使用此规则')
+
+    const adminProduct = await page.request.get(`/api/v1/admin/products/${product.id}`).then(response => response.json()).then(body => body.data)
+    expect(adminProduct.purchaseLimits).toMatchObject({ lifetime: 5, rolling24Hours: 4 })
+    expect(adminProduct.variants.find((variant: { id: string }) => variant.id === product!.variants[0]!.id).purchaseLimits)
+      .toMatchObject({ lifetime: 2, rolling24Hours: 1 })
+
+    await page.goto(`/products/${product.id}`)
+    await expectClientMounted(page, '[data-storefront-ready="true"]')
+    await expect(page.getByRole('heading', { name: productName })).toBeVisible()
+    await expect(page.getByText('该商品需要登录后购买。')).toBeVisible()
+    const loginLink = page.getByRole('link', { name: '登录后继续购买' })
+    const redirect = new URL(await loginLink.getAttribute('href') ?? '', 'http://localhost').searchParams.get('redirect')
+    expect(redirect).toMatch(/^\/checkout\?/u)
+
+    for (const width of [320, 390, 768, 1440]) await noHorizontalOverflow(page, width)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await loginLink.click()
+    await expect(page).toHaveURL(/\/login\?redirect=/u)
+    const loginRedirect = new URL(page.url()).searchParams.get('redirect')
+    expect(loginRedirect).toBe(redirect)
+    await expectClientMounted(page, '[data-customer-login-ready="true"]')
+  }
+  finally {
+    if (!page.isClosed() && product) await deleteProduct(page, product)
   }
 })

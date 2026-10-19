@@ -223,12 +223,16 @@ export async function loadOrderDetail(db: Db, id: string): Promise<OrderDetail |
   }
 }
 
-async function assertCustomerSession(trx: Transaction<Database>, customer: AuthenticatedCustomer): Promise<void> {
-  const owner = await trx.selectFrom('customers')
+async function assertCustomerSession(
+  trx: Transaction<Database>,
+  customer: AuthenticatedCustomer,
+  purchaseLock = false,
+): Promise<void> {
+  let ownerQuery = trx.selectFrom('customers')
     .select(['id', 'status', 'username'])
     .where('id', '=', customer.id)
-    .forShare()
-    .executeTakeFirst()
+  ownerQuery = purchaseLock ? ownerQuery.forUpdate() : ownerQuery.forShare()
+  const owner = await ownerQuery.executeTakeFirst()
   if (!owner || owner.status !== 'active' || !owner.username) {
     throw new OrderError(401, 'UNAUTHORIZED', '顾客登录状态已失效，请重新登录。')
   }
@@ -325,7 +329,9 @@ async function createOrderTransaction(
   let ownerType: 'customer' | 'guest'
   let ownerId: string
   if (customer) {
-    await assertCustomerSession(trx, customer)
+    // Take UPDATE first, before the session SHARE lock. This serializes all
+    // customer quota checks and avoids SHARE-to-UPDATE lock upgrade deadlocks.
+    await assertCustomerSession(trx, customer, true)
     ownerType = 'customer'
     ownerId = customer.id
   } else {
@@ -340,11 +346,15 @@ async function createOrderTransaction(
   await trx.selectFrom('storefront_customer_policy').select('singleton')
     .where('singleton', '=', true).forShare().executeTakeFirstOrThrow()
   await lockCheckoutCatalog(trx, items.map(item => item.skuId))
-  const currentQuote = await quoteCheckoutItems(trx, items, customer !== null)
+  const currentQuote = await quoteCheckoutItems(trx, items, customer?.id ?? null)
   if (currentQuote.quoteToken !== body.quoteToken) {
-    throw new CheckoutConflict('CHECKOUT_QUOTE_CHANGED', '价格、商品状态、库存或购买资格已变化，请核对最新报价后重新提交。', currentQuote)
+    throw new CheckoutConflict('CHECKOUT_QUOTE_CHANGED', '价格、商品状态、库存、限购规则或可购额度已变化，请核对最新报价后重新提交。', currentQuote)
   }
   if (!currentQuote.canContinue || currentQuote.totalAmount === null) {
+    if (currentQuote.items.some(item => item.purchaseLimits.requiresLogin
+      || item.purchaseLimits.product.exceeded || item.purchaseLimits.sku.exceeded)) {
+      throw new CheckoutConflict('PURCHASE_LIMIT_EXCEEDED', '该商品需要登录后购买，或所选数量超过当前限购额度。请调整数量后重新报价。', currentQuote)
+    }
     throw new CheckoutConflict('ORDER_NOT_ELIGIBLE', '所选商品当前不满足下单条件，请查看新的报价信息。', currentQuote)
   }
 
@@ -363,7 +373,9 @@ async function createOrderTransaction(
     history_hidden_reason: null,
   }).execute()
 
-  for (const item of currentQuote.items) {
+  const orderItems = [...currentQuote.items].sort((left, right) =>
+    (left.productId ?? '').localeCompare(right.productId ?? '') || left.skuId.localeCompare(right.skuId))
+  for (const item of orderItems) {
     const inventoryMode = item.inventoryMode
     if (!item.productId || !item.productName || !item.productType || !item.skuCode || !item.unitPrice || !item.lineTotal
       || (inventoryMode !== 'quantity' && inventoryMode !== 'unlimited')) {

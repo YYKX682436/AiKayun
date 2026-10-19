@@ -111,6 +111,11 @@ export async function loadProduct(db: Kysely<Database>, id: string): Promise<Pro
     description: product.description,
     productType: product.product_type as ProductType,
     status: product.status,
+    purchaseLimits: {
+      perOrder: product.purchase_limit_per_order,
+      lifetime: product.purchase_limit_lifetime,
+      rolling24Hours: product.purchase_limit_24h,
+    },
     revision: product.revision,
     createdAt: product.created_at.toISOString(),
     updatedAt: product.updated_at.toISOString(),
@@ -161,6 +166,11 @@ export async function loadProduct(db: Kysely<Database>, id: string): Promise<Pro
         currency: 'CNY' as const,
         enabled: variant.enabled,
         retiredAt: variant.retired_at?.toISOString() ?? null,
+        purchaseLimits: {
+          perOrder: variant.purchase_limit_per_order,
+          lifetime: variant.purchase_limit_lifetime,
+          rolling24Hours: variant.purchase_limit_24h,
+        },
         isDefault: variant.combination_key === '',
         options: optionsByVariant.get(variant.id) ?? [],
         revision: variant.revision,

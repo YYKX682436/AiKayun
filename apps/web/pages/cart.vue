@@ -21,6 +21,9 @@ const selectedQuoteItems = computed<CartSkuQuantity[]>(() => selectedItems.value
 const checkoutPath = computed(() => selectedQuoteItems.value.length
   ? shoppingCart.checkoutPath(selectedQuoteItems.value)
   : '/cart')
+const purchaseLoginRedirect = computed(() => `/login?redirect=${encodeURIComponent(checkoutPath.value)}`)
+const purchaseLoginRequired = computed(() => !isCustomer.value
+  && Boolean(selectedQuote.value?.items.some(item => item.purchaseLimits.requiresLogin)))
 
 function statusLabel(item: CheckoutQuoteItem): string {
   switch (item.reason) {
@@ -36,6 +39,8 @@ function statusLabel(item: CheckoutQuoteItem): string {
     case 'fulfillment_not_ready': return '当前发货能力尚未开放'
     case 'guest_checkout_disabled': return '游客结算未开放，请登录'
     case 'guest_free_claim_disabled': return '游客领取免费商品未开放，请登录'
+    case 'purchase_limit_exceeded': return '超过商品或规格限购额度'
+    case 'login_required_for_purchase_limit': return '该商品需要登录后购买'
     default: return item.canPurchase ? '可继续报价' : '暂不可购买'
   }
 }
@@ -270,6 +275,10 @@ onMounted(() => {
                     class="text-muted"
                   >商品状态：{{ item.productStatus }}</span>
                 </p>
+                <StorefrontPurchaseLimitNotice
+                  class="mt-3"
+                  :purchase-limits="item.purchaseLimits"
+                />
                 <div class="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
                   <span class="text-muted">单价 <strong class="font-medium tabular-nums text-highlighted">{{ item.unitPrice === null ? '暂不可计价' : `¥${item.unitPrice}` }}</strong></span>
                   <span class="text-muted">小计 <strong class="font-medium tabular-nums text-highlighted">{{ item.lineTotal === null ? '暂不可计价' : `¥${item.lineTotal}` }}</strong></span>
@@ -373,9 +382,19 @@ onMounted(() => {
             color="primary"
             block
             class="mt-5 min-h-11"
-            :disabled="selectedQuoteItems.length === 0 || quoteBusy || Boolean(quoteError)"
+            :disabled="selectedQuoteItems.length === 0 || quoteBusy || Boolean(quoteError) || (selectedQuote !== null && !selectedQuote.canContinue)"
           >
             查看结算报价
+          </UButton>
+          <UButton
+            v-if="purchaseLoginRequired"
+            :to="purchaseLoginRedirect"
+            color="primary"
+            variant="outline"
+            block
+            class="mt-2 min-h-11"
+          >
+            该商品需要登录后购买
           </UButton>
         </aside>
       </div>

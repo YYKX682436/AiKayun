@@ -20,13 +20,20 @@ const product = {
   name: 'SSR真实商品',
   description: '安全 SSR 内容',
   productType: 'digital',
+  purchaseLimits: { perOrder: null, lifetime: null, rolling24Hours: null },
   priceRange: { min: '10.00', max: '10.00', currency: 'CNY' },
   selectionStatus: 'available',
   gallery: [],
   richContentHtml: '<p>详情正文</p>',
   categories: [],
   optionGroups: [],
-  variants: [{ options: [], salePrice: '10.00', compareAtPrice: null, inventory: { mode: 'quantity', status: 'in_stock' } }],
+  variants: [{
+    options: [],
+    salePrice: '10.00',
+    compareAtPrice: null,
+    purchaseLimits: { perOrder: null, lifetime: null, rolling24Hours: null },
+    inventory: { mode: 'quantity', status: 'in_stock' },
+  }],
   attributes: [],
 }
 

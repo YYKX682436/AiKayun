@@ -10,17 +10,21 @@ import {
   ProductDeleteResultSchema,
   ProductExpectedRevisionBodySchema,
   ProductIdParamsSchema,
+  ProductVariantIdParamsSchema,
   ProductListQuerySchema,
   ProductListResponseSchema,
   ProductDetailSchema,
   UpdateProductBodySchema,
   UpdateProductLifecycleBodySchema,
+  UpdateProductPurchaseLimitsBodySchema,
+  UpdateSkuPurchaseLimitsBodySchema,
   failure,
   success,
 } from '@aikayun/contracts'
 import type {
   ProductAuditHistoryQuery,
   ProductAuditSnapshot,
+  ProductDetail,
   ProductListQuery,
   ProductListResponse,
   ProductManagementAuditEvent,
@@ -29,6 +33,8 @@ import type {
   ProductType,
   UpdateProductBody,
   UpdateProductLifecycleBody,
+  UpdateProductPurchaseLimitsBody,
+  UpdateSkuPurchaseLimitsBody,
 } from '@aikayun/contracts'
 import type { AppConfig } from '../config.js'
 import { requireAdmin, verifyCsrf } from '../auth/admin.js'
@@ -484,6 +490,89 @@ async function transitionProduct(
   })
 }
 
+async function updateProductPurchaseLimits(
+  db: Kysely<Database>,
+  productId: string,
+  administratorId: string,
+  body: UpdateProductPurchaseLimitsBody,
+): Promise<ProductDetail> {
+  return db.transaction().execute(async (trx) => {
+    const product = await lockProductAtRevision(trx, productId, body.expectedRevision)
+    assertProductNotArchived(product)
+    const beforeLimits = {
+      perOrder: product.purchase_limit_per_order,
+      lifetime: product.purchase_limit_lifetime,
+      rolling24Hours: product.purchase_limit_24h,
+    }
+    const next = body.purchaseLimits
+    if (beforeLimits.perOrder !== next.perOrder || beforeLimits.lifetime !== next.lifetime
+      || beforeLimits.rolling24Hours !== next.rolling24Hours) {
+      await trx.updateTable('products').set({
+        purchase_limit_per_order: next.perOrder,
+        purchase_limit_lifetime: next.lifetime,
+        purchase_limit_24h: next.rolling24Hours,
+      }).where('id', '=', productId).execute()
+      await appendProductAudit(trx, {
+        productId,
+        administratorId,
+        operation: 'updated',
+        before: { revision: product.revision, purchaseLimits: beforeLimits },
+        after: { revision: product.revision + 1, purchaseLimits: next },
+      })
+    }
+    const detail = await loadProduct(trx, productId)
+    if (!detail) throw new Error('Updated product purchase limits could not be read')
+    return detail
+  })
+}
+
+async function updateSkuPurchaseLimits(
+  db: Kysely<Database>,
+  productId: string,
+  skuId: string,
+  administratorId: string,
+  body: UpdateSkuPurchaseLimitsBody,
+): Promise<ProductDetail> {
+  return db.transaction().execute(async (trx) => {
+    const product = await lockProductAtRevision(trx, productId, body.expectedProductRevision)
+    assertProductNotArchived(product)
+    const variant = await trx.selectFrom('product_variants').selectAll()
+      .where('product_id', '=', productId).where('id', '=', skuId)
+      .forUpdate().executeTakeFirst()
+    if (!variant) throw new CatalogError(404, 'PRODUCT_VARIANT_NOT_FOUND', 'The SKU does not belong to this product')
+    if (variant.retired_at) {
+      throw new CatalogError(409, 'PRODUCT_VARIANT_RETIRED', 'Purchase limits on a permanently retired SKU cannot be changed')
+    }
+    if (variant.revision !== body.expectedSkuRevision) {
+      throw new CatalogError(409, 'PRODUCT_REVISION_CONFLICT', 'The product or SKU changed; reload it and retry')
+    }
+    const beforeLimits = {
+      perOrder: variant.purchase_limit_per_order,
+      lifetime: variant.purchase_limit_lifetime,
+      rolling24Hours: variant.purchase_limit_24h,
+    }
+    const next = body.purchaseLimits
+    if (beforeLimits.perOrder !== next.perOrder || beforeLimits.lifetime !== next.lifetime
+      || beforeLimits.rolling24Hours !== next.rolling24Hours) {
+      await trx.updateTable('product_variants').set({
+        purchase_limit_per_order: next.perOrder,
+        purchase_limit_lifetime: next.lifetime,
+        purchase_limit_24h: next.rolling24Hours,
+      }).where('product_id', '=', productId).where('id', '=', skuId).execute()
+      await appendProductAudit(trx, {
+        productId,
+        administratorId,
+        operation: 'updated',
+        before: { skuId, skuRevision: variant.revision, purchaseLimits: beforeLimits },
+        after: { skuId, skuRevision: variant.revision + 1, purchaseLimits: next },
+      })
+    }
+    const detail = await loadProduct(trx, productId)
+    if (!detail) throw new Error('Updated SKU purchase limits could not be read')
+    return detail
+  })
+}
+
 function copiedCombinationKey(optionValueIds: string[]): string {
   if (optionValueIds.length === 0) return ''
   return `v1:${optionValueIds.map((id) => id.toLowerCase()).sort().join('.')}`
@@ -755,6 +844,59 @@ export function registerAdminProductManagementRoutes(
     try {
       const params = request.params as { id: string }
       const result = await updateProduct(db, params.id, administratorId, request.body as UpdateProductBody)
+      return reply.send(success(result, request.id))
+    } catch (error) {
+      return fail(reply, error, request.id)
+    }
+  })
+
+  app.put('/api/v1/admin/products/:id/purchase-limits', {
+    preHandler: [authenticate, csrfCheck],
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    schema: {
+      tags: ['admin', 'catalog'],
+      summary: 'Set product-level per-order and customer purchase limits',
+      params: ProductIdParamsSchema,
+      body: UpdateProductPurchaseLimitsBodySchema,
+      response: {
+        200: ApiSuccessSchemaOf(ProductDetailSchema),
+        400: ApiErrorSchema, 401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema,
+      },
+    },
+  }, async (request, reply) => {
+    const administratorId = requestAdministratorId(request, reply, request.id)
+    if (!administratorId) return
+    try {
+      const result = await updateProductPurchaseLimits(db,
+        (request.params as { id: string }).id,
+        administratorId,
+        request.body as UpdateProductPurchaseLimitsBody)
+      return reply.send(success(result, request.id))
+    } catch (error) {
+      return fail(reply, error, request.id)
+    }
+  })
+
+  app.put('/api/v1/admin/products/:id/variants/:variantId/purchase-limits', {
+    preHandler: [authenticate, csrfCheck],
+    config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
+    schema: {
+      tags: ['admin', 'catalog'],
+      summary: 'Set purchase limits for one SKU belonging to a product',
+      params: ProductVariantIdParamsSchema,
+      body: UpdateSkuPurchaseLimitsBodySchema,
+      response: {
+        200: ApiSuccessSchemaOf(ProductDetailSchema),
+        400: ApiErrorSchema, 401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema,
+      },
+    },
+  }, async (request, reply) => {
+    const administratorId = requestAdministratorId(request, reply, request.id)
+    if (!administratorId) return
+    try {
+      const params = request.params as { id: string; variantId: string }
+      const result = await updateSkuPurchaseLimits(db, params.id, params.variantId,
+        administratorId, request.body as UpdateSkuPurchaseLimitsBody)
       return reply.send(success(result, request.id))
     } catch (error) {
       return fail(reply, error, request.id)

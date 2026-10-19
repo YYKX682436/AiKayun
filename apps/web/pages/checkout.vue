@@ -41,6 +41,8 @@ function parseRequestedItems(): CartSkuQuantity[] | null {
 const requestedItems = computed(() => parseRequestedItems())
 const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id))
 const loginRedirect = computed(() => `/login?redirect=${encodeURIComponent(route.fullPath)}`)
+const purchaseLoginRequired = computed(() => !isCustomer.value
+  && Boolean(quote.value?.items.some(item => item.purchaseLimits.requiresLogin)))
 
 function statusLabel(item: CheckoutQuoteItem): string {
   switch (item.reason) {
@@ -55,6 +57,8 @@ function statusLabel(item: CheckoutQuoteItem): string {
     case 'fulfillment_not_ready': return '发货能力尚未开放'
     case 'guest_checkout_disabled': return '游客结算已关闭'
     case 'guest_free_claim_disabled': return '游客免费领取已关闭'
+    case 'purchase_limit_exceeded': return '超过商品或规格限购额度'
+    case 'login_required_for_purchase_limit': return '该商品需要登录后购买'
     case 'product_not_found': return '商品已删除或无法读取'
     default: return item.canPurchase ? '可继续报价' : '暂不可购买'
   }
@@ -222,6 +226,25 @@ function formatDate(value: string): string {
       </UAlert>
 
       <UAlert
+        v-if="purchaseLoginRequired"
+        class="mt-4"
+        color="warning"
+        variant="subtle"
+        title="该商品需要登录后购买"
+        description="登录后会按当前账号重新核对累计购买数量和滚动24小时额度；本次结算商品会保留。"
+      >
+        <template #actions>
+          <UButton
+            :to="loginRedirect"
+            color="primary"
+            variant="outline"
+          >
+            登录后继续
+          </UButton>
+        </template>
+      </UAlert>
+
+      <UAlert
         v-if="errorMessage"
         class="mt-4"
         color="error"
@@ -298,6 +321,10 @@ function formatDate(value: string): string {
               >
                 {{ statusLabel(item) }}
               </UBadge>
+              <StorefrontPurchaseLimitNotice
+                class="mt-3"
+                :purchase-limits="item.purchaseLimits"
+              />
             </div>
             <dl class="grid grid-cols-2 gap-x-5 text-right text-sm sm:min-w-36 sm:grid-cols-1 sm:gap-y-1">
               <div>

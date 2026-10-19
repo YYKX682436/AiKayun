@@ -67,7 +67,7 @@ async function cartSnapshot(db: Db, customerId: string): Promise<CustomerCart> {
     .execute()
   if (!saved.length) return emptyCart()
 
-  const quote = await quoteCheckoutItems(db, saved.map(row => ({ skuId: row.sku_id, quantity: row.quantity })), true)
+  const quote = await quoteCheckoutItems(db, saved.map(row => ({ skuId: row.sku_id, quantity: row.quantity })), customerId)
   return {
     items: quote.items,
     itemCount: saved.length,
@@ -411,7 +411,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
       const items = (request.body as { items: CartSkuQuantity[] }).items
       const quote = await db.transaction().execute(async (trx) => {
         if (request.customer) await lockCustomer(trx, request.customer, false)
-        return quoteCheckoutItems(trx, items, request.customer !== null)
+        return quoteCheckoutItems(trx, items, request.customer?.id ?? null)
       })
       reply.header('cache-control', 'no-store')
       return success(quote, request.id)

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { ApiSuccess, PublicInventorySummary, PublicProductDetail, PublicProductVariant } from '@aikayun/contracts'
+import type { ApiSuccess, CheckoutQuote, CheckoutQuoteItem, PublicInventorySummary, PublicProductDetail, PublicProductVariant } from '@aikayun/contracts'
 
 const route = useRoute()
 const siteUrl = usePublicSiteUrl()
@@ -29,7 +29,13 @@ const selectedImage = ref(0)
 const imageFailed = ref(false)
 const quantity = ref(1)
 const shoppingCart = useShoppingCart()
+const customerApi = useCustomerApi()
 const cartFeedback = ref('')
+const purchaseQuote = ref<CheckoutQuote | null>(null)
+const purchaseQuoteError = ref('')
+const purchaseQuoteBusy = ref(false)
+let purchaseQuoteSequence = 0
+const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id))
 
 watch(product, (value) => {
   for (const key of Object.keys(selections)) delete selections[key]
@@ -50,6 +56,16 @@ const selectedVariant = computed<PublicProductVariant | null>(() => {
     const option = variant.options.find(candidate => candidate.groupId === group.id)
     return option?.valueId === selections[group.id]
   })) ?? null
+})
+const selectedPurchaseQuote = computed<CheckoutQuoteItem | null>(() =>
+  purchaseQuote.value?.items.find(item => item.skuId === selectedVariant.value?.skuId) ?? null,
+)
+const selectedPurchaseItems = computed(() => selectedVariant.value
+  ? [{ skuId: selectedVariant.value.skuId, quantity: quantity.value }]
+  : [])
+const purchaseLoginPath = computed(() => {
+  const intent = shoppingCart.checkoutPath(selectedPurchaseItems.value)
+  return `/login?redirect=${encodeURIComponent(intent)}`
 })
 
 function optionHasVariant(groupId: string, valueId: string): boolean {
@@ -90,6 +106,34 @@ function inventoryLabel(inventory: PublicInventorySummary | undefined): string {
   if (inventory.mode === 'unlimited') return '数量不限，交付能力尚未开放'
   return '库存尚未配置'
 }
+
+async function refreshPurchaseQuote(): Promise<void> {
+  const sequence = ++purchaseQuoteSequence
+  const variant = selectedVariant.value
+  purchaseQuote.value = null
+  purchaseQuoteError.value = ''
+  if (!variant || !import.meta.client) {
+    purchaseQuoteBusy.value = false
+    return
+  }
+  purchaseQuoteBusy.value = true
+  try {
+    const result = await shoppingCart.quote([{ skuId: variant.skuId, quantity: quantity.value }])
+    if (sequence === purchaseQuoteSequence) purchaseQuote.value = result
+  } catch (error) {
+    if (sequence === purchaseQuoteSequence) {
+      purchaseQuoteError.value = error instanceof Error ? error.message : '限购额度暂时无法读取。'
+    }
+  } finally {
+    if (sequence === purchaseQuoteSequence) purchaseQuoteBusy.value = false
+  }
+}
+
+watch([() => selectedVariant.value?.skuId, quantity, () => customerApi.identityVersion.value], () => {
+  if (import.meta.client) void refreshPurchaseQuote()
+})
+
+onMounted(() => { void refreshPurchaseQuote() })
 
 const selectedImageItem = computed(() => product.value?.gallery[selectedImage.value] ?? null)
 const pageTitle = computed(() => product.value?.name ?? '商品详情')
@@ -414,6 +458,33 @@ async function buySelectedNow() {
                     />
                   </div>
                 </UFormField>
+                <StorefrontPurchaseLimitNotice
+                  :purchase-limits="selectedPurchaseQuote?.purchaseLimits"
+                  :product-rules="product.purchaseLimits"
+                  :sku-rules="selectedVariant.purchaseLimits"
+                  :authenticated="isCustomer"
+                />
+                <p
+                  v-if="purchaseQuoteBusy"
+                  class="text-xs text-muted"
+                  aria-live="polite"
+                >
+                  正在读取当前账号的限购额度…
+                </p>
+                <p
+                  v-else-if="purchaseQuoteError"
+                  class="text-sm text-warning"
+                  role="status"
+                >
+                  {{ purchaseQuoteError }}
+                </p>
+                <NuxtLink
+                  v-if="selectedPurchaseQuote?.purchaseLimits.requiresLogin || (!isCustomer && (product.purchaseLimits.lifetime || product.purchaseLimits.rolling24Hours || selectedVariant.purchaseLimits.lifetime || selectedVariant.purchaseLimits.rolling24Hours))"
+                  :to="purchaseLoginPath"
+                  class="inline-flex min-h-11 items-center text-sm font-medium text-primary underline underline-offset-2"
+                >
+                  登录后继续购买
+                </NuxtLink>
                 <div class="grid gap-2 sm:grid-cols-2">
                   <UButton
                     color="neutral"
@@ -428,7 +499,7 @@ async function buySelectedNow() {
                   <UButton
                     color="primary"
                     icon="i-lucide-arrow-right"
-                    :disabled="!selectedVariant || quantity < 1 || quantity > 99 || shoppingCart.busy.value"
+                    :disabled="!selectedVariant || quantity < 1 || quantity > 99 || shoppingCart.busy.value || purchaseQuoteBusy || (selectedPurchaseQuote !== null && !selectedPurchaseQuote.canPurchase)"
                     @click="buySelectedNow"
                   >
                     立即购买

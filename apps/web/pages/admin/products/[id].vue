@@ -15,6 +15,8 @@ import type {
   ProductMediaLibraryPage,
   ProductMediaMetadata,
   ProductRichContent,
+  PurchaseLimitSettings,
+  SkuPurchaseLimitSettings,
   ProductVariantMatrixBody,
   ProductVariantMatrixPreview,
   ProductVariantMatrixSaveResult,
@@ -42,7 +44,24 @@ const sectionErrors = reactive<Record<string, string>>({})
 const sectionSuccess = reactive<Record<string, string>>({})
 const saving = ref('')
 const dirty = reactive({ basic: false, categories: false, attributes: false, gallery: false, rich: false, matrix: false, prices: false, inventory: false })
-const hasUnsavedChanges = computed(() => Object.values(dirty).some(Boolean))
+const productPurchaseLimitDraft = reactive({ perOrder: '', lifetime: '', rolling24Hours: '' })
+const skuPurchaseLimitDrafts = reactive<Record<string, { perOrder: string; lifetime: string; rolling24Hours: string }>>({})
+const productPurchaseLimitDraftDirty = computed(() => {
+  const current = product.value
+  return Boolean(current && (['perOrder', 'lifetime', 'rolling24Hours'] as const).some(key => productPurchaseLimitDraft[key] !== String(current.purchaseLimits[key] ?? '')))
+})
+const skuPurchaseLimitDraftDirty = computed(() => {
+  const current = product.value
+  if (!current) return false
+  const keys = ['perOrder', 'lifetime', 'rolling24Hours'] as const
+  const productChanged = keys.some(key => productPurchaseLimitDraft[key] !== String(current.purchaseLimits[key] ?? ''))
+  const skuChanged = current.variants.some(variant => {
+    const draft = skuPurchaseLimitDrafts[variant.id]
+    return draft && keys.some(key => draft[key] !== String(variant.purchaseLimits[key] ?? ''))
+  })
+  return productChanged || skuChanged
+})
+const hasUnsavedChanges = computed(() => Object.values(dirty).some(Boolean) || skuPurchaseLimitDraftDirty.value)
 const conflictSection = ref('')
 const conflictLatest = ref<ProductDetail | null>(null)
 const conflictPrices = ref<AdminProductVariantPricesPage | null>(null)
@@ -220,6 +239,9 @@ function resetDrafts(source: ProductDetail) {
   attributesDraft.value = source.attributes.map(attribute => ({ id: attribute.id, name: attribute.name, value: attribute.value }))
   galleryDraft.value = clone(source.gallery)
   richDraft.value = clone(source.richContent ?? EMPTY_PRODUCT_RICH_CONTENT)
+  for (const key of ['perOrder', 'lifetime', 'rolling24Hours'] as const) productPurchaseLimitDraft[key] = String(source.purchaseLimits[key] ?? '')
+  for (const key of Object.keys(skuPurchaseLimitDrafts)) delete skuPurchaseLimitDrafts[key]
+  for (const variant of source.variants) skuPurchaseLimitDrafts[variant.id] = purchaseLimitDraft(variant.purchaseLimits)
   groupsDraft.value = source.optionGroups.map(group => ({
     id: group.id, name: group.name, sortOrder: group.sortOrder, enabled: group.enabled,
     values: group.values.map(value => ({ id: value.id, name: value.name, sortOrder: value.sortOrder, enabled: value.enabled })),
@@ -235,6 +257,76 @@ function resetDrafts(source: ProductDetail) {
   for (const key of Object.keys(dirty)) dirty[key as keyof typeof dirty] = false
   for (const key of Object.keys(sectionErrors)) delete sectionErrors[key]
   for (const key of Object.keys(sectionSuccess)) delete sectionSuccess[key]
+}
+
+function purchaseLimitDraft(settings: PurchaseLimitSettings | SkuPurchaseLimitSettings) {
+  return {
+    perOrder: String(settings.perOrder ?? ''),
+    lifetime: String(settings.lifetime ?? ''),
+    rolling24Hours: String(settings.rolling24Hours ?? ''),
+  }
+}
+
+function skuLimitDraft(variant: ProductDetail['variants'][number]) {
+  return skuPurchaseLimitDrafts[variant.id] ?? (skuPurchaseLimitDrafts[variant.id] = purchaseLimitDraft(variant.purchaseLimits))
+}
+
+function hasSkuPurchaseLimitDraftChanges(variant: ProductDetail['variants'][number]) {
+  const draft = skuLimitDraft(variant)
+  return (['perOrder', 'lifetime', 'rolling24Hours'] as const).some(key => draft[key] !== String(variant.purchaseLimits[key] ?? ''))
+}
+
+function parsePurchaseLimit(value: string | number, maximum: number, label: string): number | null {
+  const normalized = String(value).trim()
+  if (normalized === '') return null
+  if (!/^\d+$/.test(normalized)) throw new Error(`${label}必须是正整数，或留空表示不限制。`)
+  const parsed = Number(normalized)
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) throw new Error(`${label}范围为 1–${maximum}，或留空表示不限制。`)
+  return parsed
+}
+
+function purchaseLimitsBody(draft: { perOrder: string; lifetime: string; rolling24Hours: string }, perOrderMaximum: number) {
+  return {
+    perOrder: parsePurchaseLimit(draft.perOrder, perOrderMaximum, '每笔订单限购'),
+    lifetime: parsePurchaseLimit(draft.lifetime, 2_147_483_647, '账号累计限购'),
+    rolling24Hours: parsePurchaseLimit(draft.rolling24Hours, 2_147_483_647, '账号 24 小时限购'),
+  }
+}
+
+async function saveProductPurchaseLimits() {
+  if (!product.value || isArchived.value || saving.value) return
+  saving.value = 'purchase-limits'
+  clearSectionStatus('purchaseLimits')
+  try {
+    const updated = await request<ProductDetail>(`/api/v1/admin/products/${productId.value}/purchase-limits`, {
+      method: 'PUT',
+      body: { expectedRevision: product.value.revision, purchaseLimits: purchaseLimitsBody(productPurchaseLimitDraft, 4950) },
+    })
+    product.value = updated
+    for (const key of ['perOrder', 'lifetime', 'rolling24Hours'] as const) productPurchaseLimitDraft[key] = String(updated.purchaseLimits[key] ?? '')
+    sectionSuccess.purchaseLimits = '商品购买限制已保存，新报价立即使用此规则。'
+  } catch (error) { await handleSectionError('purchaseLimits', error) } finally { saving.value = '' }
+}
+
+async function saveSkuPurchaseLimits(variant: ProductDetail['variants'][number]) {
+  if (!product.value || isArchived.value || variant.retiredAt || saving.value) return
+  const section = `skuPurchaseLimits:${variant.id}`
+  saving.value = section
+  clearSectionStatus(section)
+  try {
+    const updated = await request<ProductDetail>(`/api/v1/admin/products/${productId.value}/variants/${variant.id}/purchase-limits`, {
+      method: 'PUT',
+      body: {
+        expectedProductRevision: product.value.revision,
+        expectedSkuRevision: variant.revision,
+        purchaseLimits: purchaseLimitsBody(skuLimitDraft(variant), 99),
+      },
+    })
+    product.value = updated
+    const savedVariant = updated.variants.find(row => row.id === variant.id)
+    if (savedVariant) skuPurchaseLimitDrafts[variant.id] = purchaseLimitDraft(savedVariant.purchaseLimits)
+    sectionSuccess[section] = 'SKU 购买限制已保存，新报价立即使用此规则。'
+  } catch (error) { await handleSectionError(section, error) } finally { saving.value = '' }
 }
 
 async function loadPricePage(page = pricePageNumber.value) {
@@ -1450,6 +1542,108 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
               </section>
 
               <section
+                id="purchase-limits"
+                aria-labelledby="purchase-limits-title"
+                class="py-6"
+              >
+                <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <h2
+                      id="purchase-limits-title"
+                      class="text-lg font-semibold text-highlighted"
+                    >
+                      购买限制
+                    </h2>
+                    <p class="mt-1 text-sm text-muted">
+                      商品级规则汇总约束该商品下的所有 SKU。留空表示不限制；修改只影响新报价与新订单。
+                    </p>
+                  </div>
+                  <UBadge
+                    v-if="skuPurchaseLimitDraftDirty"
+                    color="warning"
+                    variant="subtle"
+                  >
+                    有未保存的购买限制
+                  </UBadge>
+                </header>
+                <UAlert
+                  v-if="sectionErrors.purchaseLimits"
+                  class="mb-3"
+                  color="error"
+                  variant="soft"
+                  :title="sectionErrors.purchaseLimits"
+                  role="alert"
+                />
+                <UAlert
+                  v-if="sectionSuccess.purchaseLimits"
+                  class="mb-3"
+                  color="success"
+                  variant="soft"
+                  :title="sectionSuccess.purchaseLimits"
+                  role="status"
+                />
+                <div class="grid gap-4 sm:grid-cols-3">
+                  <UFormField
+                    label="每笔订单最多购买"
+                    hint="1–4950 件；留空表示不限制"
+                  >
+                    <UInput
+                      v-model="productPurchaseLimitDraft.perOrder"
+                      type="number"
+                      min="1"
+                      max="4950"
+                      step="1"
+                      inputmode="numeric"
+                      class="w-full"
+                      :disabled="isArchived"
+                      @update:model-value="clearSectionStatus('purchaseLimits')"
+                    />
+                  </UFormField>
+                  <UFormField
+                    label="每账号累计最多购买"
+                    hint="1–2147483647 件；留空表示不限制"
+                  >
+                    <UInput
+                      v-model="productPurchaseLimitDraft.lifetime"
+                      type="number"
+                      min="1"
+                      max="2147483647"
+                      step="1"
+                      inputmode="numeric"
+                      class="w-full"
+                      :disabled="isArchived"
+                      @update:model-value="clearSectionStatus('purchaseLimits')"
+                    />
+                  </UFormField>
+                  <UFormField
+                    label="每账号滚动 24 小时最多购买"
+                    hint="1–2147483647 件；留空表示不限制"
+                  >
+                    <UInput
+                      v-model="productPurchaseLimitDraft.rolling24Hours"
+                      type="number"
+                      min="1"
+                      max="2147483647"
+                      step="1"
+                      inputmode="numeric"
+                      class="w-full"
+                      :disabled="isArchived"
+                      @update:model-value="clearSectionStatus('purchaseLimits')"
+                    />
+                  </UFormField>
+                </div>
+                <div class="mt-4 flex justify-end">
+                  <UButton
+                    :loading="saving === 'purchase-limits'"
+                    :disabled="isArchived || saving !== '' || !productPurchaseLimitDraftDirty"
+                    @click="saveProductPurchaseLimits"
+                  >
+                    保存商品限制
+                  </UButton>
+                </div>
+              </section>
+
+              <section
                 id="categories"
                 aria-labelledby="categories-title"
                 class="py-6"
@@ -2186,52 +2380,136 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     <li
                       v-for="variant in visibleSkuRows"
                       :key="variant.id"
-                      class="flex min-w-0 flex-col gap-2 p-3 sm:flex-row sm:items-center"
+                      class="flex min-w-0 flex-col gap-3 p-3"
                     >
-                      <div class="min-w-0 flex-1">
-                        <p class="truncate font-mono text-sm font-medium text-highlighted">
-                          {{ variant.skuCode }}
-                        </p>
-                        <p class="mt-0.5 truncate text-xs text-muted">
-                          {{ variantOptionsText(variant) }}
-                        </p>
-                        <p class="mt-1 text-xs text-dimmed">
-                          {{ priceForSku(variant.id)?.salePrice ? `售价 ¥${priceForSku(variant.id)?.salePrice}` : `售价 ¥${variant.salePrice}` }} · {{ inventoryForSku(variant.id) ? inventoryModeLabel(inventoryForSku(variant.id)!.inventory.mode) : '库存读取中' }}
-                        </p>
+                      <div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div class="min-w-0 flex-1">
+                          <p class="truncate font-mono text-sm font-medium text-highlighted">
+                            {{ variant.skuCode }}
+                          </p>
+                          <p class="mt-0.5 truncate text-xs text-muted">
+                            {{ variantOptionsText(variant) }}
+                          </p>
+                          <p class="mt-1 text-xs text-dimmed">
+                            {{ priceForSku(variant.id)?.salePrice ? `售价 ¥${priceForSku(variant.id)?.salePrice}` : `售价 ¥${variant.salePrice}` }} · {{ inventoryForSku(variant.id) ? inventoryModeLabel(inventoryForSku(variant.id)!.inventory.mode) : '库存读取中' }}
+                          </p>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2">
+                          <UBadge
+                            v-if="variant.retiredAt"
+                            color="neutral"
+                            variant="subtle"
+                          >
+                            永久退役
+                          </UBadge>
+                          <UBadge
+                            v-else-if="retireSkuIds.includes(variant.id)"
+                            color="warning"
+                            variant="subtle"
+                          >
+                            待保存永久退役
+                          </UBadge>
+                          <UCheckbox
+                            v-else
+                            :model-value="skuEnabledDraft[variant.id] ?? variant.enabled"
+                            label="启用销售"
+                            :disabled="isArchived"
+                            @update:model-value="value => setSkuEnabled(variant.id, Boolean(value))"
+                          />
+                          <UButton
+                            v-if="!variant.retiredAt"
+                            size="sm"
+                            :color="retireSkuIds.includes(variant.id) ? 'neutral' : 'error'"
+                            variant="ghost"
+                            :disabled="isArchived"
+                            @click="retireSkuIds.includes(variant.id) ? cancelRetirement(variant) : requestRetirement(variant)"
+                          >
+                            {{ retireSkuIds.includes(variant.id) ? '取消计划退役' : '永久退役' }}
+                          </UButton>
+                        </div>
                       </div>
-                      <div class="flex flex-wrap items-center gap-2">
-                        <UBadge
-                          v-if="variant.retiredAt"
-                          color="neutral"
-                          variant="subtle"
-                        >
-                          永久退役
-                        </UBadge>
-                        <UBadge
-                          v-else-if="retireSkuIds.includes(variant.id)"
-                          color="warning"
-                          variant="subtle"
-                        >
-                          待保存永久退役
-                        </UBadge>
-                        <UCheckbox
-                          v-else
-                          :model-value="skuEnabledDraft[variant.id] ?? variant.enabled"
-                          label="启用销售"
-                          :disabled="isArchived"
-                          @update:model-value="value => setSkuEnabled(variant.id, Boolean(value))"
+                      <details class="min-w-0 rounded-lg border border-default p-3">
+                        <summary class="cursor-pointer text-sm font-medium text-highlighted">
+                          SKU 购买限制
+                          <span class="ml-2 font-normal text-muted">留空表示不限制；与商品级限制同时生效</span>
+                        </summary>
+                        <UAlert
+                          v-if="sectionErrors[`skuPurchaseLimits:${variant.id}`]"
+                          class="mt-3"
+                          color="error"
+                          variant="soft"
+                          :title="sectionErrors[`skuPurchaseLimits:${variant.id}`]"
+                          role="alert"
                         />
-                        <UButton
-                          v-if="!variant.retiredAt"
-                          size="sm"
-                          :color="retireSkuIds.includes(variant.id) ? 'neutral' : 'error'"
-                          variant="ghost"
-                          :disabled="isArchived"
-                          @click="retireSkuIds.includes(variant.id) ? cancelRetirement(variant) : requestRetirement(variant)"
-                        >
-                          {{ retireSkuIds.includes(variant.id) ? '取消计划退役' : '永久退役' }}
-                        </UButton>
-                      </div>
+                        <UAlert
+                          v-if="sectionSuccess[`skuPurchaseLimits:${variant.id}`]"
+                          class="mt-3"
+                          color="success"
+                          variant="soft"
+                          :title="sectionSuccess[`skuPurchaseLimits:${variant.id}`]"
+                          role="status"
+                        />
+                        <div class="mt-3 grid gap-3 sm:grid-cols-3">
+                          <UFormField
+                            label="每笔订单最多购买"
+                            hint="1–99 件；留空表示不限制"
+                          >
+                            <UInput
+                              v-model="skuLimitDraft(variant).perOrder"
+                              type="number"
+                              min="1"
+                              max="99"
+                              step="1"
+                              inputmode="numeric"
+                              class="w-full"
+                              :disabled="isArchived || Boolean(variant.retiredAt)"
+                              @update:model-value="clearSectionStatus(`skuPurchaseLimits:${variant.id}`)"
+                            />
+                          </UFormField>
+                          <UFormField
+                            label="每账号累计最多购买"
+                            hint="1–2147483647 件；留空表示不限制"
+                          >
+                            <UInput
+                              v-model="skuLimitDraft(variant).lifetime"
+                              type="number"
+                              min="1"
+                              max="2147483647"
+                              step="1"
+                              inputmode="numeric"
+                              class="w-full"
+                              :disabled="isArchived || Boolean(variant.retiredAt)"
+                              @update:model-value="clearSectionStatus(`skuPurchaseLimits:${variant.id}`)"
+                            />
+                          </UFormField>
+                          <UFormField
+                            label="每账号滚动 24 小时最多购买"
+                            hint="1–2147483647 件；留空表示不限制"
+                          >
+                            <UInput
+                              v-model="skuLimitDraft(variant).rolling24Hours"
+                              type="number"
+                              min="1"
+                              max="2147483647"
+                              step="1"
+                              inputmode="numeric"
+                              class="w-full"
+                              :disabled="isArchived || Boolean(variant.retiredAt)"
+                              @update:model-value="clearSectionStatus(`skuPurchaseLimits:${variant.id}`)"
+                            />
+                          </UFormField>
+                        </div>
+                        <div class="mt-3 flex justify-end">
+                          <UButton
+                            size="sm"
+                            :loading="saving === `skuPurchaseLimits:${variant.id}`"
+                            :disabled="isArchived || Boolean(variant.retiredAt) || saving !== '' || !hasSkuPurchaseLimitDraftChanges(variant)"
+                            @click="saveSkuPurchaseLimits(variant)"
+                          >
+                            保存此 SKU 限制
+                          </UButton>
+                        </div>
+                      </details>
                     </li>
                   </ul>
                   <div

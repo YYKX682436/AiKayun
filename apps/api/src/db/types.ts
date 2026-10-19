@@ -41,6 +41,9 @@ export interface ProductsTable {
   product_type: ProductType
   status: ProductStatus
   revision: Generated<number>
+  purchase_limit_per_order: Generated<number | null>
+  purchase_limit_lifetime: Generated<number | null>
+  purchase_limit_24h: Generated<number | null>
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }
@@ -94,6 +97,7 @@ export interface CustomersTable {
   phone: string | null
   phone_verified_at: Date | null
   status: CustomerStatus
+  purchase_limit_lock_version: Generated<string>
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }
@@ -421,6 +425,9 @@ export interface ProductVariantsTable {
   inventory_mode: ProductInventoryMode | null
   inventory_revision: Generated<number>
   revision: Generated<number>
+  purchase_limit_per_order: Generated<number | null>
+  purchase_limit_lifetime: Generated<number | null>
+  purchase_limit_24h: Generated<number | null>
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }
