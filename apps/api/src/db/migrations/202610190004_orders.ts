@@ -42,9 +42,22 @@ export const ordersMigration: Migration = {
         order_status varchar(24);
         order_expires_at timestamptz;
       BEGIN
-        IF TG_OP = 'UPDATE' AND OLD.status = 'pending' AND NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN
-          RAISE EXCEPTION 'A pending payment attempt deadline is immutable'
-            USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_pending_deadline_immutable';
+        IF TG_OP = 'INSERT' AND NEW.order_id IS NOT NULL AND NEW.source = 'external'
+          AND NEW.status = 'created'
+          AND (NEW.expires_at IS NULL OR NEW.expires_at <= clock_timestamp()) THEN
+          RAISE EXCEPTION 'A new external order payment attempt requires a future provider deadline'
+            USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_created_deadline_required';
+        END IF;
+        IF TG_OP = 'UPDATE' AND NEW.expires_at IS DISTINCT FROM OLD.expires_at
+          AND NOT (OLD.status = 'created' AND NEW.status = 'pending') THEN
+          -- The provider deadline is captured when an attempt is created. The
+          -- only permitted later write is setting it while created -> pending;
+          -- that state transition takes the order advisory lock below and
+          -- revalidates that the order remains payable. In particular,
+          -- created -> created cannot race order closure by editing the value
+          -- that the close guard uses to classify an attempt.
+          RAISE EXCEPTION 'A payment attempt deadline is immutable after creation'
+            USING ERRCODE = '23514', CONSTRAINT = 'payment_attempts_deadline_immutable';
         END IF;
         IF NEW.status = 'pending' THEN
           IF NEW.expires_at IS NULL OR NEW.expires_at <= clock_timestamp() THEN

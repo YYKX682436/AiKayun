@@ -201,17 +201,17 @@ async function createOrder(
 
 async function attachPendingPaymentWithoutExpiry(orderId: string, amount: string): Promise<string> {
   const attemptId = randomUUID()
-  await db.insertInto('payment_attempts').values({
-    id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
-    topup_customer_id: null, source: 'external', amount, status: 'created', provider: 'integration',
-    provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
-    requested_wallet_amount: null, expires_at: null, completed_at: null,
-  }).execute()
-  // Simulate a row that was valid under the frozen ④-1 schema before the
-  // ④-5 deadline guard was introduced.
   await db.transaction().execute(async (trx) => {
     await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
     try {
+      // Simulate a row that was valid under the frozen ④-1 schema before the
+      // ④-5 deadline contract was introduced.
+      await trx.insertInto('payment_attempts').values({
+        id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+        topup_customer_id: null, source: 'external', amount, status: 'created', provider: 'integration',
+        provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+        requested_wallet_amount: null, expires_at: null, completed_at: null,
+      }).execute()
       await trx.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
     } finally {
       await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
@@ -242,13 +242,20 @@ async function attachExpiredPendingPayment(orderId: string, amount: string): Pro
 
 async function attachExpiredCreatedPayment(orderId: string, amount: string): Promise<string> {
   const attemptId = randomUUID()
-  await db.insertInto('payment_attempts').values({
-    id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
-    topup_customer_id: null, source: 'external', amount, status: 'created', provider: 'integration',
-    provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
-    requested_wallet_amount: null, created_at: new Date(Date.now() - 2 * 60 * 60_000),
-    expires_at: new Date(Date.now() - 60 * 60_000), completed_at: null,
-  }).execute()
+  await db.transaction().execute(async (trx) => {
+    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+    try {
+      await trx.insertInto('payment_attempts').values({
+        id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+        topup_customer_id: null, source: 'external', amount, status: 'created', provider: 'integration',
+        provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+        requested_wallet_amount: null, created_at: new Date(Date.now() - 2 * 60 * 60_000),
+        expires_at: new Date(Date.now() - 60 * 60_000), completed_at: null,
+      }).execute()
+    } finally {
+      await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+    }
+  })
   return attemptId
 }
 
@@ -277,16 +284,17 @@ async function attachExpiredWalletHold(options: {
       requested_amount: options.walletAmount, operation_type: 'order_payment_hold',
       request_sha256: digest, actor_admin_id: null,
     }).execute()
-    await trx.insertInto('payment_attempts').values({
-      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: options.orderId,
-      topup_customer_id: null, source: 'external', amount: options.externalAmount, status: 'created',
-      provider: 'integration', provider_payment_id: null, wallet_operation_id: null,
-      wallet_hold_operation_id: holdOperationId, requested_wallet_amount: options.walletAmount,
-      created_at: new Date(Date.now() - 2 * 60 * 60_000),
-      expires_at: new Date(Date.now() - 60 * 60_000), completed_at: null,
-    }).execute()
     await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
     try {
+      // This models an attempt created before ④-5 required a deadline on new attempts.
+      await trx.insertInto('payment_attempts').values({
+        id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: options.orderId,
+        topup_customer_id: null, source: 'external', amount: options.externalAmount, status: 'created',
+        provider: 'integration', provider_payment_id: null, wallet_operation_id: null,
+        wallet_hold_operation_id: holdOperationId, requested_wallet_amount: options.walletAmount,
+        created_at: new Date(Date.now() - 2 * 60 * 60_000),
+        expires_at: new Date(Date.now() - 60 * 60_000), completed_at: null,
+      }).execute()
       await trx.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
     } finally {
       await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
@@ -735,12 +743,26 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
     const orderId = created.json().data.order.id as string
     const attemptId = randomUUID()
-    await db.insertInto('payment_attempts').values({
+    await expect(db.insertInto('payment_attempts').values({
       id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
       topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
       provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
       requested_wallet_amount: null, expires_at: null, completed_at: null,
-    }).execute()
+    }).execute()).rejects.toMatchObject({ constraint: 'payment_attempts_created_deadline_required' })
+    // Simulate a legacy ④-1 row so NULL remains protected during migration-era cleanup.
+    await db.transaction().execute(async (trx) => {
+      await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+      try {
+        await trx.insertInto('payment_attempts').values({
+          id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+          topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
+          provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+          requested_wallet_amount: null, expires_at: null, completed_at: null,
+        }).execute()
+      } finally {
+        await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+      }
+    })
 
     const createdCancel = await inject({
       method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
@@ -753,13 +775,174 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     }).where('id', '=', attemptId).execute()
     await expect(db.updateTable('payment_attempts').set({ expires_at: new Date(Date.now() + 120_000) })
       .where('id', '=', attemptId).execute())
-      .rejects.toMatchObject({ constraint: 'payment_attempts_pending_deadline_immutable' })
+      .rejects.toMatchObject({ constraint: 'payment_attempts_deadline_immutable' })
     const pendingCancel = await inject({
       method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
     })
     expect(pendingCancel.statusCode).toBe(409)
     expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
       .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(1)
+  })
+
+  it('R3 rejects standalone created deadline edits', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const attemptId = randomUUID()
+    const deadline = new Date(Date.now() + 60_000)
+    await db.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+      topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
+      provider_payment_id: null, wallet_operation_id: null, wallet_hold_operation_id: null,
+      requested_wallet_amount: null, expires_at: deadline, completed_at: null,
+    }).execute()
+
+    await expect(db.updateTable('payment_attempts').set({
+      expires_at: new Date(deadline.getTime() + 60_000),
+    }).where('id', '=', attemptId).execute())
+      .rejects.toMatchObject({ constraint: 'payment_attempts_deadline_immutable' })
+    await expect(db.updateTable('payment_attempts').set({
+      expires_at: new Date(Date.now() - 60_000),
+    }).where('id', '=', attemptId).execute())
+      .rejects.toMatchObject({ constraint: 'payment_attempts_deadline_immutable' })
+    await expect(db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute())
+      .rejects.toMatchObject({ constraint: 'orders_close_payment_unresolved' })
+
+    let releaseShortening!: () => void
+    let signalShortening!: () => void
+    const shorteningGate = new Promise<void>((resolve) => { releaseShortening = resolve })
+    const shorteningReady = new Promise<void>((resolve) => { signalShortening = resolve })
+    const shortening = db.transaction().execute(async (trx) => {
+      try {
+        await trx.updateTable('payment_attempts').set({ expires_at: new Date(Date.now() - 60_000) })
+          .where('id', '=', attemptId).execute()
+        signalShortening()
+        await shorteningGate
+        return { changed: true }
+      } catch (error) {
+        signalShortening()
+        return { changed: false, error }
+      }
+    })
+    await shorteningReady
+    try {
+      await expect(db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute())
+        .rejects.toMatchObject({ constraint: 'orders_close_payment_unresolved' })
+    } finally {
+      releaseShortening()
+    }
+    expect(await shortening).toMatchObject({
+      changed: false,
+      error: { constraint: 'payment_attempts_deadline_immutable' },
+    })
+
+    // The only deadline edit after creation is atomic with the protected
+    // created -> pending transition. Pending deadlines remain immutable.
+    await db.updateTable('payment_attempts').set({
+      status: 'pending', expires_at: new Date(Date.now() + 120_000),
+    }).where('id', '=', attemptId).execute()
+    await expect(db.updateTable('payment_attempts').set({
+      expires_at: new Date(Date.now() + 180_000),
+    }).where('id', '=', attemptId).execute())
+      .rejects.toMatchObject({ constraint: 'payment_attempts_deadline_immutable' })
+    await db.updateTable('payment_attempts').set({ status: 'failed', completed_at: new Date() })
+      .where('id', '=', attemptId).execute()
+    await expect(db.updateTable('payment_attempts').set({
+      expires_at: new Date(Date.now() + 240_000),
+    }).where('id', '=', attemptId).execute())
+      .rejects.toMatchObject({ constraint: 'payment_attempts_deadline_immutable' })
+    await db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute()
+  })
+
+  it('R3 serializes an expired created deadline extension against timeout closure', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const attemptId = await attachExpiredCreatedPayment(orderId, '1.20')
+    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
+    try {
+      await sql`UPDATE orders SET unpaid_expires_at = clock_timestamp() - interval '1 second'
+        WHERE id = ${orderId}::uuid`.execute(db)
+    } finally {
+      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+    }
+
+    let releaseMutation!: () => void
+    let signalMutation!: () => void
+    const mutationGate = new Promise<void>((resolve) => { releaseMutation = resolve })
+    const mutationReady = new Promise<void>((resolve) => { signalMutation = resolve })
+    const mutation = db.transaction().execute(async (trx) => {
+      try {
+        await trx.updateTable('payment_attempts').set({ expires_at: new Date(Date.now() + 60_000) })
+          .where('id', '=', attemptId).execute()
+        signalMutation()
+        await mutationGate
+        return { changed: true }
+      } catch (error) {
+        signalMutation()
+        return { changed: false, error }
+      }
+    })
+    await mutationReady
+    let closed!: number
+    try {
+      // On the old trigger this closes using the committed expired deadline
+      // while the extension is still uncommitted, after which that extension
+      // could commit on an already-closed order.
+      closed = await expireDueUnpaidOrders(db, new Date(), 1)
+    } finally {
+      releaseMutation()
+    }
+    const mutationResult = await mutation
+    expect(closed).toBe(1)
+    expect(mutationResult).toMatchObject({
+      changed: false,
+      error: { constraint: 'payment_attempts_deadline_immutable' },
+    })
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('closed')
+    expect((await db.selectFrom('payment_attempts').select(['status', 'expires_at'])
+      .where('id', '=', attemptId).executeTakeFirstOrThrow()).expires_at?.getTime())
+      .toBeLessThan(Date.now())
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(0)
+  })
+
+  it('R3 cannot revive an expired created attempt after its order closes', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteResult = await quote(items, customer)
+    const created = await createOrder(items, quoteResult.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const attemptId = await attachExpiredCreatedPayment(orderId, '1.20')
+    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
+    try {
+      await sql`UPDATE orders SET unpaid_expires_at = clock_timestamp() - interval '1 second'
+        WHERE id = ${orderId}::uuid`.execute(db)
+    } finally {
+      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+    }
+    expect(await expireDueUnpaidOrders(db)).toBe(1)
+    await expect(db.updateTable('payment_attempts').set({ expires_at: new Date(Date.now() + 60_000) })
+      .where('id', '=', attemptId).execute())
+      .rejects.toMatchObject({ constraint: 'payment_attempts_deadline_immutable' })
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('closed')
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(0)
   })
 
   it('rejects pending attempts inserted without a deadline and serializes payment updates against cancellation', async () => {
@@ -912,6 +1095,10 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
       .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()).toEqual({
       gift_available: '0.00', gift_frozen: '1.00',
     })
+    const paymentProtection = await sql<{ unresolved: boolean }>`
+      SELECT order_has_unresolved_payment_attempts(${orderId}::uuid) AS unresolved
+    `.execute(db)
+    expect(paymentProtection.rows[0]?.unresolved).toBe(true)
     expect(await expireDueUnpaidOrders(db, new Date(Date.now() + 60 * 60_000))).toBe(0)
     await expect(db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute())
       .rejects.toMatchObject({ constraint: 'orders_close_payment_unresolved' })
