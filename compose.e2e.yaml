@@ -1,0 +1,7 @@
+# This override is only for browser E2E through the loopback-bound CI Compose stack.
+# The browser tests assign a distinct synthetic client IP to each isolated auth flow;
+# this lets the real API rate limiter exercise those flows independently.
+services:
+  caddy:
+    volumes:
+      - ./deploy/Caddyfile.e2e:/etc/caddy/Caddyfile:ro
