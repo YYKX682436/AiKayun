@@ -18,7 +18,7 @@ watch(() => route.path, () => {
 })
 
 watch(
-  () => customerApi.sessionResolved.value ? customerApi.session.value?.customer.id ?? null : undefined,
+  () => customerApi.sessionResolved.value ? customerApi.identityVersion.value : undefined,
   () => { if (import.meta.client) void shoppingCart.syncSession() },
   { flush: 'sync' },
 )

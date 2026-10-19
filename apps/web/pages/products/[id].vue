@@ -372,8 +372,14 @@ async function buySelectedNow() {
                   {{ inventoryLabel(selectedVariant?.inventory) }}
                 </p>
               </div>
-              <div v-if="selectedVariant" class="mt-4 grid gap-3">
-                <UFormField label="购买数量" name="quantity">
+              <div
+                v-if="selectedVariant"
+                class="mt-4 grid gap-3"
+              >
+                <UFormField
+                  label="购买数量"
+                  name="quantity"
+                >
                   <div class="flex w-fit items-center rounded-lg border border-default">
                     <UButton
                       type="button"
@@ -428,9 +434,19 @@ async function buySelectedNow() {
                     立即购买
                   </UButton>
                 </div>
-                <p v-if="cartFeedback || shoppingCart.errorMessage.value" class="text-sm text-warning" role="status" aria-live="polite">
+                <p
+                  v-if="cartFeedback || shoppingCart.errorMessage.value"
+                  class="text-sm text-warning"
+                  role="status"
+                  aria-live="polite"
+                >
                   {{ cartFeedback || shoppingCart.errorMessage.value }}
-                  <NuxtLink to="/cart" class="ml-1 font-medium text-primary underline underline-offset-2">查看购物车</NuxtLink>
+                  <NuxtLink
+                    to="/cart"
+                    class="ml-1 font-medium text-primary underline underline-offset-2"
+                  >
+                    查看购物车
+                  </NuxtLink>
                 </p>
               </div>
               <UAlert

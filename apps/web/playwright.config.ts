@@ -44,6 +44,7 @@ export default defineConfig({
         PUBLIC_ORIGIN: baseURL,
         MEDIA_ROOT: mediaRoot,
         COOKIE_SECURE: 'false',
+        TRUST_PROXY: 'true',
       },
     },
     {

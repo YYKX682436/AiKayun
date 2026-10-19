@@ -81,6 +81,13 @@ watch(selectedQuoteItems, async (value) => {
   }
 }, { deep: true })
 
+watch(() => customerApi.identityVersion.value, () => {
+  quoteSequence += 1
+  selectedQuote.value = null
+  quoteError.value = ''
+  quoteBusy.value = false
+}, { flush: 'sync' })
+
 onMounted(() => {
   if (!shoppingCart.ready.value) void shoppingCart.syncSession()
 })
@@ -88,15 +95,31 @@ onMounted(() => {
 
 <template>
   <UContainer class="py-7 sm:py-10">
-    <main id="main-content" class="mx-auto max-w-6xl">
+    <main
+      id="main-content"
+      class="mx-auto max-w-6xl"
+    >
       <div class="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <p class="text-sm font-medium text-primary">商城</p>
-          <h1 class="mt-1 text-2xl font-semibold tracking-tight text-highlighted sm:text-3xl">购物车</h1>
-          <p class="mt-2 text-sm text-muted">价格和库存会在每次报价时重新读取；购物车不保留价格或库存。</p>
+          <p class="text-sm font-medium text-primary">
+            商城
+          </p>
+          <h1 class="mt-1 text-2xl font-semibold tracking-tight text-highlighted sm:text-3xl">
+            购物车
+          </h1>
+          <p class="mt-2 text-sm text-muted">
+            价格和库存会在每次报价时重新读取；购物车不保留价格或库存。
+          </p>
         </div>
-        <NuxtLink to="/search" class="inline-flex min-h-11 items-center gap-2 rounded-lg px-3 text-sm font-medium text-primary hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary">
-          <UIcon name="i-lucide-search" class="size-4" aria-hidden="true" />
+        <NuxtLink
+          to="/search"
+          class="inline-flex min-h-11 items-center gap-2 rounded-lg px-3 text-sm font-medium text-primary hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+        >
+          <UIcon
+            name="i-lucide-search"
+            class="size-4"
+            aria-hidden="true"
+          />
           继续选购
         </NuxtLink>
       </div>
@@ -112,7 +135,14 @@ onMounted(() => {
         aria-live="assertive"
       >
         <template #actions>
-          <UButton color="error" variant="outline" :loading="shoppingCart.busy.value" @click="shoppingCart.refresh()">重试</UButton>
+          <UButton
+            color="error"
+            variant="outline"
+            :loading="shoppingCart.busy.value"
+            @click="shoppingCart.refresh()"
+          >
+            重试
+          </UButton>
         </template>
       </UAlert>
       <UAlert
@@ -125,19 +155,51 @@ onMounted(() => {
         aria-live="polite"
       />
 
-      <div v-if="!shoppingCart.ready.value" class="mt-7 space-y-3" aria-label="正在加载购物车" aria-busy="true">
-        <div v-for="index in 3" :key="index" class="h-28 animate-pulse rounded-xl border border-default bg-elevated motion-reduce:animate-none" />
+      <div
+        v-if="!shoppingCart.ready.value"
+        class="mt-7 space-y-3"
+        aria-label="正在加载购物车"
+        aria-busy="true"
+      >
+        <div
+          v-for="index in 3"
+          :key="index"
+          class="h-28 animate-pulse rounded-xl border border-default bg-elevated motion-reduce:animate-none"
+        />
       </div>
 
-      <section v-else-if="isEmpty" class="mt-8 rounded-2xl border border-dashed border-default bg-elevated px-5 py-14 text-center sm:py-20">
-        <UIcon name="i-lucide-shopping-basket" class="mx-auto size-10 text-muted" aria-hidden="true" />
-        <h2 class="mt-4 text-lg font-semibold text-highlighted">购物车还是空的</h2>
-        <p class="mt-2 text-sm text-muted">挑选商品和规格后，它们会显示在这里。</p>
-        <UButton to="/search" color="primary" class="mt-6">浏览商品</UButton>
+      <section
+        v-else-if="isEmpty"
+        class="mt-8 rounded-2xl border border-dashed border-default bg-elevated px-5 py-14 text-center sm:py-20"
+      >
+        <UIcon
+          name="i-lucide-shopping-basket"
+          class="mx-auto size-10 text-muted"
+          aria-hidden="true"
+        />
+        <h2 class="mt-4 text-lg font-semibold text-highlighted">
+          购物车还是空的
+        </h2>
+        <p class="mt-2 text-sm text-muted">
+          挑选商品和规格后，它们会显示在这里。
+        </p>
+        <UButton
+          to="/search"
+          color="primary"
+          class="mt-6"
+        >
+          浏览商品
+        </UButton>
       </section>
 
-      <div v-else-if="shoppingCart.ready.value" class="mt-7 grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] lg:items-start">
-        <section aria-label="购物车商品" class="min-w-0">
+      <div
+        v-else-if="shoppingCart.ready.value"
+        class="mt-7 grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] lg:items-start"
+      >
+        <section
+          aria-label="购物车商品"
+          class="min-w-0"
+        >
           <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
             <label class="inline-flex min-h-11 items-center gap-2 rounded-md px-2 text-sm text-highlighted">
               <input
@@ -162,7 +224,11 @@ onMounted(() => {
           </div>
 
           <ul class="space-y-3">
-            <li v-for="item in items" :key="item.skuId" class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-3 rounded-xl border border-default bg-elevated p-4 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:gap-4 sm:p-5">
+            <li
+              v-for="item in items"
+              :key="item.skuId"
+              class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-3 rounded-xl border border-default bg-elevated p-4 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:gap-4 sm:p-5"
+            >
               <input
                 type="checkbox"
                 class="mt-1 size-4 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
@@ -171,14 +237,38 @@ onMounted(() => {
                 @change="selectionChanged(item.skuId, ($event.target as HTMLInputElement).checked)"
               >
               <div class="min-w-0">
-                <h2 class="break-words font-medium text-highlighted">{{ item.productName ?? '商品信息暂不可用' }}</h2>
-                <p v-if="item.skuCode" class="mt-1 break-all text-xs text-muted">SKU {{ item.skuCode }}</p>
-                <ul v-if="item.options.length" class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-sm text-muted" aria-label="当前规格">
-                  <li v-for="option in item.options" :key="option.groupId">{{ option.groupName }}：{{ option.valueName }}</li>
+                <h2 class="break-words font-medium text-highlighted">
+                  {{ item.productName ?? '商品信息暂不可用' }}
+                </h2>
+                <p
+                  v-if="item.skuCode"
+                  class="mt-1 break-all text-xs text-muted"
+                >
+                  SKU {{ item.skuCode }}
+                </p>
+                <ul
+                  v-if="item.options.length"
+                  class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-sm text-muted"
+                  aria-label="当前规格"
+                >
+                  <li
+                    v-for="option in item.options"
+                    :key="option.groupId"
+                  >
+                    {{ option.groupName }}：{{ option.valueName }}
+                  </li>
                 </ul>
                 <p class="mt-2 flex flex-wrap items-center gap-2 text-sm">
-                  <UBadge :color="item.canPurchase ? 'success' : 'warning'" variant="soft">{{ statusLabel(item) }}</UBadge>
-                  <span v-if="item.productStatus && item.productStatus !== 'active'" class="text-muted">商品状态：{{ item.productStatus }}</span>
+                  <UBadge
+                    :color="item.canPurchase ? 'success' : 'warning'"
+                    variant="soft"
+                  >
+                    {{ statusLabel(item) }}
+                  </UBadge>
+                  <span
+                    v-if="item.productStatus && item.productStatus !== 'active'"
+                    class="text-muted"
+                  >商品状态：{{ item.productStatus }}</span>
                 </p>
                 <div class="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
                   <span class="text-muted">单价 <strong class="font-medium tabular-nums text-highlighted">{{ item.unitPrice === null ? '暂不可计价' : `¥${item.unitPrice}` }}</strong></span>
@@ -187,27 +277,97 @@ onMounted(() => {
               </div>
 
               <div class="col-start-2 flex min-w-0 items-center justify-between gap-3 sm:col-start-auto sm:flex-col sm:items-end sm:justify-between">
-                <div class="flex items-center rounded-lg border border-default" :aria-label="`${item.productName ?? '商品'}购买数量`">
-                  <UButton type="button" color="neutral" variant="ghost" icon="i-lucide-minus" :aria-label="`减少${item.productName ?? '商品'}数量`" class="min-h-10 min-w-10 justify-center" :disabled="item.quantity <= 1 || shoppingCart.busy.value" @click="shoppingCart.setQuantity(item.skuId, item.quantity - 1)" />
-                  <span class="min-w-9 px-1 text-center text-sm tabular-nums text-highlighted" aria-live="polite">{{ item.quantity }}</span>
-                  <UButton type="button" color="neutral" variant="ghost" icon="i-lucide-plus" :aria-label="`增加${item.productName ?? '商品'}数量`" class="min-h-10 min-w-10 justify-center" :disabled="item.quantity >= 99 || shoppingCart.busy.value" @click="shoppingCart.setQuantity(item.skuId, item.quantity + 1)" />
+                <div
+                  class="flex items-center rounded-lg border border-default"
+                  :aria-label="`${item.productName ?? '商品'}购买数量`"
+                >
+                  <UButton
+                    type="button"
+                    color="neutral"
+                    variant="ghost"
+                    icon="i-lucide-minus"
+                    :aria-label="`减少${item.productName ?? '商品'}数量`"
+                    class="min-h-10 min-w-10 justify-center"
+                    :disabled="item.quantity <= 1 || shoppingCart.busy.value"
+                    @click="shoppingCart.setQuantity(item.skuId, item.quantity - 1)"
+                  />
+                  <span
+                    class="min-w-9 px-1 text-center text-sm tabular-nums text-highlighted"
+                    aria-live="polite"
+                  >{{ item.quantity }}</span>
+                  <UButton
+                    type="button"
+                    color="neutral"
+                    variant="ghost"
+                    icon="i-lucide-plus"
+                    :aria-label="`增加${item.productName ?? '商品'}数量`"
+                    class="min-h-10 min-w-10 justify-center"
+                    :disabled="item.quantity >= 99 || shoppingCart.busy.value"
+                    @click="shoppingCart.setQuantity(item.skuId, item.quantity + 1)"
+                  />
                 </div>
-                <UButton color="neutral" variant="link" icon="i-lucide-x" :disabled="shoppingCart.busy.value" @click="shoppingCart.remove(item.skuId)">移除</UButton>
+                <UButton
+                  color="neutral"
+                  variant="link"
+                  icon="i-lucide-x"
+                  :disabled="shoppingCart.busy.value"
+                  @click="shoppingCart.remove(item.skuId)"
+                >
+                  移除
+                </UButton>
               </div>
             </li>
           </ul>
         </section>
 
-        <aside class="rounded-xl border border-default bg-elevated p-4 sm:p-5 lg:sticky lg:top-4" aria-labelledby="cart-summary-title">
-          <h2 id="cart-summary-title" class="text-lg font-semibold text-highlighted">所选商品</h2>
+        <aside
+          class="rounded-xl border border-default bg-elevated p-4 sm:p-5 lg:sticky lg:top-4"
+          aria-labelledby="cart-summary-title"
+        >
+          <h2
+            id="cart-summary-title"
+            class="text-lg font-semibold text-highlighted"
+          >
+            所选商品
+          </h2>
           <dl class="mt-4 space-y-3 border-b border-default pb-4 text-sm">
-            <div class="flex justify-between gap-3"><dt class="text-muted">商品数量</dt><dd class="tabular-nums text-highlighted">{{ selectedCount }}</dd></div>
-            <div class="flex justify-between gap-3"><dt class="text-muted">当前报价合计</dt><dd class="font-semibold tabular-nums text-primary">{{ quoteBusy ? '正在报价…' : selectedQuote?.totalAmount === null ? '无法完整计价' : selectedQuote ? `¥${selectedQuote.totalAmount}` : '—' }}</dd></div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-muted">
+                商品数量
+              </dt><dd class="tabular-nums text-highlighted">
+                {{ selectedCount }}
+              </dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-muted">
+                当前报价合计
+              </dt><dd class="font-semibold tabular-nums text-primary">
+                {{ quoteBusy ? '正在报价…' : selectedQuote?.totalAmount === null ? '无法完整计价' : selectedQuote ? `¥${selectedQuote.totalAmount}` : '—' }}
+              </dd>
+            </div>
           </dl>
-          <p v-if="selectedQuote?.totalComplete === false" class="mt-3 text-sm text-warning">有商品当前无法读取售价，合计金额不完整。</p>
-          <p v-if="quoteError" class="mt-3 text-sm text-error" role="alert">{{ quoteError }}</p>
-          <p v-if="!isCustomer" class="mt-3 text-sm leading-6 text-muted">游客可以使用本地购物车。店铺的游客结算与免费领取政策会在报价中检查。</p>
-          <p class="mt-3 text-xs leading-5 text-muted">此页面只生成当前报价预览。尚未创建订单，也不会预留库存或发起支付。</p>
+          <p
+            v-if="selectedQuote?.totalComplete === false"
+            class="mt-3 text-sm text-warning"
+          >
+            有商品当前无法读取售价，合计金额不完整。
+          </p>
+          <p
+            v-if="quoteError"
+            class="mt-3 text-sm text-error"
+            role="alert"
+          >
+            {{ quoteError }}
+          </p>
+          <p
+            v-if="!isCustomer"
+            class="mt-3 text-sm leading-6 text-muted"
+          >
+            游客可以使用本地购物车。店铺的游客结算与免费领取政策会在报价中检查。
+          </p>
+          <p class="mt-3 text-xs leading-5 text-muted">
+            此页面只生成当前报价预览。尚未创建订单，也不会预留库存或发起支付。
+          </p>
           <UButton
             :to="checkoutPath"
             color="primary"
