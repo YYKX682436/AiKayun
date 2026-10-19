@@ -7,19 +7,35 @@ import type {
 } from '@aikayun/contracts'
 import { CustomerApiError, useCustomerApi } from './useCustomerApi'
 
-const storageKey = 'aikayun-guest-cart-v1'
+const storageKey = 'aikayun-guest-cart-v2'
+const storageLockName = 'aikayun:guest-cart:v2'
 const maxLineQuantity = 99
 const maxCartLines = 50
+const maxPendingBatches = 50
 
-type GuestCartEnvelope = {
-  version: 1
+type GuestCartBatch = {
+  ownerId: string
   mergeId: string
   items: CartSkuQuantity[]
 }
 
-type GuestCartSnapshot = GuestCartEnvelope & {
+type GuestCartStore = {
+  version: 2
+  unclaimedItems: CartSkuQuantity[]
+  pendingBatches: GuestCartBatch[]
+}
+
+type StoredGuestCart = {
+  ok: boolean
+  raw: string | null
+  store: GuestCartStore
+}
+
+type GuestCartSnapshot = {
+  items: CartSkuQuantity[]
   raw: string | null
   revision: number
+  storageOk: boolean
 }
 
 type CartScope = {
@@ -27,16 +43,8 @@ type CartScope = {
   customerId: string | null
 }
 
-type MergeClaim = {
-  identityVersion: number
-  customerId: string
-  mergeId: string
-  raw: string | null
-  items: CartSkuQuantity[]
-  status: 'pending' | 'failed' | 'succeeded'
-}
-
 type SyncResult = 'complete' | 'failed' | 'deferred'
+type MergeResult = 'merged' | 'failed' | 'stale'
 
 function isUuid(value: unknown): value is string {
   return typeof value === 'string'
@@ -47,32 +55,58 @@ function newId(): string {
   return crypto.randomUUID()
 }
 
-function parseGuestCart(raw: string | null): GuestCartEnvelope {
-  if (!raw) return { version: 1, mergeId: newId(), items: [] }
-  try {
-    const parsed = JSON.parse(raw) as Partial<GuestCartEnvelope>
-    if (parsed.version !== 1 || !isUuid(parsed.mergeId) || !Array.isArray(parsed.items) || parsed.items.length > maxCartLines) {
-      throw new Error('Invalid guest cart')
+function emptyGuestCartStore(): GuestCartStore {
+  return { version: 2, unclaimedItems: [], pendingBatches: [] }
+}
+
+function parseItems(value: unknown): CartSkuQuantity[] | null {
+  if (!Array.isArray(value) || value.length > maxCartLines) return null
+  const seen = new Set<string>()
+  const items: CartSkuQuantity[] = []
+  for (const candidate of value) {
+    if (!candidate || !isUuid(candidate.skuId) || seen.has(candidate.skuId)
+      || !Number.isSafeInteger(candidate.quantity) || candidate.quantity < 1 || candidate.quantity > maxLineQuantity) {
+      return null
     }
-    const merged = new Map<string, number>()
-    for (const candidate of parsed.items) {
-      if (!candidate || !isUuid(candidate.skuId) || !Number.isSafeInteger(candidate.quantity)
-        || candidate.quantity < 1 || candidate.quantity > maxLineQuantity) {
-        throw new Error('Invalid guest cart item')
-      }
-      const quantity = (merged.get(candidate.skuId) ?? 0) + candidate.quantity
-      if (quantity > maxLineQuantity) throw new Error('Invalid guest cart quantity')
-      merged.set(candidate.skuId, quantity)
-    }
-    if (merged.size > maxCartLines) throw new Error('Invalid guest cart size')
-    return {
-      version: 1,
-      mergeId: parsed.mergeId,
-      items: [...merged].map(([skuId, quantity]) => ({ skuId, quantity })),
-    }
-  } catch {
-    return { version: 1, mergeId: newId(), items: [] }
+    seen.add(candidate.skuId)
+    items.push({ skuId: candidate.skuId, quantity: candidate.quantity })
   }
+  return items
+}
+
+function parseGuestCartStore(raw: string | null): GuestCartStore | null {
+  if (!raw) return emptyGuestCartStore()
+  try {
+    const value = JSON.parse(raw) as Partial<GuestCartStore>
+    if (value.version !== 2 || !Array.isArray(value.pendingBatches) || value.pendingBatches.length > maxPendingBatches) return null
+    const unclaimedItems = parseItems(value.unclaimedItems)
+    if (!unclaimedItems) return null
+    const pendingBatches: GuestCartBatch[] = []
+    for (const candidate of value.pendingBatches) {
+      if (!candidate || !isUuid(candidate.ownerId) || !isUuid(candidate.mergeId)) return null
+      const items = parseItems(candidate.items)
+      if (!items?.length) return null
+      pendingBatches.push({ ownerId: candidate.ownerId, mergeId: candidate.mergeId, items })
+    }
+    return { version: 2, unclaimedItems, pendingBatches }
+  }
+  catch {
+    return null
+  }
+}
+
+function cloneItems(items: CartSkuQuantity[]): CartSkuQuantity[] {
+  return items.map(item => ({ skuId: item.skuId, quantity: item.quantity }))
+}
+
+function sameItems(left: CartSkuQuantity[], right: CartSkuQuantity[]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function sameBatch(left: GuestCartBatch, right: GuestCartBatch): boolean {
+  return left.ownerId === right.ownerId
+    && left.mergeId === right.mergeId
+    && sameItems(left.items, right.items)
 }
 
 export function useShoppingCart() {
@@ -93,7 +127,11 @@ export function useShoppingCart() {
   const cartMutationVersion = useState('storefront-cart-mutation-version', () => 0)
   const cartOperationVersion = useState('storefront-cart-operation-version', () => 0)
   const guestRevision = useState('storefront-cart-guest-revision', () => 0)
-  const mergeClaim = useState<MergeClaim | null>('storefront-cart-merge-claim', () => null)
+  const guestStoreRaw = useState<string | null>('storefront-cart-storage-raw', () => null)
+  const guestStorageError = useState<string | null>('storefront-cart-storage-error', () => null)
+  const nuxtApp = useNuxtApp() as ReturnType<typeof useNuxtApp> & {
+    _shoppingCartStorageListener?: (event: StorageEvent) => void
+  }
 
   const customerId = computed(() => customerApi.session.value?.customer.id ?? null)
   const activeIdentityVersion = computed(() => customerApi.identityVersion.value)
@@ -114,52 +152,97 @@ export function useShoppingCart() {
       && ownerId.value === scope.customerId
   }
 
-  function readStorageRaw(): string | null {
-    if (!import.meta.client) return null
-    try { return localStorage.getItem(storageKey) } catch { return null }
+  function readStoredGuestCart(rawOverride?: string | null): StoredGuestCart {
+    if (!import.meta.client) return { ok: false, raw: null, store: emptyGuestCartStore() }
+    try {
+      const raw = rawOverride === undefined ? localStorage.getItem(storageKey) : rawOverride
+      const store = parseGuestCartStore(raw)
+      return store ? { ok: true, raw, store } : { ok: false, raw, store: emptyGuestCartStore() }
+    }
+    catch {
+      return { ok: false, raw: null, store: emptyGuestCartStore() }
+    }
+  }
+
+  function applyStoredGuestCart(stored: StoredGuestCart, forceRevision = false): void {
+    if (!stored.ok) {
+      guestStorageError.value = '本机购物车存储不可用或数据无效，无法安全同步。'
+      guestItems.value = []
+      guestQuote.value = null
+      return
+    }
+    guestStorageError.value = null
+    if (forceRevision || guestStoreRaw.value !== stored.raw) {
+      guestStoreRaw.value = stored.raw
+      guestRevision.value += 1
+      guestQuote.value = null
+    }
+    guestItems.value = cloneItems(stored.store.unclaimedItems)
+  }
+
+  function restoreGuestItems(): boolean {
+    const stored = readStoredGuestCart()
+    applyStoredGuestCart(stored)
+    return stored.ok
+  }
+
+  function writeGuestStore(store: GuestCartStore): void {
+    const raw = store.unclaimedItems.length || store.pendingBatches.length
+      ? JSON.stringify(store)
+      : null
+    try {
+      if (raw) localStorage.setItem(storageKey, raw)
+      else localStorage.removeItem(storageKey)
+    }
+    catch {
+      throw new Error('本机购物车无法写入浏览器存储，请检查存储空间后重试。')
+    }
+    applyStoredGuestCart({ ok: true, raw, store }, true)
+  }
+
+  async function withGuestStorageLock<T>(operation: () => T, required = false): Promise<T> {
+    if (!import.meta.client) return operation()
+    const locks = navigator.locks
+    if (!locks) {
+      if (required) throw new Error('当前浏览器不支持安全的跨标签购物车同步。')
+      return operation()
+    }
+    return locks.request(storageLockName, { mode: 'exclusive' }, operation)
   }
 
   function readGuestSnapshot(): GuestCartSnapshot {
-    const raw = readStorageRaw()
-    const envelope = parseGuestCart(raw)
-    if (raw && envelope.items.length === 0) {
-      try { localStorage.removeItem(storageKey) } catch { /* Best effort only. */ }
+    const stored = readStoredGuestCart()
+    applyStoredGuestCart(stored)
+    return {
+      items: stored.ok ? cloneItems(stored.store.unclaimedItems) : [],
+      raw: stored.raw,
+      revision: guestRevision.value,
+      storageOk: stored.ok,
     }
-    return { ...envelope, raw, revision: guestRevision.value }
   }
 
-  function writeStorage(items: CartSkuQuantity[], mergeId = newId()): GuestCartEnvelope {
-    const envelope: GuestCartEnvelope = { version: 1, mergeId, items }
-    guestRevision.value += 1
-    if (import.meta.client) {
-      try { localStorage.setItem(storageKey, JSON.stringify(envelope)) } catch { /* The visible cart still works for this page view. */ }
-    }
-    guestItems.value = items
-    return envelope
+  function snapshotIsCurrent(scope: CartScope, snapshot: GuestCartSnapshot): boolean {
+    if (!scopeIsActive(scope) || guestRevision.value !== snapshot.revision) return false
+    const latest = readStoredGuestCart()
+    return latest.ok && latest.raw === snapshot.raw
   }
 
-  function clearStorageIfUnchanged(scope: CartScope, snapshot: GuestCartSnapshot): boolean {
-    if (!scopeIsCurrent(scope) || guestRevision.value !== snapshot.revision || readStorageRaw() !== snapshot.raw) return false
-    const latest = parseGuestCart(snapshot.raw)
-    if (latest.mergeId !== snapshot.mergeId || JSON.stringify(latest.items) !== JSON.stringify(snapshot.items)) return false
-    guestRevision.value += 1
-    if (import.meta.client) {
-      try { localStorage.removeItem(storageKey) } catch { /* Best effort only. */ }
+  function installStorageListener(): void {
+    if (!import.meta.client || nuxtApp._shoppingCartStorageListener) return
+    const listener = (event: StorageEvent) => {
+      if (event.key !== storageKey) return
+      const stored = readStoredGuestCart()
+      applyStoredGuestCart(stored, true)
+      if (!customerApi.sessionResolved.value) return
+      const scope = currentScope()
+      if (scope.customerId) void syncSession(true)
+      else if (scopeIsActive(scope)) void refreshGuestQuote(scope, readGuestSnapshot())
     }
-    guestItems.value = []
-    guestQuote.value = null
-    return true
+    window.addEventListener('storage', listener)
+    nuxtApp._shoppingCartStorageListener = listener
   }
 
-  function clearGuestCart(): void {
-    guestRevision.value += 1
-    if (import.meta.client) {
-      try { localStorage.removeItem(storageKey) } catch { /* Best effort only. */ }
-    }
-    guestItems.value = []
-    guestQuote.value = null
-    if (mergeClaim.value?.status !== 'pending') mergeClaim.value = null
-  }
+  installStorageListener()
 
   function activateScope(scope: CartScope): void {
     ownerId.value = scope.customerId
@@ -175,16 +258,21 @@ export function useShoppingCart() {
     cartMutationVersion.value += 1
     syncAttemptedIdentityVersion.value = null
     syncRequestVersion.value += 1
-    if (!scope.customerId) guestItems.value = readGuestSnapshot().items
+    restoreGuestItems()
+    if (guestStorageError.value) errorState.value = guestStorageError.value
   }
 
   function readError(error: unknown, fallback: string): string {
-    return error instanceof CustomerApiError ? error.message : fallback
+    return error instanceof CustomerApiError ? error.message : error instanceof Error ? error.message : fallback
   }
 
   async function refreshGuestQuote(scope: CartScope, snapshot = readGuestSnapshot()): Promise<boolean> {
+    if (!snapshot.storageOk) {
+      if (scopeIsActive(scope)) errorState.value = guestStorageError.value ?? '本机购物车无法安全读取，请重试。'
+      return false
+    }
     if (!snapshot.items.length) {
-      if (scopeIsActive(scope) && guestRevision.value === snapshot.revision) {
+      if (snapshotIsCurrent(scope, snapshot)) {
         guestQuote.value = null
         errorState.value = null
       }
@@ -195,86 +283,98 @@ export function useShoppingCart() {
         method: 'POST',
         body: { items: snapshot.items },
       })
-      if (!scopeIsActive(scope) || guestRevision.value !== snapshot.revision) return false
+      if (!snapshotIsCurrent(scope, snapshot)) return false
       guestQuote.value = quote
       errorState.value = null
       return true
-    } catch (error) {
-      if (scopeIsActive(scope) && guestRevision.value === snapshot.revision) {
-        errorState.value = readError(error, '购物车报价暂时无法加载，请重试。')
-      }
+    }
+    catch (error) {
+      if (snapshotIsCurrent(scope, snapshot)) errorState.value = readError(error, '购物车报价暂时无法加载，请重试。')
       return false
     }
   }
 
-  function mergeClaimMatches(claim: MergeClaim, scope: CartScope, snapshot: GuestCartSnapshot): boolean {
-    return claim.customerId === scope.customerId
-      && claim.mergeId === snapshot.mergeId
-      && claim.raw === snapshot.raw
-      && JSON.stringify(claim.items) === JSON.stringify(snapshot.items)
+  async function claimGuestItems(scope: CartScope): Promise<{ batches: GuestCartBatch[]; hasOtherOwners: boolean }> {
+    const claimingCustomerId = scope.customerId
+    if (!claimingCustomerId) return { batches: [], hasOtherOwners: false }
+    return withGuestStorageLock(() => {
+      if (!scopeIsActive(scope)) return { batches: [], hasOtherOwners: false }
+      const stored = readStoredGuestCart()
+      if (!stored.ok) throw new Error(guestStorageError.value ?? '本机购物车存储不可用，未发送合并请求。')
+      let store = stored.store
+      if (store.unclaimedItems.length) {
+        if (store.pendingBatches.length >= maxPendingBatches) throw new Error('本机有过多待确认购物车批次，请先登录原账户完成同步。')
+        const batch: GuestCartBatch = {
+          ownerId: claimingCustomerId,
+          mergeId: newId(),
+          items: cloneItems(store.unclaimedItems),
+        }
+        store = {
+          version: 2,
+          unclaimedItems: [],
+          pendingBatches: [...store.pendingBatches, batch],
+        }
+        writeGuestStore(store)
+      }
+      else {
+        applyStoredGuestCart(stored)
+      }
+      return {
+        batches: store.pendingBatches.filter(batch => batch.ownerId === claimingCustomerId).map(batch => ({
+          ownerId: batch.ownerId,
+          mergeId: batch.mergeId,
+          items: cloneItems(batch.items),
+        })),
+        hasOtherOwners: store.pendingBatches.some(batch => batch.ownerId !== claimingCustomerId),
+      }
+    }, true)
   }
 
-  async function mergeGuestCart(scope: CartScope, snapshot: GuestCartSnapshot): Promise<'merged' | 'failed' | 'blocked' | 'stale'> {
-    if (!scope.customerId || !snapshot.items.length) return 'merged'
-    const existing = mergeClaim.value
-    if (existing) {
-      if (!mergeClaimMatches(existing, scope, snapshot)) {
-        if (scopeIsActive(scope)) {
-          noticeState.value = '游客购物车仍保留在本机，未合并到当前账户。'
-        }
-        return 'blocked'
+  async function removeConfirmedBatch(scope: CartScope, batch: GuestCartBatch): Promise<boolean> {
+    return withGuestStorageLock(() => {
+      if (!scopeIsCurrent(scope)) return false
+      const stored = readStoredGuestCart()
+      if (!stored.ok) throw new Error('本机存储暂时无法确认合并结果；原始批次已保留供幂等重试。')
+      const index = stored.store.pendingBatches.findIndex(candidate => sameBatch(candidate, batch))
+      if (index < 0) {
+        applyStoredGuestCart(stored)
+        return !stored.store.pendingBatches.some(candidate => candidate.mergeId === batch.mergeId && candidate.ownerId === batch.ownerId)
       }
-      if (existing.status === 'pending') return 'blocked'
-      if (existing.status === 'succeeded') {
-        if (!scopeIsCurrent(scope)) return 'stale'
-        if (clearStorageIfUnchanged(scope, snapshot) && scopeIsActive(scope)) {
-          noticeState.value = '游客购物车已合并到当前账户。'
-        }
-        return 'merged'
-      }
-    }
+      const pendingBatches = stored.store.pendingBatches.filter((_, candidateIndex) => candidateIndex !== index)
+      writeGuestStore({ ...stored.store, pendingBatches })
+      return true
+    }, true)
+  }
 
-    const claim: MergeClaim = {
-      identityVersion: scope.identityVersion,
-      customerId: scope.customerId,
-      mergeId: snapshot.mergeId,
-      raw: snapshot.raw,
-      items: snapshot.items.map(item => ({ ...item })),
-      status: 'pending',
+  async function mergeGuestBatch(scope: CartScope, batch: GuestCartBatch): Promise<MergeResult> {
+    if (!scopeIsCurrent(scope)) return 'stale'
+    const mergeBody: CustomerCartMergeBody = {
+      mergeId: batch.mergeId,
+      items: cloneItems(batch.items),
     }
-    mergeClaim.value = claim
-    const mergeBody: CustomerCartMergeBody = { mergeId: snapshot.mergeId, items: snapshot.items }
     try {
       const merged = await customerApi.request<CustomerCartMutation>('/api/v1/customer/cart/merge', {
         method: 'POST',
         body: mergeBody,
       })
-      if (mergeClaim.value?.mergeId === claim.mergeId && mergeClaim.value.identityVersion === claim.identityVersion) {
-        mergeClaim.value = { ...claim, status: 'succeeded' }
-      }
       if (!scopeIsCurrent(scope)) return 'stale'
-      const cleared = clearStorageIfUnchanged(scope, snapshot)
+      const cleared = await removeConfirmedBatch(scope, batch)
       if (!scopeIsActive(scope)) return 'stale'
-      if (cleared) {
-        customerCart.value = merged.cart
-        if (merged.skippedSkuIds.length) {
-          noticeState.value = `${merged.skippedSkuIds.length} 件已删除的商品规格未能合并。`
-        } else if (merged.changed) {
-          noticeState.value = '游客购物车已合并到当前账户。'
-        }
-      } else if (guestRevision.value !== snapshot.revision || readStorageRaw() !== snapshot.raw) {
-        noticeState.value = '购物车在同步期间发生了变化，本机数据已保留。'
+      if (!cleared) throw new Error('合并已响应，但本机仍保留待确认批次；重试不会重复增加商品。')
+      if (merged.skippedSkuIds.length) {
+        noticeState.value = `${merged.skippedSkuIds.length} 件已删除的商品规格未能合并。`
+      }
+      else if (merged.changed) {
+        noticeState.value = '游客购物车已合并到当前账户。'
       }
       return 'merged'
-    } catch (error) {
-      if (mergeClaim.value?.mergeId === claim.mergeId && mergeClaim.value.identityVersion === claim.identityVersion) {
-        mergeClaim.value = { ...claim, status: 'failed' }
-      }
+    }
+    catch (error) {
       if (!scopeIsCurrent(scope)) return 'stale'
       if (scopeIsActive(scope)) {
-        errorState.value = error instanceof CustomerApiError
-          ? `游客购物车合并未完成：${error.message} 本机购物车仍已保留。`
-          : '游客购物车合并未完成，本机购物车仍已保留。'
+        errorState.value = error instanceof CustomerApiError || error instanceof Error
+          ? `游客购物车合并待确认：${error.message} 原始批次仍已保留，可安全重试。`
+          : '游客购物车合并结果未知，原始批次仍已保留，可安全重试。'
       }
       return 'failed'
     }
@@ -286,11 +386,10 @@ export function useShoppingCart() {
       if (!scopeIsActive(scope) || busyState.value || cartMutationVersion.value !== mutationVersion) return 'deferred'
       customerCart.value = cart
       return 'complete'
-    } catch (error) {
+    }
+    catch (error) {
       if (!scopeIsActive(scope) || busyState.value || cartMutationVersion.value !== mutationVersion) return 'deferred'
-      if (scopeIsActive(scope) && !busyState.value && cartMutationVersion.value === mutationVersion) {
-        errorState.value = readError(error, '购物车暂时无法加载，请重试。')
-      }
+      errorState.value = readError(error, '购物车暂时无法加载，请重试。')
       return 'failed'
     }
   }
@@ -298,21 +397,40 @@ export function useShoppingCart() {
   async function syncOneScope(scope: CartScope): Promise<SyncResult> {
     if (busyState.value) return 'deferred'
     if (scope.customerId) {
-      const snapshot = readGuestSnapshot()
-      guestItems.value = snapshot.items
-      let mergeResult: 'merged' | 'failed' | 'blocked' | 'stale' = 'merged'
-      if (snapshot.items.length) mergeResult = await mergeGuestCart(scope, snapshot)
-      if (mergeResult === 'stale' || !scopeIsActive(scope)) return 'deferred'
-      if (busyState.value) return 'deferred'
+      let mergeFailed = false
+      let hasOtherOwners = false
+      try {
+        const claimed = await claimGuestItems(scope)
+        hasOtherOwners = claimed.hasOtherOwners
+        for (const batch of claimed.batches) {
+          const result = await mergeGuestBatch(scope, batch)
+          if (result === 'stale' || !scopeIsActive(scope)) return 'deferred'
+          if (result === 'failed') mergeFailed = true
+        }
+      }
+      catch (error) {
+        if (!scopeIsCurrent(scope)) return 'deferred'
+        mergeFailed = true
+        if (scopeIsActive(scope)) errorState.value = readError(error, '本机购物车暂时无法安全同步，请重试。')
+      }
+      if (!scopeIsActive(scope) || busyState.value) return 'deferred'
       const cartResult = await syncCustomerCart(scope, cartMutationVersion.value)
       if (cartResult !== 'complete') return cartResult
-      if (mergeResult === 'merged' && !errorState.value) errorState.value = null
+      if (hasOtherOwners && scopeIsActive(scope)) noticeState.value = '另有待确认购物车已绑定其他账户，当前账户不会读取或合并该批次。'
+      if (!mergeFailed && scopeIsActive(scope)) errorState.value = null
       return 'complete'
     }
 
     customerCart.value = null
     const snapshot = readGuestSnapshot()
-    guestItems.value = snapshot.items
+    if (guestStorageError.value) {
+      if (scopeIsActive(scope)) errorState.value = guestStorageError.value
+      return 'failed'
+    }
+    const stored = readStoredGuestCart()
+    if (stored.ok && stored.store.pendingBatches.length && scopeIsActive(scope)) {
+      noticeState.value = '有待原账户确认的游客购物车，已与当前访客购物车隔离。'
+    }
     const quoted = await refreshGuestQuote(scope, snapshot)
     if (!quoted) {
       if (!scopeIsActive(scope) || guestRevision.value !== snapshot.revision) return 'deferred'
@@ -343,11 +461,12 @@ export function useShoppingCart() {
         readyState.value = result === 'complete'
         break
       }
-    } finally {
+    }
+    finally {
       syncing.value = false
       const scope = currentScope()
       const superseded = !scopeIsActive(scope)
-        || (readyState.value && syncAttemptedIdentityVersion.value !== scope.identityVersion)
+        || syncAttemptedIdentityVersion.value !== scope.identityVersion
       if (customerApi.sessionResolved.value && !busyState.value && superseded) void syncSession()
     }
   }
@@ -405,13 +524,29 @@ export function useShoppingCart() {
     if (!readyState.value || syncing.value) void syncSession(true)
   }
 
+  async function mutateGuestCart(
+    scope: CartScope,
+    operationVersion: number,
+    update: (store: GuestCartStore) => GuestCartStore,
+  ): Promise<GuestCartSnapshot | null> {
+    return withGuestStorageLock(() => {
+      if (!operationIsCurrent(scope, operationVersion) || scope.customerId) return null
+      const stored = readStoredGuestCart()
+      if (!stored.ok) throw new Error('本机购物车存储不可用或数据无效，尚未修改。')
+      const next = update(stored.store)
+      writeGuestStore(next)
+      return {
+        items: cloneItems(next.unclaimedItems),
+        raw: next.unclaimedItems.length || next.pendingBatches.length ? JSON.stringify(next) : null,
+        revision: guestRevision.value,
+        storageOk: true,
+      }
+    })
+  }
+
   async function refresh(): Promise<void> {
     const scope = currentScope()
-    if (scope.customerId) {
-      await syncSession(true)
-      return
-    }
-    if (!scopeIsActive(scope)) {
+    if (scope.customerId || !scopeIsActive(scope)) {
       await syncSession(true)
       return
     }
@@ -433,26 +568,26 @@ export function useShoppingCart() {
           method: 'POST', body: { skuId, quantity },
         })
         if (operationIsCurrent(scope, operationVersion)) customerCart.value = result.cart
-      } else {
-        const current = guestItems.value.find(item => item.skuId === skuId)?.quantity ?? 0
-        const next = current + quantity
-        if (next > maxLineQuantity) throw new Error(`同一规格数量不能超过 ${maxLineQuantity}。`)
-        if (!current && guestItems.value.length >= maxCartLines) throw new Error(`购物车最多包含 ${maxCartLines} 个规格。`)
-        const nextItems = current
-          ? guestItems.value.map(item => item.skuId === skuId ? { skuId, quantity: next } : item)
-          : [...guestItems.value, { skuId, quantity }]
-        writeStorage(nextItems)
-        const snapshot = readGuestSnapshot()
-        await refreshGuestQuote(scope, snapshot)
+      }
+      else {
+        const snapshot = await mutateGuestCart(scope, operationVersion, (store) => {
+          const current = store.unclaimedItems.find(item => item.skuId === skuId)?.quantity ?? 0
+          const next = current + quantity
+          if (next > maxLineQuantity) throw new Error(`同一规格数量不能超过 ${maxLineQuantity}。`)
+          if (!current && store.unclaimedItems.length >= maxCartLines) throw new Error(`购物车最多包含 ${maxCartLines} 个规格。`)
+          const unclaimedItems = current
+            ? store.unclaimedItems.map(item => item.skuId === skuId ? { skuId, quantity: next } : item)
+            : [...store.unclaimedItems, { skuId, quantity }]
+          return { ...store, unclaimedItems }
+        })
+        if (snapshot && scopeIsActive(scope)) await refreshGuestQuote(scope, snapshot)
       }
       if (operationIsCurrent(scope, operationVersion)) noticeState.value = '已加入购物车。'
-    } catch (error) {
-      if (operationIsCurrent(scope, operationVersion)) {
-        errorState.value = error instanceof CustomerApiError || error instanceof Error
-          ? error.message
-          : '暂时无法加入购物车，请重试。'
-      }
-    } finally {
+    }
+    catch (error) {
+      if (operationIsCurrent(scope, operationVersion)) errorState.value = readError(error, '暂时无法加入购物车，请重试。')
+    }
+    finally {
       finishOperation(scope, operationVersion)
     }
   }
@@ -468,13 +603,19 @@ export function useShoppingCart() {
           method: 'PATCH', body: { quantity },
         })
         if (operationIsCurrent(scope, operationVersion)) customerCart.value = result.cart
-      } else {
-        writeStorage(guestItems.value.map(item => item.skuId === skuId ? { skuId, quantity } : item))
-        await refreshGuestQuote(scope, readGuestSnapshot())
       }
-    } catch (error) {
-      if (operationIsCurrent(scope, operationVersion)) errorState.value = error instanceof Error ? error.message : '数量更新失败，请重试。'
-    } finally {
+      else {
+        const snapshot = await mutateGuestCart(scope, operationVersion, store => ({
+          ...store,
+          unclaimedItems: store.unclaimedItems.map(item => item.skuId === skuId ? { skuId, quantity } : item),
+        }))
+        if (snapshot && scopeIsActive(scope)) await refreshGuestQuote(scope, snapshot)
+      }
+    }
+    catch (error) {
+      if (operationIsCurrent(scope, operationVersion)) errorState.value = readError(error, '数量更新失败，请重试。')
+    }
+    finally {
       finishOperation(scope, operationVersion)
     }
   }
@@ -487,13 +628,19 @@ export function useShoppingCart() {
       if (scope.customerId) {
         const result = await customerApi.request<CustomerCartMutation>(`/api/v1/customer/cart/items/${encodeURIComponent(skuId)}`, { method: 'DELETE' })
         if (operationIsCurrent(scope, operationVersion)) customerCart.value = result.cart
-      } else {
-        writeStorage(guestItems.value.filter(item => item.skuId !== skuId))
-        await refreshGuestQuote(scope, readGuestSnapshot())
       }
-    } catch (error) {
-      if (operationIsCurrent(scope, operationVersion)) errorState.value = error instanceof Error ? error.message : '移除商品失败，请重试。'
-    } finally {
+      else {
+        const snapshot = await mutateGuestCart(scope, operationVersion, store => ({
+          ...store,
+          unclaimedItems: store.unclaimedItems.filter(item => item.skuId !== skuId),
+        }))
+        if (snapshot && scopeIsActive(scope)) await refreshGuestQuote(scope, snapshot)
+      }
+    }
+    catch (error) {
+      if (operationIsCurrent(scope, operationVersion)) errorState.value = readError(error, '移除商品失败，请重试。')
+    }
+    finally {
       finishOperation(scope, operationVersion)
     }
   }
@@ -506,13 +653,16 @@ export function useShoppingCart() {
       if (scope.customerId) {
         const result = await customerApi.request<CustomerCartMutation>('/api/v1/customer/cart', { method: 'DELETE' })
         if (operationIsCurrent(scope, operationVersion)) customerCart.value = result.cart
-      } else {
-        clearGuestCart()
+      }
+      else {
+        await mutateGuestCart(scope, operationVersion, store => ({ ...store, unclaimedItems: [] }))
       }
       if (operationIsCurrent(scope, operationVersion)) noticeState.value = null
-    } catch (error) {
-      if (operationIsCurrent(scope, operationVersion)) errorState.value = error instanceof Error ? error.message : '清空购物车失败，请重试。'
-    } finally {
+    }
+    catch (error) {
+      if (operationIsCurrent(scope, operationVersion)) errorState.value = readError(error, '清空购物车失败，请重试。')
+    }
+    finally {
       finishOperation(scope, operationVersion)
     }
   }

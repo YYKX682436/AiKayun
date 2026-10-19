@@ -282,6 +282,13 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     expect(replay.statusCode).toBe(200)
     expect(replay.json().data.cart.items.find((item: { skuId: string }) => item.skuId === skuA!.skuId).quantity).toBe(3)
     expect(replay.json().data.changed).toBe(false)
+    const persistedMerge = await db.selectFrom('customer_cart_merge_requests').selectAll()
+      .where('customer_id', '=', owner.id).where('merge_id', '=', mergeId).execute()
+    expect(persistedMerge).toHaveLength(1)
+    const persistedCart = await db.selectFrom('customer_cart_items').select(['sku_id', 'quantity'])
+      .where('customer_id', '=', owner.id).orderBy('sku_id').execute()
+    expect(persistedCart).toHaveLength(2)
+    expect(persistedCart.find(item => item.sku_id === skuA!.skuId)?.quantity).toBe(3)
 
     const reused = await app.inject({
       method: 'POST', url: '/api/v1/customer/cart/merge', headers: customerHeaders(owner),

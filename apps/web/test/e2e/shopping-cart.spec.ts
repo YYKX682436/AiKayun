@@ -10,9 +10,18 @@ type Product = {
   variants: Array<{ id: string }>
 }
 
-const guestCartKey = 'aikayun-guest-cart-v1'
+const guestCartKey = 'aikayun-guest-cart-v2'
+const customerIdentityRevisionKey = 'aikayun-customer-identity-revision-v1'
 const testPassword = 'Cart-Browser-Password-2026!'
 let loginRequestSequence = 0
+let quoteRequestSequence = 0
+
+test.beforeEach(async ({ page }) => {
+  const ip = `198.51.100.${(quoteRequestSequence++ % 250) + 1}`
+  await page.route('**/api/v1/checkout/quote', route => route.continue({
+    headers: { ...route.request().headers(), 'x-forwarded-for': ip },
+  }))
+})
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void
@@ -218,17 +227,18 @@ test('guest cart persists locally, merges safely into accounts, and stays privat
     await addProductFromDetail(page, productB, 1)
     const guestEnvelope = await page.evaluate((key) => JSON.parse(localStorage.getItem(key) ?? 'null'), guestCartKey) as {
       version: number
-      mergeId: string
-      items: Array<{ skuId: string; quantity: number; [key: string]: unknown }>
+      unclaimedItems: Array<{ skuId: string; quantity: number; [key: string]: unknown }>
+      pendingBatches: unknown[]
       [key: string]: unknown
     }
-    expect(Object.keys(guestEnvelope).sort()).toEqual(['items', 'mergeId', 'version'])
-    expect(guestEnvelope.version).toBe(1)
-    expect(guestEnvelope.items).toEqual([
+    expect(Object.keys(guestEnvelope).sort()).toEqual(['pendingBatches', 'unclaimedItems', 'version'])
+    expect(guestEnvelope.version).toBe(2)
+    expect(guestEnvelope.pendingBatches).toEqual([])
+    expect(guestEnvelope.unclaimedItems).toEqual([
       { skuId: productA.variants[0]!.id, quantity: 2 },
       { skuId: productB.variants[0]!.id, quantity: 1 },
     ])
-    expect(guestEnvelope.items.every(item => Object.keys(item).sort().join(',') === 'quantity,skuId')).toBe(true)
+    expect(guestEnvelope.unclaimedItems.every(item => Object.keys(item).sort().join(',') === 'quantity,skuId')).toBe(true)
 
     // Refresh preserves browser storage and the server re-quotes current product data.
     await page.goto('/cart')
@@ -396,6 +406,7 @@ test('a delayed guest merge preserves new local changes and cannot leak into a s
   const mergeResponseGate = deferred()
   const mergeStarted = deferred()
   let mergeRequests = 0
+  let firstMergeBody: { mergeId: string; items: Array<{ skuId: string; quantity: number }> } | undefined
 
   try {
     await attachBrowserAdmin(page)
@@ -408,16 +419,22 @@ test('a delayed guest merge preserves new local changes and cannot leak into a s
     await addProductFromDetail(page, productA, 1)
     const originalGuestCart = await page.evaluate(key => localStorage.getItem(key), guestCartKey)
     expect(originalGuestCart).not.toBeNull()
-    expect(JSON.parse(originalGuestCart!).items).toEqual([{ skuId: productA.variants[0]!.id, quantity: 1 }])
+    expect(JSON.parse(originalGuestCart!).unclaimedItems).toEqual([{ skuId: productA.variants[0]!.id, quantity: 1 }])
     await openCartInApp(page)
     await expect(page.getByRole('heading', { name: productAName })).toBeVisible()
     await page.route('**/api/v1/customer/cart/merge', async (route) => {
       if (route.request().method() === 'POST' && mergeRequests === 0) {
         mergeRequests += 1
+        firstMergeBody = route.request().postDataJSON() as typeof firstMergeBody
         const response = await route.fetch()
         mergeStarted.resolve()
         await mergeResponseGate.promise
-        await route.fulfill({ response })
+        try {
+          await route.fulfill({ response })
+        }
+        catch {
+          // Navigation can cancel the waiting browser request after server acceptance.
+        }
         return
       }
       if (route.request().method() === 'POST') mergeRequests += 1
@@ -431,24 +448,42 @@ test('a delayed guest merge preserves new local changes and cannot leak into a s
     await addProductFromDetailInApp(page, productB, 2)
     const changedGuestCart = await page.evaluate(key => localStorage.getItem(key), guestCartKey)
     expect(changedGuestCart).not.toBe(originalGuestCart)
+    const separatedGuestCart = JSON.parse(changedGuestCart ?? 'null') as {
+      unclaimedItems: Array<{ skuId: string; quantity: number }>
+      pendingBatches: Array<{ mergeId: string; items: Array<{ skuId: string; quantity: number }> }>
+    }
+    expect(separatedGuestCart.pendingBatches).toHaveLength(1)
+    expect(separatedGuestCart.pendingBatches[0]).toMatchObject({
+      mergeId: firstMergeBody?.mergeId,
+      items: [{ skuId: productA.variants[0]!.id, quantity: 1 }],
+    })
+    expect(separatedGuestCart.unclaimedItems).toEqual([{ skuId: productB.variants[0]!.id, quantity: 2 }])
 
     await loginCustomerInApp(page, secondUsername)
     await openCartInApp(page)
     mergeResponseGate.resolve()
-
-    await expect(page.getByRole('heading', { name: '购物车还是空的' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: productBName })).toBeVisible()
     await expect(page.getByRole('heading', { name: productAName })).toHaveCount(0)
-    await expect(page.getByRole('heading', { name: productBName })).toHaveCount(0)
-    await expect(page.getByRole('link', { name: '购物车，0 件商品' })).toBeVisible()
-    await expect.poll(() => mergeRequests).toBe(1)
-    await expect.poll(() => page.evaluate(key => localStorage.getItem(key), guestCartKey)).toBe(changedGuestCart)
+    await expect(page.getByRole('link', { name: '购物车，2 件商品' })).toBeVisible()
+
+    await expect(page.getByRole('heading', { name: productBName })).toBeVisible()
+    await expect(page.getByRole('heading', { name: productAName })).toHaveCount(0)
+    await expect(page.getByRole('link', { name: '购物车，2 件商品' })).toBeVisible()
+    await expect.poll(() => mergeRequests).toBe(2)
+    await expect.poll(async () => {
+      const raw = await page.evaluate(key => localStorage.getItem(key), guestCartKey)
+      return raw ? (JSON.parse(raw) as { pendingBatches: unknown[] }).pendingBatches.length : 0
+    }).toBe(1)
     await expect(page.getByText('游客购物车已合并到当前账户。')).toHaveCount(0)
 
     await logoutCustomer(page)
     await openCartInApp(page)
+    await expect(page.getByRole('link', { name: '购物车，0 件商品' })).toBeVisible()
+    await loginCustomerInApp(page, firstUsername)
+    await openCartInApp(page)
     await expect(page.getByRole('heading', { name: productAName })).toBeVisible()
-    await expect(page.getByRole('heading', { name: productBName })).toBeVisible()
-    await expect(page.getByRole('link', { name: '购物车，3 件商品' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: productBName })).toHaveCount(0)
+    await expect(page.getByRole('link', { name: '购物车，1 件商品' })).toBeVisible()
   }
   finally {
     mergeResponseGate.resolve()
@@ -466,6 +501,7 @@ test('a failed guest merge retains local data and retries idempotently', async (
   let product: Product | undefined
   const firstFailureDelivered = deferred()
   let mergeRequests = 0
+  const mergeBodies: unknown[] = []
 
   try {
     await attachBrowserAdmin(page)
@@ -474,14 +510,14 @@ test('a failed guest merge retains local data and retries idempotently', async (
     await addProductFromDetail(page, product, 2)
     const localCartBeforeLogin = await page.evaluate(key => localStorage.getItem(key), guestCartKey)
     expect(localCartBeforeLogin).not.toBeNull()
-    expect(JSON.parse(localCartBeforeLogin!).items).toEqual([{ skuId: product.variants[0]!.id, quantity: 2 }])
+    expect(JSON.parse(localCartBeforeLogin!).unclaimedItems).toEqual([{ skuId: product.variants[0]!.id, quantity: 2 }])
     await openCartInApp(page)
     await expect(page.getByRole('heading', { name: productName })).toBeVisible()
 
     await page.route('**/api/v1/customer/cart/merge', async (route) => {
       if (route.request().method() === 'POST' && mergeRequests === 0) {
         mergeRequests += 1
-        await route.fetch()
+        mergeBodies.push(route.request().postDataJSON())
         await route.fulfill({
           status: 503,
           contentType: 'application/json',
@@ -490,7 +526,10 @@ test('a failed guest merge retains local data and retries idempotently', async (
         firstFailureDelivered.resolve()
         return
       }
-      if (route.request().method() === 'POST') mergeRequests += 1
+      if (route.request().method() === 'POST') {
+        mergeRequests += 1
+        mergeBodies.push(route.request().postDataJSON())
+      }
       await route.continue()
     })
 
@@ -498,13 +537,24 @@ test('a failed guest merge retains local data and retries idempotently', async (
     await expect.poll(() => mergeRequests, { timeout: 10_000 }).toBe(1)
     await firstFailureDelivered.promise
     await openCartInApp(page)
-    await expect(page.getByRole('alert')).toContainText('本机购物车仍已保留')
-    expect(await page.evaluate(key => localStorage.getItem(key), guestCartKey)).toBe(localCartBeforeLogin)
+    await expect(page.getByRole('alert')).toContainText('原始批次仍已保留')
+    const pendingStore = JSON.parse(await page.evaluate(key => localStorage.getItem(key), guestCartKey) ?? 'null') as {
+      unclaimedItems: unknown[]
+      pendingBatches: Array<{ ownerId: string; mergeId: string; items: Array<{ skuId: string; quantity: number }> }>
+    }
+    expect(pendingStore.unclaimedItems).toEqual([])
+    expect(pendingStore.pendingBatches).toHaveLength(1)
+    expect(pendingStore.pendingBatches[0]?.items).toEqual([{ skuId: product.variants[0]!.id, quantity: 2 }])
+    expect(JSON.parse(localCartBeforeLogin!).unclaimedItems).toEqual([{ skuId: product.variants[0]!.id, quantity: 2 }])
 
-    await page.getByRole('button', { name: '重试', exact: true }).click()
+    await logoutCustomer(page)
+    await page.reload()
+    await loginCustomerInApp(page, username)
+    await openCartInApp(page)
     await expect(page.getByRole('heading', { name: productName })).toBeVisible()
     await expect.poll(() => mergeRequests).toBe(2)
     await expect.poll(() => page.evaluate(key => localStorage.getItem(key), guestCartKey)).toBeNull()
+    expect(mergeBodies[1]).toEqual(mergeBodies[0])
     await expect(page.getByRole('link', { name: '购物车，2 件商品' })).toBeVisible()
     await expect(page.getByRole('listitem').filter({ hasText: productName })).toContainText('2')
   }
@@ -572,6 +622,365 @@ test('a delayed add response cannot overwrite the newly logged-in customer cart'
     if (!page.isClosed()) {
       await page.unroute('**/api/v1/customer/cart/items')
       for (const product of products) await deleteProduct(page, product)
+    }
+  }
+})
+
+test('a committed guest merge remains owned by its original customer after reload', async ({ page }) => {
+  test.setTimeout(120_000)
+  const productName = `Cart持久归属-${randomUUID().slice(0, 8)}`
+  const firstUsername = `claim-a-${randomUUID().replaceAll('-', '').slice(0, 18)}`
+  const secondUsername = `claim-b-${randomUUID().replaceAll('-', '').slice(0, 18)}`
+  const firstResponseGate = deferred()
+  const firstMergeCommitted = deferred()
+  const products: Product[] = []
+  let mergeRequests = 0
+
+  try {
+    await attachBrowserAdmin(page)
+    const product = await createProduct(page, productName, '7.50')
+    products.push(product)
+    await createEmptyCustomer(page, firstUsername)
+    await createEmptyCustomer(page, secondUsername)
+    await addProductFromDetail(page, product, 1)
+
+    await page.route('**/api/v1/customer/cart/merge', async (route) => {
+      if (route.request().method() !== 'POST') {
+        await route.continue()
+        return
+      }
+      mergeRequests += 1
+      const response = await route.fetch()
+      if (mergeRequests === 1) {
+        expect(response.status()).toBe(200)
+        firstMergeCommitted.resolve()
+        await firstResponseGate.promise
+      }
+      try {
+        await route.fulfill({ response })
+      }
+      catch {
+        // A reload can cancel the browser side after the server has committed.
+      }
+    })
+
+    await loginCustomer(page, firstUsername)
+    await firstMergeCommitted.promise
+    await logoutCustomer(page)
+    await loginCustomerInApp(page, secondUsername)
+    await openCartInApp(page)
+    await expect(page.getByRole('link', { name: '购物车，0 件商品' })).toBeVisible()
+
+    const secondCartRead = page.waitForResponse(response => response.request().method() === 'GET'
+      && new URL(response.url()).pathname === '/api/v1/customer/cart'
+      && response.status() === 200)
+    await page.reload()
+    const cartResponse = await secondCartRead
+    const cartPayload = await cartResponse.json() as { data: { items: Array<{ skuId: string; quantity: number }> } }
+
+    expect(cartPayload.data.items).toEqual([])
+    expect(mergeRequests).toBe(1)
+    await expect(page.getByRole('heading', { name: '购物车还是空的' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: productName })).toHaveCount(0)
+    await expect(page.getByRole('link', { name: '购物车，0 件商品' })).toBeVisible()
+  }
+  finally {
+    firstResponseGate.resolve()
+    if (!page.isClosed()) {
+      await page.unroute('**/api/v1/customer/cart/merge')
+      for (const product of products) await deleteProduct(page, product)
+    }
+  }
+})
+
+test('a lost successful merge response retries the exact request after logout and reload', async ({ page }) => {
+  test.setTimeout(120_000)
+  const productName = `Cart响应丢失-${randomUUID().slice(0, 8)}`
+  const username = `lost-${randomUUID().replaceAll('-', '').slice(0, 20)}`
+  const firstResponseGate = deferred()
+  const firstMergeCommitted = deferred()
+  const firstResponseLost = deferred()
+  const mergeBodies: unknown[] = []
+  let mergeRequests = 0
+  let product: Product | undefined
+
+  try {
+    await attachBrowserAdmin(page)
+    product = await createProduct(page, productName, '6.25')
+    await createEmptyCustomer(page, username)
+    await addProductFromDetail(page, product, 2)
+
+    await page.route('**/api/v1/customer/cart/merge', async (route) => {
+      if (route.request().method() !== 'POST') {
+        await route.continue()
+        return
+      }
+      mergeRequests += 1
+      mergeBodies.push(route.request().postDataJSON())
+      if (mergeRequests === 1) {
+        const response = await route.fetch()
+        expect(response.status()).toBe(200)
+        firstMergeCommitted.resolve()
+        await firstResponseGate.promise
+        await route.abort('failed')
+        firstResponseLost.resolve()
+        return
+      }
+      await route.continue()
+    })
+
+    await loginCustomer(page, username)
+    await firstMergeCommitted.promise
+    firstResponseGate.resolve()
+    await firstResponseLost.promise
+    await logoutCustomer(page)
+    await page.reload()
+    await loginCustomerInApp(page, username)
+    await expect.poll(() => mergeRequests).toBe(2)
+    await openCartInApp(page)
+    await expect(page.getByRole('heading', { name: productName })).toBeVisible()
+    await expect(page.getByRole('link', { name: '购物车，2 件商品' })).toBeVisible()
+
+    expect(mergeBodies).toHaveLength(2)
+    expect(mergeBodies[1]).toEqual(mergeBodies[0])
+    const response = await page.request.get('/api/v1/customer/cart')
+    expect(response.status()).toBe(200)
+    const cart = (await response.json()).data as { items: Array<{ skuId: string; quantity: number }> }
+    expect(cart.items).toHaveLength(1)
+    expect(cart.items[0]).toMatchObject({ skuId: product.variants[0]!.id, quantity: 2 })
+  }
+  finally {
+    firstResponseGate.resolve()
+    if (!page.isClosed()) {
+      await page.unroute('**/api/v1/customer/cart/merge')
+      if (product) await deleteProduct(page, product)
+    }
+  }
+})
+
+test('guest cart add, quantity changes, removal, and clear persist only unclaimed items', async ({ page }) => {
+  test.setTimeout(120_000)
+  const productName = `Cart访客本地操作-${randomUUID().slice(0, 8)}`
+  let product: Product | undefined
+
+  try {
+    await attachBrowserAdmin(page)
+    product = await createProduct(page, productName, '4.00')
+    await addProductFromDetail(page, product, 2)
+    const store = JSON.parse(await page.evaluate(key => localStorage.getItem(key), guestCartKey) ?? 'null') as {
+      unclaimedItems: Array<{ skuId: string; quantity: number }>
+      pendingBatches: unknown[]
+    }
+    expect(store.unclaimedItems).toEqual([{ skuId: product.variants[0]!.id, quantity: 2 }])
+    expect(store.pendingBatches).toEqual([])
+
+    await openCartInApp(page)
+    const quantity = page.locator(`[aria-label="${productName}购买数量"]`)
+    await page.getByRole('button', { name: `增加${productName}数量` }).click()
+    await expect(quantity).toContainText('3')
+    await expect.poll(async () => {
+      const raw = await page.evaluate(key => localStorage.getItem(key), guestCartKey)
+      return raw ? (JSON.parse(raw) as typeof store).unclaimedItems[0]?.quantity : null
+    }).toBe(3)
+    await page.getByRole('button', { name: `减少${productName}数量` }).click()
+    await expect(quantity).toContainText('2')
+    await page.getByRole('listitem').filter({ hasText: productName }).getByRole('button', { name: '移除' }).click()
+    await expect(page.getByRole('heading', { name: '购物车还是空的' })).toBeVisible()
+    await expect.poll(() => page.evaluate(key => localStorage.getItem(key), guestCartKey)).toBeNull()
+
+    await addProductFromDetail(page, product, 1)
+    await openCartInApp(page)
+    await page.getByRole('button', { name: '清空购物车' }).click()
+    await expect(page.getByRole('heading', { name: '购物车还是空的' })).toBeVisible()
+    await expect.poll(() => page.evaluate(key => localStorage.getItem(key), guestCartKey)).toBeNull()
+    await expect(page.getByRole('link', { name: '购物车，0 件商品' })).toBeVisible()
+  }
+  finally {
+    if (!page.isClosed() && product) await deleteProduct(page, product)
+  }
+})
+
+test('two tabs keep a claimed batch bound to its account while the shared session changes', async ({ page }) => {
+  test.setTimeout(120_000)
+  const productName = `Cart双标签归属-${randomUUID().slice(0, 8)}`
+  const firstUsername = `tab-a-${randomUUID().replaceAll('-', '').slice(0, 18)}`
+  const secondUsername = `tab-b-${randomUUID().replaceAll('-', '').slice(0, 18)}`
+  const firstResponseGate = deferred()
+  const firstMergeCommitted = deferred()
+  const firstResponseReleased = deferred()
+  const secondResponseGate = deferred()
+  const secondMergeCommitted = deferred()
+  const secondResponseReleased = deferred()
+  const products: Product[] = []
+  const secondPage = await page.context().newPage()
+  let firstMergeBody: unknown
+  const secondMergeBodies: unknown[] = []
+  let firstMergeRequests = 0
+  let secondMergeRequests = 0
+
+  try {
+    await attachBrowserAdmin(page)
+    const product = await createProduct(page, productName, '3.75')
+    products.push(product)
+    await createEmptyCustomer(page, firstUsername)
+    await createEmptyCustomer(page, secondUsername)
+    await addProductFromDetail(page, product, 1)
+    await secondPage.goto('/')
+    await expectClientMounted(secondPage, '[data-storefront-ready="true"]')
+
+    await page.route('**/api/v1/customer/cart/merge', async (route) => {
+      if (route.request().method() !== 'POST') {
+        await route.continue()
+        return
+      }
+      firstMergeRequests += 1
+      firstMergeBody = route.request().postDataJSON()
+      const response = await route.fetch()
+      const responseStatus = response.status()
+      const responseBody = responseStatus === 200 ? undefined : await response.text()
+      expect(responseStatus, responseBody).toBe(200)
+      firstMergeCommitted.resolve()
+      await firstResponseGate.promise
+      try {
+        await route.fulfill({ response })
+      }
+      catch {
+        // The old tab may have navigated after the shared identity changed.
+      }
+      firstResponseReleased.resolve()
+    })
+    await secondPage.route('**/api/v1/customer/cart/merge', async (route) => {
+      if (route.request().method() !== 'POST') {
+        await route.continue()
+        return
+      }
+      secondMergeRequests += 1
+      secondMergeBodies.push(route.request().postDataJSON())
+      const response = await route.fetch()
+      const responseStatus = response.status()
+      const responseBody = responseStatus === 200 ? undefined : await response.text()
+      expect(responseStatus, responseBody).toBe(200)
+      if (secondMergeRequests === 1) {
+        secondMergeCommitted.resolve()
+        await secondResponseGate.promise
+        try {
+          await route.fulfill({ response })
+        }
+        catch {
+          // The tab may switch identity while the accepted response is held.
+        }
+        secondResponseReleased.resolve()
+        return
+      }
+      await route.fulfill({ response })
+    })
+
+    await loginCustomer(page, firstUsername)
+    await firstMergeCommitted.promise
+    const firstSession = await page.request.get('/api/customer/session').then(response => response.json())
+    const firstCustomerId = firstSession.data.customer.id as string
+    await expect(secondPage.getByRole('link', { name: `顾客账户，${firstUsername}` })).toBeVisible()
+    await secondMergeCommitted.promise
+    await logoutCustomer(secondPage)
+    await secondPage.evaluate((revisionKey) => {
+      const realm = window as Window & { __originalStorageSetItem?: typeof Storage.prototype.setItem }
+      realm.__originalStorageSetItem = Storage.prototype.setItem
+      Storage.prototype.setItem = function (key: string, value: string) {
+        if (key === revisionKey) throw new DOMException('Storage is full', 'QuotaExceededError')
+        return realm.__originalStorageSetItem!.call(this, key, value)
+      }
+    }, customerIdentityRevisionKey)
+    await loginCustomerInApp(secondPage, secondUsername)
+    await openCartInApp(secondPage)
+    await expect(secondPage.getByRole('link', { name: '购物车，0 件商品' })).toBeVisible()
+    await expect(page.getByRole('link', { name: `顾客账户，${secondUsername}` })).toBeVisible()
+    await openCartInApp(page)
+    await expect(page.getByRole('link', { name: '购物车，0 件商品' })).toBeVisible()
+    expect(firstMergeRequests).toBe(1)
+    expect(secondMergeRequests).toBe(1)
+
+    const firstCustomerCartRead = page.waitForResponse(response => response.request().method() === 'GET'
+      && new URL(response.url()).pathname === '/api/v1/customer/cart'
+      && response.status() === 200)
+    firstResponseGate.resolve()
+    secondResponseGate.resolve()
+    await Promise.all([firstResponseReleased.promise, secondResponseReleased.promise, firstCustomerCartRead])
+    expect(secondMergeRequests).toBe(1)
+
+    const stored = JSON.parse(await page.evaluate(key => localStorage.getItem(key), guestCartKey) ?? 'null') as {
+      pendingBatches: Array<{ ownerId: string; mergeId: string }>
+    }
+    expect(stored.pendingBatches).toHaveLength(1)
+    expect(stored.pendingBatches[0]?.ownerId).toBe(firstCustomerId)
+    await expect(page.getByRole('link', { name: '购物车，0 件商品' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: '购物车还是空的' })).toBeVisible()
+    await expect(secondPage.getByRole('heading', { name: productName })).toHaveCount(0)
+
+    await secondPage.evaluate(() => {
+      const realm = window as Window & { __originalStorageSetItem?: typeof Storage.prototype.setItem }
+      if (realm.__originalStorageSetItem) Storage.prototype.setItem = realm.__originalStorageSetItem
+    })
+    await logoutCustomer(secondPage)
+    await loginCustomerInApp(secondPage, firstUsername)
+    await openCartInApp(secondPage)
+    await expect(secondPage.getByRole('heading', { name: productName })).toBeVisible()
+    await expect.poll(() => secondMergeBodies.length).toBe(2)
+    expect(secondMergeBodies[1]).toEqual(firstMergeBody)
+    await expect(secondPage.getByRole('link', { name: '购物车，1 件商品' })).toBeVisible()
+    const cart = await secondPage.request.get('/api/v1/customer/cart').then(response => response.json())
+    expect(cart.data.items).toHaveLength(1)
+    expect(cart.data.items[0]).toMatchObject({ skuId: product.variants[0]!.id, quantity: 1 })
+  }
+  finally {
+    firstResponseGate.resolve()
+    secondResponseGate.resolve()
+    if (!page.isClosed()) await page.unroute('**/api/v1/customer/cart/merge')
+    if (!secondPage.isClosed()) {
+      await secondPage.unroute('**/api/v1/customer/cart/merge')
+      await secondPage.close()
+    }
+    for (const product of products) await deleteProduct(page, product)
+  }
+})
+
+test('a failed localStorage write never sends an unpersisted merge request', async ({ page }) => {
+  test.setTimeout(120_000)
+  const productName = `Cart本地存储失败-${randomUUID().slice(0, 8)}`
+  const username = `storage-${randomUUID().replaceAll('-', '').slice(0, 18)}`
+  let product: Product | undefined
+  let mergeRequests = 0
+
+  try {
+    await attachBrowserAdmin(page)
+    product = await createProduct(page, productName, '2.00')
+    await createEmptyCustomer(page, username)
+    await page.addInitScript((key) => {
+      const originalSetItem = Storage.prototype.setItem
+      Storage.prototype.setItem = function (storageKey: string, value: string) {
+        if (storageKey === key) throw new DOMException('Storage is full', 'QuotaExceededError')
+        return originalSetItem.call(this, storageKey, value)
+      }
+    }, guestCartKey)
+    await page.route('**/api/v1/customer/cart/merge', async (route) => {
+      if (route.request().method() === 'POST') mergeRequests += 1
+      await route.continue()
+    })
+
+    await page.goto(`/products/${product.id}`)
+    await expectClientMounted(page, '[data-storefront-ready="true"]')
+    await page.getByLabel('购买数量').fill('1')
+    await page.getByRole('button', { name: '加入购物车' }).click()
+    await expect(page.getByRole('status')).toContainText('无法写入浏览器存储')
+    await loginCustomer(page, username)
+    await openCartInApp(page)
+    await expect(page.getByRole('link', { name: '购物车，0 件商品' })).toBeVisible()
+    expect(mergeRequests).toBe(0)
+    expect(await page.evaluate(key => localStorage.getItem(key), guestCartKey)).toBeNull()
+  }
+  finally {
+    if (!page.isClosed()) {
+      await page.unroute('**/api/v1/customer/cart/merge')
+      if (product) await deleteProduct(page, product)
     }
   }
 })
