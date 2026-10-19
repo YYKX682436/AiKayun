@@ -559,11 +559,7 @@ export function registerAdminCustomerRoutes(
         if (!customer) throw new CustomerManagementError(404, 'CUSTOMER_NOT_FOUND', '顾客不存在。')
         if (customer.status === 'deleted') return
 
-        const wallet = await trx.selectFrom('wallet_accounts')
-          .select(['cash_available', 'cash_frozen', 'gift_available', 'gift_frozen'])
-          .where('customer_id', '=', id).forUpdate().executeTakeFirst()
-        if (!wallet) throw new Error('A customer wallet account is missing')
-
+        // Trade and refund transitions lock orders before touching wallet rows.
         await trx.selectFrom('orders').select('id')
           .where('customer_id', '=', id)
           .orderBy('id')
@@ -577,44 +573,44 @@ export function registerAdminCustomerRoutes(
           throw new CustomerManagementError(409, 'CUSTOMER_HAS_UNFINISHED_ORDERS', '账户存在未完成订单，不能删除。')
         }
 
-        const pendingPayment = await sql<{ id: string }>`
-          SELECT attempt.id
-          FROM payment_attempts AS attempt
-          LEFT JOIN orders AS order_row ON order_row.id = attempt.order_id
-          WHERE (attempt.topup_customer_id = ${id} OR order_row.customer_id = ${id})
-            AND attempt.status IN ('created', 'pending', 'reconciliation_required')
+        const unsettledPayment = await sql<{ id: string }>`
+          SELECT obligation.id
+          FROM (
+            SELECT attempt.id
+            FROM payment_attempts AS attempt
+            LEFT JOIN orders AS order_row ON order_row.id = attempt.order_id
+            WHERE (attempt.topup_customer_id = ${id} OR order_row.customer_id = ${id})
+              AND (
+                attempt.status IN ('created', 'pending')
+                OR (attempt.status = 'reconciliation_required' AND EXISTS (
+                  SELECT 1 FROM payment_receipts AS receipt
+                  WHERE receipt.payment_attempt_id = attempt.id
+                    AND receipt.disposition IN ('late', 'excess', 'amount_mismatch')
+                    AND receipt.refunded_amount < receipt.amount
+                ))
+              )
+            UNION ALL
+            SELECT receipt.id
+            FROM payment_receipts AS receipt
+            JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
+            LEFT JOIN orders AS order_row ON order_row.id = attempt.order_id
+            WHERE (attempt.topup_customer_id = ${id} OR order_row.customer_id = ${id})
+              AND receipt.disposition IN ('late', 'excess', 'amount_mismatch')
+              AND receipt.refunded_amount < receipt.amount
+            UNION ALL
+            SELECT financial.order_id AS id
+            FROM order_financial_status AS financial
+            JOIN orders AS order_row ON order_row.id = financial.order_id
+            WHERE order_row.customer_id = ${id}
+              AND (
+                financial.payment_status IN ('late_paid', 'requires_reconciliation', 'overpaid', 'partially_paid')
+                OR (order_row.status = 'closed' AND financial.payment_status IN ('paid', 'partially_refunded'))
+              )
+          ) AS obligation
           LIMIT 1
         `.execute(trx)
-        if (pendingPayment.rows.length) {
-          throw new CustomerManagementError(409, 'CUSTOMER_HAS_PENDING_PAYMENT', '账户存在待处理支付或资金对账，不能删除。')
-        }
-
-        const unresolvedFinance = await sql<{ order_id: string }>`
-          SELECT financial.order_id
-          FROM order_financial_status AS financial
-          JOIN orders AS order_row ON order_row.id = financial.order_id
-          WHERE order_row.customer_id = ${id}
-            AND (
-              financial.payment_status IN ('late_paid', 'requires_reconciliation', 'overpaid', 'partially_paid')
-              OR (order_row.status = 'closed' AND financial.payment_status IN ('paid', 'partially_refunded'))
-            )
-          LIMIT 1
-        `.execute(trx)
-        if (unresolvedFinance.rows.length) {
-          throw new CustomerManagementError(409, 'CUSTOMER_HAS_PENDING_PAYMENT', '账户存在未结清支付或资金义务，不能删除。')
-        }
-
-        const unresolvedReceipt = await sql<{ id: string }>`
-          SELECT receipt.id
-          FROM payment_receipts AS receipt
-          JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
-          LEFT JOIN orders AS order_row ON order_row.id = attempt.order_id
-          WHERE (attempt.topup_customer_id = ${id} OR order_row.customer_id = ${id})
-            AND (receipt.disposition IN ('late', 'excess', 'amount_mismatch') OR receipt.refund_reserved_amount > 0)
-          LIMIT 1
-        `.execute(trx)
-        if (unresolvedReceipt.rows.length) {
-          throw new CustomerManagementError(409, 'CUSTOMER_HAS_PENDING_PAYMENT', '账户存在未完成的支付或退款分配，不能删除。')
+        if (unsettledPayment.rows.length) {
+          throw new CustomerManagementError(409, 'CUSTOMER_HAS_PENDING_PAYMENT', '账户存在未结清支付或资金对账，不能删除。')
         }
 
         const pendingRefund = await sql<{ id: string }>`
@@ -629,6 +625,12 @@ export function registerAdminCustomerRoutes(
           JOIN order_refunds AS refund ON refund.id = allocation.refund_id
           JOIN orders AS order_row ON order_row.id = refund.order_id
           WHERE order_row.customer_id = ${id} AND allocation.status = 'reserved'
+          UNION ALL
+          SELECT receipt.id
+          FROM payment_receipts AS receipt
+          JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
+          JOIN orders AS order_row ON order_row.id = attempt.order_id
+          WHERE order_row.customer_id = ${id} AND receipt.refund_reserved_amount > 0
           LIMIT 1
         `.execute(trx)
         if (pendingRefund.rows.length) {
@@ -650,6 +652,11 @@ export function registerAdminCustomerRoutes(
         if (pendingWithdrawal.rows.length) {
           throw new CustomerManagementError(409, 'CUSTOMER_HAS_PENDING_WITHDRAWAL', '账户存在待处理提现或打款，不能删除。')
         }
+
+        const wallet = await trx.selectFrom('wallet_accounts')
+          .select(['cash_available', 'cash_frozen', 'gift_available', 'gift_frozen'])
+          .where('customer_id', '=', id).forUpdate().executeTakeFirst()
+        if (!wallet) throw new Error('A customer wallet account is missing')
 
         if ([wallet.cash_available, wallet.cash_frozen, wallet.gift_available, wallet.gift_frozen]
           .some(amount => amount !== '0.00' && amount !== '0')) {

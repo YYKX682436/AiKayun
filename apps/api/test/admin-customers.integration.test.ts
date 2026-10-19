@@ -147,6 +147,124 @@ async function completePaidOrder(customerId: string) {
   return order
 }
 
+async function createLateReceipt(customerId: string) {
+  const catalog = await createCatalog()
+  const order = await db.transaction().execute(trx => insertOrder(trx, customerId, catalog))
+  const attemptId = randomUUID()
+  const receiptId = randomUUID()
+  await db.transaction().execute(async trx => {
+    await trx.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: order.id,
+      topup_customer_id: null, source: 'external', amount: '10.00', provider: 'epay-compatible',
+      provider_payment_id: `late-${attemptId}`, wallet_operation_id: null,
+      expires_at: new Date(Date.now() + 900), completed_at: null,
+    }).execute()
+    await trx.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+    await trx.updateTable('payment_attempts').set({ status: 'expired' }).where('id', '=', attemptId).execute()
+    await new Promise(resolve => setTimeout(resolve, 1_100))
+    await trx.insertInto('payment_receipts').values({
+      id: receiptId, payment_attempt_id: attemptId, source_bucket: 'external', provider: 'epay-compatible',
+      provider_transaction_id: `late-receipt-${attemptId}`, wallet_operation_id: null, wallet_line_no: null, amount: '10.00',
+    }).execute()
+  })
+  return { ...order, attemptId, receiptId }
+}
+
+async function createReceiptRefund(orderId: string, receiptId: string, amount: string, destination: 'original_source' | 'cash_balance' = 'original_source') {
+  return createRefund(orderId, [{ receiptId, amount }], amount, destination)
+}
+
+async function createRefund(
+  orderId: string,
+  sources: Array<{ receiptId: string; amount: string }>,
+  amount: string,
+  destination: 'original_source' | 'cash_balance' = 'original_source',
+) {
+  const refundId = randomUUID()
+  const allocationIds: string[] = []
+  await db.transaction().execute(async trx => {
+    await trx.insertInto('order_refunds').values({
+      id: refundId, order_id: orderId, idempotency_key: randomUUID(), request_sha256: digest, amount,
+    }).execute()
+    await trx.updateTable('order_refunds').set({ status: 'approved' }).where('id', '=', refundId).execute()
+    await trx.updateTable('order_refunds').set({ status: 'processing' }).where('id', '=', refundId).execute()
+    for (const source of sources) {
+      const allocationId = randomUUID()
+      allocationIds.push(allocationId)
+      await trx.insertInto('order_refund_allocations').values({
+        id: allocationId, refund_id: refundId, source_payment_receipt_id: source.receiptId,
+        operation_id: randomUUID(), request_sha256: digest, destination, amount: source.amount,
+        provider: null, provider_refund_id: null, completed_at: null,
+      }).execute()
+      await trx.updateTable('order_refund_allocations').set(destination === 'original_source'
+        ? { status: 'succeeded', provider: 'epay-compatible', provider_refund_id: `refund-${randomUUID()}` }
+        : { status: 'succeeded' }).where('id', '=', allocationId).execute()
+    }
+    await trx.updateTable('order_refunds').set({ status: 'succeeded' }).where('id', '=', refundId).execute()
+  })
+  return { refundId, allocationIds }
+}
+
+async function createFullyRefundedLateOrder(customerId: string) {
+  const late = await createLateReceipt(customerId)
+  const refund = await createReceiptRefund(late.id, late.receiptId, '10.00')
+  return { ...late, ...refund }
+}
+
+async function createExceptionalReceipt(customerId: string, kind: 'mismatch' | 'excess') {
+  const catalog = await createCatalog()
+  const order = await db.transaction().execute(trx => insertOrder(trx, customerId, catalog))
+  const receiptIds: Array<{ receiptId: string; amount: string }> = []
+  if (kind === 'excess') {
+    const baseAttemptId = randomUUID()
+    const baseReceiptId = randomUUID()
+    await db.transaction().execute(async trx => {
+      await trx.insertInto('payment_attempts').values({
+        id: baseAttemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: order.id,
+        topup_customer_id: null, source: 'external', amount: '6.00', provider: 'epay-compatible',
+        provider_payment_id: `base-${baseAttemptId}`, wallet_operation_id: null,
+        expires_at: new Date(Date.now() + 60_000), completed_at: null,
+      }).execute()
+      await trx.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', baseAttemptId).execute()
+      await trx.insertInto('payment_receipts').values({
+        id: baseReceiptId, payment_attempt_id: baseAttemptId, source_bucket: 'external', provider: 'epay-compatible',
+        provider_transaction_id: `base-receipt-${baseAttemptId}`, wallet_operation_id: null, wallet_line_no: null,
+        amount: '6.00',
+      }).execute()
+    })
+    receiptIds.push({ receiptId: baseReceiptId, amount: '6.00' })
+  }
+
+  const attemptId = randomUUID()
+  const receiptId = randomUUID()
+  const expectedAmount = kind === 'mismatch' ? '10.00' : '5.00'
+  const receivedAmount = kind === 'mismatch' ? '9.00' : '5.00'
+  await db.transaction().execute(async trx => {
+    await trx.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: order.id,
+      topup_customer_id: null, source: 'external', amount: expectedAmount, provider: 'epay-compatible',
+      provider_payment_id: `exception-${attemptId}`, wallet_operation_id: null,
+      expires_at: new Date(Date.now() + 900), completed_at: null,
+    }).execute()
+    await trx.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+    await trx.insertInto('payment_receipts').values({
+      id: receiptId, payment_attempt_id: attemptId, source_bucket: 'external', provider: 'epay-compatible',
+      provider_transaction_id: `exception-receipt-${attemptId}`, wallet_operation_id: null, wallet_line_no: null,
+      amount: receivedAmount,
+    }).execute()
+  })
+  receiptIds.push({ receiptId, amount: receivedAmount })
+  return { ...order, attemptId, receiptId, receivedAmount, receiptIds }
+}
+
+async function createFullyRefundedExceptionalOrder(customerId: string, kind: 'mismatch' | 'excess') {
+  const exceptional = await createExceptionalReceipt(customerId, kind)
+  await new Promise(resolve => setTimeout(resolve, 1_100))
+  const total = exceptional.receiptIds.reduce((sum, receipt) => sum + Number(receipt.amount), 0).toFixed(2)
+  const refund = await createRefund(exceptional.id, exceptional.receiptIds, total)
+  return { ...exceptional, ...refund }
+}
+
 async function waitForLock(queryFragment: string) {
   await expect.poll(async () => {
     const result = await sql<{ count: string }>`
@@ -434,6 +552,31 @@ describe('④-3 admin customer management on PostgreSQL', () => {
     expect(paymentDelete.statusCode).toBe(409)
     expect(paymentDelete.json().error.code).toBe('CUSTOMER_HAS_PENDING_PAYMENT')
 
+    const exceptionalTopupCustomer = await createCustomer('Delete-Exceptional-Topup')
+    const exceptionalAttemptId = randomUUID()
+    await db.transaction().execute(async trx => {
+      await trx.insertInto('payment_attempts').values({
+        id: exceptionalAttemptId, idempotency_key: randomUUID(), request_sha256: digest,
+        order_id: null, topup_customer_id: exceptionalTopupCustomer, source: 'external', amount: '10.00',
+        provider: 'epay-compatible', provider_payment_id: `late-topup-${exceptionalAttemptId}`, wallet_operation_id: null,
+        expires_at: new Date(Date.now() + 60_000), completed_at: null,
+      }).execute()
+      await trx.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', exceptionalAttemptId).execute()
+      await trx.updateTable('payment_attempts').set({ status: 'failed' }).where('id', '=', exceptionalAttemptId).execute()
+      await trx.insertInto('payment_receipts').values({
+        id: randomUUID(), payment_attempt_id: exceptionalAttemptId, source_bucket: 'external', provider: 'epay-compatible',
+        provider_transaction_id: `late-topup-receipt-${exceptionalAttemptId}`, wallet_operation_id: null,
+        wallet_line_no: null, amount: '10.00',
+      }).execute()
+    })
+    expect((await db.selectFrom('payment_receipts').select('disposition')
+      .where('payment_attempt_id', '=', exceptionalAttemptId).executeTakeFirstOrThrow()).disposition).toBe('late')
+    const exceptionalTopupDelete = await app.inject({
+      method: 'DELETE', url: `/api/v1/admin/customers/${exceptionalTopupCustomer}`, headers: headers(auth),
+    })
+    expect(exceptionalTopupDelete.statusCode).toBe(409)
+    expect(exceptionalTopupDelete.json().error.code).toBe('CUSTOMER_HAS_PENDING_PAYMENT')
+
     const availableCustomer = await createCustomer('Delete-Available-Balance')
     const availableOperation = randomUUID()
     await db.transaction().execute(async trx => {
@@ -513,6 +656,168 @@ describe('④-3 admin customer management on PostgreSQL', () => {
     expect(await db.selectFrom('payment_receipts').innerJoin('payment_attempts', 'payment_attempts.id', 'payment_receipts.payment_attempt_id')
       .select('payment_receipts.id').where('payment_attempts.order_id', '=', historicalOrder.id).execute()).toHaveLength(1)
     expect((await app.inject({ url: '/api/v1/customer/profile', headers: { cookie: historicalSession.cookie } })).statusCode).toBe(401)
+  })
+
+  it('allows anonymization after an exceptional late receipt is fully refunded', async () => {
+    const customerId = await createCustomer('Delete-Fully-Refunded-Late')
+    const history = await createFullyRefundedLateOrder(customerId)
+    const auth = await adminAuth()
+
+    expect((await db.selectFrom('payment_receipts').select(['disposition', 'amount', 'refunded_amount'])
+      .where('id', '=', history.receiptId).executeTakeFirstOrThrow()))
+      .toEqual({ disposition: 'late', amount: '10.00', refunded_amount: '10.00' })
+    expect((await db.selectFrom('order_financial_status').select(['payment_status', 'refund_status'])
+      .where('order_id', '=', history.id).executeTakeFirstOrThrow()))
+      .toEqual({ payment_status: 'refunded', refund_status: 'refunded' })
+
+    const response = await app.inject({ method: 'DELETE', url: `/api/v1/admin/customers/${customerId}`, headers: headers(auth) })
+    expect(response.statusCode).toBe(200)
+    expect((await db.selectFrom('customers').select(['status', 'username', 'password_hash', 'email', 'phone'])
+      .where('id', '=', customerId).executeTakeFirstOrThrow()))
+      .toEqual({ status: 'deleted', username: null, password_hash: null, email: null, phone: null })
+    expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', history.attemptId).executeTakeFirstOrThrow())
+      .status).toBe('late_succeeded')
+    expect(await db.selectFrom('payment_receipts').select('id').where('id', '=', history.receiptId).execute()).toHaveLength(1)
+    expect(await db.selectFrom('orders').select('id').where('id', '=', history.id).execute()).toHaveLength(1)
+    expect((await db.selectFrom('order_refunds').select('status').where('id', '=', history.refundId).executeTakeFirstOrThrow())
+      .status).toBe('succeeded')
+    expect((await db.selectFrom('order_refund_allocations').select(['status', 'amount'])
+      .where('id', '=', history.allocationIds[0]!).executeTakeFirstOrThrow()))
+      .toEqual({ status: 'succeeded', amount: '10.00' })
+    expect(await db.selectFrom('customer_management_audit').select(['administrator_id', 'customer_id', 'action'])
+      .where('customer_id', '=', customerId).execute())
+      .toContainEqual({ administrator_id: adminId, customer_id: customerId, action: 'deleted' })
+  })
+
+  it('blocks anomalous receipts while any amount remains unpaid, and allows resolved mismatches or excess', async () => {
+    const unpaidCustomer = await createCustomer('Delete-Late-Unpaid')
+    await createLateReceipt(unpaidCustomer)
+    const partialCustomer = await createCustomer('Delete-Late-Partial')
+    const partial = await createLateReceipt(partialCustomer)
+    await createReceiptRefund(partial.id, partial.receiptId, '4.00')
+
+    const auth = await adminAuth()
+    for (const customerId of [unpaidCustomer, partialCustomer]) {
+      const response = await app.inject({ method: 'DELETE', url: `/api/v1/admin/customers/${customerId}`, headers: headers(auth) })
+      expect(response.statusCode).toBe(409)
+      expect(response.json().error.code).toBe('CUSTOMER_HAS_PENDING_PAYMENT')
+    }
+
+    for (const kind of ['mismatch', 'excess'] as const) {
+      const customerId = await createCustomer(`Delete-${kind}-Unresolved`)
+      const history = await createExceptionalReceipt(customerId, kind)
+      expect((await db.selectFrom('payment_receipts').select('disposition').where('id', '=', history.receiptId).executeTakeFirstOrThrow())
+        .disposition).toBe(kind === 'mismatch' ? 'amount_mismatch' : 'excess')
+      const response = await app.inject({ method: 'DELETE', url: `/api/v1/admin/customers/${customerId}`, headers: headers(auth) })
+      expect(response.statusCode).toBe(409)
+      expect(response.json().error.code).toBe('CUSTOMER_HAS_UNFINISHED_ORDERS')
+    }
+
+    for (const kind of ['mismatch', 'excess'] as const) {
+      const customerId = await createCustomer(`Delete-${kind}-Refunded`)
+      const history = await createFullyRefundedExceptionalOrder(customerId, kind)
+      const response = await app.inject({ method: 'DELETE', url: `/api/v1/admin/customers/${customerId}`, headers: headers(auth) })
+      expect(response.statusCode).toBe(200)
+      expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', history.attemptId).executeTakeFirstOrThrow())
+        .status).toBe('reconciliation_required')
+      expect((await db.selectFrom('payment_receipts').select(['disposition', 'refunded_amount'])
+        .where('id', '=', history.receiptId).executeTakeFirstOrThrow()))
+        .toEqual({ disposition: kind === 'mismatch' ? 'amount_mismatch' : 'excess', refunded_amount: history.receivedAmount })
+      expect((await db.selectFrom('order_financial_status').select('payment_status').where('order_id', '=', history.id)
+        .executeTakeFirstOrThrow()).payment_status).toBe('refunded')
+    }
+  })
+
+  it('keeps a settled exceptional refund from allowing deletion when it credits a remaining wallet balance', async () => {
+    const customerId = await createCustomer('Delete-Settled-Refund-Wallet')
+    const history = await createLateReceipt(customerId)
+    await createReceiptRefund(history.id, history.receiptId, '10.00', 'cash_balance')
+    const auth = await adminAuth()
+
+    const response = await app.inject({ method: 'DELETE', url: `/api/v1/admin/customers/${customerId}`, headers: headers(auth) })
+    expect(response.statusCode).toBe(409)
+    expect(response.json().error.code).toBe('CUSTOMER_HAS_WALLET_BALANCE')
+    expect((await db.selectFrom('wallet_accounts').select('cash_available').where('customer_id', '=', customerId)
+      .executeTakeFirstOrThrow()).cash_available).toBe('10.00')
+  })
+
+  it('still blocks an exceptional refund that is settled when another refund allocation is reserved', async () => {
+    const customerId = await createCustomer('Delete-Settled-Exception-Other-Refund')
+    const late = await createLateReceipt(customerId)
+    await createReceiptRefund(late.id, late.receiptId, '10.00')
+
+    const order = await completePaidOrder(customerId)
+    const receipt = await db.selectFrom('payment_receipts').innerJoin('payment_attempts', 'payment_attempts.id', 'payment_receipts.payment_attempt_id')
+      .select('payment_receipts.id').where('payment_attempts.order_id', '=', order.id).executeTakeFirstOrThrow()
+    const refundId = randomUUID()
+    await db.transaction().execute(async trx => {
+      await trx.insertInto('order_refunds').values({
+        id: refundId, order_id: order.id, idempotency_key: randomUUID(), request_sha256: digest, amount: '1.00',
+      }).execute()
+      await trx.updateTable('order_refunds').set({ status: 'approved' }).where('id', '=', refundId).execute()
+      await trx.updateTable('order_refunds').set({ status: 'processing' }).where('id', '=', refundId).execute()
+      await trx.insertInto('order_refund_allocations').values({
+        id: randomUUID(), refund_id: refundId, source_payment_receipt_id: receipt.id,
+        operation_id: randomUUID(), request_sha256: digest, destination: 'original_source', amount: '1.00',
+        provider: null, provider_refund_id: null, completed_at: null,
+      }).execute()
+    })
+
+    const auth = await adminAuth()
+    const response = await app.inject({ method: 'DELETE', url: `/api/v1/admin/customers/${customerId}`, headers: headers(auth) })
+    expect(response.statusCode).toBe(409)
+    expect(response.json().error.code).toBe('CUSTOMER_HAS_PENDING_REFUND')
+  })
+
+  it('serializes deletion with a refund settlement that credits the wallet', async () => {
+    const customerId = await createCustomer('Delete-Refund-Race')
+    const order = await completePaidOrder(customerId)
+    const receipt = await db.selectFrom('payment_receipts').innerJoin('payment_attempts', 'payment_attempts.id', 'payment_receipts.payment_attempt_id')
+      .select('payment_receipts.id').where('payment_attempts.order_id', '=', order.id).executeTakeFirstOrThrow()
+    const refundId = randomUUID()
+    const allocationId = randomUUID()
+    await db.transaction().execute(async trx => {
+      await trx.insertInto('order_refunds').values({
+        id: refundId, order_id: order.id, idempotency_key: randomUUID(), request_sha256: digest, amount: '10.00',
+      }).execute()
+      await trx.updateTable('order_refunds').set({ status: 'approved' }).where('id', '=', refundId).execute()
+      await trx.updateTable('order_refunds').set({ status: 'processing' }).where('id', '=', refundId).execute()
+      await trx.insertInto('order_refund_allocations').values({
+        id: allocationId, refund_id: refundId, source_payment_receipt_id: receipt.id,
+        operation_id: randomUUID(), request_sha256: digest, destination: 'cash_balance', amount: '10.00',
+        provider: null, provider_refund_id: null, completed_at: null,
+      }).execute()
+    })
+
+    let releaseUpdate!: () => void
+    let signalOrderLock!: () => void
+    const updateRelease = new Promise<void>(resolve => { releaseUpdate = resolve })
+    const orderLockReady = new Promise<void>(resolve => { signalOrderLock = resolve })
+    const refundUpdate = db.transaction().execute(async trx => {
+      await trx.selectFrom('orders').select('id').where('id', '=', order.id).forUpdate().executeTakeFirstOrThrow()
+      signalOrderLock()
+      await updateRelease
+      await trx.updateTable('order_refund_allocations').set({ status: 'succeeded' }).where('id', '=', allocationId).execute()
+      await trx.updateTable('order_refunds').set({ status: 'succeeded' }).where('id', '=', refundId).execute()
+    })
+    await orderLockReady
+    const auth = await adminAuth()
+    const deletion = app.inject({ method: 'DELETE', url: `/api/v1/admin/customers/${customerId}`, headers: headers(auth) })
+    try {
+      await waitForLock('FROM "orders"')
+      releaseUpdate()
+      await refundUpdate
+      const response = await deletion
+      expect(response.statusCode).toBe(409)
+      expect(response.json().error.code).toBe('CUSTOMER_HAS_WALLET_BALANCE')
+      expect((await db.selectFrom('customers').select('status').where('id', '=', customerId).executeTakeFirstOrThrow()).status)
+        .toBe('active')
+    } catch (error) {
+      releaseUpdate()
+      await refundUpdate.catch(() => undefined)
+      await deletion.catch(() => undefined)
+      throw error
+    }
   })
 
   it('serializes deletion with an order insert and rejects the new obligation after the creator commits', async () => {
