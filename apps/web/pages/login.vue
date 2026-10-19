@@ -110,7 +110,7 @@ async function submitLogin() {
                 autocomplete="username"
                 minlength="3"
                 maxlength="32"
-                pattern="[A-Za-z0-9][A-Za-z0-9_.-]{2,31}"
+                pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{2,31}"
                 required
                 :disabled="busy || !clientReady"
               />

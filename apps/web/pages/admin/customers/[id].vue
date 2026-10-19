@@ -392,7 +392,7 @@ async function confirmDelete() {
                   autocomplete="username"
                   minlength="3"
                   maxlength="32"
-                  pattern="[A-Za-z0-9][A-Za-z0-9_.-]{2,31}"
+                  pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{2,31}"
                   required
                   :disabled="!canMutate || savingProfile"
                   aria-label="用户名"

@@ -27,6 +27,9 @@ const productTypeLabels = { physical: '实物商品', digital: '数字商品', s
 const selections = reactive<Record<string, string>>({})
 const selectedImage = ref(0)
 const imageFailed = ref(false)
+const quantity = ref(1)
+const shoppingCart = useShoppingCart()
+const cartFeedback = ref('')
 
 watch(product, (value) => {
   for (const key of Object.keys(selections)) delete selections[key]
@@ -35,6 +38,7 @@ watch(product, (value) => {
   }
   selectedImage.value = 0
   imageFailed.value = false
+  quantity.value = 1
 }, { immediate: true })
 
 const selectedVariant = computed<PublicProductVariant | null>(() => {
@@ -145,6 +149,19 @@ watch([id, notFound], async ([currentId, missing]) => {
 
 const galleryPath = computed(() => product.value?.gallery ?? [])
 const typeLabel = computed(() => product.value ? productTypeLabels[product.value.productType] : '')
+
+async function addSelectedToCart() {
+  if (!selectedVariant.value || shoppingCart.busy.value) return
+  cartFeedback.value = ''
+  await shoppingCart.add(selectedVariant.value.skuId, quantity.value)
+  cartFeedback.value = shoppingCart.errorMessage.value ?? shoppingCart.noticeMessage.value ?? ''
+}
+
+async function buySelectedNow() {
+  if (!selectedVariant.value || shoppingCart.busy.value) return
+  cartFeedback.value = ''
+  await navigateTo(shoppingCart.checkoutPath([{ skuId: selectedVariant.value.skuId, quantity: quantity.value }]))
+}
 </script>
 
 <template>
@@ -355,12 +372,73 @@ const typeLabel = computed(() => product.value ? productTypeLabels[product.value
                   {{ inventoryLabel(selectedVariant?.inventory) }}
                 </p>
               </div>
+              <div v-if="selectedVariant" class="mt-4 grid gap-3">
+                <UFormField label="购买数量" name="quantity">
+                  <div class="flex w-fit items-center rounded-lg border border-default">
+                    <UButton
+                      type="button"
+                      color="neutral"
+                      variant="ghost"
+                      icon="i-lucide-minus"
+                      aria-label="减少数量"
+                      class="min-h-11 min-w-11 justify-center"
+                      :disabled="quantity <= 1 || shoppingCart.busy.value"
+                      @click="quantity = Math.max(1, quantity - 1)"
+                    />
+                    <UInput
+                      v-model.number="quantity"
+                      type="number"
+                      min="1"
+                      max="99"
+                      inputmode="numeric"
+                      aria-label="购买数量"
+                      class="w-20 text-center tabular-nums"
+                      :disabled="shoppingCart.busy.value"
+                      @change="quantity = Math.min(99, Math.max(1, Math.trunc(quantity || 1)))"
+                    />
+                    <UButton
+                      type="button"
+                      color="neutral"
+                      variant="ghost"
+                      icon="i-lucide-plus"
+                      aria-label="增加数量"
+                      class="min-h-11 min-w-11 justify-center"
+                      :disabled="quantity >= 99 || shoppingCart.busy.value"
+                      @click="quantity = Math.min(99, quantity + 1)"
+                    />
+                  </div>
+                </UFormField>
+                <div class="grid gap-2 sm:grid-cols-2">
+                  <UButton
+                    color="neutral"
+                    variant="outline"
+                    icon="i-lucide-shopping-cart"
+                    :loading="shoppingCart.busy.value"
+                    :disabled="!selectedVariant || quantity < 1 || quantity > 99"
+                    @click="addSelectedToCart"
+                  >
+                    加入购物车
+                  </UButton>
+                  <UButton
+                    color="primary"
+                    icon="i-lucide-arrow-right"
+                    :disabled="!selectedVariant || quantity < 1 || quantity > 99 || shoppingCart.busy.value"
+                    @click="buySelectedNow"
+                  >
+                    立即购买
+                  </UButton>
+                </div>
+                <p v-if="cartFeedback || shoppingCart.errorMessage.value" class="text-sm text-warning" role="status" aria-live="polite">
+                  {{ cartFeedback || shoppingCart.errorMessage.value }}
+                  <NuxtLink to="/cart" class="ml-1 font-medium text-primary underline underline-offset-2">查看购物车</NuxtLink>
+                </p>
+              </div>
               <UAlert
                 color="neutral"
                 variant="subtle"
                 icon="i-lucide-info"
-                title="购买功能尚未开放"
-                description="当前页面仅提供商品信息浏览，商城暂未开放购物车、订单、支付和交付。"
+                title="当前仅提供结算报价预览"
+                description="商品与库存会在进入报价时重新校验。当前不会创建订单，也不会预留库存、发起支付或交付商品。"
                 class="mt-5"
               />
             </div>

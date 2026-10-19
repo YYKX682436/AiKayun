@@ -339,8 +339,8 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
   expect(structuredData.image).toHaveLength(2)
   expect(structuredData).not.toHaveProperty('offers')
   expect(detailHtml).not.toContain('"offers"')
-  expect(detailHtml).toContain('购买功能尚未开放')
-  expect(detailHtml).not.toContain('立即购买')
+  expect(detailHtml).toContain('当前仅提供结算报价预览')
+  expect(detailHtml).toContain('立即购买')
 
   const detailBrowserRequests: string[] = []
   const recordDetailRequest = (request: import('@playwright/test').Request) => detailBrowserRequests.push(request.url())
@@ -350,8 +350,9 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
   expect(detailBrowserRequests.filter(url => url.includes(`/api/v1/public/products/${product.id}`))).toHaveLength(0)
   expect(detailBrowserRequests.some(url => /ProductRichContentEditor|@tiptap|prosemirror/iu.test(url))).toBe(false)
   page.off('request', recordDetailRequest)
-  await expect(page.getByText('购买功能尚未开放')).toBeVisible()
-  await expect(page.getByRole('button', { name: /购买|加入购物车|立即购买/ })).toHaveCount(0)
+  await expect(page.getByText('当前仅提供结算报价预览')).toBeVisible()
+  await expect(page.getByRole('button', { name: '加入购物车' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '立即购买' })).toBeVisible()
   await expect(page.locator('.product-rich-content')).toContainText('真实结构化商品说明')
   await expect(page.locator('img[fetchpriority="high"]')).toBeVisible()
   await expect(page.locator('img[loading="lazy"]').first()).toBeVisible()

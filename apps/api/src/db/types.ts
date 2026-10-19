@@ -116,6 +116,22 @@ export interface CustomerManagementAuditTable {
   created_at: Generated<Date>
 }
 
+export interface CustomerCartItemsTable {
+  customer_id: string
+  sku_id: string
+  quantity: number
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
+
+export interface CustomerCartMergeRequestsTable {
+  customer_id: string
+  merge_id: string
+  request_sha256: string
+  skipped_sku_ids: string[]
+  created_at: Generated<Date>
+}
+
 export interface GuestOrderSessionsTable {
   id: string
   token_hash: string
@@ -519,6 +535,8 @@ export interface Database {
   customers: CustomersTable
   customer_sessions: CustomerSessionsTable
   customer_management_audit: CustomerManagementAuditTable
+  customer_cart_items: CustomerCartItemsTable
+  customer_cart_merge_requests: CustomerCartMergeRequestsTable
   guest_order_sessions: GuestOrderSessionsTable
   product_variant_fulfillment: ProductVariantFulfillmentTable
   orders: OrdersTable

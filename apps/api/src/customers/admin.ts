@@ -681,6 +681,8 @@ export function registerAdminCustomerRoutes(
           throw new CustomerManagementError(409, 'CUSTOMER_HAS_UNRESOLVED_FULFILLMENT', '账户存在尚未完成的履约义务，不能删除。')
         }
 
+        await trx.deleteFrom('customer_cart_items').where('customer_id', '=', id).execute()
+        await trx.deleteFrom('customer_cart_merge_requests').where('customer_id', '=', id).execute()
         const revokedSessionCount = await revokeCustomerSessions(trx, id)
         await trx.updateTable('customers').set({
           status: 'deleted',

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { addUnitAmounts, allocateWalletOrderPayment, allocateWalletSpend, multiplyUnitAmount, parseUnitAmount, settleAmount } from '../src/index.ts'
+import { addSettlementAmounts, addUnitAmounts, allocateWalletOrderPayment, allocateWalletSpend, multiplyUnitAmount, parseUnitAmount, settleAmount } from '../src/index.ts'
 
 describe('decimal monetary helpers', () => {
   it('adds decimal strings without binary floating point drift', () => {
@@ -41,6 +41,8 @@ describe('decimal monetary helpers', () => {
     expect(() => settleAmount('9999999999999999.995')).toThrow(RangeError)
     expect(settleAmount('-9999999999999999.99499')).toBe('-9999999999999999.99')
     expect(() => settleAmount('-9999999999999999.995')).toThrow(RangeError)
+    expect(addSettlementAmounts('9999999999999999.98', '0.01')).toBe('9999999999999999.99')
+    expect(() => addSettlementAmounts('9999999999999999.99', '0.01')).toThrow(TypeError)
   })
 
   it('supports signed generic arithmetic without treating negative values as valid sale prices', () => {

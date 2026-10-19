@@ -68,6 +68,14 @@ export function settleAmount(value: string): string {
   return rounded.toFixed(2)
 }
 
+/** Adds two already-settled non-negative amounts within NUMERIC(18,2). */
+export function addSettlementAmounts(left: string, right: string): string {
+  const result = parseWalletAmount(left).plus(parseWalletAmount(right))
+  const normalized = result.toFixed(2)
+  parseWalletAmount(normalized)
+  return normalized
+}
+
 /** Allocates an order wallet debit from gift funds first, then cash funds. */
 export function allocateWalletSpend(
   amount: string,

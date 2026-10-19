@@ -136,6 +136,44 @@ export function requireCustomer(db: Kysely<Database>, config: AppConfig): preHan
   }
 }
 
+/** Authenticate an optional storefront customer without creating guest sessions. */
+export function optionalCustomer(db: Kysely<Database>, config: AppConfig): preHandlerHookHandler {
+  return async (request, reply) => {
+    const token = request.cookies[CUSTOMER_SESSION_COOKIE]
+    if (!token) return
+    if (!isPlausibleSessionToken(token)) {
+      clearSessionCookie(reply, CUSTOMER_SESSION_COOKIE, config)
+      return reply.code(401).send(failure('UNAUTHORIZED', 'Customer authentication is required', request.id))
+    }
+
+    const session = await db.selectFrom('customer_sessions')
+      .innerJoin('customers', 'customers.id', 'customer_sessions.customer_id')
+      .select([
+        'customer_sessions.id as session_id',
+        'customer_sessions.expires_at as expires_at',
+        'customers.id as customer_id',
+        'customers.username as username',
+      ])
+      .where('customer_sessions.token_hash', '=', hashToken(token))
+      .where('customer_sessions.revoked_at', 'is', null)
+      .where('customer_sessions.expires_at', '>', new Date())
+      .where('customers.status', '=', 'active')
+      .executeTakeFirst()
+
+    if (!session || !session.username) {
+      clearSessionCookie(reply, CUSTOMER_SESSION_COOKIE, config)
+      return reply.code(401).send(failure('UNAUTHORIZED', 'Customer authentication is required', request.id))
+    }
+
+    request.customer = {
+      id: session.customer_id,
+      username: session.username,
+      sessionId: session.session_id,
+      expiresAt: new Date(session.expires_at),
+    }
+  }
+}
+
 export function registerCustomerAuthRoutes(
   app: FastifyInstance,
   db: Kysely<Database>,

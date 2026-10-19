@@ -822,6 +822,7 @@ export const PublicProductOptionGroupSchema = Type.Object({
 }, { additionalProperties: false })
 
 export const PublicProductVariantSchema = Type.Object({
+  skuId: Type.String({ format: 'uuid' }),
   options: Type.Array(Type.Object({
     groupId: Type.String({ format: 'uuid' }),
     valueId: Type.String({ format: 'uuid' }),
@@ -829,6 +830,104 @@ export const PublicProductVariantSchema = Type.Object({
   salePrice: ProductSalePriceSchema,
   compareAtPrice: Type.Union([ProductSalePriceSchema, Type.Null()]),
   inventory: PublicInventorySummarySchema,
+}, { additionalProperties: false })
+
+export const SettlementAmountSchema = Type.String({ pattern: '^-?(?:0|[1-9]\\d{0,15})\\.\\d{2}$' })
+
+export const CartSkuQuantitySchema = Type.Object({
+  skuId: Type.String({ format: 'uuid' }),
+  quantity: Type.Integer({ minimum: 1, maximum: 99 }),
+}, { additionalProperties: false })
+
+export const CustomerCartAddBodySchema = CartSkuQuantitySchema
+export const CustomerCartUpdateBodySchema = Type.Object({
+  quantity: Type.Integer({ minimum: 1, maximum: 99 }),
+}, { additionalProperties: false })
+
+export const CustomerCartMergeBodySchema = Type.Object({
+  mergeId: Type.String({ format: 'uuid' }),
+  items: Type.Array(CartSkuQuantitySchema, { minItems: 1, maxItems: 50 }),
+}, { additionalProperties: false })
+
+export const CheckoutQuoteBodySchema = Type.Object({
+  items: Type.Array(CartSkuQuantitySchema, { minItems: 1, maxItems: 50 }),
+}, { additionalProperties: false })
+
+export const CartOptionSchema = Type.Object({
+  groupId: Type.String({ format: 'uuid' }),
+  groupName: Type.String({ minLength: 1, maxLength: 80 }),
+  valueId: Type.String({ format: 'uuid' }),
+  valueName: Type.String({ minLength: 1, maxLength: 80 }),
+}, { additionalProperties: false })
+
+export const CheckoutQuoteReasonSchema = Type.Union([
+  Type.Literal('product_not_found'),
+  Type.Literal('product_not_active'),
+  Type.Literal('sku_not_found'),
+  Type.Literal('sku_disabled'),
+  Type.Literal('sku_retired'),
+  Type.Literal('specification_invalid'),
+  Type.Literal('inventory_not_configured'),
+  Type.Literal('insufficient_inventory'),
+  Type.Literal('inventory_not_ready'),
+  Type.Literal('fulfillment_not_ready'),
+  Type.Literal('guest_checkout_disabled'),
+  Type.Literal('guest_free_claim_disabled'),
+])
+
+export const CheckoutQuoteItemSchema = Type.Object({
+  skuId: Type.String({ format: 'uuid' }),
+  productId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  productName: Type.Union([Type.String({ minLength: 1, maxLength: 200 }), Type.Null()]),
+  productStatus: Type.Union([ProductStatusSchema, Type.Null()]),
+  skuCode: Type.Union([Type.String({ minLength: 1, maxLength: 64 }), Type.Null()]),
+  options: Type.Array(CartOptionSchema, { maxItems: 5 }),
+  unitPrice: Type.Union([ProductSalePriceSchema, Type.Null()]),
+  quantity: Type.Integer({ minimum: 1, maximum: 99 }),
+  lineTotal: Type.Union([SettlementAmountSchema, Type.Null()]),
+  inventoryMode: Type.Union([NullableProductInventoryModeSchema, Type.Null()]),
+  availableQuantity: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  identityValid: Type.Boolean(),
+  canPurchase: Type.Boolean(),
+  reason: Type.Union([CheckoutQuoteReasonSchema, Type.Null()]),
+}, { additionalProperties: false })
+
+export const CheckoutQuoteSchema = Type.Object({
+  quotedAt: Type.String({ format: 'date-time' }),
+  currency: Type.Literal('CNY'),
+  items: Type.Array(CheckoutQuoteItemSchema, { minItems: 1, maxItems: 50 }),
+  pricedSubtotal: SettlementAmountSchema,
+  totalAmount: Type.Union([SettlementAmountSchema, Type.Null()]),
+  totalComplete: Type.Boolean(),
+  canContinue: Type.Boolean(),
+  customerAuthenticated: Type.Boolean(),
+  guestCheckoutEnabled: Type.Boolean(),
+  guestFreeClaimEnabled: Type.Boolean(),
+  policyReasons: Type.Array(Type.Union([
+    Type.Literal('guest_checkout_disabled'), Type.Literal('guest_free_claim_disabled'),
+  ]), { maxItems: 2 }),
+}, { additionalProperties: false })
+
+export const CustomerCartSchema = Type.Object({
+  items: Type.Array(CheckoutQuoteItemSchema, { maxItems: 50 }),
+  itemCount: Type.Integer({ minimum: 0, maximum: 50 }),
+  totalQuantity: Type.Integer({ minimum: 0 }),
+  pricedSubtotal: SettlementAmountSchema,
+  totalAmount: Type.Union([SettlementAmountSchema, Type.Null()]),
+  totalComplete: Type.Boolean(),
+  canContinue: Type.Boolean(),
+  policyReasons: Type.Array(Type.Union([
+    Type.Literal('guest_checkout_disabled'), Type.Literal('guest_free_claim_disabled'),
+  ]), { maxItems: 2 }),
+  quotedAt: Type.String({ format: 'date-time' }),
+  currency: Type.Literal('CNY'),
+}, { additionalProperties: false })
+
+export const CustomerCartMutationSchema = Type.Object({
+  changed: Type.Boolean(),
+  merged: Type.Boolean(),
+  skippedSkuIds: Type.Array(Type.String({ format: 'uuid' }), { maxItems: 50 }),
+  cart: CustomerCartSchema,
 }, { additionalProperties: false })
 
 export const PublicProductCategoryAssignmentSchema = Type.Object({
@@ -1113,8 +1212,6 @@ export const ReadySchema = Type.Object({
 })
 
 export const UnitAmountSchema = Type.String({ pattern: '^-?(?:0|[1-9]\\d{0,12})(?:\\.\\d{1,5})?$' })
-export const SettlementAmountSchema = Type.String({ pattern: '^-?(?:0|[1-9]\\d{0,15})\\.\\d{2}$' })
-
 export function ApiSuccessSchemaOf<T extends TSchema>(data: T) {
   return Type.Object({ data, meta: RequestMetaSchema })
 }
@@ -1218,6 +1315,16 @@ export type PublicCategoryProductsResponse = Static<typeof PublicCategoryProduct
 export type PublicInventorySummary = Static<typeof PublicInventorySummarySchema>
 export type PublicProductOptionGroup = Static<typeof PublicProductOptionGroupSchema>
 export type PublicProductVariant = Static<typeof PublicProductVariantSchema>
+export type CartSkuQuantity = Static<typeof CartSkuQuantitySchema>
+export type CustomerCartAddBody = Static<typeof CustomerCartAddBodySchema>
+export type CustomerCartUpdateBody = Static<typeof CustomerCartUpdateBodySchema>
+export type CustomerCartMergeBody = Static<typeof CustomerCartMergeBodySchema>
+export type CheckoutQuoteBody = Static<typeof CheckoutQuoteBodySchema>
+export type CheckoutQuoteReason = Static<typeof CheckoutQuoteReasonSchema>
+export type CheckoutQuoteItem = Static<typeof CheckoutQuoteItemSchema>
+export type CheckoutQuote = Static<typeof CheckoutQuoteSchema>
+export type CustomerCart = Static<typeof CustomerCartSchema>
+export type CustomerCartMutation = Static<typeof CustomerCartMutationSchema>
 export type PublicProductCategoryAssignment = Static<typeof PublicProductCategoryAssignmentSchema>
 export type PublicProductAttribute = Static<typeof PublicProductAttributeSchema>
 export type PublicProductDetail = Static<typeof PublicProductDetailSchema>

@@ -90,15 +90,11 @@ function formatSalePrice(value: string): string {
   return amount.toFixed(2)
 }
 
-function publicVariantEligibility(alias: string) {
+export function variantOptionCombinationValid(alias: string) {
   const id = sql.ref(`${alias}.id`)
   const productId = sql.ref(`${alias}.product_id`)
-  const enabled = sql.ref(`${alias}.enabled`)
-  const retiredAt = sql.ref(`${alias}.retired_at`)
   return sql`
-    AND ${enabled} = TRUE
-    AND ${retiredAt} IS NULL
-    AND (
+    (
       SELECT count(*)
       FROM product_variant_option_values AS enabled_relation
       WHERE enabled_relation.product_id = ${productId}
@@ -140,6 +136,16 @@ function publicVariantEligibility(alias: string) {
             AND option_value.enabled
         )
     )
+  `
+}
+
+function publicVariantEligibility(alias: string) {
+  const enabled = sql.ref(`${alias}.enabled`)
+  const retiredAt = sql.ref(`${alias}.retired_at`)
+  return sql`
+    AND ${enabled} = TRUE
+    AND ${retiredAt} IS NULL
+    AND ${variantOptionCombinationValid(alias)}
   `
 }
 
@@ -393,6 +399,7 @@ async function loadPublicVariants(db: KyselyDatabase<Database>, productId: strin
   }
 
   return rows.rows.map((row) => ({
+    skuId: row.id,
     options: optionsByVariant.get(row.id) ?? [],
     salePrice: formatSalePrice(row.sale_price),
     compareAtPrice: row.compare_at_price === null ? null : formatSalePrice(row.compare_at_price),

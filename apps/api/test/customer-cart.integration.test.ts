@@ -1,0 +1,497 @@
+import { randomUUID } from 'node:crypto'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { sql, type Kysely } from 'kysely'
+import type { FastifyInstance } from 'fastify'
+import { createApp } from '../src/app.js'
+import { readConfig } from '../src/config.js'
+import { hashPassword } from '../src/auth/password.js'
+import { AppMigrationProvider } from '../src/db/migration-provider.js'
+import { createDatabase } from '../src/db/pool.js'
+import type { Database, ProductInventoryMode, ProductStatus } from '../src/db/types.js'
+
+const testDatabaseUrl = process.env.TEST_DATABASE_URL
+const testOrigin = 'http://localhost:3000'
+const password = 'Cart-Integration-Password-2026!'
+
+let app: FastifyInstance
+let db: Kysely<Database>
+let nextIp = 10
+
+type CustomerFixture = { id: string; sessionCookie: string; csrf: { token: string; cookie: string } }
+type CatalogFixture = { productId: string; skuId: string; productName: string }
+
+function cookieFrom(response: { headers: Record<string, string | string[] | undefined> }, name: string): string {
+  const header = response.headers['set-cookie']
+  const cookies = Array.isArray(header) ? header : header ? [header] : []
+  const cookie = cookies.find(value => value.startsWith(`${name}=`))
+  if (!cookie) throw new Error(`Expected ${name} cookie`)
+  return cookie.split(';', 1)[0] ?? ''
+}
+
+async function customerCsrf(target: FastifyInstance = app) {
+  const response = await target.inject({ method: 'GET', url: '/api/v1/customer/auth/csrf' })
+  expect(response.statusCode).toBe(200)
+  return { token: response.json().data.csrfToken as string, cookie: cookieFrom(response, 'aikayun_customer_csrf') }
+}
+
+function customerHeaders(customer: CustomerFixture, includeSession = true) {
+  return {
+    origin: testOrigin,
+    cookie: [includeSession ? customer.sessionCookie : '', customer.csrf.cookie].filter(Boolean).join('; '),
+    'x-csrf-token': customer.csrf.token,
+  }
+}
+
+async function createCustomer(): Promise<CustomerFixture> {
+  const csrf = await customerCsrf()
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/v1/customer/auth/register',
+    remoteAddress: `198.51.100.${nextIp++}`,
+    headers: { origin: testOrigin, cookie: csrf.cookie, 'x-csrf-token': csrf.token },
+    payload: { username: `cart-${randomUUID().replaceAll('-', '').slice(0, 20)}`, password },
+  })
+  expect(response.statusCode).toBe(201)
+  return {
+    id: response.json().data.customer.id as string,
+    sessionCookie: cookieFrom(response, 'aikayun_customer_session'),
+    csrf,
+  }
+}
+
+async function createAdminSession() {
+  const email = `cart-admin-${randomUUID().slice(0, 8)}@example.test`
+  await db.insertInto('admin_users').values({ id: randomUUID(), email, password_hash: await hashPassword(password) }).execute()
+  const csrfResponse = await app.inject({ method: 'GET', url: '/api/v1/admin/auth/csrf' })
+  const csrf = csrfResponse.json().data.csrfToken as string
+  const csrfCookie = cookieFrom(csrfResponse, 'aikayun_admin_csrf')
+  const login = await app.inject({
+    method: 'POST', url: '/api/v1/admin/auth/login',
+    headers: { origin: testOrigin, cookie: csrfCookie, 'x-csrf-token': csrf },
+    payload: { email, password },
+  })
+  expect(login.statusCode).toBe(200)
+  return {
+    csrf,
+    cookie: `${cookieFrom(login, 'aikayun_admin_session')}; ${csrfCookie}`,
+  }
+}
+
+async function createCatalog(options: {
+  price?: string
+  mode?: ProductInventoryMode | null
+  stocked?: number
+  status?: ProductStatus
+  enabled?: boolean
+  retired?: boolean
+  fulfillmentMethod?: 'manual' | 'code_pool' | 'fixed_content' | 'link' | 'file' | 'api' | null
+  count?: number
+} = {}): Promise<CatalogFixture[]> {
+  const result: CatalogFixture[] = []
+  await db.transaction().execute(async (trx) => {
+    for (let index = 0; index < (options.count ?? 1); index += 1) {
+      const productId = randomUUID()
+      const skuId = randomUUID()
+      const productName = `Cart fixture ${randomUUID().slice(0, 8)}`
+      await trx.insertInto('products').values({
+        id: productId,
+        name: productName,
+        description: '',
+        product_type: 'digital',
+        status: options.status ?? 'active',
+      }).execute()
+      await trx.insertInto('product_variants').values({
+        id: skuId,
+        product_id: productId,
+        sku_code: `CART-${randomUUID().replaceAll('-', '').slice(0, 20)}`,
+        combination_key: '',
+        sale_price: options.price ?? '0.10',
+        enabled: options.enabled ?? true,
+        retired_at: options.retired ? new Date() : null,
+        inventory_mode: options.mode ?? null,
+      }).execute()
+      if (options.mode === 'quantity') {
+        await trx.insertInto('product_variant_quantity_inventory').values({
+          product_id: productId,
+          product_variant_id: skuId,
+          stocked: options.stocked ?? 10,
+        }).execute()
+      }
+      if (options.fulfillmentMethod) {
+        await trx.insertInto('product_variant_fulfillment').values({
+          product_variant_id: skuId,
+          method: options.fulfillmentMethod,
+        }).execute()
+      }
+      result.push({ productId, skuId, productName })
+    }
+  })
+  return result
+}
+
+async function createOptionCatalog(): Promise<CatalogFixture> {
+  const productId = randomUUID()
+  const skuId = randomUUID()
+  const groupId = randomUUID()
+  const valueId = randomUUID()
+  const productName = `Cart option fixture ${randomUUID().slice(0, 8)}`
+  await db.transaction().execute(async (trx) => {
+    await trx.insertInto('products').values({
+      id: productId, name: productName, description: '', product_type: 'digital', status: 'active',
+    }).execute()
+    await trx.insertInto('product_option_groups').values({
+      id: groupId, product_id: productId, name: '套餐', sort_order: 0, enabled: true,
+    }).execute()
+    await trx.insertInto('product_option_values').values({
+      id: valueId, product_id: productId, option_group_id: groupId, name: '基础版', sort_order: 0, enabled: true,
+    }).execute()
+    await trx.insertInto('product_variants').values({
+      id: skuId, product_id: productId, sku_code: `CART-${randomUUID().slice(0, 12)}`,
+      combination_key: '', sale_price: '0.50', enabled: true, retired_at: null, inventory_mode: null,
+    }).execute()
+    await trx.insertInto('product_variant_option_values').values({
+      product_id: productId, product_variant_id: skuId, option_group_id: groupId, option_value_id: valueId,
+    }).execute()
+    await sql`UPDATE product_variants SET combination_key = product_variant_combination_key(${productId}::uuid, ${skuId}::uuid) WHERE id = ${skuId}::uuid`.execute(trx)
+  })
+  return { productId, skuId, productName }
+}
+
+async function addCartItem(customer: CustomerFixture, skuId: string, quantity: number, extraHeaders: Record<string, string> = {}) {
+  return app.inject({
+    method: 'POST', url: '/api/v1/customer/cart/items',
+    headers: { ...customerHeaders(customer), ...extraHeaders },
+    payload: { skuId, quantity },
+  })
+}
+
+async function quote(items: Array<{ skuId: string; quantity: number }>, customer?: CustomerFixture) {
+  const csrf = customer?.csrf ?? await customerCsrf()
+  return app.inject({
+    method: 'POST', url: '/api/v1/checkout/quote',
+    headers: {
+      origin: testOrigin,
+      cookie: [customer?.sessionCookie, csrf.cookie].filter(Boolean).join('; '),
+      'x-csrf-token': csrf.token,
+    },
+    payload: { items },
+  })
+}
+
+beforeAll(async () => {
+  if (!testDatabaseUrl) throw new Error('TEST_DATABASE_URL must point to a dedicated PostgreSQL database ending in _test')
+  const databaseUrl = new URL(testDatabaseUrl)
+  if (!databaseUrl.pathname.slice(1).endsWith('_test')) {
+    throw new Error('Refusing to run cart API integration tests unless TEST_DATABASE_URL names a database ending in _test')
+  }
+  process.env.DATABASE_URL = testDatabaseUrl
+  db = createDatabase()
+  await sql`drop schema public cascade`.execute(db)
+  await sql`create schema public`.execute(db)
+  const { Migrator } = await import('kysely/migration')
+  const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
+  const migrated = await migrator.migrateToLatest()
+  if (migrated.error) throw migrated.error
+  const repeated = await migrator.migrateToLatest()
+  if (repeated.error) throw repeated.error
+
+  const config = readConfig({
+    ...process.env,
+    DATABASE_URL: testDatabaseUrl,
+    NODE_ENV: 'test',
+    PUBLIC_ORIGIN: testOrigin,
+    COOKIE_SECURE: 'false',
+  })
+  app = await createApp({ db, config, logger: false })
+  await app.ready()
+})
+
+afterAll(async () => {
+  if (app) await app.close()
+  if (db) await db.destroy()
+})
+
+describe('customer cart and checkout quote with PostgreSQL', () => {
+  it('isolates authenticated carts, merges concurrent adds, supports quantity changes and enforces CSRF', async () => {
+    const [owner, other] = await Promise.all([createCustomer(), createCustomer()])
+    const [skuA, skuB] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual', count: 2 })
+
+    expect((await addCartItem(owner, skuA!.skuId, 1, { origin: 'https://attacker.example' })).statusCode).toBe(403)
+    expect((await app.inject({ method: 'POST', url: '/api/v1/customer/cart/items', headers: { origin: testOrigin, cookie: owner.sessionCookie }, payload: { skuId: skuA!.skuId, quantity: 1 } })).statusCode).toBe(403)
+    expect((await addCartItem(owner, skuA!.skuId, 0)).statusCode).toBe(400)
+    expect((await addCartItem(owner, randomUUID(), 1)).statusCode).toBe(404)
+    expect((await addCartItem(owner, skuA!.skuId, 1, { cookie: `${owner.sessionCookie}; ${owner.csrf.cookie}` })).statusCode).toBe(200)
+
+    const additions = await Promise.all([
+      addCartItem(owner, skuA!.skuId, 2),
+      addCartItem(owner, skuA!.skuId, 3),
+    ])
+    expect(additions.map(response => response.statusCode)).toEqual([200, 200])
+    const crossDeviceRead = await app.inject({ method: 'GET', url: '/api/v1/customer/cart', headers: { cookie: owner.sessionCookie } })
+    expect(crossDeviceRead.statusCode).toBe(200)
+    expect(crossDeviceRead.json().data.items).toHaveLength(1)
+    expect(crossDeviceRead.json().data.items[0]).toMatchObject({ skuId: skuA!.skuId, quantity: 6 })
+
+    expect((await addCartItem(owner, skuB!.skuId, 2)).statusCode).toBe(200)
+    const otherRead = await app.inject({ method: 'GET', url: '/api/v1/customer/cart', headers: { cookie: other.sessionCookie } })
+    expect(otherRead.json().data.items).toEqual([])
+    const clientCustomerId = await app.inject({
+      method: 'POST', url: '/api/v1/customer/cart/items', headers: customerHeaders(owner),
+      payload: { customerId: other.id, skuId: skuB!.skuId, quantity: 1 },
+    })
+    expect(clientCustomerId.statusCode).toBe(400)
+
+    const update = await app.inject({
+      method: 'PATCH', url: `/api/v1/customer/cart/items/${skuA!.skuId}`,
+      headers: customerHeaders(owner), payload: { quantity: 4 },
+    })
+    expect(update.statusCode).toBe(200)
+    expect(update.json().data.cart.items.find((item: { skuId: string }) => item.skuId === skuA!.skuId).quantity).toBe(4)
+    expect((await app.inject({
+      method: 'DELETE', url: `/api/v1/customer/cart/items/${skuA!.skuId}`, headers: customerHeaders(owner),
+    })).json().data.cart.items).toHaveLength(1)
+    const cleared = await app.inject({ method: 'DELETE', url: '/api/v1/customer/cart', headers: customerHeaders(owner) })
+    expect(cleared.statusCode).toBe(200)
+    expect(cleared.json().data.cart.items).toEqual([])
+
+    const logout = await app.inject({ method: 'POST', url: '/api/v1/customer/auth/logout', headers: customerHeaders(owner) })
+    expect(logout.statusCode).toBe(200)
+    expect((await app.inject({ method: 'GET', url: '/api/v1/customer/cart', headers: { cookie: owner.sessionCookie } })).statusCode).toBe(401)
+    expect((await quote([{ skuId: skuA!.skuId, quantity: 1 }], owner)).statusCode).toBe(401)
+  })
+
+  it('merges guest items atomically, skips unknown SKUs, and makes merge replay idempotent', async () => {
+    const owner = await createCustomer()
+    const other = await createCustomer()
+    const [skuA, skuB] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual', count: 2 })
+    const mergeId = randomUUID()
+    const body = {
+      mergeId,
+      items: [
+        { skuId: skuA!.skuId, quantity: 2 },
+        { skuId: skuA!.skuId, quantity: 1 },
+        { skuId: skuB!.skuId, quantity: 2 },
+      ],
+    }
+    const merge = () => app.inject({ method: 'POST', url: '/api/v1/customer/cart/merge', headers: customerHeaders(owner), payload: body })
+    const first = await merge()
+    expect(first.statusCode).toBe(200)
+    expect(first.json().data.cart.items).toHaveLength(2)
+    expect(first.json().data.cart.items.find((item: { skuId: string }) => item.skuId === skuA!.skuId).quantity).toBe(3)
+    const replay = await merge()
+    expect(replay.statusCode).toBe(200)
+    expect(replay.json().data.cart.items.find((item: { skuId: string }) => item.skuId === skuA!.skuId).quantity).toBe(3)
+    expect(replay.json().data.changed).toBe(false)
+
+    const reused = await app.inject({
+      method: 'POST', url: '/api/v1/customer/cart/merge', headers: customerHeaders(owner),
+      payload: { mergeId, items: [{ skuId: skuA!.skuId, quantity: 4 }] },
+    })
+    expect(reused.statusCode).toBe(409)
+    expect((await app.inject({ method: 'GET', url: '/api/v1/customer/cart', headers: { cookie: other.sessionCookie } })).json().data.items).toEqual([])
+
+    const unknownSku = randomUUID()
+    const partialMerge = await app.inject({
+      method: 'POST', url: '/api/v1/customer/cart/merge', headers: customerHeaders(other),
+      payload: { mergeId: randomUUID(), items: [{ skuId: skuB!.skuId, quantity: 1 }, { skuId: unknownSku, quantity: 1 }] },
+    })
+    expect(partialMerge.statusCode).toBe(200)
+    expect(partialMerge.json().data.skippedSkuIds).toEqual([unknownSku])
+    expect(partialMerge.json().data.cart.items).toHaveLength(1)
+  })
+
+  it('re-quotes current prices and inventory, checks policies and eligibility, and has no transaction side effects', async () => {
+    const customer = await createCustomer()
+    const quantitySku = (await createCatalog({ mode: 'quantity', stocked: 2, fulfillmentMethod: 'manual' }))[0]!
+    const unlimitedSku = (await createCatalog({ mode: 'unlimited', price: '0.20', fulfillmentMethod: 'manual' }))[0]!
+    const freeSku = (await createCatalog({ mode: 'unlimited', price: '0.00', fulfillmentMethod: 'manual' }))[0]!
+
+    const before = {
+      product: await db.selectFrom('products').select('revision').where('id', '=', quantitySku!.productId).executeTakeFirstOrThrow(),
+      variant: await db.selectFrom('product_variants').select(['revision', 'inventory_revision']).where('id', '=', quantitySku!.skuId).executeTakeFirstOrThrow(),
+      inventory: await db.selectFrom('product_variant_quantity_inventory').selectAll().where('product_variant_id', '=', quantitySku!.skuId).executeTakeFirstOrThrow(),
+      orders: await db.selectFrom('orders').select(eb => eb.fn.countAll<number>().as('total')).executeTakeFirstOrThrow(),
+      reservations: await db.selectFrom('order_inventory_reservations').select(eb => eb.fn.countAll<number>().as('total')).executeTakeFirstOrThrow(),
+      ledger: await db.selectFrom('wallet_ledger_entries').select(eb => eb.fn.countAll<number>().as('total')).executeTakeFirstOrThrow(),
+    }
+
+    const duplicateSkuQuote = await quote([
+      { skuId: unlimitedSku!.skuId, quantity: 1 },
+      { skuId: unlimitedSku!.skuId, quantity: 2 },
+    ])
+    expect(duplicateSkuQuote.statusCode).toBe(200)
+    expect(duplicateSkuQuote.json().data.items).toHaveLength(1)
+    expect(duplicateSkuQuote.json().data.items[0]).toMatchObject({ quantity: 3, unitPrice: '0.20', lineTotal: '0.60' })
+
+    const multiQuote = await quote([
+      { skuId: quantitySku!.skuId, quantity: 3 },
+      { skuId: unlimitedSku!.skuId, quantity: 2 },
+    ])
+    expect(multiQuote.statusCode).toBe(200)
+    expect(multiQuote.json().data.pricedSubtotal).toBe('0.70')
+    expect(multiQuote.json().data.totalAmount).toBe('0.70')
+    expect(multiQuote.json().data.items.find((item: { skuId: string }) => item.skuId === quantitySku!.skuId))
+      .toMatchObject({ lineTotal: '0.30', reason: 'insufficient_inventory' })
+    expect(multiQuote.json().data.items.find((item: { skuId: string }) => item.skuId === unlimitedSku!.skuId))
+      .toMatchObject({ lineTotal: '0.40', reason: 'fulfillment_not_ready' })
+    expect(multiQuote.json().data.policyReasons).toContain('guest_checkout_disabled')
+    expect(multiQuote.headers['cache-control']).toContain('no-store')
+    expect((await app.inject({
+      method: 'POST', url: '/api/v1/checkout/quote', headers: { origin: testOrigin },
+      payload: { items: [{ skuId: quantitySku.skuId, quantity: 1 }] },
+    })).statusCode).toBe(403)
+
+    const afterQuotes = {
+      product: await db.selectFrom('products').select('revision').where('id', '=', quantitySku.productId).executeTakeFirstOrThrow(),
+      variant: await db.selectFrom('product_variants').select(['revision', 'inventory_revision']).where('id', '=', quantitySku.skuId).executeTakeFirstOrThrow(),
+      inventory: await db.selectFrom('product_variant_quantity_inventory').selectAll().where('product_variant_id', '=', quantitySku.skuId).executeTakeFirstOrThrow(),
+      orders: await db.selectFrom('orders').select(eb => eb.fn.countAll<number>().as('total')).executeTakeFirstOrThrow(),
+      reservations: await db.selectFrom('order_inventory_reservations').select(eb => eb.fn.countAll<number>().as('total')).executeTakeFirstOrThrow(),
+      ledger: await db.selectFrom('wallet_ledger_entries').select(eb => eb.fn.countAll<number>().as('total')).executeTakeFirstOrThrow(),
+    }
+    expect(afterQuotes).toEqual(before)
+
+    await db.updateTable('storefront_customer_policy').set({
+      guest_checkout_enabled: true,
+      guest_free_claim_enabled: true,
+    }).execute()
+    const freeQuote = await quote([{ skuId: freeSku!.skuId, quantity: 1 }])
+    expect(freeQuote.json().data.guestFreeClaimEnabled).toBe(true)
+    await db.updateTable('storefront_customer_policy').set({ guest_free_claim_enabled: false }).execute()
+    const deniedFreeQuote = await quote([{ skuId: freeSku!.skuId, quantity: 1 }])
+    expect(deniedFreeQuote.json().data.policyReasons).toContain('guest_free_claim_disabled')
+    expect(deniedFreeQuote.json().data.canContinue).toBe(false)
+    const authenticatedFreeQuote = await quote([{ skuId: freeSku.skuId, quantity: 1 }], customer)
+    expect(authenticatedFreeQuote.json().data.customerAuthenticated).toBe(true)
+    expect(authenticatedFreeQuote.json().data.policyReasons).toEqual([])
+
+    for (const mode of ['resource_pool', 'external'] as const) {
+      const notReadySku = (await createCatalog({ mode, fulfillmentMethod: 'manual' }))[0]!
+      const result = await quote([{ skuId: notReadySku.skuId, quantity: 1 }])
+      expect(result.json().data.items[0]).toMatchObject({ inventoryMode: mode, reason: 'inventory_not_ready' })
+    }
+    const draftSku = (await createCatalog({ status: 'draft', mode: 'unlimited', fulfillmentMethod: 'manual' }))[0]!
+    expect((await quote([{ skuId: draftSku.skuId, quantity: 1 }])).json().data.items[0])
+      .toMatchObject({ productStatus: 'draft', reason: 'product_not_active' })
+    const unconfiguredSku = (await createCatalog())[0]!
+    expect((await quote([{ skuId: unconfiguredSku.skuId, quantity: 1 }])).json().data.items[0].reason)
+      .toBe('inventory_not_configured')
+    const optionSku = await createOptionCatalog()
+    await db.updateTable('product_option_groups').set({ name: '新套餐' }).where('product_id', '=', optionSku.productId).execute()
+    await db.updateTable('product_option_values').set({ name: '年度版' }).where('product_id', '=', optionSku.productId).execute()
+    expect((await quote([{ skuId: optionSku.skuId, quantity: 1 }])).json().data.items[0].options)
+      .toEqual([{ groupId: expect.any(String), groupName: '新套餐', valueId: expect.any(String), valueName: '年度版' }])
+
+    await db.updateTable('product_variants').set({ sale_price: '0.30' }).where('id', '=', quantitySku!.skuId).execute()
+    const changedPriceQuote = await quote([{ skuId: quantitySku!.skuId, quantity: 2 }])
+    expect(changedPriceQuote.json().data.items[0]).toMatchObject({ unitPrice: '0.30', lineTotal: '0.60' })
+    await db.updateTable('products').set({ status: 'paused' }).where('id', '=', quantitySku!.productId).execute()
+    const pausedQuote = await quote([{ skuId: quantitySku!.skuId, quantity: 1 }])
+    expect(pausedQuote.json().data.items[0]).toMatchObject({ productStatus: 'paused', unitPrice: '0.30', reason: 'product_not_active' })
+    await db.updateTable('products').set({ status: 'active' }).where('id', '=', quantitySku!.productId).execute()
+    await db.updateTable('products').set({ status: 'archived' }).where('id', '=', quantitySku!.productId).execute()
+    expect((await quote([{ skuId: quantitySku!.skuId, quantity: 1 }])).json().data.items[0].reason).toBe('product_not_active')
+    await db.updateTable('products').set({ status: 'active' }).where('id', '=', quantitySku!.productId).execute()
+    await db.updateTable('product_variants').set({ enabled: false }).where('id', '=', quantitySku!.skuId).execute()
+    expect((await quote([{ skuId: quantitySku!.skuId, quantity: 1 }])).json().data.items[0].reason).toBe('sku_disabled')
+    const retiredSku = (await createCatalog({ enabled: false }))[0]!
+    await db.updateTable('product_variants').set({ retired_at: new Date() }).where('id', '=', retiredSku.skuId).execute()
+    expect((await quote([{ skuId: retiredSku.skuId, quantity: 1 }])).json().data.items[0].reason).toBe('sku_retired')
+
+    const switchableSku = (await createCatalog({ mode: 'quantity', stocked: 0, fulfillmentMethod: 'manual' }))[0]!
+    const revisions = await db.selectFrom('products')
+      .innerJoin('product_variants', 'product_variants.product_id', 'products.id')
+      .select([
+        'products.revision as productRevision',
+        'product_variants.revision as skuRevision',
+        'product_variants.inventory_revision as inventoryRevision',
+      ])
+      .where('products.id', '=', switchableSku.productId)
+      .where('product_variants.id', '=', switchableSku.skuId)
+      .executeTakeFirstOrThrow()
+    const administrator = await createAdminSession()
+    const modeChange = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/admin/products/${switchableSku.productId}/variants/${switchableSku.skuId}/inventory-mode`,
+      headers: { origin: testOrigin, cookie: administrator.cookie, 'x-csrf-token': administrator.csrf },
+      payload: {
+        expectedRevision: revisions.productRevision,
+        expectedSkuRevision: revisions.skuRevision,
+        expectedInventoryRevision: revisions.inventoryRevision,
+        inventoryMode: 'unlimited',
+      },
+    })
+    expect(modeChange.statusCode).toBe(200)
+    expect((await quote([{ skuId: switchableSku.skuId, quantity: 1 }])).json().data.items[0])
+      .toMatchObject({ inventoryMode: 'unlimited', reason: 'fulfillment_not_ready' })
+  })
+
+  it('rejects oversized cart inputs and settlement totals without floating-point arithmetic', async () => {
+    const customer = await createCustomer()
+    const [sku] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual' })
+    expect((await quote([{ skuId: sku!.skuId, quantity: 0 }])).statusCode).toBe(400)
+    expect((await quote([{ skuId: sku!.skuId, quantity: 100 }])).statusCode).toBe(400)
+    expect((await quote([{ skuId: 'not-a-uuid', quantity: 1 }])).statusCode).toBe(400)
+    expect((await quote([{ skuId: sku!.skuId, quantity: 99 }, { skuId: sku!.skuId, quantity: 1 }])).statusCode).toBe(400)
+    const unknown = await quote([{ skuId: randomUUID(), quantity: 2 }])
+    expect(unknown.statusCode).toBe(200)
+    expect(unknown.json().data.items[0]).toMatchObject({ identityValid: false, lineTotal: null, reason: 'sku_not_found' })
+    expect(unknown.json().data.totalAmount).toBeNull()
+
+    const largeSkus = await createCatalog({ price: '9999999999999.99', mode: 'unlimited', fulfillmentMethod: 'manual', count: 12 })
+    const overflow = await quote(largeSkus.map(item => ({ skuId: item.skuId, quantity: 99 })))
+    expect(overflow.statusCode).toBe(422)
+
+    const missingSkuAdd = await addCartItem(customer, randomUUID(), 1)
+    expect(missingSkuAdd.statusCode).toBe(404)
+  })
+
+  it('enforces the 50-SKU cart cap and keeps retired catalog identities safe to read', async () => {
+    const customer = await createCustomer()
+    const skus = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual', count: 51 })
+    const merged = await app.inject({
+      method: 'POST', url: '/api/v1/customer/cart/merge', headers: customerHeaders(customer),
+      payload: { mergeId: randomUUID(), items: skus.slice(0, 50).map(item => ({ skuId: item.skuId, quantity: 1 })) },
+    })
+    expect(merged.statusCode).toBe(200)
+    expect(merged.json().data.cart.itemCount).toBe(50)
+    expect((await addCartItem(customer, skus[50]!.skuId, 1)).statusCode).toBe(409)
+
+    await db.transaction().execute(async (trx) => {
+      await trx.deleteFrom('product_variants').where('id', '=', skus[0]!.skuId).execute()
+      await trx.deleteFrom('products').where('id', '=', skus[0]!.productId).execute()
+    })
+    const staleCart = await app.inject({ method: 'GET', url: '/api/v1/customer/cart', headers: { cookie: customer.sessionCookie } })
+    expect(staleCart.statusCode).toBe(200)
+    expect(staleCart.json().data.items.some((item: { skuId: string }) => item.skuId === skus[0]!.skuId)).toBe(true)
+    expect(staleCart.json().data.items.find((item: { skuId: string }) => item.skuId === skus[0]!.skuId))
+      .toMatchObject({ identityValid: false, reason: 'sku_not_found', lineTotal: null })
+  })
+
+  it('revokes disabled sessions and clears cart identity data on customer anonymization', async () => {
+    const disabled = await createCustomer()
+    const [disabledSku] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual' })
+    expect((await addCartItem(disabled, disabledSku!.skuId, 1)).statusCode).toBe(200)
+    await db.updateTable('customers').set({ status: 'disabled' }).where('id', '=', disabled.id).execute()
+    expect((await app.inject({ method: 'GET', url: '/api/v1/customer/cart', headers: { cookie: disabled.sessionCookie } })).statusCode).toBe(401)
+    expect((await addCartItem(disabled, disabledSku!.skuId, 1)).statusCode).toBe(401)
+
+    const deleted = await createCustomer()
+    const [deletedSku] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual' })
+    expect((await addCartItem(deleted, deletedSku!.skuId, 1)).statusCode).toBe(200)
+    const mergeId = randomUUID()
+    expect((await app.inject({
+      method: 'POST', url: '/api/v1/customer/cart/merge', headers: customerHeaders(deleted),
+      payload: { mergeId, items: [{ skuId: deletedSku!.skuId, quantity: 1 }] },
+    })).statusCode).toBe(200)
+    const administrator = await createAdminSession()
+    const anonymized = await app.inject({
+      method: 'DELETE', url: `/api/v1/admin/customers/${deleted.id}`,
+      headers: { origin: testOrigin, cookie: administrator.cookie, 'x-csrf-token': administrator.csrf },
+    })
+    expect(anonymized.statusCode).toBe(200)
+    expect((await app.inject({ method: 'GET', url: '/api/v1/customer/cart', headers: { cookie: deleted.sessionCookie } })).statusCode).toBe(401)
+    expect(await db.selectFrom('customer_cart_items').select('sku_id').where('customer_id', '=', deleted.id).execute()).toEqual([])
+    expect(await db.selectFrom('customer_cart_merge_requests').select('merge_id').where('customer_id', '=', deleted.id).execute()).toEqual([])
+  })
+})
