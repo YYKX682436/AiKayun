@@ -29,7 +29,7 @@ jobs:
       TEST_DATABASE_URL: postgresql://aikayun:ci-test-password@127.0.0.1:5432/aikayun_test
       POSTGRES_USER: aikayun
       POSTGRES_PASSWORD: ci-only-compose-password
-      POSTGRES_DB: aikayun
+      POSTGRES_DB: aikayun_test
       PUBLIC_ORIGIN: http://localhost:8080
       COOKIE_SECURE: "false"
       TRUST_PROXY: "true"
@@ -78,20 +78,20 @@ jobs:
           done
           curl --fail --silent http://localhost:8080/ | grep -q '暂无可展示的商品'
           docker compose exec -T -e ADMIN_INITIAL_EMAIL=browser-test@example.com -e 'ADMIN_INITIAL_PASSWORD=Only-For-E2E-Tests-2026!!' api node dist/admin-init.js
-          PLAYWRIGHT_BASE_URL=http://localhost:8080 PLAYWRIGHT_EXTERNAL_SERVER=true pnpm e2e
+          TEST_DATABASE_URL="postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@127.0.0.1:$PG_PORT/$POSTGRES_DB" PLAYWRIGHT_BASE_URL=http://localhost:8080 PLAYWRIGHT_EXTERNAL_SERVER=true pnpm e2e
       - name: Verify PostgreSQL data survives Compose rebuild
         run: |
-          docker compose exec -T db psql -U aikayun -d aikayun -v ON_ERROR_STOP=1 -c "CREATE TABLE compose_persistence_check (marker text PRIMARY KEY); INSERT INTO compose_persistence_check VALUES ('persisted');"
+          docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "CREATE TABLE compose_persistence_check (marker text PRIMARY KEY); INSERT INTO compose_persistence_check VALUES ('persisted');"
           docker compose up -d --build --force-recreate
           for attempt in $(seq 1 60); do
-            if docker compose exec -T db pg_isready -U aikayun -d aikayun >/dev/null; then break; fi
+            if docker compose exec -T db pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null; then break; fi
             sleep 2
           done
           for attempt in $(seq 1 60); do
             if curl --fail --silent http://localhost:8080/api/v1/health/ready >/dev/null; then break; fi
             sleep 2
           done
-          docker compose exec -T db psql -U aikayun -d aikayun -Atc 'SELECT marker FROM compose_persistence_check' | grep -qx persisted
+          docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc 'SELECT marker FROM compose_persistence_check' | grep -qx persisted
           curl --fail --silent http://localhost:8080/api/v1/health/ready
           for attempt in $(seq 1 60); do
             if curl --fail --silent http://localhost:8080/ | grep -q '全部商品'; then break; fi
