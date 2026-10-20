@@ -311,7 +311,7 @@ function formatDate(value: string): string {
               >
                 {{ item.options.map(option => `${option.groupName}：${option.valueName}`).join(' / ') }}
               </p>
-              <p class="mt-1 text-sm text-muted">
+              <p class="mt-1 break-all text-sm text-muted">
                 数量：{{ item.quantity }} <span v-if="item.skuCode">· SKU {{ item.skuCode }}</span>
               </p>
               <UBadge
