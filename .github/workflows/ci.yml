@@ -88,7 +88,7 @@ jobs:
           done
           curl --fail --silent http://localhost:8080/ | grep -q '暂无可展示的商品'
           docker compose exec -T -e ADMIN_INITIAL_EMAIL=browser-test@example.com -e 'ADMIN_INITIAL_PASSWORD=Only-For-E2E-Tests-2026!!' api node dist/admin-init.js
-          TEST_DATABASE_URL="postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@127.0.0.1:$PG_PORT/$POSTGRES_DB" PLAYWRIGHT_BASE_URL=http://localhost:8080 PLAYWRIGHT_EXTERNAL_SERVER=true pnpm e2e
+          TEST_DATABASE_URL="postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@127.0.0.1:$PG_PORT/$POSTGRES_DB" PLAYWRIGHT_BASE_URL=http://localhost:8080 PLAYWRIGHT_EXTERNAL_SERVER=true pnpm --filter @aikayun/web exec playwright test
       - name: Verify PostgreSQL data survives Compose rebuild
         run: |
           docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "CREATE TABLE compose_persistence_check (marker text PRIMARY KEY); INSERT INTO compose_persistence_check VALUES ('persisted');"
