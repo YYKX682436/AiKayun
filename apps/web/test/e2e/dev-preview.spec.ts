@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test'
 import { wcagContrast } from 'culori'
 
-test('development design preview composes existing components without business actions', async ({ page }) => {
+test('development design preview composes existing components and keeps semantic status contrast in both themes', async ({ page }) => {
   const response = await page.goto('/dev-preview')
   expect(response?.status()).toBe(200)
   await expect(page).toHaveTitle('设计系统预览 · AiKayun 数字商城')
@@ -11,10 +11,6 @@ test('development design preview composes existing components without business a
   await expect(page.getByRole('button', { name: '提交中' })).toBeDisabled()
   await expect(page.getByRole('button', { name: '不可用' })).toBeDisabled()
   await expect(page.getByRole('link', { name: /购买|加入购物车/ })).toHaveCount(0)
-})
-
-test('semantic status text keeps WCAG AA contrast in both themes', async ({ page }) => {
-  await page.goto('/dev-preview')
 
   for (const mode of ['light', 'dark'] as const) {
     await page.evaluate((value) => {
