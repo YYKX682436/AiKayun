@@ -754,12 +754,24 @@ async function adminOrderDetail(db: Kysely<Database>, orderId: string): Promise<
     events.push(event)
     providerEventsByAttempt.set(event.payment_attempt_id, events)
   }
+  const reconciliationCases = paymentAttemptIds.length
+    ? await db.selectFrom('payment_provider_reconciliation_cases').selectAll()
+      .where('payment_attempt_id', 'in', paymentAttemptIds)
+      .orderBy('opened_at').orderBy('id').execute()
+    : []
+  const reconciliationCasesByAttempt = new Map<string, typeof reconciliationCases>()
+  for (const reconciliationCase of reconciliationCases) {
+    const cases = reconciliationCasesByAttempt.get(reconciliationCase.payment_attempt_id) ?? []
+    cases.push(reconciliationCase)
+    reconciliationCasesByAttempt.set(reconciliationCase.payment_attempt_id, cases)
+  }
   const payments = {
     needsReconciliation: paymentAttempts.some(attempt =>
       attempt.status === 'late_succeeded' || attempt.status === 'reconciliation_required'
+      || (reconciliationCasesByAttempt.get(attempt.id) ?? []).some(reconciliationCase => reconciliationCase.state === 'open')
       || (providerEventsByAttempt.get(attempt.id) ?? []).some(event =>
         event.verification === 'unverified' || event.disposition === 'reconciliation_required'
-          || event.disposition === 'pending_confirmation' || event.disposition === 'unknown')),
+          || event.disposition === 'unknown')),
     attempts: paymentAttempts.map(attempt => ({
       id: attempt.id,
       providerType: attempt.provider_type_snapshot ?? 'zpay_epay_v1',
@@ -777,6 +789,19 @@ async function adminOrderDetail(db: Kysely<Database>, orderId: string): Promise<
       createdAt: attempt.created_at.toISOString(),
       expiresAt: attempt.expires_at?.toISOString() ?? null,
       completedAt: attempt.completed_at?.toISOString() ?? null,
+      reconciliationOpen: (reconciliationCasesByAttempt.get(attempt.id) ?? []).some(reconciliationCase => reconciliationCase.state === 'open'),
+      reconciliationCases: (reconciliationCasesByAttempt.get(attempt.id) ?? []).map(reconciliationCase => ({
+        id: reconciliationCase.id,
+        reason: reconciliationCase.reason,
+        state: reconciliationCase.state,
+        openedAt: reconciliationCase.opened_at.toISOString(),
+        resolvedAt: reconciliationCase.resolved_at?.toISOString() ?? null,
+        resolvedByAdminId: reconciliationCase.resolved_by_admin_id,
+        resolutionQueryEventSha256: reconciliationCase.resolution_query_event_sha256?.trim() ?? null,
+        resolutionProviderTransactionId: reconciliationCase.resolution_provider_transaction_id,
+        resolutionPaymentMethod: reconciliationCase.resolution_payment_method,
+        resolutionConfirmedAmount: reconciliationCase.resolution_confirmed_amount,
+      })),
       events: (providerEventsByAttempt.get(attempt.id) ?? []).map(event => ({
         id: event.id,
         source: event.source,
@@ -1101,6 +1126,13 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
         if (!order) throw new OrderError(404, 'ORDER_NOT_FOUND', '订单不存在。')
         if (order.status !== 'processing') {
           throw new OrderError(409, 'ORDER_FULFILLMENT_REQUIRES_PROCESSING', '只有零元订单或已确认付款的 processing 订单可以履约。')
+        }
+        const openPaymentCase = await trx.selectFrom('payment_provider_reconciliation_cases as reconciliation')
+          .innerJoin('payment_attempts as payment_attempt', 'payment_attempt.id', 'reconciliation.payment_attempt_id')
+          .select('reconciliation.id').where('payment_attempt.order_id', '=', params.id)
+          .where('reconciliation.state', '=', 'open').limit(1).executeTakeFirst()
+        if (openPaymentCase) {
+          throw new OrderError(409, 'ORDER_PAYMENT_RECONCILIATION_OPEN', '订单存在尚未解决的服务商资金冲突，核验完成前不能进行人工交付。')
         }
         const item = await trx.selectFrom('order_items')
           .select(['id', 'order_id', 'quantity', 'fulfilled_quantity', 'fulfillment_reserved_quantity', 'fulfillment_method_snapshot'])

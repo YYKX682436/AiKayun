@@ -263,7 +263,7 @@ export class ZpayEpayProvider implements PaymentProviderAdapter {
     return {
       status: returnedOrderNo === merchantOrderNo && merchantId === credentials.merchantId
         && returnedOrderNo.length <= 32 && providerOrderId && providerOrderId.length <= 200
-        && paymentMethod && amount ? status : 'unknown',
+        && amount ? status : 'unknown',
       merchantOrderNo: returnedOrderNo,
       merchantId,
       providerOrderId,

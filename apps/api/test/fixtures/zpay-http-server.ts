@@ -31,6 +31,7 @@ export interface ZpayHttpFixture {
   close(): Promise<void>
   orders(): Array<Omit<FixtureOrder, 'merchantKey'>>
   pauseNextCreateResponse(): { entered: Promise<void>; release(): void }
+  pauseNextQueryResponse(): { entered: Promise<void>; release(): void }
   setPaid(merchantOrderNo: string, overrides?: { amount?: string; providerOrderId?: string }): Record<string, string>
   stats(): { creates: number; queries: number; balanceChecks: number }
 }
@@ -109,6 +110,12 @@ export async function startZpayHttpFixture(options: FixtureOptions = {}): Promis
     waitForRelease: Promise<void>
     release(): void
   } | null = null
+  let nextQueryResponseGate: {
+    entered: Promise<void>
+    signalEntered(): void
+    waitForRelease: Promise<void>
+    release(): void
+  } | null = null
 
   const server = createServer(async (request, response) => {
     try {
@@ -167,15 +174,22 @@ export async function startZpayHttpFixture(options: FixtureOptions = {}): Promis
           sendJson(response, 200, { code: 0 })
           return
         }
+        const queryOrder = { ...order }
+        const queryResponseGate = nextQueryResponseGate
+        if (queryResponseGate) {
+          nextQueryResponseGate = null
+          queryResponseGate.signalEntered()
+          await queryResponseGate.waitForRelease
+        }
         sendJson(response, 200, {
           code: 1,
-          trade_no: order.providerOrderId,
-          out_trade_no: order.merchantOrderNo,
-          type: order.paymentMethod,
-          pid: order.merchantId,
-          money: order.amount,
-          status: Number(order.status),
-          endtime: order.paidAt ?? '',
+          trade_no: queryOrder.providerOrderId,
+          out_trade_no: queryOrder.merchantOrderNo,
+          type: queryOrder.paymentMethod,
+          pid: queryOrder.merchantId,
+          money: queryOrder.amount,
+          status: Number(queryOrder.status),
+          endtime: queryOrder.paidAt ?? '',
         })
         return
       }
@@ -255,6 +269,15 @@ export async function startZpayHttpFixture(options: FixtureOptions = {}): Promis
       const entered = new Promise<void>((resolve) => { signalEntered = resolve })
       const waitForRelease = new Promise<void>((resolve) => { release = resolve })
       nextCreateResponseGate = { entered, signalEntered, waitForRelease, release }
+      return { entered, release: () => release() }
+    },
+    pauseNextQueryResponse() {
+      if (nextQueryResponseGate) throw new Error('A provider query response is already paused')
+      let signalEntered!: () => void
+      let release!: () => void
+      const entered = new Promise<void>((resolve) => { signalEntered = resolve })
+      const waitForRelease = new Promise<void>((resolve) => { release = resolve })
+      nextQueryResponseGate = { entered, signalEntered, waitForRelease, release }
       return { entered, release: () => release() }
     },
     setPaid(merchantOrderNo, overrides = {}) {

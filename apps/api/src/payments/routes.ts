@@ -4,6 +4,8 @@ import { sql, type Kysely, type Transaction } from 'kysely'
 import {
   ApiErrorSchema,
   ApiSuccessSchemaOf,
+  AdminPaymentReconciliationParamsSchema,
+  AdminPaymentReconciliationResultSchema,
   CreateOrderPaymentBodySchema,
   CustomerOrderPaymentSchema,
   PaymentOrderIdParamsSchema,
@@ -14,13 +16,14 @@ import type { CreateOrderPaymentBody, ExternalPaymentMethod, PaymentAction } fro
 import { settleAmount } from '@aikayun/money'
 import type { AppConfig } from '../config.js'
 import { CUSTOMER_CSRF_COOKIE, optionalCustomer, type AuthenticatedCustomer } from '../auth/customer.js'
+import { requireAdmin, verifyCsrf } from '../auth/admin.js'
 import { verifyDoubleSubmitCsrf } from '../auth/security.js'
 import { assertCustomerSession, assertGuestSession, guestSessionCookie } from '../commerce/orders.js'
 import type { Database, PaymentAttemptStatus, PaymentProviderRequestState } from '../db/types.js'
 import { decryptPaymentConfig, encryptPaymentConfig, parsePaymentConfig, serializePaymentConfig } from './credentials.js'
 import { registerPaymentChannelRoutes } from './channels.js'
 import type { PaymentProviderAdapter } from './provider.js'
-import { PaymentServiceError, handleProviderCallback, loadPaymentAttemptSnapshot, refreshPaymentAttempt } from './settlement.js'
+import { PaymentServiceError, handleProviderCallback, loadPaymentAttemptSnapshot, refreshPaymentAttempt, resolvePaymentReconciliation } from './settlement.js'
 
 const providerName = 'epay:zpayz.cn'
 const paymentAttemptLifetimeMs = 10 * 60 * 1000
@@ -150,6 +153,10 @@ async function buildCustomerPaymentView(
     .select(sql<boolean>`COALESCE(bool_or(event.disposition = 'reconciliation_required'), false)`.as('needs_reconciliation'))
     .where('attempt.order_id', '=', orderId)
     .executeTakeFirstOrThrow()
+  const openCase = await db.selectFrom('payment_provider_reconciliation_cases as reconciliation')
+    .innerJoin('payment_attempts as attempt', 'attempt.id', 'reconciliation.payment_attempt_id')
+    .select('reconciliation.id').where('attempt.order_id', '=', orderId)
+    .where('reconciliation.state', '=', 'open').limit(1).executeTakeFirst()
   const attempts = await db.selectFrom('payment_attempts')
     .select('id')
     .where('order_id', '=', orderId)
@@ -163,7 +170,7 @@ async function buildCustomerPaymentView(
       .where('id', '=', attempts[0].id).executeTakeFirst()
     : undefined
   let paymentStatus: 'unpaid' | 'pending' | 'paid' | 'late_paid' | 'reconciliation_required' | 'not_payable'
-  if (receipts.has_mismatch || providerEvidence.needs_reconciliation) paymentStatus = 'reconciliation_required'
+  if (receipts.has_mismatch || providerEvidence.needs_reconciliation || openCase) paymentStatus = 'reconciliation_required'
   else if (receipts.has_late) paymentStatus = 'late_paid'
   else if (receipts.receipt_count > 0 && ['processing', 'completed'].includes(order.status)) paymentStatus = 'paid'
   else if (order.status !== 'pending_payment' || !order.unpaid_expires_at || order.unpaid_expires_at <= now) paymentStatus = 'not_payable'
@@ -172,7 +179,7 @@ async function buildCustomerPaymentView(
 
   const payable = order.status === 'pending_payment'
     && order.unpaid_expires_at !== null && order.unpaid_expires_at > now
-    && receipts.receipt_count === 0
+    && receipts.receipt_count === 0 && !openCase
   const rows = payable
     ? await db.selectFrom('payment_channels').select(['id', 'name', 'payment_methods'])
       .where('enabled', '=', true).where('provider_type', '=', 'zpay_epay_v1')
@@ -233,6 +240,11 @@ async function createOrReuseAttempt(
     if (order.currency !== 'CNY') throw new PaymentRouteError(409, 'PAYMENT_CURRENCY_UNSUPPORTED', '当前支付通道仅支持人民币订单。')
     const amount = settleAmount(order.total_amount)
     if (amount === '0.00') throw new PaymentRouteError(409, 'ORDER_PAYMENT_NOT_REQUIRED', '零元订单不需要在线付款。')
+    const openCase = await trx.selectFrom('payment_provider_reconciliation_cases as reconciliation')
+      .innerJoin('payment_attempts as attempt', 'attempt.id', 'reconciliation.payment_attempt_id')
+      .select('reconciliation.id').where('attempt.order_id', '=', orderId)
+      .where('reconciliation.state', '=', 'open').limit(1).executeTakeFirst()
+    if (openCase) throw new PaymentRouteError(409, 'PAYMENT_RECONCILIATION_REQUIRED', '订单有待核对的服务商资金证据，暂不能再次付款。')
     const requestHash = sha256(JSON.stringify({ orderId, channelId: body.channelId, paymentMethod: body.paymentMethod, amount }))
     const existingByKey = await trx.selectFrom('payment_attempts').select(['id', 'request_sha256'])
       .where('idempotency_key', '=', body.idempotencyKey).executeTakeFirst()
@@ -493,7 +505,7 @@ export function registerPaymentRoutes(
       const owner = ownerFor(request)
       await db.transaction().execute(async (trx) => { await loadOwnedOrder(trx, params.id, request, owner) })
       const attempt = await db.selectFrom('payment_attempts').select('id')
-        .where('order_id', '=', params.id).where('status', 'in', ['created', 'pending'])
+        .where('order_id', '=', params.id).where('status', 'in', ['created', 'pending', 'reconciliation_required'])
         .orderBy('created_at', 'desc').orderBy('id', 'desc').executeTakeFirst()
       if (attempt) await refreshPaymentAttempt(db, config, provider, attempt.id)
       const view = await buildCustomerPaymentView(db, request, params.id, owner)
@@ -530,5 +542,41 @@ export function registerPaymentRoutes(
       request.log.warn({ callbackProcessingFailed: true }, 'payment callback could not be confirmed')
       return reply.code(503).type('text/plain').send('fail')
     }
+  })
+
+  app.post('/api/v1/admin/orders/:id/payments/:attemptId/reconcile', {
+    logLevel: 'silent',
+    preHandler: [requireAdmin(db, config), verifyCsrf(config)],
+    config: { rateLimit: { max: 6, timeWindow: '1 minute' } },
+    schema: {
+      tags: ['admin', 'payments'],
+      summary: 'Resolve a payment reconciliation case only after a fresh authenticated provider query',
+      params: AdminPaymentReconciliationParamsSchema,
+      response: {
+        200: ApiSuccessSchemaOf(AdminPaymentReconciliationResultSchema),
+        401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema,
+        409: ApiErrorSchema, 429: ApiErrorSchema, 503: ApiErrorSchema,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const params = request.params as { id: string; attemptId: string }
+      const attempt = await db.selectFrom('payment_attempts').select('id')
+        .where('id', '=', params.attemptId).where('order_id', '=', params.id)
+        .where('source', '=', 'external').executeTakeFirst()
+      if (!attempt) throw new PaymentRouteError(404, 'PAYMENT_ATTEMPT_NOT_FOUND', '此订单没有该在线支付尝试。')
+      const result = await resolvePaymentReconciliation(db, config, provider, attempt.id, request.admin!.id)
+      const resolved = 'resolutionMade' in result && result.resolutionMade === true
+      const state = result.kind === 'throttled' ? 'throttled' : resolved ? 'resolved' : 'still_open'
+      reply.header('cache-control', 'no-store')
+      return success({
+        state,
+        providerStatus: result.kind === 'throttled' ? null : result.providerStatus,
+        message: state === 'resolved'
+          ? '服务商最新认证结果与可用资金凭证一致，核对已记录。'
+          : state === 'throttled' ? '查单频率受限，请稍后重试。'
+            : '最新服务商结果尚不足以解除异常；资金凭证仍受保护，订单不会自动履约。',
+      }, request.id)
+    } catch (error) { return handlePaymentError(error, reply, request.id) }
   })
 }

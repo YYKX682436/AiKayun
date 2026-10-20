@@ -1233,9 +1233,10 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
       }
 
       // Keep this frozen ④-6 upgrade/rollback regression anchored at the pre-payment
-      // schema. The ④-7 migration intentionally has no destructive down migration.
+      // schema. The ④-7 migrations intentionally have no destructive down migration.
       const prePaymentMigrations = await new AppMigrationProvider().getMigrations()
       delete prePaymentMigrations['202610200002_online_payments']
+      delete prePaymentMigrations['202610200003_payment_reconciliation']
       const prePaymentProvider = { getMigrations: async () => prePaymentMigrations }
       const currentMigrator = new Migrator({ db, provider: prePaymentProvider })
       const upgradeResult = await currentMigrator.migrateToLatest()

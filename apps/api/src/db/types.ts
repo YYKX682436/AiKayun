@@ -354,6 +354,28 @@ export interface PaymentProviderEventsTable {
   received_at: Generated<Date>
 }
 
+export type PaymentProviderReconciliationReason =
+  | 'callback_query_mismatch' | 'provider_identity_conflict' | 'provider_transaction_conflict'
+  | 'provider_amount_mismatch' | 'receipt_conflict' | 'late_confirmed_payment'
+
+export interface PaymentProviderReconciliationCasesTable {
+  id: string
+  payment_attempt_id: string
+  reason: PaymentProviderReconciliationReason
+  opening_callback_event_id: string | null
+  opening_query_event_id: string | null
+  state: 'open' | 'resolved'
+  opened_at: Generated<Date>
+  resolved_at: Date | null
+  resolved_by_admin_id: string | null
+  resolution_query_event_sha256: string | null
+  resolution_provider_transaction_id: string | null
+  resolution_payment_method: 'alipay' | 'wechat' | null
+  resolution_confirmed_amount: ColumnType<string | null, string | null, string | null>
+  resolution_currency: 'CNY' | null
+  resolution_payload: ColumnType<Record<string, unknown> | null, Record<string, unknown> | null, Record<string, unknown> | null>
+}
+
 export type PaymentReceiptBucket = 'external' | 'cash' | 'gift'
 export type PaymentReceiptDisposition = 'on_time' | 'late' | 'excess' | 'amount_mismatch'
 
@@ -653,6 +675,7 @@ export interface Database {
   payment_attempt_secrets: PaymentAttemptSecretsTable
   payment_attempt_provider_state: PaymentAttemptProviderStateTable
   payment_provider_events: PaymentProviderEventsTable
+  payment_provider_reconciliation_cases: PaymentProviderReconciliationCasesTable
   order_refunds: OrderRefundsTable
   order_refund_allocations: OrderRefundAllocationsTable
   wallet_ledger_entries: WalletLedgerEntriesTable

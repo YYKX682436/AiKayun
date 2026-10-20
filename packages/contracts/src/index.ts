@@ -1116,11 +1116,37 @@ export const AdminPaymentAttemptSchema = Type.Object({
   createdAt: Type.String({ format: 'date-time' }),
   expiresAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
   completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  reconciliationOpen: Type.Boolean(),
+  reconciliationCases: Type.Array(Type.Object({
+    id: Type.String({ format: 'uuid' }),
+    reason: Type.Union([
+      Type.Literal('callback_query_mismatch'), Type.Literal('provider_identity_conflict'),
+      Type.Literal('provider_transaction_conflict'), Type.Literal('provider_amount_mismatch'),
+      Type.Literal('receipt_conflict'), Type.Literal('late_confirmed_payment'),
+    ]),
+    state: Type.Union([Type.Literal('open'), Type.Literal('resolved')]),
+    openedAt: Type.String({ format: 'date-time' }),
+    resolvedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+    resolvedByAdminId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+    resolutionQueryEventSha256: Type.Union([Type.String({ pattern: '^[0-9a-f]{64}$' }), Type.Null()]),
+    resolutionProviderTransactionId: Type.Union([Type.String({ maxLength: 200 }), Type.Null()]),
+    resolutionPaymentMethod: Type.Union([ExternalPaymentMethodSchema, Type.Null()]),
+    resolutionConfirmedAmount: Type.Union([SettlementAmountSchema, Type.Null()]),
+  }, { additionalProperties: false })),
   events: Type.Array(AdminPaymentProviderEventSchema),
 }, { additionalProperties: false })
 export const AdminOrderPaymentsSchema = Type.Object({
   needsReconciliation: Type.Boolean(),
   attempts: Type.Array(AdminPaymentAttemptSchema),
+}, { additionalProperties: false })
+export const AdminPaymentReconciliationParamsSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  attemptId: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+export const AdminPaymentReconciliationResultSchema = Type.Object({
+  state: Type.Union([Type.Literal('resolved'), Type.Literal('still_open'), Type.Literal('throttled')]),
+  providerStatus: Type.Union([Type.Literal('paid'), Type.Literal('pending'), Type.Literal('failed'), Type.Literal('unknown'), Type.Null()]),
+  message: Type.String({ maxLength: 200 }),
 }, { additionalProperties: false })
 export const OrderPaymentStatusSchema = Type.Union([
   Type.Literal('not_required'), Type.Literal('unpaid'), Type.Literal('paid'),

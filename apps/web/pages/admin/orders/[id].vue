@@ -12,6 +12,7 @@ const { request } = useAdminApi()
 const data = shallowRef<AdminOrderDetail | null>(null)
 const loading = ref(false)
 const savingItemId = ref('')
+const reconcilingAttemptId = ref('')
 const errorMessage = ref('')
 const successMessage = ref('')
 const deliveryDrafts = reactive<Record<string, string>>({})
@@ -51,6 +52,29 @@ async function loadOrder() {
     errorMessage.value = error instanceof Error ? error.message : '订单详情暂时无法加载。'
   } finally {
     if (currentSequence === sequence) loading.value = false
+  }
+}
+
+async function reconcilePayment(attemptId: string) {
+  if (reconcilingAttemptId.value) return
+  reconcilingAttemptId.value = attemptId
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    const result = await request<{
+      state: 'resolved' | 'still_open' | 'throttled'
+      providerStatus: 'paid' | 'pending' | 'failed' | 'unknown' | null
+      message: string
+    }>(`/api/v1/admin/orders/${orderId.value}/payments/${attemptId}/reconcile`, { method: 'POST' })
+    await loadOrder()
+    successMessage.value = result.message
+  } catch (error) {
+    errorMessage.value = error instanceof AdminApiError || error instanceof Error
+      ? error.message
+      : '服务商核验未能确认，请查看支付事件后重试。'
+    await loadOrder()
+  } finally {
+    reconcilingAttemptId.value = ''
   }
 }
 
@@ -436,6 +460,42 @@ onBeforeUnmount(() => { sequence++ })
                   :title="`服务商状态：${attempt.providerErrorCode}`"
                   description="请查看下方事件并通过服务商后台核对，不要手工改写订单付款状态。"
                 />
+                <div
+                  v-if="attempt.reconciliationCases.length"
+                  class="mt-3 grid gap-2"
+                >
+                  <div
+                    v-for="reconciliationCase in attempt.reconciliationCases"
+                    :key="reconciliationCase.id"
+                    class="rounded-md border border-warning/40 bg-warning/5 p-3 text-sm"
+                  >
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <p class="font-medium text-highlighted">
+                        {{ reconciliationCase.state === 'open' ? '待核对' : '已核对' }} · {{ reconciliationCase.reason }} · {{ formatDate(reconciliationCase.openedAt) }}
+                      </p>
+                      <UButton
+                        v-if="reconciliationCase.state === 'open'"
+                        size="sm"
+                        color="warning"
+                        variant="soft"
+                        :loading="reconcilingAttemptId === attempt.id"
+                        :disabled="Boolean(reconcilingAttemptId)"
+                        @click="reconcilePayment(attempt.id)"
+                      >
+                        重新向服务商核验
+                      </UButton>
+                    </div>
+                    <p class="mt-1 text-muted">
+                      只有新的认证查单与既有查单及实际回执一致时才会解除异常；此操作不会手工标记付款。
+                    </p>
+                    <p
+                      v-if="reconciliationCase.state === 'resolved'"
+                      class="mt-1 break-all text-muted"
+                    >
+                      {{ reconciliationCase.resolvedAt ? formatDate(reconciliationCase.resolvedAt) : '' }} · 管理员 {{ reconciliationCase.resolvedByAdminId ?? '未知' }} · 查单 SHA-256 {{ reconciliationCase.resolutionQueryEventSha256 ?? '未知' }}
+                    </p>
+                  </div>
+                </div>
                 <div
                   v-if="attempt.events.length"
                   class="mt-4 border-t border-default pt-3"
