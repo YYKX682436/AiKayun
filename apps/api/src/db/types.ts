@@ -83,6 +83,9 @@ export interface StorefrontCustomerPolicyTable {
   guest_checkout_enabled: Generated<boolean>
   guest_free_claim_enabled: Generated<boolean>
   unpaid_order_timeout_minutes: Generated<number>
+  wallet_top_up_enabled: Generated<boolean>
+  wallet_top_up_min_amount: ColumnType<string, string | undefined, string>
+  wallet_top_up_max_amount: ColumnType<string, string | undefined, string>
   updated_at: Generated<Date>
 }
 

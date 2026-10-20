@@ -28,6 +28,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     to: '/admin/payment-channels',
   },
   {
+    label: '钱包与充值',
+    icon: 'i-lucide-wallet',
+    to: '/admin/wallets',
+  },
+  {
     label: '顾客设置',
     icon: 'i-lucide-user-round-cog',
     to: '/admin/storefront/customer-policy',

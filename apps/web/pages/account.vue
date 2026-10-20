@@ -113,6 +113,15 @@ async function logout() {
         </div>
         <div class="flex flex-wrap gap-2">
           <UButton
+            to="/wallet"
+            color="primary"
+            variant="outline"
+            icon="i-lucide-wallet"
+            class="min-h-11 shrink-0"
+          >
+            我的钱包
+          </UButton>
+          <UButton
             to="/orders"
             color="primary"
             variant="outline"

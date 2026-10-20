@@ -577,6 +577,9 @@ describe('customer authentication and storefront policy with PostgreSQL', () => 
       guestCheckoutEnabled: true,
       guestFreeClaimEnabled: true,
       unpaidOrderTimeoutMinutes: 15,
+      walletTopUpEnabled: false,
+      walletTopUpMinAmount: '1.00',
+      walletTopUpMaxAmount: '1000.00',
     }
     const badOrigin = await app.inject({
       method: 'PUT',

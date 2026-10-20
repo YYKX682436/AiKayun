@@ -12,7 +12,7 @@ export interface PaymentProviderCredentials {
 
 export interface PaymentCreateRequest {
   merchantOrderNo: string
-  orderId: string
+  orderId: string | null
   amount: string
   currency: 'CNY'
   paymentMethod: PaymentMethod

@@ -26,7 +26,9 @@ const providerQueryCooldownSeconds = 10
 
 export interface PaymentAttemptSnapshot {
   id: string
-  orderId: string
+  orderId: string | null
+  topupCustomerId: string | null
+  walletHoldOperationId: string | null
   amount: string
   status: PaymentAttemptStatus
   provider: string
@@ -87,7 +89,8 @@ export async function loadPaymentAttemptSnapshot(
   const row = await db.selectFrom('payment_attempts as attempt')
     .innerJoin('payment_attempt_provider_state as provider_state', 'provider_state.payment_attempt_id', 'attempt.id')
     .select([
-      'attempt.id as id', 'attempt.order_id as order_id', 'attempt.amount as amount',
+      'attempt.id as id', 'attempt.order_id as order_id', 'attempt.topup_customer_id as topup_customer_id',
+      'attempt.wallet_hold_operation_id as wallet_hold_operation_id', 'attempt.amount as amount',
       'attempt.status as status', 'attempt.provider as provider', 'attempt.provider_type_snapshot as provider_type',
       'attempt.payment_method_snapshot as payment_method', 'attempt.payment_channel_id as channel_id',
       'attempt.payment_channel_name_snapshot as channel_name', 'attempt.channel_credential_version as credential_version',
@@ -100,7 +103,8 @@ export async function loadPaymentAttemptSnapshot(
     .where('attempt.id', '=', attemptId)
     .where('attempt.source', '=', 'external')
     .executeTakeFirst()
-  if (!row || !row.order_id || row.provider_type !== 'zpay_epay_v1' || !row.payment_method
+  if (!row || (row.order_id === null) === (row.topup_customer_id === null)
+    || row.provider_type !== 'zpay_epay_v1' || !row.payment_method
     || !row.channel_id || !row.channel_name || row.credential_version === null
     || !row.merchant_order_no || !row.expires_at) return undefined
   const actionRecord = row.action as Record<string, unknown> | null
@@ -112,6 +116,8 @@ export async function loadPaymentAttemptSnapshot(
   return {
     id: row.id,
     orderId: row.order_id,
+    topupCustomerId: row.topup_customer_id,
+    walletHoldOperationId: row.wallet_hold_operation_id,
     amount: settleAmount(row.amount),
     status: row.status,
     provider: row.provider ?? '',
@@ -159,12 +165,38 @@ export async function recordCallbackObservation(
   db: Kysely<Database>, attemptId: string, observation: CallbackObservation, disposition: string,
 ): Promise<string> {
   return await db.transaction().execute(async (trx) => {
-    const attempt = await trx.selectFrom('payment_attempts').select(['id', 'order_id', 'status'])
+    const attempt = await trx.selectFrom('payment_attempts').select(['id', 'order_id', 'wallet_hold_operation_id', 'status'])
       .where('id', '=', attemptId).executeTakeFirst()
     if (!attempt) throw new PaymentServiceError(404, 'PAYMENT_ATTEMPT_NOT_FOUND', '支付尝试不存在。')
-    // Callback observations and settlements share the established order -> attempt lock order.
+    // Plain orders use order -> attempt. Combo orders use customer -> order ->
+    // wallet -> attempt; top-ups use customer -> wallet -> attempt. A common
+    // customer/account prefix prevents receipt-settlement cycles across both.
     if (attempt.order_id) {
+      if (attempt.wallet_hold_operation_id) {
+        const orderOwner = await trx.selectFrom('orders').select('customer_id')
+          .where('id', '=', attempt.order_id).executeTakeFirst()
+        if (orderOwner?.customer_id) {
+          await trx.selectFrom('customers').select('id').where('id', '=', orderOwner.customer_id)
+            .forUpdate().executeTakeFirst()
+        }
+      }
       await trx.selectFrom('orders').select('id').where('id', '=', attempt.order_id).forUpdate().executeTakeFirst()
+      if (attempt.wallet_hold_operation_id) {
+        const orderOwner = await trx.selectFrom('orders').select('customer_id')
+          .where('id', '=', attempt.order_id).executeTakeFirstOrThrow()
+        if (orderOwner.customer_id) {
+          await trx.selectFrom('wallet_accounts').select('customer_id')
+            .where('customer_id', '=', orderOwner.customer_id).forUpdate().executeTakeFirst()
+        }
+      }
+    } else {
+      const topupCustomer = await trx.selectFrom('payment_attempts').select('topup_customer_id')
+        .where('id', '=', attemptId).executeTakeFirstOrThrow()
+      if (topupCustomer.topup_customer_id) {
+        await trx.selectFrom('customers').select('id').where('id', '=', topupCustomer.topup_customer_id).forUpdate().executeTakeFirst()
+        await trx.selectFrom('wallet_accounts').select('customer_id')
+          .where('customer_id', '=', topupCustomer.topup_customer_id).forUpdate().executeTakeFirst()
+      }
     }
     await trx.selectFrom('payment_attempts').select('id').where('id', '=', attemptId).forUpdate().executeTakeFirst()
     const inserted = await trx.insertInto('payment_provider_events').values({
@@ -197,7 +229,7 @@ export async function recordCallbackObservation(
         .where('payment_attempt_id', '=', attemptId).where('source', '=', 'query')
         .where('verification', '=', 'verified').where('provider_status', '=', 'paid').execute()
       const conflictingQuery = priorQueries.find(query => !providerEventMatchesCallback(query, observation))
-      if (conflictingQuery && attempt.order_id) {
+      if (conflictingQuery) {
         await insertOpenReconciliationCase(trx, {
           paymentAttemptId: attemptId,
           reason: 'callback_query_mismatch',
@@ -460,8 +492,14 @@ async function writeVerifiedReceipt(
       if (settlement.receiptDisposition === 'on_time' && settleAmount(result.amount!) === attempt.amount) {
         await trx.updateTable('payment_attempts').set({ status: 'succeeded' })
           .where('id', '=', attempt.id).where('status', '=', 'reconciliation_required').execute()
-        await trx.updateTable('orders').set({ status: 'processing' })
-          .where('id', '=', attempt.orderId).where('status', '=', 'pending_payment').execute()
+        if (attempt.walletHoldOperationId) {
+          await sql`SELECT resolve_order_wallet_hold(${attempt.walletHoldOperationId}::uuid, 'order_payment_settlement')`.execute(trx)
+        }
+        if (attempt.orderId) {
+          await trx.updateTable('orders').set({ status: 'processing' })
+            .where('id', '=', attempt.orderId).where('status', '=', 'pending_payment')
+            .where(sql<boolean>`NOT order_has_unresolved_payment_attempts(${attempt.orderId}::uuid)`).execute()
+        }
       }
       resolutionMade = true
       hasOpenCase = undefined
@@ -481,7 +519,29 @@ export async function processProviderQuery(
 ): Promise<RefreshAttemptResult> {
   const identityVerified = queryMatchesAttempt(attempt, credentials, result)
   const persisted = await db.transaction().execute(async (trx) => {
-    await trx.selectFrom('orders').select('id').where('id', '=', attempt.orderId).forUpdate().executeTakeFirst()
+    if (attempt.orderId) {
+      if (attempt.walletHoldOperationId) {
+        const orderOwner = await trx.selectFrom('orders').select('customer_id')
+          .where('id', '=', attempt.orderId).executeTakeFirst()
+        if (orderOwner?.customer_id) {
+          await trx.selectFrom('customers').select('id').where('id', '=', orderOwner.customer_id)
+            .forUpdate().executeTakeFirst()
+        }
+      }
+      await trx.selectFrom('orders').select('id').where('id', '=', attempt.orderId).forUpdate().executeTakeFirst()
+      if (attempt.walletHoldOperationId) {
+        const orderOwner = await trx.selectFrom('orders').select('customer_id')
+          .where('id', '=', attempt.orderId).executeTakeFirstOrThrow()
+        if (orderOwner.customer_id) {
+          await trx.selectFrom('wallet_accounts').select('customer_id')
+            .where('customer_id', '=', orderOwner.customer_id).forUpdate().executeTakeFirst()
+        }
+      }
+    } else if (attempt.topupCustomerId) {
+      await trx.selectFrom('customers').select('id').where('id', '=', attempt.topupCustomerId).forUpdate().executeTakeFirst()
+      await trx.selectFrom('wallet_accounts').select('customer_id')
+        .where('customer_id', '=', attempt.topupCustomerId).forUpdate().executeTakeFirst()
+    }
     await trx.selectFrom('payment_attempts').select('id').where('id', '=', attempt.id).forUpdate().executeTakeFirst()
     const inserted = await trx.insertInto('payment_provider_events').values({
       id: randomUUID(), payment_attempt_id: attempt.id, source: 'query', event_sha256: result.eventSha256,
@@ -520,6 +580,12 @@ export async function processProviderQuery(
       }
       const openCase = await trx.selectFrom('payment_provider_reconciliation_cases').select('id')
         .where('payment_attempt_id', '=', attempt.id).where('state', '=', 'open').executeTakeFirst()
+      const receipt = await trx.selectFrom('payment_receipts').select('id')
+        .where('payment_attempt_id', '=', attempt.id).executeTakeFirst()
+      if (identityVerified && result.status === 'failed' && !callback && !receipt && !openCase) {
+        await trx.updateTable('payment_attempts').set({ status: 'failed' })
+          .where('id', '=', attempt.id).where('status', 'in', ['created', 'pending']).execute()
+      }
       return { settlement: null, reconciliationOpen: Boolean(openCase), resolutionMade: false }
     }
     const resultWrite = await writeVerifiedReceipt(trx, attempt, result, queryEvent.id, callback, resolverAdminId)

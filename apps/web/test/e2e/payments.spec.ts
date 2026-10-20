@@ -76,10 +76,10 @@ async function registerCustomer(page: Page, username: string): Promise<void> {
   await expect(page).toHaveURL(/\/account$/u)
 }
 
-async function addProductToCart(page: Page, product: Product): Promise<void> {
+async function addProductToCart(page: Page, product: Product, quantity = 1): Promise<void> {
   await page.goto(`/products/${product.id}`)
   await expectClientMounted(page, '[data-storefront-ready="true"]')
-  await page.getByLabel('购买数量').fill('1')
+  await page.getByLabel('购买数量').fill(String(quantity))
   await page.getByRole('button', { name: '加入购物车' }).click()
   await expect(page.getByRole('status')).toContainText('已加入购物车。')
 }
@@ -92,6 +92,7 @@ async function noHorizontalOverflow(page: Page, width: number): Promise<void> {
 
 test('creates a channel in the admin UI and confirms real payment evidence in a customer order', async ({ page }) => {
   test.setTimeout(180_000)
+  page.setDefaultTimeout(10_000)
   const unique = randomUUID().slice(0, 8)
   const channelName = `浏览器支付通道-${unique}`
   const productName = `浏览器在线支付-${unique}`
@@ -132,14 +133,15 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     await registerCustomer(page, username)
     await addProductToCart(page, product)
     await page.goto('/cart')
+    await expectClientMounted(page, '[data-storefront-ready="true"]')
     await page.getByRole('link', { name: '查看结算报价' }).click()
     await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
     await page.getByRole('button', { name: '提交订单' }).click()
     await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
     const orderId = page.url().split('/').at(-1)!
-    await expect(page.getByText('在线支付', { exact: true })).toBeVisible()
+    await expect(page.getByText('外部支付', { exact: true })).toBeVisible()
     await expect(page.getByText('¥5.00', { exact: false }).first()).toBeVisible()
-    await page.getByRole('button', { name: /创建支付/u }).click()
+    await page.getByRole('button', { name: /创建外部支付/u }).click()
     await expect(page.getByAltText('本次订单的支付二维码')).toBeVisible()
     for (const width of [320, 390, 768, 1440]) await noHorizontalOverflow(page, width)
     await page.setViewportSize({ width: 1280, height: 900 })
@@ -173,6 +175,97 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     await expect(page.getByText(tradeNo, { exact: true })).toBeVisible()
     await expect(page.getByText('无待核对异常')).toBeVisible()
     await expect(page.getByRole('button', { name: /标记.*付款|确认.*付款/u })).toHaveCount(0)
+
+    const policyResponse = await page.request.get('/api/v1/admin/storefront/customer-policy')
+    expect(policyResponse.status()).toBe(200)
+    const policy = (await policyResponse.json()).data
+    const enabledTopUps = await page.request.put('/api/v1/admin/storefront/customer-policy', {
+      headers: await adminHeaders(page),
+      data: {
+        requireEmail: policy.requireEmail,
+        requirePhone: policy.requirePhone,
+        guestCheckoutEnabled: policy.guestCheckoutEnabled,
+        guestFreeClaimEnabled: policy.guestFreeClaimEnabled,
+        unpaidOrderTimeoutMinutes: policy.unpaidOrderTimeoutMinutes,
+        walletTopUpEnabled: true,
+        walletTopUpMinAmount: policy.walletTopUpMinAmount,
+        walletTopUpMaxAmount: policy.walletTopUpMaxAmount,
+      },
+    })
+    expect(enabledTopUps.status()).toBe(200)
+
+    await page.goto('/wallet')
+    await expect(page.getByRole('heading', { name: '我的钱包', exact: true })).toBeVisible()
+    await expect(page.locator('[data-wallet-ready="true"]')).toBeAttached()
+    await page.getByLabel('充值金额').fill('2.00')
+    await page.getByRole('button', { name: '创建充值支付' }).click()
+    await expect(page.getByRole('heading', { name: '充值处理中' })).toBeVisible()
+    await expect(page.getByAltText('钱包充值支付二维码')).toBeVisible()
+
+    const walletFixturePort = process.env.ZPAY_FIXTURE_PORT ?? '3099'
+    const walletFixtureBaseUrl = `http://127.0.0.1:${walletFixturePort}`
+    const topUpOrdersResponse = await page.request.get(`${walletFixtureBaseUrl}/__fixture/orders`)
+    expect(topUpOrdersResponse.status()).toBe(200)
+    const topUpOrder = (await topUpOrdersResponse.json()).items.at(-1) as { merchantOrderNo: string; amount: string }
+    expect(topUpOrder.amount).toBe('2.00')
+    const topUpPaid = await page.request.post(`${walletFixtureBaseUrl}/__fixture/mark-paid`, {
+      data: { merchantOrderNo: topUpOrder.merchantOrderNo },
+    })
+    expect(topUpPaid.status()).toBe(200)
+    const topUpCallback = (await topUpPaid.json()).callback as Record<string, string>
+    const topUpApiPort = process.env.AIKAYUN_TEST_API_PORT ?? '3001'
+    const topUpCallbackResponse = await page.request.get(
+      `http://127.0.0.1:${topUpApiPort}/api/v1/payments/callback/zpay?${new URLSearchParams(topUpCallback).toString()}`,
+    )
+    expect(topUpCallbackResponse.status()).toBe(200)
+    expect(await topUpCallbackResponse.text()).toBe('success')
+    await page.reload()
+    await expect(page.getByText('可用现金', { exact: true })).toBeVisible()
+    await expect(page.getByText('¥2.00', { exact: true }).first()).toBeVisible()
+
+    await page.goto('/cart')
+    await page.getByRole('button', { name: '清空购物车' }).click()
+    await expect(page.getByRole('heading', { name: '购物车还是空的' })).toBeVisible()
+    await addProductToCart(page, product, 2)
+    await page.goto('/cart')
+    await expectClientMounted(page, '[data-storefront-ready="true"]')
+    await page.getByRole('link', { name: '查看结算报价' }).click()
+    await page.getByRole('button', { name: '提交订单' }).click()
+    await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
+    const comboOrderId = page.url().split('/').at(-1)!
+    await page.getByRole('radio', { name: '钱包与外部组合' }).check()
+    await expect(page.getByText('钱包 ¥2.00（赠送 ¥0.00，现金 ¥2.00），外部支付 ¥8.00')).toBeVisible()
+    await page.getByRole('button', { name: '创建组合支付 · ¥2.00 + ¥8.00' }).click()
+    await expect(page.getByAltText('本次订单的支付二维码')).toBeVisible()
+
+    const comboOrdersResponse = await page.request.get(`${walletFixtureBaseUrl}/__fixture/orders`)
+    const comboProviderOrder = (await comboOrdersResponse.json()).items.at(-1) as { merchantOrderNo: string; amount: string }
+    expect(comboProviderOrder.amount).toBe('8.00')
+    const comboPaid = await page.request.post(`${walletFixtureBaseUrl}/__fixture/mark-paid`, {
+      data: { merchantOrderNo: comboProviderOrder.merchantOrderNo },
+    })
+    expect(comboPaid.status()).toBe(200)
+    const comboCallback = (await comboPaid.json()).callback as Record<string, string>
+    const comboCallbackResponse = await page.request.get(
+      `http://127.0.0.1:${topUpApiPort}/api/v1/payments/callback/zpay?${new URLSearchParams(comboCallback).toString()}`,
+    )
+    expect(comboCallbackResponse.status()).toBe(200)
+    expect(await comboCallbackResponse.text()).toBe('success')
+    await page.getByRole('button', { name: '刷新支付状态' }).click()
+    await expect(page.getByText('服务端已确认付款').first()).toBeVisible()
+    await expect(page.getByText('等待商家交付').first()).toBeVisible()
+
+    await page.goto('/admin/wallets')
+    await page.getByLabel('按顾客用户名搜索').fill(username)
+    await page.getByRole('button', { name: '搜索钱包' }).click()
+    await expect(page.getByText(username, { exact: true })).toBeVisible()
+    await page.getByRole('listitem').filter({ hasText: username })
+      .getByRole('link', { name: '流水与充值' }).click()
+    await expect(page.getByRole('heading', { name: '顾客钱包明细' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: '充值记录与支付凭证' })).toBeVisible()
+    await expect(page.getByText('不可变钱包流水', { exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: /修改余额|人工充值/u })).toHaveCount(0)
+    expect(comboOrderId).toMatch(/^[0-9a-f-]{36}$/iu)
     expect(consoleMessages.join('\n')).not.toContain(merchantKey)
   } finally {
     if (createdChannelId) {

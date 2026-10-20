@@ -16,6 +16,8 @@ const errorMessage = ref('')
 const mounted = ref(false)
 const selectedChannelId = ref('')
 const selectedPaymentMethod = ref<ExternalPaymentMethod>('alipay')
+const selectedPaymentMode = ref<'external' | 'wallet' | 'hybrid'>('external')
+const hybridWalletAmountInput = ref('')
 const qrDataUrl = ref('')
 const qrError = ref('')
 let sequence = 0
@@ -27,14 +29,79 @@ useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 
 const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id))
 const hasActiveAttempt = computed(() => Boolean(payment.value?.attempt
-  && ['created', 'pending'].includes(payment.value.attempt.status)))
+  && ['created', 'pending', 'reconciliation_required'].includes(payment.value.attempt.status)))
 const canCancel = computed(() => order.value?.status === 'pending_payment' && !hasActiveAttempt.value)
 const selectedChannel = computed(() => payment.value?.channels.find(channel => channel.id === selectedChannelId.value) ?? null)
-const canCreatePayment = computed(() => Boolean(payment.value?.paymentStatus === 'unpaid'
-  && !hasActiveAttempt.value && selectedChannel.value?.paymentMethods.includes(selectedPaymentMethod.value)))
 const qrAction = computed(() => payment.value?.attempt?.action?.type === 'qr_code'
   ? payment.value.attempt.action.value
   : '')
+
+function amountToCents(value: string): bigint {
+  const [whole, fraction = '00'] = value.split('.')
+  if (!/^\d+$/u.test(whole!) || !/^\d{2}$/u.test(fraction)) return 0n
+  return BigInt(whole!) * 100n + BigInt(fraction)
+}
+
+function centsToAmount(value: bigint): string {
+  return `${value / 100n}.${(value % 100n).toString().padStart(2, '0')}`
+}
+
+const walletAvailableCents = computed(() => payment.value?.walletBalance
+  ? amountToCents(payment.value.walletBalance.totalAvailable) : 0n)
+const orderAmountCents = computed(() => payment.value ? amountToCents(payment.value.totalAmount) : 0n)
+const maxWalletContributionCents = computed(() => walletAvailableCents.value < orderAmountCents.value
+  ? walletAvailableCents.value : orderAmountCents.value)
+const maxWalletContribution = computed(() => centsToAmount(maxWalletContributionCents.value))
+const walletOnlyAvailable = computed(() => orderAmountCents.value > 0n
+  && maxWalletContributionCents.value >= orderAmountCents.value)
+const walletPaymentAvailable = computed(() => walletAvailableCents.value > 0n)
+const canCombineWallet = computed(() => walletPaymentAvailable.value && orderAmountCents.value > 1n)
+const selectedWalletAmount = computed(() => {
+  if (selectedPaymentMode.value === 'external') return '0.00'
+  if (selectedPaymentMode.value === 'wallet') return payment.value?.totalAmount ?? '0.00'
+  const value = hybridWalletAmountInput.value
+  if (!/^\d+(?:\.\d{1,2})?$/u.test(value)) return '0.00'
+  const normalized = value.includes('.') ? value.padEnd(value.indexOf('.') + 3, '0') : `${value}.00`
+  const cents = amountToCents(normalized)
+  return cents > 0n && cents < orderAmountCents.value && cents <= walletAvailableCents.value
+    ? centsToAmount(cents) : '0.00'
+})
+const selectedExternalAmount = computed(() => {
+  const remainder = orderAmountCents.value - amountToCents(selectedWalletAmount.value)
+  return centsToAmount(remainder > 0n ? remainder : 0n)
+})
+const estimatedGiftUse = computed(() => {
+  const gift = amountToCents(payment.value?.walletBalance?.giftAvailable ?? '0.00')
+  const spend = amountToCents(selectedWalletAmount.value)
+  return centsToAmount(gift < spend ? gift : spend)
+})
+const estimatedCashUse = computed(() => {
+  const remainder = amountToCents(selectedWalletAmount.value) - amountToCents(estimatedGiftUse.value)
+  return centsToAmount(remainder > 0n ? remainder : 0n)
+})
+const canCreatePayment = computed(() => Boolean(payment.value?.paymentStatus === 'unpaid'
+  && !hasActiveAttempt.value
+  && (selectedPaymentMode.value === 'wallet'
+    ? walletOnlyAvailable.value
+    : selectedPaymentMode.value === 'hybrid'
+      ? selectedWalletAmount.value !== '0.00' && selectedExternalAmount.value !== '0.00'
+        && selectedChannel.value?.paymentMethods.includes(selectedPaymentMethod.value)
+      : selectedChannel.value?.paymentMethods.includes(selectedPaymentMethod.value))))
+const paymentButtonLabel = computed(() => selectedPaymentMode.value === 'wallet'
+  ? `确认钱包支付 · ¥${payment.value?.totalAmount ?? '0.00'}`
+  : selectedPaymentMode.value === 'hybrid'
+    ? `创建组合支付 · ¥${selectedWalletAmount.value} + ¥${selectedExternalAmount.value}`
+    : `创建外部支付 · ¥${payment.value?.totalAmount ?? '0.00'}`)
+
+function selectPaymentMode(mode: 'external' | 'wallet' | 'hybrid') {
+  selectedPaymentMode.value = mode
+  if (mode === 'hybrid' && (hybridWalletAmountInput.value === '' || selectedWalletAmount.value === '0.00')) {
+    const initial = maxWalletContributionCents.value < orderAmountCents.value
+      ? maxWalletContributionCents.value
+      : orderAmountCents.value / 2n
+    hybridWalletAmountInput.value = centsToAmount(initial)
+  }
+}
 
 function statusLabel(value: OrderDetail): string {
   if (value.status === 'pending_payment') return '等待付款'
@@ -116,13 +183,14 @@ async function cancelOrder() {
   }
 }
 
-function paymentKeyStorageKey(channelId: string, method: ExternalPaymentMethod): string {
-  return `aikayun-payment-request-v1:${customerApi.identityVersion.value}:${orderId.value}:${channelId}:${method}`
+function paymentKeyStorageKey(channelId: string, method: ExternalPaymentMethod, walletAmount: string): string {
+  const mode = walletAmount === '0.00' ? 'external' : walletAmount === payment.value?.totalAmount ? 'wallet' : 'hybrid'
+  return `aikayun-payment-request-v2:${customerApi.identityVersion.value}:${orderId.value}:${mode}:${walletAmount}:${channelId}:${method}`
 }
 
-function paymentIdempotencyKey(channelId: string, method: ExternalPaymentMethod): string {
+function paymentIdempotencyKey(channelId: string, method: ExternalPaymentMethod, walletAmount: string): string {
   if (!import.meta.client) throw new Error('请在浏览器中发起支付。')
-  const key = paymentKeyStorageKey(channelId, method)
+  const key = paymentKeyStorageKey(channelId, method, walletAmount)
   try {
     const existing = sessionStorage.getItem(key)
     if (existing && /^[0-9a-f-]{36}$/iu.test(existing)) return existing
@@ -135,7 +203,10 @@ function paymentIdempotencyKey(channelId: string, method: ExternalPaymentMethod)
 }
 
 async function createPayment() {
-  if (!canCreatePayment.value || creatingPayment.value || !selectedChannelId.value) return
+  if (!canCreatePayment.value || creatingPayment.value) return
+  const walletAmount = selectedWalletAmount.value
+  const needsExternal = selectedExternalAmount.value !== '0.00'
+  if (needsExternal && !selectedChannelId.value) return
   creatingPayment.value = true
   errorMessage.value = ''
   const orderAtStart = orderId.value
@@ -144,15 +215,15 @@ async function createPayment() {
     const result = await customerApi.request<CustomerOrderPayment>(`/api/v1/orders/${orderAtStart}/payments`, {
       method: 'POST',
       body: {
-        idempotencyKey: paymentIdempotencyKey(selectedChannelId.value, selectedPaymentMethod.value),
-        channelId: selectedChannelId.value,
-        paymentMethod: selectedPaymentMethod.value,
+        idempotencyKey: paymentIdempotencyKey(needsExternal ? selectedChannelId.value : '', selectedPaymentMethod.value, walletAmount),
+        ...(walletAmount !== '0.00' ? { walletAmount } : {}),
+        ...(needsExternal ? { channelId: selectedChannelId.value, paymentMethod: selectedPaymentMethod.value } : {}),
       },
     })
     if (orderAtStart !== orderId.value || identityAtStart !== customerApi.identityVersion.value) return
     payment.value = result
     if (result.attempt && ['failed', 'expired', 'cancelled'].includes(result.attempt.status)) {
-      try { sessionStorage.removeItem(paymentKeyStorageKey(selectedChannelId.value, selectedPaymentMethod.value)) } catch { /* The server attempt remains authoritative. */ }
+      try { sessionStorage.removeItem(paymentKeyStorageKey(selectedChannelId.value, selectedPaymentMethod.value, walletAmount)) } catch { /* The server attempt remains authoritative. */ }
     }
     await loadOrder()
   } catch (error) {
@@ -215,6 +286,8 @@ watch(() => customerApi.identityVersion.value, () => {
   payment.value = null
   confirmCancel.value = false
   selectedChannelId.value = ''
+  selectedPaymentMode.value = 'external'
+  hybridWalletAmountInput.value = ''
   qrDataUrl.value = ''
   void loadOrder()
 }, { flush: 'sync' })
@@ -225,6 +298,8 @@ watch(orderId, () => {
   order.value = null
   payment.value = null
   selectedChannelId.value = ''
+  selectedPaymentMode.value = 'external'
+  hybridWalletAmountInput.value = ''
   confirmCancel.value = false
   qrDataUrl.value = ''
   void loadOrder()
@@ -409,7 +484,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
           <div class="flex flex-wrap items-start justify-between gap-4">
             <div class="min-w-0">
               <p class="text-sm font-medium text-primary">
-                在线支付
+                付款方式
               </p>
               <h2
                 id="order-payment-title"
@@ -517,8 +592,108 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
           </template>
 
           <template v-else-if="payment.paymentStatus === 'unpaid'">
+            <div
+              v-if="isCustomer && payment.walletBalance"
+              class="mt-4 grid gap-4 rounded-xl border border-default bg-default/60 p-4"
+            >
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h3 class="font-medium text-highlighted">
+                    钱包余额
+                  </h3>
+                  <p class="mt-1 text-sm text-muted">
+                    可用 ¥{{ payment.walletBalance.totalAvailable }} · 赠送余额优先抵扣
+                  </p>
+                </div>
+                <UButton
+                  to="/wallet"
+                  color="neutral"
+                  variant="outline"
+                  size="sm"
+                  icon="i-lucide-wallet"
+                >
+                  钱包明细
+                </UButton>
+              </div>
+
+              <fieldset class="grid gap-2 sm:grid-cols-3">
+                <legend class="mb-2 text-sm font-medium text-highlighted">
+                  选择付款方式
+                </legend>
+                <label
+                  class="flex min-h-12 cursor-pointer items-center gap-3 rounded-xl border border-default px-3 py-2 hover:bg-muted"
+                  :class="selectedPaymentMode === 'external' ? 'border-primary bg-primary/5' : ''"
+                >
+                  <input
+                    type="radio"
+                    name="payment-mode"
+                    :checked="selectedPaymentMode === 'external'"
+                    class="size-4 shrink-0 accent-primary"
+                    @change="selectPaymentMode('external')"
+                  >
+                  <span class="text-sm font-medium text-highlighted">外部支付</span>
+                </label>
+                <label
+                  class="flex min-h-12 items-center gap-3 rounded-xl border border-default px-3 py-2"
+                  :class="[walletOnlyAvailable ? 'cursor-pointer hover:bg-muted' : 'cursor-not-allowed opacity-50', selectedPaymentMode === 'wallet' ? 'border-primary bg-primary/5' : '']"
+                >
+                  <input
+                    type="radio"
+                    name="payment-mode"
+                    :checked="selectedPaymentMode === 'wallet'"
+                    :disabled="!walletOnlyAvailable"
+                    class="size-4 shrink-0 accent-primary"
+                    @change="selectPaymentMode('wallet')"
+                  >
+                  <span class="text-sm font-medium text-highlighted">钱包全额支付</span>
+                </label>
+                <label
+                  class="flex min-h-12 items-center gap-3 rounded-xl border border-default px-3 py-2"
+                  :class="[canCombineWallet ? 'cursor-pointer hover:bg-muted' : 'cursor-not-allowed opacity-50', selectedPaymentMode === 'hybrid' ? 'border-primary bg-primary/5' : '']"
+                >
+                  <input
+                    type="radio"
+                    name="payment-mode"
+                    :checked="selectedPaymentMode === 'hybrid'"
+                    :disabled="!canCombineWallet"
+                    class="size-4 shrink-0 accent-primary"
+                    @change="selectPaymentMode('hybrid')"
+                  >
+                  <span class="text-sm font-medium text-highlighted">钱包与外部组合</span>
+                </label>
+              </fieldset>
+
+              <div
+                v-if="selectedPaymentMode === 'hybrid'"
+                class="grid gap-3 sm:grid-cols-2 sm:items-end"
+              >
+                <UFormField
+                  label="钱包支付金额"
+                  :description="`可用余额最多 ¥${maxWalletContribution}，赠送余额先抵扣。`"
+                >
+                  <UInput
+                    v-model="hybridWalletAmountInput"
+                    type="text"
+                    inputmode="decimal"
+                    autocomplete="off"
+                    placeholder="输入钱包支付金额"
+                    class="w-full"
+                  />
+                </UFormField>
+                <p class="text-sm text-muted">
+                  钱包 ¥{{ selectedWalletAmount }}（赠送 ¥{{ estimatedGiftUse }}，现金 ¥{{ estimatedCashUse }}），外部支付 ¥{{ selectedExternalAmount }}
+                </p>
+              </div>
+              <p
+                v-else-if="selectedPaymentMode === 'wallet'"
+                class="text-sm text-muted"
+              >
+                本次使用赠送余额 ¥{{ estimatedGiftUse }}，现金余额 ¥{{ estimatedCashUse }}。
+              </p>
+            </div>
+
             <UAlert
-              v-if="payment.channels.length === 0"
+              v-if="selectedPaymentMode !== 'wallet' && payment.channels.length === 0"
               class="mt-4"
               color="neutral"
               variant="subtle"
@@ -526,12 +701,14 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
               description="请稍后重试，或联系商家确认支付配置。"
             />
             <div
-              v-else
               class="mt-4 grid gap-5"
             >
-              <fieldset class="grid gap-2">
+              <fieldset
+                v-if="selectedPaymentMode !== 'wallet' && payment.channels.length > 0"
+                class="grid gap-2"
+              >
                 <legend class="text-sm font-medium text-highlighted">
-                  选择支付通道
+                  {{ selectedPaymentMode === 'hybrid' ? '选择尾款支付通道' : '选择支付通道' }}
                 </legend>
                 <label
                   v-for="channel in payment.channels"
@@ -551,7 +728,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
               </fieldset>
 
               <fieldset
-                v-if="selectedChannel"
+                v-if="selectedPaymentMode !== 'wallet' && selectedChannel"
                 class="grid gap-2"
               >
                 <legend class="text-sm font-medium text-highlighted">
@@ -578,7 +755,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
 
               <div class="flex flex-wrap items-center justify-between gap-3 border-t border-default pt-4">
                 <p class="max-w-xl text-xs leading-5 text-muted">
-                  金额由服务器按订单快照计算。付款成功页面和浏览器返回本身不会确认收款。
+                  金额由服务器按订单快照计算。钱包先使用赠送余额，再使用现金余额；浏览器返回不会确认外部收款。
                 </p>
                 <UButton
                   color="primary"
@@ -587,7 +764,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                   :disabled="!canCreatePayment || creatingPayment"
                   @click="createPayment"
                 >
-                  创建支付 · ¥{{ payment.totalAmount }}
+                  {{ paymentButtonLabel }}
                 </UButton>
               </div>
             </div>

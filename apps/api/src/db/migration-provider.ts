@@ -17,6 +17,7 @@ import { ordersMigration } from './migrations/202610190004_orders.js'
 import { purchaseLimitsMigration } from './migrations/202610200001_purchase_limits.js'
 import { onlinePaymentsMigration } from './migrations/202610200002_online_payments.js'
 import { paymentReconciliationMigration } from './migrations/202610200003_payment_reconciliation.js'
+import { walletPaymentsMigration } from './migrations/202610200004_wallet_payments.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -39,6 +40,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610200001_purchase_limits': purchaseLimitsMigration,
       '202610200002_online_payments': onlinePaymentsMigration,
       '202610200003_payment_reconciliation': paymentReconciliationMigration,
+      '202610200004_wallet_payments': walletPaymentsMigration,
     }
   }
 }

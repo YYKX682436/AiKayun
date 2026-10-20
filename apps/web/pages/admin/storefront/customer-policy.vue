@@ -17,6 +17,9 @@ const settings = reactive({
   guestCheckoutEnabled: policyResponse.value?.data.guestCheckoutEnabled ?? false,
   guestFreeClaimEnabled: policyResponse.value?.data.guestFreeClaimEnabled ?? false,
   unpaidOrderTimeoutMinutes: policyResponse.value?.data.unpaidOrderTimeoutMinutes ?? 15,
+  walletTopUpEnabled: policyResponse.value?.data.walletTopUpEnabled ?? false,
+  walletTopUpMinAmount: policyResponse.value?.data.walletTopUpMinAmount ?? '1.00',
+  walletTopUpMaxAmount: policyResponse.value?.data.walletTopUpMaxAmount ?? '1000.00',
 })
 const busy = ref(false)
 const errorMessage = ref('')
@@ -132,6 +135,55 @@ async function saveSettings() {
                   :disabled="busy || pending || !policyResponse"
                 />
               </UFormField>
+            </div>
+          </UCard>
+
+          <UCard>
+            <template #header>
+              <div>
+                <h2 class="text-lg font-semibold text-highlighted">
+                  钱包充值
+                </h2>
+                <p class="mt-1 text-sm leading-6 text-muted">
+                  顾客的在线充值只会在支付服务端确认足额到账后记入现金余额。此设置不会直接修改任何顾客余额。
+                </p>
+              </div>
+            </template>
+            <div class="grid gap-5 sm:grid-cols-2">
+              <UFormField name="walletTopUpEnabled">
+                <USwitch
+                  v-model="settings.walletTopUpEnabled"
+                  label="开放钱包在线充值"
+                  description="沿用已配置的在线支付通道；关闭后仍可恢复已开始的充值。"
+                  :disabled="busy || pending || !policyResponse"
+                />
+              </UFormField>
+              <div class="grid gap-4 sm:grid-cols-2">
+                <UFormField
+                  label="单笔最低金额"
+                  name="walletTopUpMinAmount"
+                >
+                  <UInput
+                    v-model="settings.walletTopUpMinAmount"
+                    inputmode="decimal"
+                    autocomplete="off"
+                    class="w-full"
+                    :disabled="busy || pending || !policyResponse"
+                  />
+                </UFormField>
+                <UFormField
+                  label="单笔最高金额"
+                  name="walletTopUpMaxAmount"
+                >
+                  <UInput
+                    v-model="settings.walletTopUpMaxAmount"
+                    inputmode="decimal"
+                    autocomplete="off"
+                    class="w-full"
+                    :disabled="busy || pending || !policyResponse"
+                  />
+                </UFormField>
+              </div>
             </div>
           </UCard>
 

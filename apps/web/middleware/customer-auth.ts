@@ -1,5 +1,5 @@
 export default defineNuxtRouteMiddleware(async (to) => {
-  if (to.path !== '/account') return
+  if (to.path !== '/account' && to.path !== '/wallet') return
 
   const customerApi = useCustomerApi()
   if (!customerApi.sessionResolved.value) {

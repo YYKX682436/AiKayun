@@ -251,6 +251,9 @@ export const StorefrontCustomerPolicySchema = Type.Object({
   guestCheckoutEnabled: Type.Boolean(),
   guestFreeClaimEnabled: Type.Boolean(),
   unpaidOrderTimeoutMinutes: Type.Union([Type.Literal(5), Type.Literal(15), Type.Literal(30)]),
+  walletTopUpEnabled: Type.Boolean(),
+  walletTopUpMinAmount: Type.String({ pattern: '^(?:0|[1-9]\\d{0,15})\\.\\d{2}$' }),
+  walletTopUpMaxAmount: Type.String({ pattern: '^(?:0|[1-9]\\d{0,15})\\.\\d{2}$' }),
   updatedAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
 
@@ -260,6 +263,9 @@ export const UpdateStorefrontCustomerPolicyBodySchema = Type.Object({
   guestCheckoutEnabled: Type.Boolean(),
   guestFreeClaimEnabled: Type.Boolean(),
   unpaidOrderTimeoutMinutes: Type.Union([Type.Literal(5), Type.Literal(15), Type.Literal(30)]),
+  walletTopUpEnabled: Type.Optional(Type.Boolean()),
+  walletTopUpMinAmount: Type.Optional(Type.String({ pattern: '^(?:0|[1-9]\\d{0,15})\\.\\d{2}$' })),
+  walletTopUpMaxAmount: Type.Optional(Type.String({ pattern: '^(?:0|[1-9]\\d{0,15})\\.\\d{2}$' })),
 }, { additionalProperties: false })
 
 export const ProductTypeSchema = Type.Union([
@@ -1011,6 +1017,11 @@ export const CustomerPaymentAttemptSchema = Type.Object({
   expiresAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
   completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
   errorCode: Type.Union([Type.String({ maxLength: 64 }), Type.Null()]),
+  source: Type.Union([Type.Literal('external'), Type.Literal('wallet')]),
+  amount: SettlementAmountSchema,
+  walletGiftAmount: SettlementAmountSchema,
+  walletCashAmount: SettlementAmountSchema,
+  walletRequestedAmount: Type.Union([SettlementAmountSchema, Type.Null()]),
 }, { additionalProperties: false })
 export const CustomerOrderPaymentSchema = Type.Object({
   orderId: Type.String({ format: 'uuid' }),
@@ -1023,15 +1034,122 @@ export const CustomerOrderPaymentSchema = Type.Object({
   confirmedAmount: SettlementAmountSchema,
   currency: Type.Literal('CNY'),
   unpaidExpiresAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  walletBalance: Type.Union([Type.Object({
+    cashAvailable: SettlementAmountSchema,
+    giftAvailable: SettlementAmountSchema,
+    totalAvailable: SettlementAmountSchema,
+  }, { additionalProperties: false }), Type.Null()]),
   channels: Type.Array(PublicPaymentChannelSchema),
   attempt: Type.Union([CustomerPaymentAttemptSchema, Type.Null()]),
 }, { additionalProperties: false })
 export const CreateOrderPaymentBodySchema = Type.Object({
   idempotencyKey: Type.String({ format: 'uuid' }),
+  channelId: Type.Optional(Type.String({ format: 'uuid' })),
+  paymentMethod: Type.Optional(ExternalPaymentMethodSchema),
+  walletAmount: Type.Optional(Type.String({ pattern: '^(?:0|[1-9]\\d{0,15})\\.\\d{2}$' })),
+}, { additionalProperties: false })
+export const PaymentOrderIdParamsSchema = Type.Object({ id: Type.String({ format: 'uuid' }) })
+
+export const CustomerWalletSummarySchema = Type.Object({
+  cashAvailable: SettlementAmountSchema,
+  cashFrozen: SettlementAmountSchema,
+  giftAvailable: SettlementAmountSchema,
+  giftFrozen: SettlementAmountSchema,
+  totalAvailable: SettlementAmountSchema,
+  topUpEnabled: Type.Boolean(),
+  topUpMinAmount: SettlementAmountSchema,
+  topUpMaxAmount: SettlementAmountSchema,
+}, { additionalProperties: false })
+export const CustomerWalletLedgerEntrySchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  operationId: Type.String({ format: 'uuid' }),
+  operationType: Type.String({ maxLength: 24 }),
+  bucket: Type.Union([Type.Literal('cash'), Type.Literal('gift')]),
+  action: Type.Union([Type.Literal('credit_available'), Type.Literal('debit_available'), Type.Literal('freeze'), Type.Literal('unfreeze'), Type.Literal('debit_frozen')]),
+  amount: SettlementAmountSchema,
+  createdAt: Type.String({ format: 'date-time' }),
+  orderId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  paymentAttemptId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  paymentStatus: Type.Union([Type.String({ maxLength: 32 }), Type.Null()]),
+  paymentDisposition: Type.Union([Type.String({ maxLength: 24 }), Type.Null()]),
+  providerTransactionId: Type.Union([Type.String({ maxLength: 200 }), Type.Null()]),
+}, { additionalProperties: false })
+export const CustomerWalletLedgerPageSchema = Type.Object({
+  items: Type.Array(CustomerWalletLedgerEntrySchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const CustomerWalletPageQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+}, { additionalProperties: false })
+export const CustomerTopUpSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  amount: SettlementAmountSchema,
+  status: Type.Union([Type.Literal('created'), Type.Literal('pending'), Type.Literal('succeeded'), Type.Literal('failed'), Type.Literal('expired'), Type.Literal('cancelled'), Type.Literal('late_succeeded'), Type.Literal('reconciliation_required')]),
+  providerState: Type.Union([Type.Literal('requesting'), Type.Literal('ready'), Type.Literal('unknown'), Type.Literal('failed'), Type.Null()]),
+  paymentMethod: Type.Union([ExternalPaymentMethodSchema, Type.Null()]),
+  channelName: Type.Union([Type.String({ maxLength: 80 }), Type.Null()]),
+  action: Type.Union([PaymentActionSchema, Type.Null()]),
+  providerTransactionId: Type.Union([Type.String({ maxLength: 200 }), Type.Null()]),
+  receiptAmount: Type.Union([SettlementAmountSchema, Type.Null()]),
+  receiptDisposition: Type.Union([Type.String({ maxLength: 24 }), Type.Null()]),
+  reconciliationOpen: Type.Boolean(),
+  reconciliationReasons: Type.Array(Type.Union([
+    Type.Literal('callback_query_mismatch'), Type.Literal('provider_identity_conflict'),
+    Type.Literal('provider_transaction_conflict'), Type.Literal('provider_amount_mismatch'),
+    Type.Literal('receipt_conflict'), Type.Literal('late_confirmed_payment'),
+  ])),
+  createdAt: Type.String({ format: 'date-time' }),
+  expiresAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+}, { additionalProperties: false })
+export const CustomerTopUpPageSchema = Type.Object({
+  items: Type.Array(CustomerTopUpSchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const AdminWalletListQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  search: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+}, { additionalProperties: false })
+export const AdminWalletListItemSchema = Type.Object({
+  customerId: Type.String({ format: 'uuid' }),
+  username: Type.Union([CustomerUsernameSchema, Type.Null()]),
+  status: AdminCustomerStatusSchema,
+  cashAvailable: SettlementAmountSchema,
+  cashFrozen: SettlementAmountSchema,
+  giftAvailable: SettlementAmountSchema,
+  giftFrozen: SettlementAmountSchema,
+  totalAvailable: SettlementAmountSchema,
+}, { additionalProperties: false })
+export const AdminWalletListSchema = Type.Object({
+  items: Type.Array(AdminWalletListItemSchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const AdminWalletDetailSchema = Type.Object({
+  customerId: Type.String({ format: 'uuid' }),
+  username: Type.Union([CustomerUsernameSchema, Type.Null()]),
+  status: AdminCustomerStatusSchema,
+  wallet: CustomerWalletSummarySchema,
+  ledger: CustomerWalletLedgerPageSchema,
+  topUps: CustomerTopUpPageSchema,
+}, { additionalProperties: false })
+export const CreateWalletTopUpBodySchema = Type.Object({
+  idempotencyKey: Type.String({ format: 'uuid' }),
+  amount: Type.String({ pattern: '^(?:0|[1-9]\\d{0,15})\\.\\d{2}$' }),
   channelId: Type.String({ format: 'uuid' }),
   paymentMethod: ExternalPaymentMethodSchema,
 }, { additionalProperties: false })
-export const PaymentOrderIdParamsSchema = Type.Object({ id: Type.String({ format: 'uuid' }) })
+export const AdminWalletCustomerParamsSchema = Type.Object({ customerId: Type.String({ format: 'uuid' }) })
 
 export const AdminPaymentChannelSchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
@@ -1141,6 +1259,10 @@ export const AdminOrderPaymentsSchema = Type.Object({
 }, { additionalProperties: false })
 export const AdminPaymentReconciliationParamsSchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
+  attemptId: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+export const AdminTopUpReconciliationParamsSchema = Type.Object({
+  customerId: Type.String({ format: 'uuid' }),
   attemptId: Type.String({ format: 'uuid' }),
 }, { additionalProperties: false })
 export const AdminPaymentReconciliationResultSchema = Type.Object({
@@ -1668,6 +1790,18 @@ export type CustomerManagementAuditAction = Static<typeof CustomerManagementAudi
 export type CustomerManagementAuditSummary = Static<typeof CustomerManagementAuditSummarySchema>
 export type AdminCustomerAuditEvent = Static<typeof AdminCustomerAuditEventSchema>
 export type AdminCustomerAuditPage = Static<typeof AdminCustomerAuditPageSchema>
+export type CustomerWalletSummary = Static<typeof CustomerWalletSummarySchema>
+export type CustomerWalletLedgerEntry = Static<typeof CustomerWalletLedgerEntrySchema>
+export type CustomerWalletLedgerPage = Static<typeof CustomerWalletLedgerPageSchema>
+export type CustomerTopUp = Static<typeof CustomerTopUpSchema>
+export type CustomerTopUpPage = Static<typeof CustomerTopUpPageSchema>
+export type CreateWalletTopUpBody = Static<typeof CreateWalletTopUpBodySchema>
+export type CustomerWalletPageQuery = Static<typeof CustomerWalletPageQuerySchema>
+export type AdminWalletListQuery = Static<typeof AdminWalletListQuerySchema>
+export type AdminWalletListItem = Static<typeof AdminWalletListItemSchema>
+export type AdminWalletList = Static<typeof AdminWalletListSchema>
+export type AdminWalletDetail = Static<typeof AdminWalletDetailSchema>
+export type AdminPaymentReconciliationResult = Static<typeof AdminPaymentReconciliationResultSchema>
 export type StorefrontCustomerPolicy = Static<typeof StorefrontCustomerPolicySchema>
 export type UpdateStorefrontCustomerPolicyBody = Static<typeof UpdateStorefrontCustomerPolicyBodySchema>
 export type ProductType = Static<typeof ProductTypeSchema>

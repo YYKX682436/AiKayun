@@ -12,6 +12,15 @@ export interface WalletOrderPaymentInput {
   amount: string
   /** Required when wallet funds do not cover the whole order. */
   externalProvider?: string
+  externalPaymentSnapshot?: {
+    channelId: string
+    providerType: 'zpay_epay_v1'
+    paymentMethod: 'alipay' | 'wechat'
+    channelName: string
+    credentialVersion: number
+    merchantOrderNo: string
+    expiresAt: Date
+  }
 }
 
 export interface WalletOrderPaymentResult {
@@ -35,13 +44,16 @@ export async function recordWalletOrderPayment(
   // This lets account disable and anonymization serialize against a payment
   // already in flight and rejects a payment that starts after either change.
   const customer = await trx.selectFrom('customers').select(['id', 'status'])
-    .where('id', '=', input.customerId).forKeyShare().executeTakeFirst()
+    .where('id', '=', input.customerId).forUpdate().executeTakeFirst()
   if (!customer || customer.status !== 'active') throw new Error('CUSTOMER_NOT_ACTIVE')
 
   const order = await trx.selectFrom('orders').select(['customer_id', 'status', 'total_amount', 'unpaid_expires_at'])
     .where('id', '=', input.orderId).forUpdate().executeTakeFirst()
   if (!order) throw new Error('ORDER_NOT_FOUND')
   if (order.customer_id !== input.customerId) throw new Error('ORDER_CUSTOMER_MISMATCH')
+
+  const nowRow = await trx.selectNoFrom((eb) => eb.fn<Date>('clock_timestamp').as('now')).executeTakeFirstOrThrow()
+  if (!order.unpaid_expires_at || order.unpaid_expires_at <= nowRow.now) throw new Error('ORDER_NOT_PAYABLE')
 
   const existing = await trx.selectFrom('payment_attempts').selectAll()
     .where('idempotency_key', '=', input.operationId).executeTakeFirst()
@@ -115,8 +127,14 @@ export async function recordWalletOrderPayment(
     wallet_operation_id: isExternal ? null : input.operationId,
     wallet_hold_operation_id: isExternal && hasWalletAmount ? input.operationId : null,
     requested_wallet_amount: requestedAmount,
-    expires_at: order.unpaid_expires_at,
+    expires_at: isExternal ? input.externalPaymentSnapshot?.expiresAt ?? order.unpaid_expires_at : order.unpaid_expires_at,
     completed_at: null,
+    payment_channel_id: isExternal ? input.externalPaymentSnapshot?.channelId ?? null : null,
+    provider_type_snapshot: isExternal ? input.externalPaymentSnapshot?.providerType ?? null : null,
+    payment_method_snapshot: isExternal ? input.externalPaymentSnapshot?.paymentMethod ?? null : null,
+    payment_channel_name_snapshot: isExternal ? input.externalPaymentSnapshot?.channelName ?? null : null,
+    channel_credential_version: isExternal ? input.externalPaymentSnapshot?.credentialVersion ?? null : null,
+    merchant_order_no: isExternal ? input.externalPaymentSnapshot?.merchantOrderNo ?? null : null,
   }).execute()
 
   if (hasWalletAmount) {

@@ -14,7 +14,7 @@ if (!customerApi.sessionResolved.value) {
 }
 
 watch(() => route.path, () => {
-  if (customerApi.session.value && route.path !== '/account') void customerApi.refreshSession()
+  if (customerApi.session.value && route.path !== '/account' && route.path !== '/wallet') void customerApi.refreshSession()
 })
 
 watch(
@@ -95,6 +95,19 @@ onMounted(() => {
           >
             <UIcon
               name="i-lucide-receipt-text"
+              class="size-4"
+              aria-hidden="true"
+            />
+          </NuxtLink>
+          <NuxtLink
+            v-if="customerApi.session.value"
+            to="/wallet"
+            class="hidden min-h-11 min-w-10 items-center justify-center rounded-lg px-2 text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:flex"
+            aria-label="我的钱包"
+            title="我的钱包"
+          >
+            <UIcon
+              name="i-lucide-wallet"
               class="size-4"
               aria-hidden="true"
             />

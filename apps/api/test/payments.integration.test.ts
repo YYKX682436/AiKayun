@@ -185,6 +185,7 @@ async function createPayment(orderId: string, owner: Owner, options: {
   paymentMethod?: 'alipay' | 'wechat'
   channelId?: string
   idempotencyKey?: string
+  walletAmount?: string
 } = {}) {
   return await inject({
     method: 'POST', url: `/api/v1/orders/${orderId}/payments`,
@@ -193,8 +194,65 @@ async function createPayment(orderId: string, owner: Owner, options: {
       idempotencyKey: options.idempotencyKey ?? randomUUID(),
       channelId: options.channelId ?? channelId,
       paymentMethod: options.paymentMethod ?? 'alipay',
+      ...(options.walletAmount ? { walletAmount: options.walletAmount } : {}),
     },
   })
+}
+
+async function createWalletTopUp(owner: Customer, options: {
+  amount: string
+  idempotencyKey?: string
+  paymentMethod?: 'alipay' | 'wechat'
+}): Promise<{ response: Awaited<ReturnType<typeof inject>>; attemptId: string }> {
+  const response = await inject({
+    method: 'POST', url: '/api/v1/customer/wallet/top-ups', headers: customerHeaders(owner),
+    payload: {
+      idempotencyKey: options.idempotencyKey ?? randomUUID(), amount: options.amount,
+      channelId, paymentMethod: options.paymentMethod ?? 'alipay',
+    },
+  })
+  const attemptId = response.statusCode < 300
+    ? response.json().data.items[0].id as string : ''
+  return { response, attemptId }
+}
+
+async function creditGiftFixture(owner: Customer, amount: string): Promise<void> {
+  const operationId = randomUUID()
+  await db.transaction().execute(async (trx) => {
+    await trx.insertInto('wallet_operations').values({
+      id: operationId, customer_id: owner.id, order_id: null, resolves_operation_id: null,
+      operation_type: 'gift', request_sha256: createHash('sha256').update(`${owner.id}:${operationId}`).digest('hex'),
+      actor_admin_id: admin.id,
+    }).execute()
+    await trx.insertInto('wallet_ledger_entries').values({
+      id: randomUUID(), wallet_operation_id: operationId, line_no: 1, customer_id: owner.id,
+      bucket: 'gift', action: 'credit_available', amount, payment_attempt_id: null,
+      refund_allocation_id: null, withdrawal_id: null,
+    }).execute()
+  })
+}
+
+async function expectWalletMatchesLedger(customerId: string): Promise<void> {
+  const [account, rows] = await Promise.all([
+    db.selectFrom('wallet_accounts').selectAll().where('customer_id', '=', customerId).executeTakeFirstOrThrow(),
+    sql<{ bucket: 'cash' | 'gift'; available: string; frozen: string }>`
+      SELECT bucket,
+        COALESCE(sum(CASE WHEN action IN ('credit_available', 'unfreeze') THEN amount
+          WHEN action IN ('debit_available', 'freeze') THEN -amount ELSE 0 END), 0)::text AS available,
+        COALESCE(sum(CASE WHEN action = 'freeze' THEN amount
+          WHEN action IN ('unfreeze', 'debit_frozen') THEN -amount ELSE 0 END), 0)::text AS frozen
+      FROM wallet_ledger_entries WHERE customer_id = ${customerId}::uuid GROUP BY bucket
+    `.execute(db),
+  ])
+  for (const bucket of ['cash', 'gift'] as const) {
+    const row = rows.rows.find(item => item.bucket === bucket)
+    const normalize = (amount: string) => {
+      const [whole, fraction = '00'] = amount.split('.')
+      return `${BigInt(whole!)}.${fraction.padEnd(2, '0')}`
+    }
+    expect(normalize(row?.available ?? '0.00')).toBe(normalize(bucket === 'cash' ? account.cash_available : account.gift_available))
+    expect(normalize(row?.frozen ?? '0.00')).toBe(normalize(bucket === 'cash' ? account.cash_frozen : account.gift_frozen))
+  }
 }
 
 function callbackUrl(parameters: Record<string, string>): string {
@@ -1014,5 +1072,413 @@ describe('online payment settlement through a real local HTTP provider and Postg
     expect(await db.selectFrom('payment_receipts').select('payment_receipts.id')
       .innerJoin('payment_attempts', 'payment_attempts.id', 'payment_receipts.payment_attempt_id')
       .where('payment_attempts.order_id', '=', rejectedOrder).execute()).toHaveLength(0)
+  })
+
+  it('creates customer-only top-ups and credits cash once from an exact provider receipt', async () => {
+    await db.updateTable('storefront_customer_policy').set({
+      wallet_top_up_enabled: true, wallet_top_up_min_amount: '1.00', wallet_top_up_max_amount: '1000.00',
+    }).where('singleton', '=', true).execute()
+    const customer = await createCustomer()
+    const otherCustomer = await createCustomer()
+    const before = await inject({ method: 'GET', url: '/api/v1/customer/wallet', headers: customerHeaders(customer, false) })
+    expect(before.statusCode).toBe(200)
+    expect(before.json().data).toMatchObject({
+      cashAvailable: '0.00', cashFrozen: '0.00', giftAvailable: '0.00', giftFrozen: '0.00', totalAvailable: '0.00',
+    })
+
+    const idempotencyKey = randomUUID()
+    const created = await createWalletTopUp(customer, { amount: '10.00', idempotencyKey })
+    expect(created.response.statusCode).toBe(201)
+    expect(created.response.json().data.items[0]).toMatchObject({ id: created.attemptId, amount: '10.00', status: 'pending' })
+    const attemptTarget = await db.selectFrom('payment_attempts').select(['order_id', 'topup_customer_id', 'source', 'amount'])
+      .where('id', '=', created.attemptId).executeTakeFirstOrThrow()
+    expect(attemptTarget).toEqual({ order_id: null, topup_customer_id: customer.id, source: 'external', amount: '10.00' })
+    expect(await db.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()).toHaveLength(0)
+    expect((await inject({ method: 'GET', url: '/api/v1/customer/wallet', headers: customerHeaders(customer, false) })).json().data.cashAvailable)
+      .toBe('0.00')
+
+    const replay = await createWalletTopUp(customer, { amount: '10.00', idempotencyKey })
+    expect(replay.response.statusCode).toBe(200)
+    expect(replay.attemptId).toBe(created.attemptId)
+    const secondTopUp = await createWalletTopUp(customer, { amount: '10.00' })
+    expect(secondTopUp.response.statusCode).toBe(409)
+    expect(await db.selectFrom('payment_attempts').select('id').where('topup_customer_id', '=', customer.id).execute()).toHaveLength(1)
+
+    const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', created.attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+    const callback = fixture.setPaid(merchantNo)
+    expect((await inject({ method: 'GET', url: callbackUrl(callback) })).body).toBe('success')
+    expect((await inject({ method: 'GET', url: callbackUrl(callback) })).body).toBe('success')
+    const after = await inject({ method: 'GET', url: '/api/v1/customer/wallet', headers: customerHeaders(customer, false) })
+    expect(after.json().data).toMatchObject({ cashAvailable: '10.00', giftAvailable: '0.00', totalAvailable: '10.00' })
+    expect(await db.selectFrom('wallet_ledger_entries').select('id')
+      .where('payment_attempt_id', '=', created.attemptId).where('bucket', '=', 'cash').execute()).toHaveLength(1)
+    expect(await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', created.attemptId).execute())
+      .toHaveLength(1)
+    await expectWalletMatchesLedger(customer.id)
+
+    const otherWallet = await inject({ method: 'GET', url: '/api/v1/customer/wallet', headers: customerHeaders(otherCustomer, false) })
+    expect(otherWallet.json().data.cashAvailable).toBe('0.00')
+    expect((await inject({
+      method: 'POST', url: `/api/v1/customer/wallet/top-ups/${created.attemptId}/refresh`, headers: customerHeaders(otherCustomer),
+    })).statusCode).toBe(404)
+    expect((await inject({
+      method: 'GET', url: `/api/v1/admin/wallets/${customer.id}?page=1&pageSize=20`, headers: adminHeaders(),
+    })).json().data.wallet.cashAvailable).toBe('10.00')
+    expect((await inject({ method: 'PUT', url: `/api/v1/admin/wallets/${customer.id}`, headers: adminHeaders(), payload: { cashAvailable: '999.00' } })).statusCode)
+      .toBe(404)
+    await expect(db.updateTable('wallet_accounts').set({ cash_available: '999.00' }).where('customer_id', '=', customer.id).execute())
+      .rejects.toThrow()
+  })
+
+  it('refuses top-ups outside merchant limits and does not credit amount mismatches', async () => {
+    await db.updateTable('storefront_customer_policy').set({
+      wallet_top_up_enabled: true, wallet_top_up_min_amount: '5.00', wallet_top_up_max_amount: '20.00',
+    }).where('singleton', '=', true).execute()
+    const customer = await createCustomer()
+    expect((await createWalletTopUp(customer, { amount: '4.99' })).response.statusCode).toBe(400)
+    expect((await createWalletTopUp(customer, { amount: '20.01' })).response.statusCode).toBe(400)
+    expect(await db.selectFrom('payment_attempts').select('id').where('topup_customer_id', '=', customer.id).execute()).toHaveLength(0)
+
+    const created = await createWalletTopUp(customer, { amount: '10.00' })
+    expect(created.response.statusCode).toBe(201)
+    const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', created.attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+    const callback = fixture.setPaid(merchantNo, { amount: '8.00' })
+    expect((await inject({ method: 'GET', url: callbackUrl(callback) })).body).toBe('success')
+    const attempt = await db.selectFrom('payment_attempts').select('status').where('id', '=', created.attemptId).executeTakeFirstOrThrow()
+    const receipt = await db.selectFrom('payment_receipts').select(['amount', 'disposition'])
+      .where('payment_attempt_id', '=', created.attemptId).executeTakeFirstOrThrow()
+    const wallet = await db.selectFrom('wallet_accounts').select(['cash_available', 'cash_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()
+    expect(attempt.status).toBe('reconciliation_required')
+    expect(receipt).toEqual({ amount: '8.00', disposition: 'amount_mismatch' })
+    expect(wallet).toEqual({ cash_available: '0.00', cash_frozen: '0.00' })
+    expect(await db.selectFrom('wallet_ledger_entries').select('id').where('payment_attempt_id', '=', created.attemptId).execute())
+      .toHaveLength(0)
+    expect(await db.selectFrom('payment_provider_reconciliation_cases').select(['reason', 'state'])
+      .where('payment_attempt_id', '=', created.attemptId).execute()).toEqual([{ reason: 'provider_amount_mismatch', state: 'open' }])
+  })
+
+  it('settles full wallet payments once, spends gift funds first, and serializes two devices', async () => {
+    const customer = await createCustomer()
+    await creditGiftFixture(customer, '5.00')
+    const orderId = await createOrder(customer, `双端钱包全额支付-${randomUUID().slice(0, 8)}`)
+    const [first, second] = await Promise.all([
+      createPayment(orderId, customer, { walletAmount: '5.00', idempotencyKey: randomUUID() }),
+      fetch(`${api2BaseUrl}/api/v1/orders/${orderId}/payments`, {
+        method: 'POST', headers: { ...customerHeaders(customer), 'content-type': 'application/json' },
+        body: JSON.stringify({ idempotencyKey: randomUUID(), walletAmount: '5.00' }),
+      }),
+    ])
+    const secondStatus = second instanceof Response ? second.status : second.statusCode
+    expect([201, 409]).toContain(first.statusCode)
+    expect([201, 409]).toContain(secondStatus)
+    expect(Number(first.statusCode === 201) + Number(secondStatus === 201)).toBe(1)
+    const attempts = await db.selectFrom('payment_attempts').select(['id', 'source', 'status', 'amount'])
+      .where('order_id', '=', orderId).execute()
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({ source: 'wallet', status: 'succeeded', amount: '5.00' })
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('processing')
+    expect(await db.selectFrom('wallet_ledger_entries').select(['bucket', 'action', 'amount'])
+      .where('payment_attempt_id', '=', attempts[0]!.id).orderBy('line_no').execute())
+      .toEqual([{ bucket: 'gift', action: 'debit_available', amount: '5.00' }])
+    expect(await db.selectFrom('payment_receipts').select('amount').where('payment_attempt_id', '=', attempts[0]!.id).execute())
+      .toEqual([{ amount: '5.00' }])
+  })
+
+  it('freezes a gift-first combination and settles only after an exact on-time receipt without an open case', async () => {
+    await db.updateTable('storefront_customer_policy').set({ wallet_top_up_enabled: true, wallet_top_up_min_amount: '1.00', wallet_top_up_max_amount: '1000.00' })
+      .where('singleton', '=', true).execute()
+    const customer = await createCustomer()
+    await creditGiftFixture(customer, '20.00')
+    const topUp = await createWalletTopUp(customer, { amount: '30.00' })
+    expect(topUp.response.statusCode).toBe(201)
+    const topUpNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', topUp.attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+    expect((await inject({ method: 'GET', url: callbackUrl(fixture.setPaid(topUpNo)) })).body).toBe('success')
+
+    const orderId = await createOrder(customer, `钱包余额与在线组合-${randomUUID().slice(0, 8)}`, { amount: '100.00' })
+    const idem = randomUUID()
+    const [first, concurrent] = await Promise.all([
+      createPayment(orderId, customer, { walletAmount: '50.00', idempotencyKey: idem }),
+      createPayment(orderId, customer, { walletAmount: '50.00', idempotencyKey: randomUUID() }),
+    ])
+    expect(first.statusCode).toBe(201)
+    expect(concurrent.statusCode).toBe(200)
+    expect(concurrent.json().data.attempt.id).toBe(first.json().data.attempt.id)
+    const attemptId = first.json().data.attempt.id as string
+    expect(first.json().data.attempt).toMatchObject({ source: 'external', amount: '50.00', walletGiftAmount: '20.00', walletCashAmount: '30.00' })
+    const frozen = await db.selectFrom('wallet_accounts').select(['cash_available', 'cash_frozen', 'gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()
+    expect(frozen).toEqual({ cash_available: '0.00', cash_frozen: '30.00', gift_available: '0.00', gift_frozen: '20.00' })
+    expect(await db.selectFrom('wallet_ledger_entries').select('id').where('wallet_operation_id', '=', idem).where('action', '=', 'freeze').execute())
+      .toHaveLength(2)
+    expect(await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', attemptId).execute())
+      .toHaveLength(0)
+
+    const attempt = await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', attemptId).executeTakeFirstOrThrow()
+    expect((await inject({ method: 'GET', url: callbackUrl(fixture.setPaid(attempt.merchant_order_no!)) })).body).toBe('success')
+    const wallet = await db.selectFrom('wallet_accounts').select(['cash_available', 'cash_frozen', 'gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()
+    expect(wallet).toEqual({ cash_available: '0.00', cash_frozen: '0.00', gift_available: '0.00', gift_frozen: '0.00' })
+    const receipts = await db.selectFrom('payment_receipts').select([
+      'payment_receipts.source_bucket', 'payment_receipts.amount', 'payment_receipts.disposition',
+    ])
+      .innerJoin('payment_attempts', 'payment_attempts.id', 'payment_receipts.payment_attempt_id')
+      .where('payment_attempts.order_id', '=', orderId).execute()
+    expect(receipts.reduce((total, receipt) => total + Number(receipt.amount), 0)).toBe(100)
+    expect(receipts.every(receipt => receipt.disposition === 'on_time')).toBe(true)
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('processing')
+    expect(await db.selectFrom('wallet_operations').select('id').where('resolves_operation_id', '=', idem).execute())
+      .toHaveLength(1)
+    await expectWalletMatchesLedger(customer.id)
+  })
+
+  it('keeps combo funds frozen for an on-time receipt with an open R1 case, then resolves from an authenticated query', async () => {
+    const customer = await createCustomer()
+    await creditGiftFixture(customer, '3.00')
+    const orderId = await createOrder(customer, `R1组合核对冻结-${randomUUID().slice(0, 8)}`, { amount: '10.00' })
+    const created = await createPayment(orderId, customer, { walletAmount: '3.00' })
+    expect(created.statusCode).toBe(201)
+    const attemptId = created.json().data.attempt.id as string
+    const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+    const mismatch = fixture.setPaid(merchantNo)
+    mismatch.money = '6.00'
+    resignCallback(mismatch)
+    expect((await inject({ method: 'GET', url: callbackUrl(mismatch) })).body).toBe('success')
+
+    const attempt = await db.selectFrom('payment_attempts').select(['status', 'amount', 'wallet_hold_operation_id'])
+      .where('id', '=', attemptId).executeTakeFirstOrThrow()
+    const receipt = await db.selectFrom('payment_receipts').select(['amount', 'disposition'])
+      .where('payment_attempt_id', '=', attemptId).executeTakeFirstOrThrow()
+    const wallet = await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()
+    expect(attempt.status).toBe('reconciliation_required')
+    expect(attempt.amount).toBe('7.00')
+    expect(receipt).toEqual({ amount: '7.00', disposition: 'on_time' })
+    expect(wallet).toEqual({ gift_available: '0.00', gift_frozen: '3.00' })
+    expect(await db.selectFrom('wallet_operations').select('id').where('resolves_operation_id', '=', attempt.wallet_hold_operation_id!).execute())
+      .toHaveLength(0)
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('pending_payment')
+
+    await db.updateTable('payment_attempt_provider_state').set({ last_query_at: new Date(Date.now() - 11_000) })
+      .where('payment_attempt_id', '=', attemptId).execute()
+    const resolution = await inject({
+      method: 'POST', url: `/api/v1/admin/orders/${orderId}/payments/${attemptId}/reconcile`, headers: adminHeaders(),
+    })
+    expect(resolution.statusCode).toBe(200)
+    expect(resolution.json().data.state).toBe('resolved')
+    expect((await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow())).toEqual({ gift_available: '0.00', gift_frozen: '0.00' })
+    expect(await db.selectFrom('wallet_operations').select('id').where('resolves_operation_id', '=', attempt.wallet_hold_operation_id!).execute())
+      .toHaveLength(1)
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('processing')
+  })
+
+  it('releases combo funds after a definitive provider rejection and retains them for an unknown result', async () => {
+    const customer = await createCustomer()
+    await creditGiftFixture(customer, '4.00')
+    const rejectedOrder = await createOrder(customer, `__reject__combo-${randomUUID().slice(0, 8)}`, { amount: '10.00' })
+    const rejected = await createPayment(rejectedOrder, customer, { walletAmount: '4.00' })
+    expect(rejected.statusCode).toBe(201)
+    expect(rejected.json().data.attempt.status).toBe('failed')
+    expect((await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow())).toEqual({ gift_available: '4.00', gift_frozen: '0.00' })
+    const holdId = (await db.selectFrom('payment_attempts').select('wallet_hold_operation_id')
+      .where('order_id', '=', rejectedOrder).executeTakeFirstOrThrow()).wallet_hold_operation_id!
+    expect(await db.selectFrom('wallet_operations').select(['operation_type', 'resolves_operation_id'])
+      .where('resolves_operation_id', '=', holdId).execute()).toEqual([{ operation_type: 'order_payment_release', resolves_operation_id: holdId }])
+
+    const unknownOrder = await createOrder(customer, `__unknown__combo-${randomUUID().slice(0, 8)}`, { amount: '10.00' })
+    const unknownKey = randomUUID()
+    const unknown = await createPayment(unknownOrder, customer, { walletAmount: '4.00', idempotencyKey: unknownKey })
+    expect(unknown.statusCode).toBe(201)
+    expect(unknown.json().data.attempt.providerState).toBe('unknown')
+    expect(unknown.json().data.attempt.status).toBe('pending')
+    const retry = await createPayment(unknownOrder, customer, { walletAmount: '4.00', idempotencyKey: randomUUID() })
+    expect(retry.statusCode).toBe(200)
+    expect(retry.json().data.attempt.id).toBe(unknown.json().data.attempt.id)
+    expect((await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow())).toEqual({ gift_available: '0.00', gift_frozen: '4.00' })
+    const unknownHold = (await db.selectFrom('payment_attempts').select('wallet_hold_operation_id')
+      .where('order_id', '=', unknownOrder).executeTakeFirstOrThrow()).wallet_hold_operation_id!
+    expect(await db.selectFrom('wallet_operations').select('id').where('id', '=', unknownHold).execute()).toHaveLength(1)
+    expect(await db.selectFrom('payment_attempts').select('id').where('order_id', '=', unknownOrder).execute()).toHaveLength(1)
+  })
+
+  it('does not allow guests, insufficient balances, or disabled customers to create wallet payment plans', async () => {
+    const customer = await createCustomer()
+    const orderId = await createOrder(customer)
+    const insufficient = await createPayment(orderId, customer, { walletAmount: '5.00' })
+    expect(insufficient.statusCode).toBe(409)
+    expect(insufficient.json().error.code).toBe('WALLET_INSUFFICIENT_BALANCE')
+    expect(await db.selectFrom('payment_attempts').select('id').where('order_id', '=', orderId).execute()).toHaveLength(0)
+
+    const guest = await createGuestSession()
+    const guestOrderId = await createOrder(guest)
+    const guestPayment = await createPayment(guestOrderId, guest, { walletAmount: '5.00' })
+    expect(guestPayment.statusCode).toBe(403)
+    expect(guestPayment.json().error.code).toBe('WALLET_LOGIN_REQUIRED')
+
+    await creditGiftFixture(customer, '5.00')
+    const disabledOrder = await createOrder(customer, `钱包账户禁用-${randomUUID().slice(0, 8)}`)
+    await db.updateTable('customers').set({ status: 'disabled' }).where('id', '=', customer.id).execute()
+    const disabledPayment = await createPayment(disabledOrder, customer, { walletAmount: '5.00' })
+    expect([401, 403]).toContain(disabledPayment.statusCode)
+    expect(await db.selectFrom('payment_attempts').select('id').where('order_id', '=', disabledOrder).execute()).toHaveLength(0)
+    const account = await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()
+    expect(account).toEqual({ gift_available: '5.00', gift_frozen: '0.00' })
+  })
+
+  it('keeps an exact top-up receipt uncredited while R1 evidence is open, then credits once after admin query resolution', async () => {
+    await db.updateTable('storefront_customer_policy').set({ wallet_top_up_enabled: true, wallet_top_up_min_amount: '1.00', wallet_top_up_max_amount: '1000.00' })
+      .where('singleton', '=', true).execute()
+    const customer = await createCustomer()
+    const created = await createWalletTopUp(customer, { amount: '12.00' })
+    expect(created.response.statusCode).toBe(201)
+    const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', created.attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+    const callback = fixture.setPaid(merchantNo)
+    callback.money = '11.00'
+    resignCallback(callback)
+    expect((await inject({ method: 'GET', url: callbackUrl(callback) })).body).toBe('success')
+
+    const held = await db.selectFrom('payment_attempts').select('status').where('id', '=', created.attemptId).executeTakeFirstOrThrow()
+    const receipt = await db.selectFrom('payment_receipts').select(['amount', 'disposition'])
+      .where('payment_attempt_id', '=', created.attemptId).executeTakeFirstOrThrow()
+    const before = await db.selectFrom('wallet_accounts').select('cash_available')
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()
+    expect(held.status).toBe('reconciliation_required')
+    expect(receipt).toEqual({ amount: '12.00', disposition: 'on_time' })
+    expect(before.cash_available).toBe('0.00')
+    expect(await db.selectFrom('wallet_ledger_entries').select('id')
+      .where('payment_attempt_id', '=', created.attemptId).execute()).toHaveLength(0)
+    expect(await db.selectFrom('payment_provider_reconciliation_cases').select(['reason', 'state'])
+      .where('payment_attempt_id', '=', created.attemptId).execute())
+      .toEqual([{ reason: 'callback_query_mismatch', state: 'open' }])
+
+    await db.updateTable('payment_attempt_provider_state').set({ last_query_at: new Date(Date.now() - 11_000) })
+      .where('payment_attempt_id', '=', created.attemptId).execute()
+    const resolved = await inject({
+      method: 'POST',
+      url: `/api/v1/admin/wallets/${customer.id}/top-ups/${created.attemptId}/reconcile`,
+      headers: adminHeaders(),
+    })
+    expect(resolved.statusCode).toBe(200)
+    expect(resolved.json().data.state).toBe('resolved')
+    const after = await db.selectFrom('wallet_accounts').select('cash_available')
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()
+    expect(after.cash_available).toBe('12.00')
+    expect(await db.selectFrom('wallet_ledger_entries').select('id')
+      .where('payment_attempt_id', '=', created.attemptId).execute()).toHaveLength(1)
+    await expectWalletMatchesLedger(customer.id)
+  })
+
+  it('serializes a shared provider transaction across a top-up and combo attempt on two API instances', async () => {
+    await db.updateTable('storefront_customer_policy').set({ wallet_top_up_enabled: true, wallet_top_up_min_amount: '1.00', wallet_top_up_max_amount: '1000.00' })
+      .where('singleton', '=', true).execute()
+    const customer = await createCustomer()
+    await creditGiftFixture(customer, '2.00')
+    const orderId = await createOrder(customer, `跨支付类型交易号竞争-${randomUUID().slice(0, 8)}`, { amount: '10.00' })
+    const combo = await createPayment(orderId, customer, { walletAmount: '2.00' })
+    expect(combo.statusCode).toBe(201)
+    const comboAttemptId = combo.json().data.attempt.id as string
+    const topUp = await createWalletTopUp(customer, { amount: '3.00' })
+    expect(topUp.response.statusCode).toBe(201)
+    const attempts = await db.selectFrom('payment_attempts').select(['id', 'merchant_order_no'])
+      .where('id', 'in', [comboAttemptId, topUp.attemptId]).execute()
+    const transactionId = `SHARED-${randomUUID()}`
+    const callbacks = new Map<string, Record<string, string>>()
+    for (const attempt of attempts) {
+      const callback = fixture.setPaid(attempt.merchant_order_no!, { providerOrderId: transactionId })
+      callbacks.set(attempt.id, callback)
+    }
+
+    const comboCallback = callbacks.get(comboAttemptId)!
+    const topUpCallback = callbacks.get(topUp.attemptId)!
+    const [comboResponse, topUpResponse] = await Promise.all([
+      inject({ method: 'GET', url: callbackUrl(comboCallback) }),
+      fetch(`${api2BaseUrl}${callbackUrl(topUpCallback)}`),
+    ])
+    expect(comboResponse.statusCode).toBe(200)
+    expect(topUpResponse.status).toBe(200)
+    const receipts = await db.selectFrom('payment_receipts').select(['payment_attempt_id', 'amount'])
+      .where('provider_transaction_id', '=', transactionId).execute()
+    expect(receipts).toHaveLength(1)
+    const statuses = await db.selectFrom('payment_attempts').select(['id', 'status'])
+      .where('id', 'in', [comboAttemptId, topUp.attemptId]).execute()
+    expect(statuses.filter(attempt => attempt.status === 'succeeded')).toHaveLength(1)
+    expect(statuses.filter(attempt => attempt.status === 'reconciliation_required')).toHaveLength(1)
+    expect(await db.selectFrom('payment_provider_reconciliation_cases').select('reason')
+      .where('payment_attempt_id', 'in', [comboAttemptId, topUp.attemptId]).where('state', '=', 'open').execute())
+      .toEqual([{ reason: 'provider_transaction_conflict' }])
+    await expectWalletMatchesLedger(customer.id)
+  })
+
+  it('closes an expired combo order on late receipt and releases its held wallet funds exactly once', async () => {
+    const customer = await createCustomer()
+    await creditGiftFixture(customer, '2.00')
+    const orderId = await createOrder(customer, `组合付款迟到收款-${randomUUID().slice(0, 8)}`, { amount: '10.00', quantityStock: 1 })
+    const created = await createPayment(orderId, customer, { walletAmount: '2.00' })
+    expect(created.statusCode).toBe(201)
+    const attemptId = created.json().data.attempt.id as string
+    const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+    const callback = fixture.setPaid(merchantNo)
+
+    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
+    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_guard`.execute(db)
+    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_deadline_r1`.execute(db)
+    try {
+      await db.updateTable('orders').set({ unpaid_expires_at: new Date(Date.now() - 2_000) }).where('id', '=', orderId).execute()
+      await sql`UPDATE payment_attempts SET created_at = clock_timestamp() - interval '1 minute',
+        expires_at = clock_timestamp() - interval '2 seconds' WHERE id = ${attemptId}::uuid`.execute(db)
+    } finally {
+      await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_deadline_r1`.execute(db)
+      await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_guard`.execute(db)
+      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+    }
+
+    await expireDueUnpaidOrders(db)
+    const callbackResult = await inject({ method: 'GET', url: callbackUrl(callback) })
+    expect(callbackResult.statusCode).toBe(200)
+    expect((await db.selectFrom('payment_receipts').select('disposition')
+      .where('payment_attempt_id', '=', attemptId).executeTakeFirstOrThrow()).disposition).toBe('late')
+    expect((await db.selectFrom('payment_attempts').select('status')
+      .where('id', '=', attemptId).executeTakeFirstOrThrow()).status).toBe('late_succeeded')
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('pending_payment')
+    expect((await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow())).toEqual({ gift_available: '2.00', gift_frozen: '0.00' })
+    const holdId = (await db.selectFrom('payment_attempts').select('wallet_hold_operation_id')
+      .where('id', '=', attemptId).executeTakeFirstOrThrow()).wallet_hold_operation_id!
+    expect(await db.selectFrom('wallet_operations').select('id')
+      .where('operation_type', '=', 'order_payment_release').where('resolves_operation_id', '=', holdId).execute())
+      .toHaveLength(1)
+    await expectWalletMatchesLedger(customer.id)
+
+    await db.updateTable('payment_attempt_provider_state').set({ last_query_at: new Date(Date.now() - 11_000) })
+      .where('payment_attempt_id', '=', attemptId).execute()
+    const reconciled = await inject({
+      method: 'POST', url: `/api/v1/admin/orders/${orderId}/payments/${attemptId}/reconcile`, headers: adminHeaders(),
+    })
+    expect(reconciled.statusCode).toBe(200)
+    expect(reconciled.json().data.state).toBe('resolved')
+    expect(await expireDueUnpaidOrders(db)).toBe(0)
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('pending_payment')
+    const inventory = await db.selectFrom('product_variant_quantity_inventory as inventory')
+      .innerJoin('order_inventory_reservations as reservation', 'reservation.product_variant_id', 'inventory.product_variant_id')
+      .innerJoin('order_items as item', 'item.id', 'reservation.order_item_id')
+      .select('inventory.reserved').where('item.order_id', '=', orderId).executeTakeFirstOrThrow()
+    expect(inventory.reserved).toBe(1)
   })
 })
