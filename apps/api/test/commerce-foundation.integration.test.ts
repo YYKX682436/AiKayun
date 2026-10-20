@@ -965,7 +965,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
     const firstAttemptId = randomUUID()
     await db.insertInto('withdrawal_payout_attempts').values({
       id: firstAttemptId, withdrawal_id: withdrawalId, operation_id: randomUUID(),
-      started_by_admin_id: adminId, provider_reference: 'bank-transfer-1', completed_at: null,
+      started_by_admin_id: adminId, provider_reference: null, completed_at: null,
     }).execute()
     await db.updateTable('withdrawal_payout_attempts').set({ status: 'unknown' }).where('id', '=', firstAttemptId).execute()
     expect((await db.selectFrom('withdrawals').select('status').where('id', '=', withdrawalId).executeTakeFirstOrThrow()).status)
@@ -978,17 +978,33 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
       .where('id', '=', firstAttemptId).execute()).rejects.toMatchObject({ constraint: 'withdrawal_payout_result_requires_evidence' })
     expect((await db.selectFrom('withdrawal_payout_attempts').select('status')
       .where('id', '=', firstAttemptId).executeTakeFirstOrThrow()).status).toBe('unknown')
-    await db.updateTable('withdrawal_payout_attempts').set({
-      status: 'failed', resolved_by_admin_id: adminId, result_sha256: digest,
-    }).where('id', '=', firstAttemptId).execute()
+    await db.transaction().execute(async (trx) => {
+      await trx.insertInto('withdrawal_payout_results').values({
+        attempt_id: firstAttemptId, outcome: 'failed', resolved_by_admin_id: adminId,
+        provider_reference: null, actual_payout_amount: null, actual_payout_at: null,
+        confirmed_no_transfer: true, evidence_sha256: digest, evidence_summary: '核对确认未转账',
+        result_sha256: digest,
+      }).execute()
+      await trx.updateTable('withdrawal_payout_attempts').set({
+        status: 'failed', resolved_by_admin_id: adminId, result_sha256: digest,
+      }).where('id', '=', firstAttemptId).execute()
+    })
     const secondAttemptId = randomUUID()
     await db.insertInto('withdrawal_payout_attempts').values({
       id: secondAttemptId, withdrawal_id: withdrawalId, operation_id: randomUUID(),
-      started_by_admin_id: adminId, provider_reference: 'bank-transfer-3', completed_at: null,
+      started_by_admin_id: adminId, provider_reference: null, completed_at: null,
     }).execute()
-    await db.updateTable('withdrawal_payout_attempts').set({
-      status: 'succeeded', resolved_by_admin_id: adminId, result_sha256: digest,
-    }).where('id', '=', secondAttemptId).execute()
+    await db.transaction().execute(async (trx) => {
+      await trx.insertInto('withdrawal_payout_results').values({
+        attempt_id: secondAttemptId, outcome: 'succeeded', resolved_by_admin_id: adminId,
+        provider_reference: 'bank-transfer-3', actual_payout_amount: '55.00', actual_payout_at: new Date(),
+        confirmed_no_transfer: false, evidence_sha256: digest, evidence_summary: '打款凭证已核验',
+        result_sha256: digest,
+      }).execute()
+      await trx.updateTable('withdrawal_payout_attempts').set({
+        status: 'succeeded', resolved_by_admin_id: adminId, result_sha256: digest,
+      }).where('id', '=', secondAttemptId).execute()
+    })
     expect((await db.selectFrom('withdrawals').select('status').where('id', '=', withdrawalId).executeTakeFirstOrThrow()).status)
       .toBe('completed')
     expect(await db.selectFrom('wallet_accounts').select(['cash_available', 'cash_frozen'])
@@ -1234,6 +1250,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
       // Keep this frozen ④-6 upgrade/rollback regression anchored at the pre-payment
       // schema. The ④-7 migrations intentionally have no destructive down migration.
       const prePaymentMigrations = await new AppMigrationProvider().getMigrations()
+      delete prePaymentMigrations['202610210001_withdrawals']
       delete prePaymentMigrations['202610200002_online_payments']
       delete prePaymentMigrations['202610200003_payment_reconciliation']
       delete prePaymentMigrations['202610200004_wallet_payments']

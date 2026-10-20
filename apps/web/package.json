@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@aikayun/contracts": "workspace:*",
+    "@aikayun/money": "workspace:*",
     "@nuxt/ui": "4.11.3",
     "@tiptap/core": "3.32.0",
     "@tiptap/extension-blockquote": "3.32.0",

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { addSettlementAmounts, addUnitAmounts, allocateWalletOrderPayment, allocateWalletSpend, multiplyUnitAmount, parseUnitAmount, settleAmount } from '../src/index.ts'
+import { addSettlementAmounts, addUnitAmounts, allocateWalletOrderPayment, allocateWalletSpend, calculateWithdrawalFee, multiplyUnitAmount, normalizeWithdrawalPercent, parseUnitAmount, settleAmount } from '../src/index.ts'
 
 describe('decimal monetary helpers', () => {
   it('adds decimal strings without binary floating point drift', () => {
@@ -43,6 +43,19 @@ describe('decimal monetary helpers', () => {
     expect(() => settleAmount('-9999999999999999.995')).toThrow(RangeError)
     expect(addSettlementAmounts('9999999999999999.98', '0.01')).toBe('9999999999999999.99')
     expect(() => addSettlementAmounts('9999999999999999.99', '0.01')).toThrow(TypeError)
+  })
+
+  it('calculates withdrawal fees exactly and rounds the combined fee half up once', () => {
+    expect(calculateWithdrawalFee('100.00', '1.25', '0.75')).toEqual({
+      feeAmount: '2.00', payoutAmount: '98.00',
+    })
+    expect(calculateWithdrawalFee('0.03', '50', '0.00')).toEqual({
+      feeAmount: '0.02', payoutAmount: '0.01',
+    })
+    expect(normalizeWithdrawalPercent('2.5')).toBe('2.5000')
+    expect(() => calculateWithdrawalFee('10.00', '100', '0.00')).toThrow(RangeError)
+    expect(() => calculateWithdrawalFee('0.01', '0', '0.01')).toThrow(RangeError)
+    expect(() => normalizeWithdrawalPercent('100.0001')).toThrow(RangeError)
   })
 
   it('supports signed generic arithmetic without treating negative values as valid sale prices', () => {

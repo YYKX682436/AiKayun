@@ -19,6 +19,7 @@ import { onlinePaymentsMigration } from './migrations/202610200002_online_paymen
 import { paymentReconciliationMigration } from './migrations/202610200003_payment_reconciliation.js'
 import { walletPaymentsMigration } from './migrations/202610200004_wallet_payments.js'
 import { refundsMigration } from './migrations/202610200005_refunds.js'
+import { withdrawalsMigration } from './migrations/202610210001_withdrawals.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -43,6 +44,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610200003_payment_reconciliation': paymentReconciliationMigration,
       '202610200004_wallet_payments': walletPaymentsMigration,
       '202610200005_refunds': refundsMigration,
+      '202610210001_withdrawals': withdrawalsMigration,
     }
   }
 }

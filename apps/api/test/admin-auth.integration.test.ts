@@ -940,7 +940,8 @@ describe('Fastify API with PostgreSQL 18', () => {
       'product_variant_fulfillment', 'product_variant_inventory_adjustments', 'product_variant_option_values',
       'product_variant_quantity_inventory', 'product_variants', 'products',
       'storefront_customer_policy', 'wallet_accounts', 'wallet_ledger_entries', 'wallet_operations',
-      'withdrawal_payout_attempts', 'withdrawals',
+      'withdrawal_audit_events', 'withdrawal_payout_attempts', 'withdrawal_payout_results',
+      'withdrawal_private_files', 'withdrawal_settings_audit_events', 'withdrawals',
     ])
     const admin = await db.selectFrom('admin_users').select('email').where('email', '=', testEmail).executeTakeFirst()
     expect(admin?.email).toBe(testEmail)

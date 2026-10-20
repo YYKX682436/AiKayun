@@ -86,6 +86,12 @@ export interface StorefrontCustomerPolicyTable {
   wallet_top_up_enabled: Generated<boolean>
   wallet_top_up_min_amount: ColumnType<string, string | undefined, string>
   wallet_top_up_max_amount: ColumnType<string, string | undefined, string>
+  withdrawal_enabled: Generated<boolean>
+  withdrawal_min_amount: ColumnType<string, string | undefined, string>
+  withdrawal_max_amount: ColumnType<string, string | undefined, string>
+  withdrawal_fixed_fee: ColumnType<string, string | undefined, string>
+  withdrawal_percent_fee: ColumnType<string, string | undefined, string>
+  withdrawal_methods: ColumnType<WithdrawalPayoutMethod[], WithdrawalPayoutMethod[] | undefined, WithdrawalPayoutMethod[]>
   updated_at: Generated<Date>
 }
 
@@ -506,6 +512,7 @@ export interface WithdrawalsTable {
   status: Generated<WithdrawalStatus>
   reviewed_by_admin_id: string | null
   reviewed_at: Date | null
+  rejection_reason: string | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }
@@ -523,6 +530,57 @@ export interface WithdrawalPayoutAttemptsTable {
   provider_reference: string | null
   created_at: Generated<Date>
   completed_at: Date | null
+}
+
+export type WithdrawalPayoutMethod = 'alipay' | 'wechat' | 'bank_card'
+export type WithdrawalAuditActorType = 'customer' | 'admin' | 'system'
+
+export interface WithdrawalAuditEventsTable {
+  id: string
+  withdrawal_id: string
+  action: string
+  actor_type: WithdrawalAuditActorType
+  actor_customer_id: string | null
+  actor_admin_id: string | null
+  idempotency_key: string | null
+  request_sha256: string | null
+  previous_status: string | null
+  next_status: string | null
+  details: ColumnType<Record<string, unknown>, Record<string, unknown> | undefined, Record<string, unknown>>
+  created_at: Generated<Date>
+}
+
+export interface WithdrawalSettingsAuditEventsTable {
+  id: string
+  administrator_id: string
+  before_settings: ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>
+  after_settings: ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>
+  created_at: Generated<Date>
+}
+
+export interface WithdrawalPrivateFilesTable {
+  id: string
+  customer_id: string
+  withdrawal_id: string | null
+  mime_type: 'image/jpeg' | 'image/png' | 'image/webp'
+  size_bytes: number
+  sha256: string
+  content: Buffer
+  created_at: Generated<Date>
+}
+
+export interface WithdrawalPayoutResultsTable {
+  attempt_id: string
+  outcome: 'succeeded' | 'failed'
+  resolved_by_admin_id: string
+  provider_reference: string | null
+  actual_payout_amount: ColumnType<string | null, string | null, string | null>
+  actual_payout_at: Date | null
+  confirmed_no_transfer: boolean
+  evidence_sha256: string
+  evidence_summary: string
+  result_sha256: string
+  created_at: Generated<Date>
 }
 
 export type FulfillmentAttemptStatus = 'processing' | 'unknown' | 'succeeded' | 'failed'
@@ -727,6 +785,10 @@ export interface Database {
   wallet_ledger_entries: WalletLedgerEntriesTable
   withdrawals: WithdrawalsTable
   withdrawal_payout_attempts: WithdrawalPayoutAttemptsTable
+  withdrawal_audit_events: WithdrawalAuditEventsTable
+  withdrawal_settings_audit_events: WithdrawalSettingsAuditEventsTable
+  withdrawal_private_files: WithdrawalPrivateFilesTable
+  withdrawal_payout_results: WithdrawalPayoutResultsTable
   order_item_fulfillment_attempts: OrderItemFulfillmentAttemptsTable
   order_item_fulfillment_deliveries: OrderItemFulfillmentDeliveriesTable
   order_status_events: OrderStatusEventsTable

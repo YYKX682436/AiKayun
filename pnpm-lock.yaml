@@ -97,6 +97,9 @@ importers:
       '@aikayun/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@aikayun/money':
+        specifier: workspace:*
+        version: link:../../packages/money
       '@nuxt/ui':
         specifier: 4.11.3
         version: 4.11.3(92d9dae46a40f2d3c7e08ebf44fd53af)

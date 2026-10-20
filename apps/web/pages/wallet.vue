@@ -1,16 +1,20 @@
 <script setup lang="ts">
 import type {
   ApiSuccess,
+  CustomerWithdrawalPage,
   CustomerTopUpPage,
   CustomerWalletLedgerPage,
   CustomerWalletSummary,
   ExternalPaymentMethod,
+  WithdrawalPayoutMethod,
+  WithdrawalQrUpload,
 } from '@aikayun/contracts'
+import { calculateWithdrawalFee } from '@aikayun/money'
 import { CustomerApiError, useCustomerApi } from '~/composables/useCustomerApi'
 
 definePageMeta({ middleware: 'customer-auth' })
 useSeoMeta({ title: '我的钱包', description: '查看钱包余额、充值进度和不可变收支明细。', robots: 'noindex, nofollow' })
-useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
+if (import.meta.server) useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 
 type PublicPaymentChannel = { id: string; name: string; paymentMethods: ExternalPaymentMethod[] }
 type PublicPaymentChannelList = { items: PublicPaymentChannel[] }
@@ -20,7 +24,22 @@ const customerId = computed(() => customerApi.session.value?.customer.id ?? 'unk
 const identity = computed(() => `${customerId.value}-${customerApi.identityVersion.value}`)
 const ledgerPage = ref(1)
 const topUpPage = ref(1)
+const withdrawalPageNumber = ref(1)
 const amountInput = ref('')
+const withdrawalAmountInput = ref('')
+const withdrawalMethod = ref<WithdrawalPayoutMethod>('alipay')
+const withdrawalAccount = ref('')
+const withdrawalAccountName = ref('')
+const withdrawalRecipientName = ref('')
+const withdrawalBankName = ref('')
+const withdrawalCardNumber = ref('')
+const withdrawalQrFileId = ref('')
+const withdrawalQrBusy = ref(false)
+const withdrawalBusy = ref(false)
+const withdrawalCancelBusyId = ref('')
+const withdrawalError = ref('')
+const withdrawalMessage = ref('')
+const withdrawalConfirmed = ref(false)
 const selectedChannelId = ref('')
 const selectedPaymentMethod = ref<ExternalPaymentMethod>('alipay')
 const topUpBusy = ref(false)
@@ -48,6 +67,10 @@ const { data: topUpsResponse, error: topUpsError, pending: topUpsPending, refres
   '/api/v1/customer/wallet/top-ups',
   { key: computed(() => `customer-wallet-topups-${identity.value}-${topUpPage.value}`), query: { page: topUpPage, pageSize: 10 } },
 )
+const { data: withdrawalsResponse, error: withdrawalsError, pending: withdrawalsPending, refresh: refreshWithdrawals } = await useFetch<ApiSuccess<CustomerWithdrawalPage>>(
+  '/api/v1/customer/wallet/withdrawals',
+  { key: computed(() => `customer-wallet-withdrawals-${identity.value}-${withdrawalPageNumber.value}`), query: { page: withdrawalPageNumber, pageSize: 10 } },
+)
 const { data: channelsResponse } = await useFetch<ApiSuccess<PublicPaymentChannelList>>(
   '/api/v1/public/payment-channels',
   { key: 'wallet-public-payment-channels' },
@@ -56,12 +79,40 @@ const { data: channelsResponse } = await useFetch<ApiSuccess<PublicPaymentChanne
 const wallet = computed(() => walletResponse.value?.data ?? null)
 const ledger = computed(() => ledgerResponse.value?.data ?? null)
 const topUps = computed(() => topUpsResponse.value?.data ?? null)
+const withdrawals = computed(() => withdrawalsResponse.value?.data ?? null)
+const withdrawalPolicy = computed(() => withdrawals.value?.policy ?? null)
 const channels = computed(() => channelsResponse.value?.data.items ?? [])
 const selectedChannel = computed(() => channels.value.find(channel => channel.id === selectedChannelId.value) ?? null)
-const loading = computed(() => walletPending.value || ledgerPending.value || topUpsPending.value)
-const hasPageError = computed(() => walletError.value || ledgerError.value || topUpsError.value)
+const loading = computed(() => walletPending.value || ledgerPending.value || topUpsPending.value || withdrawalsPending.value)
+const hasPageError = computed(() => walletError.value || ledgerError.value || topUpsError.value || withdrawalsError.value)
 const latestActiveTopUp = computed(() => topUps.value?.items.find(item => ['created', 'pending', 'reconciliation_required'].includes(item.status)) ?? null)
 const activeQrAction = computed(() => latestActiveTopUp.value?.action?.type === 'qr_code' ? latestActiveTopUp.value.action.value : '')
+const availableWithdrawalMethods = computed(() => withdrawalPolicy.value?.methods ?? [])
+const withdrawalAmountValid = computed(() => {
+  const value = withdrawalAmountInput.value.trim()
+  if (!/^\d{1,16}(?:\.\d{1,2})?$/u.test(value) || !withdrawalPolicy.value || !wallet.value) return false
+  const amount = toCents(value)
+  return amount > 0n && amount >= toCents(withdrawalPolicy.value.minAmount)
+    && amount <= toCents(withdrawalPolicy.value.maxAmount) && amount <= toCents(wallet.value.cashAvailable)
+})
+const withdrawalEstimate = computed(() => {
+  const value = withdrawalAmountInput.value.trim()
+  if (!withdrawalAmountValid.value || !withdrawalPolicy.value) return null
+  try {
+    const amount = value.includes('.') ? value.padEnd(value.indexOf('.') + 3, '0') : `${value}.00`
+    return calculateWithdrawalFee(amount, withdrawalPolicy.value.percentFee, withdrawalPolicy.value.fixedFee)
+  } catch {
+    return null
+  }
+})
+const recipientValid = computed(() => withdrawalMethod.value === 'bank_card'
+  ? /^\d{12,19}$/u.test(withdrawalCardNumber.value)
+    && Boolean(withdrawalRecipientName.value.trim()) && Boolean(withdrawalBankName.value.trim())
+  : Boolean(withdrawalAccount.value.trim() || withdrawalQrFileId.value))
+const canCreateWithdrawal = computed(() => Boolean(withdrawalPolicy.value?.enabled
+  && availableWithdrawalMethods.value.includes(withdrawalMethod.value)
+  && withdrawalAmountValid.value && withdrawalEstimate.value && recipientValid.value
+  && withdrawalConfirmed.value && !withdrawalBusy.value && !withdrawalQrBusy.value))
 
 function toCents(value: string): bigint {
   const normalized = value.includes('.') ? value.padEnd(value.indexOf('.') + 3, '0') : `${value}.00`
@@ -178,10 +229,157 @@ async function refreshTopUp(id: string) {
   }
 }
 
+function withdrawalStatusLabel(status: CustomerWithdrawalPage['items'][number]['status']): string {
+  const labels: Record<CustomerWithdrawalPage['items'][number]['status'], string> = {
+    pending_review: '待审核', pending_transfer: '待打款', transfer_processing: '打款处理中',
+    transfer_uncertain: '结果未知 · 资金继续冻结', completed: '已完成', rejected: '已拒绝', cancelled: '已取消',
+  }
+  return labels[status]
+}
+
+function withdrawalMethodLabel(method: WithdrawalPayoutMethod): string {
+  return method === 'alipay' ? '支付宝' : method === 'wechat' ? '微信' : '银行卡'
+}
+
+async function withdrawalBodyFingerprint(): Promise<string> {
+  const amount = withdrawalAmountInput.value.includes('.')
+    ? withdrawalAmountInput.value.trim().padEnd(withdrawalAmountInput.value.trim().indexOf('.') + 3, '0')
+    : `${withdrawalAmountInput.value.trim()}.00`
+  const recipient = withdrawalMethod.value === 'bank_card'
+    ? { recipientName: withdrawalRecipientName.value.trim(), bankName: withdrawalBankName.value.trim(), cardNumber: withdrawalCardNumber.value.trim() }
+    : { account: withdrawalAccount.value.trim(), accountName: withdrawalAccountName.value.trim(), qrFileId: withdrawalQrFileId.value || null }
+  const bytes = new TextEncoder().encode(JSON.stringify({ amount, payoutMethod: withdrawalMethod.value, recipient }))
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function withdrawalIdempotencyStorageKey(customerIdentity: string, fingerprint: string): string {
+  return `aikayun-wallet-withdrawal-v1:${customerIdentity}:${fingerprint}`
+}
+
+async function getWithdrawalIdempotencyKey(fingerprint: string): Promise<string> {
+  if (!import.meta.client) throw new Error('请在浏览器中提交提现申请。')
+  const keyName = withdrawalIdempotencyStorageKey(identity.value, fingerprint)
+  try {
+    const saved = sessionStorage.getItem(keyName)
+    if (saved && /^[0-9a-f-]{36}$/iu.test(saved)) return saved
+    const key = crypto.randomUUID()
+    sessionStorage.setItem(keyName, key)
+    return key
+  } catch {
+    throw new Error('浏览器无法安全保存提现重试标识，请启用会话存储后重试。')
+  }
+}
+
+function withdrawalActionKey(id: string, action: string): string {
+  const keyName = `aikayun-wallet-withdrawal-action-v1:${identity.value}:${id}:${action}`
+  try {
+    const saved = sessionStorage.getItem(keyName)
+    if (saved && /^[0-9a-f-]{36}$/iu.test(saved)) return saved
+    const key = crypto.randomUUID()
+    sessionStorage.setItem(keyName, key)
+    return key
+  } catch {
+    return crypto.randomUUID()
+  }
+}
+
+async function uploadWithdrawalQr(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  withdrawalError.value = ''
+  withdrawalMessage.value = ''
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 5 * 1024 * 1024) {
+    withdrawalError.value = '收款二维码只支持不超过 5MB 的 JPEG、PNG 或 WebP 图片。'
+    input.value = ''
+    return
+  }
+  withdrawalQrBusy.value = true
+  try {
+    const form = new FormData()
+    form.append('file', file, file.name)
+    const uploaded = await customerApi.request<WithdrawalQrUpload>('/api/v1/customer/wallet/withdrawal-qr', {
+      method: 'POST', body: form,
+    })
+    withdrawalQrFileId.value = uploaded.id
+    withdrawalMessage.value = '收款二维码已安全保存，仅你和授权管理员可读取。'
+  } catch (error) {
+    withdrawalError.value = error instanceof Error ? error.message : '二维码上传失败，请稍后重试。'
+    input.value = ''
+  } finally {
+    withdrawalQrBusy.value = false
+  }
+}
+
+async function createWithdrawal() {
+  if (!canCreateWithdrawal.value) return
+  withdrawalBusy.value = true
+  withdrawalError.value = ''
+  withdrawalMessage.value = ''
+  const identityAtStart = identity.value
+  try {
+    const fingerprint = await withdrawalBodyFingerprint()
+    const amount = withdrawalAmountInput.value.trim().includes('.')
+      ? withdrawalAmountInput.value.trim().padEnd(withdrawalAmountInput.value.trim().indexOf('.') + 3, '0')
+      : `${withdrawalAmountInput.value.trim()}.00`
+    const recipient = withdrawalMethod.value === 'bank_card'
+      ? { recipientName: withdrawalRecipientName.value.trim(), bankName: withdrawalBankName.value.trim(), cardNumber: withdrawalCardNumber.value.trim() }
+      : {
+          account: withdrawalAccount.value.trim() || undefined,
+          accountName: withdrawalAccountName.value.trim() || undefined,
+          qrFileId: withdrawalQrFileId.value || undefined,
+        }
+    const result = await customerApi.request<{ repeated: boolean; withdrawal: CustomerWithdrawalPage['items'][number] }>(
+      '/api/v1/customer/wallet/withdrawals',
+      { method: 'POST', body: { idempotencyKey: await getWithdrawalIdempotencyKey(fingerprint), amount, payoutMethod: withdrawalMethod.value, recipient } },
+    )
+    try { sessionStorage.removeItem(withdrawalIdempotencyStorageKey(identityAtStart, fingerprint)) } catch { /* The server remains authoritative if session storage is unavailable after success. */ }
+    if (identityAtStart !== identity.value) return
+    withdrawalMessage.value = result.repeated ? '已恢复这笔提现申请，未重复冻结余额。' : '提现申请已提交，完整金额已由服务端冻结。'
+    withdrawalAmountInput.value = ''
+    withdrawalAccount.value = ''
+    withdrawalAccountName.value = ''
+    withdrawalRecipientName.value = ''
+    withdrawalBankName.value = ''
+    withdrawalCardNumber.value = ''
+    withdrawalQrFileId.value = ''
+    withdrawalConfirmed.value = false
+    await Promise.all([refreshWithdrawals(), refreshWallet(), refreshLedger()])
+  } catch (error) {
+    if (identityAtStart !== identity.value) return
+    withdrawalError.value = error instanceof Error ? error.message : '申请结果尚未确认，请刷新提现记录后恢复。'
+  } finally {
+    withdrawalBusy.value = false
+  }
+}
+
+async function cancelWithdrawal(id: string) {
+  if (withdrawalCancelBusyId.value) return
+  withdrawalCancelBusyId.value = id
+  withdrawalError.value = ''
+  withdrawalMessage.value = ''
+  try {
+    const result = await customerApi.request<{ repeated: boolean }>(`/api/v1/customer/wallet/withdrawals/${id}/cancel`, {
+      method: 'POST', body: { idempotencyKey: withdrawalActionKey(id, 'cancel') },
+    })
+    withdrawalMessage.value = result.repeated ? '已恢复取消结果。' : '提现申请已取消，冻结现金已解冻。'
+    await Promise.all([refreshWithdrawals(), refreshWallet(), refreshLedger()])
+  } catch (error) {
+    withdrawalError.value = error instanceof Error ? error.message : '取消结果尚未确认，请刷新提现记录。'
+  } finally {
+    withdrawalCancelBusyId.value = ''
+  }
+}
+
 watch(channels, (items) => {
   if (!items.some(channel => channel.id === selectedChannelId.value)) selectedChannelId.value = items[0]?.id ?? ''
   const methods = selectedChannel.value?.paymentMethods ?? []
   if (!methods.includes(selectedPaymentMethod.value) && methods[0]) selectedPaymentMethod.value = methods[0]
+}, { immediate: true })
+
+watch(availableWithdrawalMethods, (items) => {
+  if (!items.includes(withdrawalMethod.value) && items[0]) withdrawalMethod.value = items[0]
 }, { immediate: true })
 
 watch(activeQrAction, async (value) => {
@@ -329,6 +527,396 @@ watch(activeQrAction, async (value) => {
               ¥{{ wallet.totalAvailable }}
             </p>
           </UCard>
+        </section>
+
+        <section
+          class="mt-6 grid gap-6 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]"
+          aria-labelledby="withdrawals-title"
+        >
+          <UCard>
+            <template #header>
+              <div>
+                <h2
+                  id="withdrawals-title"
+                  class="text-lg font-semibold text-highlighted"
+                >
+                  申请提现
+                </h2>
+                <p class="mt-1 text-sm leading-6 text-muted">
+                  仅可使用现金余额。提交后会冻结提现全额，手续费和预计到账金额以服务端复核为准。
+                </p>
+              </div>
+            </template>
+
+            <UAlert
+              v-if="!withdrawalPolicy?.enabled"
+              color="neutral"
+              variant="soft"
+              icon="i-lucide-lock-keyhole"
+              title="商家暂未开放提现。"
+              description="已提交的历史申请仍可在右侧查看进度。"
+            />
+            <form
+              v-else
+              class="grid gap-4"
+              :aria-busy="withdrawalBusy || withdrawalQrBusy"
+              @submit.prevent="createWithdrawal"
+            >
+              <div class="grid gap-3 sm:grid-cols-2">
+                <UFormField
+                  label="提现金额"
+                  name="withdrawalAmount"
+                  :description="`单次 ¥${withdrawalPolicy.minAmount} 至 ¥${withdrawalPolicy.maxAmount}；可提现现金 ¥${wallet.cashAvailable}。`"
+                >
+                  <UInput
+                    v-model="withdrawalAmountInput"
+                    type="text"
+                    inputmode="decimal"
+                    autocomplete="off"
+                    placeholder="例如 100.00"
+                    class="w-full"
+                    :aria-invalid="withdrawalAmountInput.length > 0 && !withdrawalAmountValid"
+                  />
+                </UFormField>
+                <UFormField
+                  label="收款方式"
+                  name="withdrawalMethod"
+                >
+                  <USelect
+                    v-model="withdrawalMethod"
+                    :items="availableWithdrawalMethods.map(method => ({ label: withdrawalMethodLabel(method), value: method }))"
+                    class="w-full"
+                  />
+                </UFormField>
+              </div>
+
+              <fieldset
+                v-if="withdrawalMethod === 'bank_card'"
+                class="grid gap-3 rounded-xl border border-default p-3 sm:grid-cols-2"
+              >
+                <legend class="px-1 text-sm font-medium text-highlighted">
+                  银行卡收款信息
+                </legend>
+                <UFormField
+                  label="收款人姓名"
+                  name="withdrawalRecipientName"
+                >
+                  <UInput
+                    v-model="withdrawalRecipientName"
+                    autocomplete="name"
+                    class="w-full"
+                  />
+                </UFormField>
+                <UFormField
+                  label="开户银行"
+                  name="withdrawalBankName"
+                >
+                  <UInput
+                    v-model="withdrawalBankName"
+                    autocomplete="organization"
+                    class="w-full"
+                  />
+                </UFormField>
+                <UFormField
+                  label="银行卡号"
+                  name="withdrawalCardNumber"
+                  class="sm:col-span-2"
+                >
+                  <UInput
+                    v-model="withdrawalCardNumber"
+                    type="text"
+                    inputmode="numeric"
+                    autocomplete="off"
+                    class="w-full"
+                    aria-describedby="withdrawal-card-privacy"
+                  />
+                  <template #hint>
+                    <span id="withdrawal-card-privacy">仅你和授权管理员可查看，后台默认脱敏展示。</span>
+                  </template>
+                </UFormField>
+              </fieldset>
+
+              <fieldset
+                v-else
+                class="grid gap-3 rounded-xl border border-default p-3 sm:grid-cols-2"
+              >
+                <legend class="px-1 text-sm font-medium text-highlighted">
+                  {{ withdrawalMethodLabel(withdrawalMethod) }}收款信息
+                </legend>
+                <UFormField
+                  label="收款账号（可选）"
+                  name="withdrawalAccount"
+                >
+                  <UInput
+                    v-model="withdrawalAccount"
+                    autocomplete="off"
+                    class="w-full"
+                  />
+                </UFormField>
+                <UFormField
+                  label="收款人姓名（可选）"
+                  name="withdrawalAccountName"
+                >
+                  <UInput
+                    v-model="withdrawalAccountName"
+                    autocomplete="name"
+                    class="w-full"
+                  />
+                </UFormField>
+                <UFormField
+                  label="收款二维码（可选）"
+                  name="withdrawalQr"
+                  class="sm:col-span-2"
+                >
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    aria-label="上传收款二维码"
+                    class="block min-h-11 w-full rounded-lg border border-default bg-default px-3 py-2 text-sm text-default file:mr-3 file:min-h-8 file:rounded-md file:border-0 file:bg-muted file:px-3 file:font-medium file:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                    :disabled="withdrawalQrBusy || withdrawalBusy"
+                    @change="uploadWithdrawalQr"
+                  >
+                  <template #hint>
+                    <span>JPEG、PNG 或 WebP，最大 5MB。图片保存在私有存储中，不会生成公开地址。</span>
+                  </template>
+                </UFormField>
+                <figure
+                  v-if="withdrawalQrFileId"
+                  class="flex items-center gap-3 rounded-lg bg-muted p-3 sm:col-span-2"
+                >
+                  <img
+                    :src="`/api/v1/customer/wallet/withdrawal-qr/${withdrawalQrFileId}`"
+                    alt="已上传的私有收款二维码"
+                    width="96"
+                    height="96"
+                    class="size-24 rounded-md border border-default bg-white object-contain"
+                  >
+                  <figcaption class="text-sm text-muted">
+                    二维码已安全上传，提交申请后会与收款信息一起固定保存。
+                  </figcaption>
+                </figure>
+              </fieldset>
+
+              <div class="grid gap-2 rounded-xl bg-muted p-4 sm:grid-cols-3">
+                <div>
+                  <p class="text-xs text-muted">
+                    冻结现金金额
+                  </p>
+                  <p class="mt-1 font-semibold tabular-nums text-highlighted">
+                    ¥{{ withdrawalAmountValid ? withdrawalAmountInput : '0.00' }}
+                  </p>
+                </div>
+                <div>
+                  <p class="text-xs text-muted">
+                    预计手续费
+                  </p>
+                  <p class="mt-1 font-semibold tabular-nums text-highlighted">
+                    ¥{{ withdrawalEstimate?.feeAmount ?? '—' }}
+                  </p>
+                  <p class="mt-1 text-xs text-muted">
+                    {{ withdrawalPolicy.percentFee }}% + ¥{{ withdrawalPolicy.fixedFee }}
+                  </p>
+                </div>
+                <div>
+                  <p class="text-xs text-muted">
+                    预计到账
+                  </p>
+                  <p class="mt-1 font-semibold tabular-nums text-primary">
+                    ¥{{ withdrawalEstimate?.payoutAmount ?? '—' }}
+                  </p>
+                </div>
+              </div>
+
+              <label class="flex min-h-11 items-start gap-3 rounded-lg focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary">
+                <input
+                  v-model="withdrawalConfirmed"
+                  type="checkbox"
+                  class="mt-1 size-4 shrink-0 accent-primary"
+                >
+                <span class="text-sm leading-6 text-muted">我确认收款信息正确，并了解申请提交后将冻结全部提现金额，审核拒绝或允许取消时才会解冻。</span>
+              </label>
+
+              <UAlert
+                v-if="withdrawalError"
+                color="error"
+                variant="soft"
+                :title="withdrawalError"
+                role="alert"
+                aria-live="assertive"
+              />
+              <UAlert
+                v-if="withdrawalMessage"
+                color="success"
+                variant="soft"
+                :title="withdrawalMessage"
+                role="status"
+                aria-live="polite"
+              />
+              <UButton
+                type="submit"
+                color="primary"
+                icon="i-lucide-banknote-arrow-up"
+                class="min-h-11 w-full sm:w-fit"
+                :loading="withdrawalBusy || withdrawalQrBusy"
+                :disabled="!canCreateWithdrawal"
+              >
+                提交提现申请
+              </UButton>
+            </form>
+          </UCard>
+
+          <div class="min-w-0">
+            <div class="flex flex-wrap items-end justify-between gap-3">
+              <div>
+                <h2 class="text-lg font-semibold text-highlighted">
+                  提现记录
+                </h2>
+                <p class="mt-1 text-sm text-muted">
+                  申请进度由服务端记录；打款开始后不能直接取消。
+                </p>
+              </div>
+              <UButton
+                color="neutral"
+                variant="outline"
+                icon="i-lucide-refresh-cw"
+                class="min-h-11"
+                :loading="withdrawalsPending"
+                @click="refreshWithdrawals()"
+              >
+                刷新记录
+              </UButton>
+            </div>
+            <div
+              v-if="withdrawals?.items.length"
+              class="mt-4 grid gap-3"
+            >
+              <UCard
+                v-for="item in withdrawals.items"
+                :key="item.id"
+                class="min-w-0"
+              >
+                <div class="flex flex-wrap items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <p class="font-semibold tabular-nums text-highlighted">
+                      ¥{{ item.amount }} <span class="text-xs font-normal text-muted">申请金额</span>
+                    </p>
+                    <p class="mt-1 text-sm text-muted">
+                      {{ withdrawalMethodLabel(item.payoutMethod) }} · {{ formatDate(item.createdAt) }}
+                    </p>
+                  </div>
+                  <UBadge
+                    :color="item.status === 'completed' ? 'success' : item.status === 'rejected' || item.status === 'cancelled' ? 'neutral' : item.status === 'transfer_uncertain' ? 'warning' : 'primary'"
+                    variant="soft"
+                  >
+                    {{ withdrawalStatusLabel(item.status) }}
+                  </UBadge>
+                </div>
+                <dl class="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-3">
+                  <div>
+                    <dt class="text-muted">
+                      手续费
+                    </dt><dd class="mt-0.5 font-medium tabular-nums text-highlighted">
+                      ¥{{ item.feeAmount }}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt class="text-muted">
+                      预计到账
+                    </dt><dd class="mt-0.5 font-medium tabular-nums text-highlighted">
+                      ¥{{ item.payoutAmount }}
+                    </dd>
+                  </div>
+                  <div v-if="item.reviewedAt">
+                    <dt class="text-muted">
+                      审核时间
+                    </dt><dd class="mt-0.5 text-highlighted">
+                      {{ formatDate(item.reviewedAt) }}
+                    </dd>
+                  </div>
+                </dl>
+                <p
+                  v-if="item.rejectionReason"
+                  class="mt-3 rounded-lg bg-error/5 px-3 py-2 text-sm text-error"
+                >
+                  拒绝原因：{{ item.rejectionReason }}
+                </p>
+                <p
+                  v-if="item.status === 'transfer_uncertain'"
+                  class="mt-3 rounded-lg bg-warning/10 px-3 py-2 text-sm leading-5 text-warning"
+                >
+                  打款结果仍在核对，资金继续冻结。请等待商家确认，不要重复提交提现。
+                </p>
+                <div
+                  v-if="item.payoutAttempts.length"
+                  class="mt-3 border-t border-default pt-3"
+                >
+                  <p class="text-xs font-medium text-muted">
+                    人工打款记录
+                  </p>
+                  <ul class="mt-2 grid gap-2">
+                    <li
+                      v-for="attempt in item.payoutAttempts"
+                      :key="attempt.id"
+                      class="flex flex-wrap items-center justify-between gap-2 text-xs"
+                    >
+                      <span class="text-muted">操作 {{ attempt.operationId.slice(0, 8) }} · {{ formatDate(attempt.createdAt) }}</span>
+                      <span class="font-medium text-highlighted">{{ attempt.status === 'started' ? '处理中' : attempt.status === 'unknown' ? '结果未知' : attempt.status === 'succeeded' ? '已确认成功' : '确认未转账' }}</span>
+                    </li>
+                  </ul>
+                </div>
+                <div
+                  v-if="['pending_review', 'pending_transfer'].includes(item.status)"
+                  class="mt-3 flex justify-end"
+                >
+                  <UButton
+                    color="neutral"
+                    variant="outline"
+                    size="sm"
+                    class="min-h-11"
+                    :loading="withdrawalCancelBusyId === item.id"
+                    :disabled="Boolean(withdrawalCancelBusyId)"
+                    @click="cancelWithdrawal(item.id)"
+                  >
+                    取消申请并解冻
+                  </UButton>
+                </div>
+              </UCard>
+            </div>
+            <UCard
+              v-else
+              class="mt-4"
+            >
+              <p class="text-sm text-muted">
+                暂无提现记录。申请提交后会显示冻结、审核及打款进度。
+              </p>
+            </UCard>
+            <div
+              v-if="withdrawals && withdrawals.totalPages > 1"
+              class="mt-4 flex flex-wrap items-center justify-between gap-3"
+            >
+              <p class="text-sm text-muted">
+                第 {{ withdrawals.page }} / {{ withdrawals.totalPages }} 页 · 共 {{ withdrawals.total }} 笔
+              </p>
+              <div class="flex gap-2">
+                <UButton
+                  color="neutral"
+                  variant="outline"
+                  :disabled="withdrawalsPending || withdrawalPageNumber <= 1"
+                  @click="withdrawalPageNumber--"
+                >
+                  上一页
+                </UButton>
+                <UButton
+                  color="neutral"
+                  variant="outline"
+                  :disabled="withdrawalsPending || withdrawalPageNumber >= withdrawals.totalPages"
+                  @click="withdrawalPageNumber++"
+                >
+                  下一页
+                </UButton>
+              </div>
+            </div>
+          </div>
         </section>
 
         <section class="mt-6 grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,0.8fr)]">

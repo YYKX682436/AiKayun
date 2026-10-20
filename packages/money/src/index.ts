@@ -13,6 +13,7 @@ const unitAmountPattern = /^-?(?:0|[1-9]\d{0,12})(?:\.\d{1,5})?$/
 const intermediateAmountPattern = /^-?(?:0|[1-9]\d{0,28})(?:\.\d{1,5})?$/
 const maxSettledIntegerDigits = 16
 const walletAmountPattern = /^(?:0|[1-9]\d{0,15})(?:\.\d{1,2})?$/
+const percentagePattern = /^(?:0|[1-9]\d{0,2})(?:\.\d{1,4})?$/
 
 function parseWalletAmount(value: string): Decimal {
   if (!walletAmountPattern.test(value)) {
@@ -66,6 +67,37 @@ export function settleAmount(value: string): string {
     throw new RangeError('Settlement amount exceeds NUMERIC(18,2)')
   }
   return rounded.toFixed(2)
+}
+
+export function normalizeWithdrawalPercent(value: string): string {
+  if (!percentagePattern.test(value)) {
+    throw new TypeError('Withdrawal percentage must be a non-negative decimal string with at most 4 fractional digits')
+  }
+  const percentage = new ExactDecimal(value)
+  if (percentage.gt(100)) throw new RangeError('Withdrawal percentage may not exceed 100 percent')
+  return percentage.toFixed(4)
+}
+
+/** Calculates a withdrawal fee as amount * percentage / 100 + fixed fee.
+ * The calculation stays in Decimal until the final half-up cent settlement.
+ */
+export function calculateWithdrawalFee(
+  amount: string,
+  percentage: string,
+  fixedFee: string,
+): { feeAmount: string; payoutAmount: string } {
+  const base = parseWalletAmount(amount)
+  const fixed = parseWalletAmount(fixedFee)
+  const rate = new ExactDecimal(normalizeWithdrawalPercent(percentage))
+  if (base.lte(0)) throw new RangeError('Withdrawal amount must be greater than zero')
+
+  const fee = base.times(rate).div(100).plus(fixed).toDecimalPlaces(2, Decimal.ROUND_HALF_UP)
+  if (fee.gte(base)) throw new RangeError('Withdrawal fee must be less than the withdrawal amount')
+  const feeAmount = fee.toFixed(2)
+  const payoutAmount = base.minus(fee).toFixed(2)
+  parseWalletAmount(feeAmount)
+  parseWalletAmount(payoutAmount)
+  return { feeAmount, payoutAmount }
 }
 
 /** Adds two already-settled non-negative amounts within NUMERIC(18,2). */

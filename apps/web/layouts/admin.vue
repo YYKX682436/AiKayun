@@ -33,6 +33,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     to: '/admin/wallets',
   },
   {
+    label: '提现管理',
+    icon: 'i-lucide-banknote-arrow-up',
+    to: '/admin/withdrawals',
+  },
+  {
     label: '顾客设置',
     icon: 'i-lucide-user-round-cog',
     to: '/admin/storefront/customer-policy',

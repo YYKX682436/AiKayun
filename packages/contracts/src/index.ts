@@ -1149,6 +1149,246 @@ export const CreateWalletTopUpBodySchema = Type.Object({
   channelId: Type.String({ format: 'uuid' }),
   paymentMethod: ExternalPaymentMethodSchema,
 }, { additionalProperties: false })
+
+export const WithdrawalPayoutMethodSchema = Type.Union([
+  Type.Literal('alipay'), Type.Literal('wechat'), Type.Literal('bank_card'),
+])
+export const WithdrawalStatusSchema = Type.Union([
+  Type.Literal('pending_review'), Type.Literal('pending_transfer'), Type.Literal('transfer_processing'),
+  Type.Literal('transfer_uncertain'), Type.Literal('completed'), Type.Literal('rejected'), Type.Literal('cancelled'),
+])
+export const WithdrawalPayoutAttemptStatusSchema = Type.Union([
+  Type.Literal('started'), Type.Literal('unknown'), Type.Literal('succeeded'), Type.Literal('failed'),
+])
+export const WithdrawalAmountInputSchema = Type.String({ pattern: '^(?:0|[1-9]\\d{0,15})(?:\\.\\d{1,2})?$' })
+export const WithdrawalPercentInputSchema = Type.String({ pattern: '^(?:0|[1-9]\\d{0,2})(?:\\.\\d{1,4})?$' })
+export const WithdrawalSettingsSchema = Type.Object({
+  enabled: Type.Boolean(),
+  minAmount: SettlementAmountSchema,
+  maxAmount: SettlementAmountSchema,
+  fixedFee: SettlementAmountSchema,
+  percentFee: WithdrawalPercentInputSchema,
+  methods: Type.Array(WithdrawalPayoutMethodSchema, { uniqueItems: true }),
+  updatedAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const UpdateWithdrawalSettingsBodySchema = Type.Object({
+  enabled: Type.Boolean(),
+  minAmount: WithdrawalAmountInputSchema,
+  maxAmount: WithdrawalAmountInputSchema,
+  fixedFee: WithdrawalAmountInputSchema,
+  percentFee: WithdrawalPercentInputSchema,
+  methods: Type.Array(WithdrawalPayoutMethodSchema, { uniqueItems: true }),
+}, { additionalProperties: false })
+export const CustomerWithdrawalPolicySchema = Type.Object({
+  enabled: Type.Boolean(),
+  minAmount: SettlementAmountSchema,
+  maxAmount: SettlementAmountSchema,
+  fixedFee: SettlementAmountSchema,
+  percentFee: WithdrawalPercentInputSchema,
+  methods: Type.Array(WithdrawalPayoutMethodSchema),
+}, { additionalProperties: false })
+export const WithdrawalRecipientInputSchema = Type.Union([
+  Type.Object({
+    account: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+    accountName: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
+    qrFileId: Type.Optional(Type.String({ format: 'uuid' })),
+    recipientName: Type.Optional(Type.Never()),
+    bankName: Type.Optional(Type.Never()),
+    cardNumber: Type.Optional(Type.Never()),
+  }, { additionalProperties: false }),
+  Type.Object({
+    recipientName: Type.String({ minLength: 1, maxLength: 100 }),
+    bankName: Type.String({ minLength: 1, maxLength: 120 }),
+    cardNumber: Type.String({ minLength: 12, maxLength: 19, pattern: '^\\d{12,19}$' }),
+    account: Type.Optional(Type.Never()),
+    accountName: Type.Optional(Type.Never()),
+    qrFileId: Type.Optional(Type.Never()),
+  }, { additionalProperties: false }),
+])
+export const WithdrawalRecipientSnapshotSchema = Type.Object({
+  account: Type.Optional(Type.String({ maxLength: 120 })),
+  accountName: Type.Optional(Type.String({ maxLength: 100 })),
+  recipientName: Type.Optional(Type.String({ maxLength: 100 })),
+  bankName: Type.Optional(Type.String({ maxLength: 120 })),
+  cardNumber: Type.Optional(Type.String({ maxLength: 19 })),
+  qrFileId: Type.Optional(Type.String({ format: 'uuid' })),
+}, { additionalProperties: false })
+export const CreateWithdrawalBodySchema = Type.Object({
+  idempotencyKey: Type.String({ format: 'uuid' }),
+  amount: WithdrawalAmountInputSchema,
+  payoutMethod: WithdrawalPayoutMethodSchema,
+  recipient: WithdrawalRecipientInputSchema,
+}, { additionalProperties: false })
+export const WithdrawalPayoutResultSchema = Type.Object({
+  outcome: Type.Union([Type.Literal('succeeded'), Type.Literal('failed')]),
+  resolvedByAdminId: Type.String({ format: 'uuid' }),
+  providerReference: Type.Union([Type.String({ maxLength: 200 }), Type.Null()]),
+  actualPayoutAmount: Type.Union([SettlementAmountSchema, Type.Null()]),
+  actualPayoutAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  confirmedNoTransfer: Type.Boolean(),
+  evidenceSha256: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+  evidenceSummary: Type.String({ maxLength: 500 }),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const WithdrawalPayoutAttemptSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  operationId: Type.String({ format: 'uuid' }),
+  status: WithdrawalPayoutAttemptStatusSchema,
+  startedByAdminId: Type.String({ format: 'uuid' }),
+  createdAt: Type.String({ format: 'date-time' }),
+  completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  result: Type.Union([WithdrawalPayoutResultSchema, Type.Null()]),
+}, { additionalProperties: false })
+export const CustomerWithdrawalPayoutAttemptSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  operationId: Type.String({ format: 'uuid' }),
+  status: WithdrawalPayoutAttemptStatusSchema,
+  createdAt: Type.String({ format: 'date-time' }),
+  completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+}, { additionalProperties: false })
+export const CustomerWithdrawalSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  amount: SettlementAmountSchema,
+  feeAmount: SettlementAmountSchema,
+  payoutAmount: SettlementAmountSchema,
+  payoutMethod: WithdrawalPayoutMethodSchema,
+  recipient: WithdrawalRecipientSnapshotSchema,
+  status: WithdrawalStatusSchema,
+  rejectionReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
+  reviewedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  createdAt: Type.String({ format: 'date-time' }),
+  updatedAt: Type.String({ format: 'date-time' }),
+  payoutAttempts: Type.Array(CustomerWithdrawalPayoutAttemptSchema),
+}, { additionalProperties: false })
+export const CustomerWithdrawalPageSchema = Type.Object({
+  cashAvailable: SettlementAmountSchema,
+  cashFrozen: SettlementAmountSchema,
+  policy: CustomerWithdrawalPolicySchema,
+  items: Type.Array(CustomerWithdrawalSchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const CustomerWithdrawalMutationSchema = Type.Object({
+  repeated: Type.Boolean(),
+  withdrawal: CustomerWithdrawalSchema,
+}, { additionalProperties: false })
+export const WithdrawalPageQuerySchema = CustomerWalletPageQuerySchema
+export const WithdrawalIdParamsSchema = Type.Object({ id: Type.String({ format: 'uuid' }) })
+export const AdminWithdrawalListQuerySchema = Type.Object({
+  status: Type.Optional(WithdrawalStatusSchema),
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+}, { additionalProperties: false })
+export const AdminWithdrawalListItemSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  customerId: Type.String({ format: 'uuid' }),
+  customerUsername: Type.Union([Type.String({ maxLength: 32 }), Type.Null()]),
+  customerEmail: Type.Union([Type.String({ maxLength: 254 }), Type.Null()]),
+  amount: SettlementAmountSchema,
+  feeAmount: SettlementAmountSchema,
+  payoutAmount: SettlementAmountSchema,
+  payoutMethod: WithdrawalPayoutMethodSchema,
+  maskedRecipient: Type.String({ maxLength: 180 }),
+  status: WithdrawalStatusSchema,
+  createdAt: Type.String({ format: 'date-time' }),
+  updatedAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const AdminWithdrawalListSchema = Type.Object({
+  items: Type.Array(AdminWithdrawalListItemSchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const WithdrawalAuditEventSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  action: Type.String({ maxLength: 48 }),
+  actorType: Type.Union([Type.Literal('customer'), Type.Literal('admin'), Type.Literal('system')]),
+  actorId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  idempotencyKey: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  previousStatus: Type.Union([Type.String({ maxLength: 32 }), Type.Null()]),
+  nextStatus: Type.Union([Type.String({ maxLength: 32 }), Type.Null()]),
+  details: Type.Record(Type.String(), Type.Unknown()),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const WithdrawalLedgerEntrySchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  operationId: Type.String({ format: 'uuid' }),
+  operationType: Type.String({ maxLength: 24 }),
+  action: Type.Union([Type.Literal('freeze'), Type.Literal('unfreeze'), Type.Literal('debit_frozen')]),
+  amount: SettlementAmountSchema,
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const AdminWithdrawalHistoryItemSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }), amount: SettlementAmountSchema,
+  feeAmount: SettlementAmountSchema, payoutAmount: SettlementAmountSchema,
+  status: WithdrawalStatusSchema, createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const AdminWithdrawalDetailSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  customer: Type.Object({
+    id: Type.String({ format: 'uuid' }),
+    username: Type.Union([Type.String({ maxLength: 32 }), Type.Null()]),
+    email: Type.Union([Type.String({ maxLength: 254 }), Type.Null()]),
+    phone: Type.Union([Type.String({ maxLength: 32 }), Type.Null()]),
+    status: Type.String({ maxLength: 16 }),
+  }, { additionalProperties: false }),
+  amount: SettlementAmountSchema,
+  feeAmount: SettlementAmountSchema,
+  payoutAmount: SettlementAmountSchema,
+  payoutMethod: WithdrawalPayoutMethodSchema,
+  recipient: WithdrawalRecipientSnapshotSchema,
+  status: WithdrawalStatusSchema,
+  rejectionReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
+  reviewedByAdminId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  reviewedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  createdAt: Type.String({ format: 'date-time' }),
+  updatedAt: Type.String({ format: 'date-time' }),
+  wallet: Type.Object({
+    cashAvailable: SettlementAmountSchema, cashFrozen: SettlementAmountSchema,
+    giftAvailable: SettlementAmountSchema, giftFrozen: SettlementAmountSchema,
+  }, { additionalProperties: false }),
+  ledgerEntries: Type.Array(WithdrawalLedgerEntrySchema),
+  payoutAttempts: Type.Array(WithdrawalPayoutAttemptSchema),
+  customerHistory: Type.Array(AdminWithdrawalHistoryItemSchema),
+  auditEvents: Type.Array(WithdrawalAuditEventSchema),
+}, { additionalProperties: false })
+export const AdminWithdrawalActionBodySchema = Type.Object({
+  idempotencyKey: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+export const AdminWithdrawalRejectionBodySchema = Type.Object({
+  idempotencyKey: Type.String({ format: 'uuid' }),
+  reason: Type.String({ minLength: 1, maxLength: 500 }),
+}, { additionalProperties: false })
+export const AdminWithdrawalResolveBodySchema = Type.Union([
+  Type.Object({
+    idempotencyKey: Type.String({ format: 'uuid' }), outcome: Type.Literal('unknown'),
+    evidenceSha256: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+    evidenceSummary: Type.String({ minLength: 1, maxLength: 500 }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    idempotencyKey: Type.String({ format: 'uuid' }), outcome: Type.Literal('failed'),
+    confirmedNoTransfer: Type.Literal(true),
+    evidenceSha256: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+    evidenceSummary: Type.String({ minLength: 1, maxLength: 500 }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    idempotencyKey: Type.String({ format: 'uuid' }), outcome: Type.Literal('succeeded'),
+    providerReference: Type.String({ minLength: 1, maxLength: 200 }),
+    actualPayoutAmount: WithdrawalAmountInputSchema,
+    actualPayoutAt: Type.String({ format: 'date-time' }),
+    evidenceSha256: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+    evidenceSummary: Type.String({ minLength: 1, maxLength: 500 }),
+  }, { additionalProperties: false }),
+])
+export const WithdrawalQrUploadSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  mimeType: Type.Union([Type.Literal('image/jpeg'), Type.Literal('image/png'), Type.Literal('image/webp')]),
+  sizeBytes: Type.Integer({ minimum: 1, maximum: 5242880 }),
+  sha256: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+}, { additionalProperties: false })
 export const AdminWalletCustomerParamsSchema = Type.Object({ customerId: Type.String({ format: 'uuid' }) })
 
 export const AdminPaymentChannelSchema = Type.Object({
@@ -1955,6 +2195,32 @@ export type CustomerTopUp = Static<typeof CustomerTopUpSchema>
 export type CustomerTopUpPage = Static<typeof CustomerTopUpPageSchema>
 export type CreateWalletTopUpBody = Static<typeof CreateWalletTopUpBodySchema>
 export type CustomerWalletPageQuery = Static<typeof CustomerWalletPageQuerySchema>
+export type WithdrawalPayoutMethod = Static<typeof WithdrawalPayoutMethodSchema>
+export type WithdrawalStatus = Static<typeof WithdrawalStatusSchema>
+export type WithdrawalPayoutAttemptStatus = Static<typeof WithdrawalPayoutAttemptStatusSchema>
+export type WithdrawalSettings = Static<typeof WithdrawalSettingsSchema>
+export type UpdateWithdrawalSettingsBody = Static<typeof UpdateWithdrawalSettingsBodySchema>
+export type CustomerWithdrawalPolicy = Static<typeof CustomerWithdrawalPolicySchema>
+export type WithdrawalRecipientInput = Static<typeof WithdrawalRecipientInputSchema>
+export type WithdrawalRecipientSnapshot = Static<typeof WithdrawalRecipientSnapshotSchema>
+export type CreateWithdrawalBody = Static<typeof CreateWithdrawalBodySchema>
+export type WithdrawalPayoutResult = Static<typeof WithdrawalPayoutResultSchema>
+export type WithdrawalPayoutAttempt = Static<typeof WithdrawalPayoutAttemptSchema>
+export type CustomerWithdrawalPayoutAttempt = Static<typeof CustomerWithdrawalPayoutAttemptSchema>
+export type CustomerWithdrawal = Static<typeof CustomerWithdrawalSchema>
+export type CustomerWithdrawalPage = Static<typeof CustomerWithdrawalPageSchema>
+export type CustomerWithdrawalMutation = Static<typeof CustomerWithdrawalMutationSchema>
+export type WithdrawalPageQuery = Static<typeof WithdrawalPageQuerySchema>
+export type AdminWithdrawalListQuery = Static<typeof AdminWithdrawalListQuerySchema>
+export type AdminWithdrawalListItem = Static<typeof AdminWithdrawalListItemSchema>
+export type AdminWithdrawalList = Static<typeof AdminWithdrawalListSchema>
+export type WithdrawalAuditEvent = Static<typeof WithdrawalAuditEventSchema>
+export type WithdrawalLedgerEntry = Static<typeof WithdrawalLedgerEntrySchema>
+export type AdminWithdrawalDetail = Static<typeof AdminWithdrawalDetailSchema>
+export type AdminWithdrawalActionBody = Static<typeof AdminWithdrawalActionBodySchema>
+export type AdminWithdrawalRejectionBody = Static<typeof AdminWithdrawalRejectionBodySchema>
+export type AdminWithdrawalResolveBody = Static<typeof AdminWithdrawalResolveBodySchema>
+export type WithdrawalQrUpload = Static<typeof WithdrawalQrUploadSchema>
 export type AdminWalletListQuery = Static<typeof AdminWalletListQuerySchema>
 export type AdminWalletListItem = Static<typeof AdminWalletListItemSchema>
 export type AdminWalletList = Static<typeof AdminWalletListSchema>
