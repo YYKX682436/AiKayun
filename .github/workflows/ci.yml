@@ -64,6 +64,10 @@ jobs:
         run: PLAYWRIGHT_USE_PRODUCTION_SERVER=true pnpm e2e
       - name: Verify production runtime branding
         run: pnpm --filter @aikayun/web test:e2e:production-brand
+      - name: Configure ephemeral Compose payment encryption key
+        run: |
+          key="$(openssl rand -base64 32)"
+          printf 'PAYMENT_CREDENTIAL_KEY_RING={"activeKeyId":"ci","keys":{"ci":"%s"}}\n' "$key" >> "$GITHUB_ENV"
       - name: Build and start full Compose stack
         run: docker compose up -d --build
       - name: Check Compose web, API and admin flow
