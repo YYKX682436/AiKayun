@@ -1,0 +1,596 @@
+import { randomUUID, createHash, randomBytes } from 'node:crypto'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { sql } from 'kysely'
+import type { Kysely } from 'kysely'
+import { Migrator } from 'kysely/migration'
+import type { FastifyInstance, InjectOptions } from 'fastify'
+import { createApp } from '../src/app.js'
+import { readConfig } from '../src/config.js'
+import { hashPassword } from '../src/auth/password.js'
+import { AppMigrationProvider } from '../src/db/migration-provider.js'
+import { createDatabase } from '../src/db/pool.js'
+import type { Database } from '../src/db/types.js'
+import { expireDueUnpaidOrders } from '../src/commerce/orders.js'
+import { startZpayHttpFixture } from './fixtures/zpay-http-server.js'
+
+const testDatabaseUrl = process.env.TEST_DATABASE_URL
+  ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
+const testOrigin = 'http://localhost:3000'
+const adminPassword = 'Payments-Integration-Password-2026!'
+const customerPassword = 'Payments-Customer-Password-2026!'
+const digest = 'a'.repeat(64)
+const merchantId = 'fixture-merchant-001'
+const merchantKey = 'fixture-only-merchant-secret-never-returned'
+const encryptionKeyA = randomBytes(32)
+const encryptionKeyB = randomBytes(32)
+
+let app: FastifyInstance
+let secondApp: FastifyInstance
+let db: Kysely<Database>
+let secondDb: Kysely<Database>
+let config: ReturnType<typeof readConfig>
+let fixture: Awaited<ReturnType<typeof startZpayHttpFixture>>
+let api2BaseUrl: string
+let nextIp = 1
+let admin: { id: string; cookie: string; csrfCookie: string; csrfToken: string }
+let channelId: string
+
+type Customer = { id: string; cookie: string; csrfCookie: string; csrfToken: string }
+type Owner = Customer | { id: string; cookie: string; csrfCookie: string; csrfToken: string; guest: true }
+
+function remoteAddress(): string {
+  const value = (nextIp++ % 250) + 1
+  return `198.51.100.${value}`
+}
+
+function inject(options: InjectOptions) {
+  return app.inject({ ...options, remoteAddress: remoteAddress() })
+}
+
+function cookieFrom(response: { headers: Record<string, string | string[] | undefined> }, name: string): string {
+  const header = response.headers['set-cookie']
+  const cookies = Array.isArray(header) ? header : header ? [header] : []
+  const cookie = cookies.find(value => value.startsWith(`${name}=`))
+  if (!cookie) throw new Error(`Expected ${name} cookie`)
+  return cookie.split(';', 1)[0]!
+}
+
+async function customerCsrf() {
+  const response = await inject({ method: 'GET', url: '/api/v1/customer/auth/csrf' })
+  expect(response.statusCode).toBe(200)
+  return {
+    token: response.json().data.csrfToken as string,
+    cookie: cookieFrom(response, 'aikayun_customer_csrf'),
+  }
+}
+
+async function createCustomer(): Promise<Customer> {
+  const csrf = await customerCsrf()
+  const username = `payment-${randomUUID().replaceAll('-', '').slice(0, 20)}`
+  const response = await inject({
+    method: 'POST', url: '/api/v1/customer/auth/register',
+    headers: { origin: testOrigin, cookie: csrf.cookie, 'x-csrf-token': csrf.token },
+    payload: { username, password: customerPassword },
+  })
+  expect(response.statusCode).toBe(201)
+  return {
+    id: response.json().data.customer.id as string,
+    cookie: cookieFrom(response, 'aikayun_customer_session'),
+    csrfToken: csrf.token,
+    csrfCookie: csrf.cookie,
+  }
+}
+
+function customerHeaders(owner: Owner, includeCsrf = true): Record<string, string> {
+  return {
+    origin: testOrigin,
+    cookie: [owner.cookie, owner.csrfCookie].filter(Boolean).join('; '),
+    ...(includeCsrf ? { 'x-csrf-token': owner.csrfToken } : {}),
+  }
+}
+
+function adminHeaders() {
+  return {
+    origin: testOrigin,
+    cookie: `${admin.cookie}; ${admin.csrfCookie}`,
+    'x-csrf-token': admin.csrfToken,
+  }
+}
+
+async function createAdmin() {
+  const id = randomUUID()
+  const email = `payments-${id.slice(0, 8)}@example.test`
+  await db.insertInto('admin_users').values({ id, email, password_hash: await hashPassword(adminPassword) }).execute()
+  const csrf = await inject({ method: 'GET', url: '/api/v1/admin/auth/csrf' })
+  const csrfToken = csrf.json().data.csrfToken as string
+  const csrfCookie = cookieFrom(csrf, 'aikayun_admin_csrf')
+  const login = await inject({
+    method: 'POST', url: '/api/v1/admin/auth/login',
+    headers: { origin: testOrigin, cookie: csrfCookie, 'x-csrf-token': csrfToken },
+    payload: { email, password: adminPassword },
+  })
+  expect(login.statusCode).toBe(200)
+  return { id, csrfToken, csrfCookie, cookie: cookieFrom(login, 'aikayun_admin_session') }
+}
+
+async function createGuestSession(): Promise<Owner> {
+  const csrf = await customerCsrf()
+  const response = await inject({
+    method: 'POST', url: '/api/v1/guest/session',
+    headers: { origin: testOrigin, cookie: csrf.cookie, 'x-csrf-token': csrf.token },
+  })
+  expect([200, 201]).toContain(response.statusCode)
+  const cookie = cookieFrom(response, 'aikayun_guest_order_session')
+  const token = cookie.slice(cookie.indexOf('=') + 1)
+  const tokenHash = createHash('sha256').update(token).digest('hex')
+  const session = await db.selectFrom('guest_order_sessions').select('id').where('token_hash', '=', tokenHash).executeTakeFirstOrThrow()
+  return { id: session.id, guest: true, cookie, csrfCookie: csrf.cookie, csrfToken: csrf.token }
+}
+
+async function createOrder(owner: Owner, name = `支付集成商品-${randomUUID().slice(0, 8)}`): Promise<string> {
+  const productId = randomUUID()
+  const variantId = randomUUID()
+  const orderId = randomUUID()
+  const itemId = randomUUID()
+  await db.transaction().execute(async (trx) => {
+    await trx.insertInto('products').values({
+      id: productId, name, description: 'Payment integration fixture', product_type: 'digital', status: 'active',
+    }).execute()
+    await trx.insertInto('product_variants').values({
+      id: variantId, product_id: productId, sku_code: `PAY-${variantId.slice(0, 8)}`,
+      combination_key: '', sale_price: '5.00', compare_at_price: null, cost_price: null,
+      enabled: true, retired_at: null, inventory_mode: 'unlimited',
+    }).execute()
+    await trx.insertInto('product_variant_fulfillment').values({
+      product_variant_id: variantId, method: 'manual', manual_delivery_ready: true,
+    }).execute()
+    await trx.insertInto('orders').values({
+      id: orderId,
+      customer_id: 'guest' in owner && owner.guest ? null : owner.id,
+      guest_order_session_id: 'guest' in owner && owner.guest ? owner.id : null,
+      idempotency_key: randomUUID(), request_sha256: digest, total_amount: '5.00',
+      unpaid_expires_at: new Date(Date.now() + 15 * 60_000),
+      history_hidden_at: null, history_hidden_by_admin_id: null, history_hidden_reason: null,
+    }).execute()
+    await trx.insertInto('order_items').values({
+      id: itemId, order_id: orderId, product_id: productId, product_variant_id: variantId,
+      product_name_snapshot: name, product_type_snapshot: 'digital', sku_code_snapshot: `PAY-${variantId.slice(0, 8)}`,
+      sku_snapshot: JSON.stringify([]), inventory_mode_snapshot: 'unlimited', fulfillment_method_snapshot: 'manual',
+      unit_price: '5.00', quantity: 1, line_amount: '5.00',
+    }).execute()
+    await trx.updateTable('orders').set({ items_sealed: true }).where('id', '=', orderId).execute()
+  })
+  return orderId
+}
+
+async function createPayment(orderId: string, owner: Owner, options: {
+  paymentMethod?: 'alipay' | 'wechat'
+  channelId?: string
+  idempotencyKey?: string
+} = {}) {
+  return await inject({
+    method: 'POST', url: `/api/v1/orders/${orderId}/payments`,
+    headers: customerHeaders(owner),
+    payload: {
+      idempotencyKey: options.idempotencyKey ?? randomUUID(),
+      channelId: options.channelId ?? channelId,
+      paymentMethod: options.paymentMethod ?? 'alipay',
+    },
+  })
+}
+
+function callbackUrl(parameters: Record<string, string>): string {
+  return `/api/v1/payments/callback/zpay?${new URLSearchParams(parameters).toString()}`
+}
+
+async function createPaymentChannel(): Promise<string> {
+  const response = await inject({
+    method: 'POST', url: '/api/v1/admin/payment-channels', headers: adminHeaders(),
+    payload: {
+      providerType: 'zpay_epay_v1', name: '集成测试通道', enabled: true,
+      paymentMethods: ['alipay', 'wechat'], displayOrder: 10,
+      merchantId, merchantKey,
+    },
+  })
+  expect(response.statusCode).toBe(201)
+  return response.json().data.channel.id as string
+}
+
+beforeAll(async () => {
+  const databaseUrl = new URL(testDatabaseUrl)
+  if (!databaseUrl.pathname.slice(1).endsWith('_test')) {
+    throw new Error('Refusing to run payment integration tests unless TEST_DATABASE_URL names a database ending in _test')
+  }
+  process.env.DATABASE_URL = testDatabaseUrl
+  db = createDatabase()
+  await sql`DROP SCHEMA public CASCADE`.execute(db)
+  await sql`CREATE SCHEMA public`.execute(db)
+  const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
+  const migrated = await migrator.migrateToLatest()
+  if (migrated.error) throw migrated.error
+  const repeated = await migrator.migrateToLatest()
+  if (repeated.error) throw repeated.error
+  await db.updateTable('storefront_customer_policy').set({ guest_checkout_enabled: true }).where('singleton', '=', true).execute()
+
+  const ringJson = JSON.stringify({ activeKeyId: 'test-a', keys: { 'test-a': encryptionKeyA.toString('base64') } })
+  config = readConfig({
+    ...process.env,
+    DATABASE_URL: testDatabaseUrl,
+    NODE_ENV: 'test',
+    PUBLIC_ORIGIN: testOrigin,
+    COOKIE_SECURE: 'false',
+    PAYMENT_CREDENTIAL_KEY_RING: ringJson,
+  })
+  fixture = await startZpayHttpFixture({ merchantCredentials: { [merchantId]: merchantKey } })
+  app = await createApp({ db, config, logger: false, paymentProviderBaseUrlForTests: fixture.baseUrl })
+  await app.ready()
+  secondDb = createDatabase()
+  secondApp = await createApp({ db: secondDb, config, logger: false, paymentProviderBaseUrlForTests: fixture.baseUrl })
+  await secondApp.ready()
+  const secondAddress = await secondApp.listen({ host: '127.0.0.1', port: 0 })
+  api2BaseUrl = secondAddress
+
+  admin = await createAdmin()
+  channelId = await createPaymentChannel()
+})
+
+afterAll(async () => {
+  if (secondApp) await secondApp.close()
+  if (app) await app.close()
+  if (fixture) await fixture.close()
+  if (secondDb) await secondDb.destroy()
+  if (db) await db.destroy()
+})
+
+describe('online payment settlement through a real local HTTP provider and PostgreSQL', () => {
+  it('keeps merchant secrets out of admin and public API responses and audits channel changes', async () => {
+    const adminList = await inject({ method: 'GET', url: '/api/v1/admin/payment-channels', headers: adminHeaders() })
+    expect(adminList.statusCode).toBe(200)
+    expect(adminList.body).not.toContain(merchantKey)
+    expect(adminList.body).not.toContain(merchantId)
+    expect(adminList.json().data.items[0]).toMatchObject({
+      providerType: 'zpay_epay_v1', credentialsConfigured: true, providerAvailable: true,
+    })
+
+    const publicList = await inject({ method: 'GET', url: '/api/v1/public/payment-channels' })
+    expect(publicList.statusCode).toBe(200)
+    expect(publicList.body).not.toContain(merchantKey)
+    expect(publicList.body).not.toContain(merchantId)
+    expect(publicList.json().data.items[0]).toEqual({
+      id: channelId, name: '集成测试通道', paymentMethods: ['alipay', 'wechat'],
+    })
+
+    const testResult = await inject({ method: 'POST', url: `/api/v1/admin/payment-channels/${channelId}/test`, headers: adminHeaders() })
+    expect(testResult.statusCode).toBe(200)
+    expect(testResult.json().data.valid).toBe(true)
+    expect(fixture.stats().balanceChecks).toBe(1)
+
+    const audit = await db.selectFrom('payment_channel_audit_events').select(['action', 'summary'])
+      .where('payment_channel_id', '=', channelId).execute()
+    expect(audit).toHaveLength(1)
+    expect(JSON.stringify(audit)).not.toContain(merchantKey)
+  })
+
+  it('uses server-owned order facts and reuses an active attempt on repeated clicks', async () => {
+    const customer = await createCustomer()
+    const orderId = await createOrder(customer)
+    const requestKey = randomUUID()
+    const first = await createPayment(orderId, customer, { idempotencyKey: requestKey, paymentMethod: 'wechat' })
+    expect(first.statusCode).toBe(201)
+    expect(first.json().data.totalAmount).toBe('5.00')
+    expect(first.json().data.attempt).toMatchObject({
+      status: 'pending', providerState: 'ready', paymentMethod: 'wechat', action: { type: 'qr_code' },
+    })
+
+    const replay = await createPayment(orderId, customer, { idempotencyKey: requestKey, paymentMethod: 'wechat' })
+    expect(replay.statusCode).toBe(200)
+    expect(replay.json().data.attempt.id).toBe(first.json().data.attempt.id)
+    const secondClick = await createPayment(orderId, customer, { paymentMethod: 'alipay' })
+    expect(secondClick.statusCode).toBe(200)
+    expect(secondClick.json().data.attempt.id).toBe(first.json().data.attempt.id)
+
+    const attempts = await db.selectFrom('payment_attempts').selectAll().where('order_id', '=', orderId).execute()
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]!.amount).toBe('5.00')
+    expect(attempts[0]!.status).toBe('pending')
+    expect(fixture.stats().creates).toBe(1)
+    const encryptedSecret = await db.selectFrom('payment_attempt_secrets').select('ciphertext')
+      .where('payment_attempt_id', '=', attempts[0]!.id).executeTakeFirstOrThrow()
+    expect(encryptedSecret.ciphertext.toString('utf8')).not.toContain(merchantKey)
+  })
+
+  it('settles a verified callback that arrives before the provider create response', async () => {
+    const customer = await createCustomer()
+    const orderId = await createOrder(customer)
+    const gate = fixture.pauseNextCreateResponse()
+    const createPromise = createPayment(orderId, customer)
+    try {
+      await gate.entered
+      const merchantOrderNo = fixture.orders().at(-1)!.merchantOrderNo
+      const callback = fixture.setPaid(merchantOrderNo)
+      const accepted = await inject({ method: 'GET', url: callbackUrl(callback) })
+      expect(accepted.statusCode).toBe(200)
+      expect(accepted.body).toBe('success')
+
+      gate.release()
+      const created = await createPromise
+      expect(created.statusCode).toBe(201)
+      expect(created.json().data.paymentStatus).toBe('paid')
+      const attemptId = created.json().data.attempt.id as string
+      expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status)
+        .toBe('succeeded')
+      expect(await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', attemptId).execute())
+        .toHaveLength(1)
+      expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+        .toBe('processing')
+    } finally {
+      gate.release()
+    }
+  })
+
+  it('confirms signed callbacks with an authenticated query exactly once and advances only the protected order trigger', async () => {
+    const customer = await createCustomer()
+    const orderId = await createOrder(customer)
+    const created = await createPayment(orderId, customer)
+    const attemptId = created.json().data.attempt.id as string
+    const merchantOrderNo = fixture.orders().at(-1)!.merchantOrderNo
+    const callback = fixture.setPaid(merchantOrderNo)
+
+    const accepted = await inject({ method: 'GET', url: callbackUrl(callback) })
+    expect(accepted.statusCode).toBe(200)
+    expect(accepted.body).toBe('success')
+    const duplicate = await inject({ method: 'GET', url: callbackUrl(callback) })
+    expect(duplicate.statusCode).toBe(200)
+    expect(duplicate.body).toBe('success')
+
+    const attempt = await db.selectFrom('payment_attempts').select(['status', 'completed_at'])
+      .where('id', '=', attemptId).executeTakeFirstOrThrow()
+    const receipt = await db.selectFrom('payment_receipts').selectAll().where('payment_attempt_id', '=', attemptId).execute()
+    const order = await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()
+    expect(attempt.status).toBe('succeeded')
+    expect(attempt.completed_at).toBeTruthy()
+    expect(receipt).toHaveLength(1)
+    expect(receipt[0]!.disposition).toBe('on_time')
+    expect(order.status).toBe('processing')
+
+    const current = await inject({
+      method: 'GET', url: `/api/v1/orders/${orderId}/payment`, headers: customerHeaders(customer, false),
+    })
+    expect(current.statusCode).toBe(200)
+    expect(current.json().data.paymentStatus).toBe('paid')
+    expect(current.json().data.confirmedAmount).toBe('5.00')
+  })
+
+  it('rejects signature tampering, retains signed amount mismatches, and never auto-fulfills anomalous money', async () => {
+    const customer = await createCustomer()
+    const badOrderId = await createOrder(customer)
+    const badCreated = await createPayment(badOrderId, customer)
+    const badAttemptId = badCreated.json().data.attempt.id as string
+    const badMerchantNo = fixture.orders().at(-1)!.merchantOrderNo
+    const tampered = fixture.setPaid(badMerchantNo)
+    tampered.money = '0.01'
+    const rejected = await inject({ method: 'GET', url: callbackUrl(tampered) })
+    expect(rejected.statusCode).toBe(400)
+    expect(rejected.body).toBe('fail')
+    expect(await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', badAttemptId).execute()).toHaveLength(0)
+    expect((await db.selectFrom('payment_provider_events').select('verification')
+      .where('payment_attempt_id', '=', badAttemptId).execute()).some(row => row.verification === 'unverified')).toBe(true)
+
+    for (const actualAmount of ['4.00', '6.00']) {
+      const orderId = await createOrder(customer)
+      const created = await createPayment(orderId, customer)
+      const attemptId = created.json().data.attempt.id as string
+      const merchantOrderNo = fixture.orders().at(-1)!.merchantOrderNo
+      const callback = fixture.setPaid(merchantOrderNo, { amount: actualAmount })
+      const accepted = await inject({ method: 'GET', url: callbackUrl(callback) })
+      expect(accepted.statusCode).toBe(200)
+      expect(accepted.body).toBe('success')
+
+      const attempt = await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()
+      const receipt = await db.selectFrom('payment_receipts').select(['amount', 'disposition'])
+        .where('payment_attempt_id', '=', attemptId).executeTakeFirstOrThrow()
+      const order = await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()
+      const customerView = await inject({ method: 'GET', url: `/api/v1/orders/${orderId}/payment`, headers: customerHeaders(customer, false) })
+      expect(attempt.status).toBe('reconciliation_required')
+      expect(receipt.amount).toBe(actualAmount)
+      // The frozen ④-1 receipt trigger classifies both over- and under-payment
+      // against one attempt as amount_mismatch; cumulative excess remains a
+      // separate disposition. In either case the actual receipt is preserved.
+      expect(receipt.disposition).toBe('amount_mismatch')
+      expect(order.status).toBe('pending_payment')
+      expect(customerView.json().data.paymentStatus).toBe('reconciliation_required')
+    }
+  })
+
+  it('serializes callback and active query races across two API instances without duplicate receipts', async () => {
+    const customer = await createCustomer()
+    const orderId = await createOrder(customer)
+    const created = await createPayment(orderId, customer)
+    const attemptId = created.json().data.attempt.id as string
+    const merchantOrderNo = fixture.orders().at(-1)!.merchantOrderNo
+    const callback = fixture.setPaid(merchantOrderNo)
+    const headers = customerHeaders(customer)
+
+    const callbackRequest = fetch(`${api2BaseUrl}${callbackUrl(callback)}`)
+    const refreshRequest = app.inject({
+      method: 'POST', url: `/api/v1/orders/${orderId}/payment/refresh`, headers,
+      remoteAddress: remoteAddress(),
+    })
+    const [callbackResponse, refreshResponse] = await Promise.all([callbackRequest, refreshRequest])
+    expect([200, 503]).toContain(callbackResponse.status)
+    expect(refreshResponse.statusCode).toBe(200)
+
+    const receipts = await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', attemptId).execute()
+    const attempt = await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()
+    const order = await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()
+    expect(receipts).toHaveLength(1)
+    expect(attempt.status).toBe('succeeded')
+    expect(order.status).toBe('processing')
+  })
+
+  it('prevents a provider transaction from being attached to a second attempt across channels', async () => {
+    const customer = await createCustomer()
+    const firstOrderId = await createOrder(customer)
+    const first = await createPayment(firstOrderId, customer)
+    const firstAttemptId = first.json().data.attempt.id as string
+    const firstMerchantNo = fixture.orders().at(-1)!.merchantOrderNo
+    const sharedTransactionId = `ZPAY-SHARED-${randomUUID()}`
+    const firstCallback = fixture.setPaid(firstMerchantNo, { providerOrderId: sharedTransactionId })
+    const firstResult = await inject({ method: 'GET', url: callbackUrl(firstCallback) })
+    expect(firstResult.statusCode).toBe(200)
+    expect((await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', firstAttemptId).execute()))
+      .toHaveLength(1)
+
+    const otherChannelResponse = await inject({
+      method: 'POST', url: '/api/v1/admin/payment-channels', headers: adminHeaders(),
+      payload: {
+        providerType: 'zpay_epay_v1', name: `第二个支付通道-${randomUUID().slice(0, 8)}`,
+        enabled: true, paymentMethods: ['alipay', 'wechat'], displayOrder: 20, merchantId, merchantKey,
+      },
+    })
+    expect(otherChannelResponse.statusCode).toBe(201)
+    const secondChannelId = otherChannelResponse.json().data.channel.id as string
+    const secondOrderId = await createOrder(customer)
+    const second = await createPayment(secondOrderId, customer, { channelId: secondChannelId })
+    const secondAttemptId = second.json().data.attempt.id as string
+    const secondMerchantNo = fixture.orders().at(-1)!.merchantOrderNo
+    const secondCallback = fixture.setPaid(secondMerchantNo, { providerOrderId: sharedTransactionId })
+    const secondResult = await inject({ method: 'GET', url: callbackUrl(secondCallback) })
+    expect(secondResult.statusCode).toBe(200)
+    expect(secondResult.body).toBe('success')
+
+    expect(await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', secondAttemptId).execute())
+      .toHaveLength(0)
+    expect(await db.selectFrom('payment_provider_events').select('id')
+      .where('payment_attempt_id', '=', secondAttemptId).where('disposition', '=', 'reconciliation_required').execute())
+      .not.toHaveLength(0)
+    const status = await inject({ method: 'GET', url: `/api/v1/orders/${secondOrderId}/payment`, headers: customerHeaders(customer, false) })
+    expect(status.json().data.paymentStatus).toBe('reconciliation_required')
+  })
+
+  it('serializes a cancellation race against a signed success callback', async () => {
+    const customer = await createCustomer()
+    const orderId = await createOrder(customer)
+    const created = await createPayment(orderId, customer)
+    const attemptId = created.json().data.attempt.id as string
+    const merchantOrderNo = fixture.orders().at(-1)!.merchantOrderNo
+    const callback = fixture.setPaid(merchantOrderNo)
+    const callbackRequest = fetch(`${api2BaseUrl}${callbackUrl(callback)}`)
+    const cancellationRequest = inject({
+      method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`,
+      headers: customerHeaders(customer), remoteAddress: remoteAddress(),
+    })
+    const [callbackResponse, cancellationResponse] = await Promise.all([callbackRequest, cancellationRequest])
+    expect(callbackResponse.status).toBe(200)
+    expect([200, 409]).toContain(cancellationResponse.statusCode)
+
+    const order = await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()
+    const attempt = await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()
+    const receipt = await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', attemptId).execute()
+    expect(order.status).toBe('processing')
+    expect(attempt.status).toBe('succeeded')
+    expect(receipt).toHaveLength(1)
+  })
+
+  it('keeps unknown provider creates recoverable without creating a second external order', async () => {
+    const customer = await createCustomer()
+    const orderId = await createOrder(customer, `__unknown__${randomUUID().slice(0, 8)}`)
+    const idempotencyKey = randomUUID()
+    const createCountBefore = fixture.stats().creates
+    const created = await createPayment(orderId, customer, { idempotencyKey })
+    expect(created.statusCode).toBe(201)
+    expect(created.json().data.attempt).toMatchObject({ status: 'created', providerState: 'unknown', action: null })
+
+    const retry = await createPayment(orderId, customer, { idempotencyKey })
+    expect(retry.statusCode).toBe(200)
+    expect(retry.json().data.attempt.id).toBe(created.json().data.attempt.id)
+    expect(retry.json().data.attempt.status).toBe('created')
+    expect(await db.selectFrom('payment_attempts').select('id').where('order_id', '=', orderId).execute()).toHaveLength(1)
+    expect(fixture.stats().creates).toBe(createCountBefore + 1)
+  })
+
+  it('isolates guest orders and does not expose another session payment state', async () => {
+    const guest = await createGuestSession()
+    const stranger = await createGuestSession()
+    const orderId = await createOrder(guest, `游客支付隔离-${randomUUID().slice(0, 8)}`)
+    const own = await inject({ method: 'GET', url: `/api/v1/orders/${orderId}/payment`, headers: customerHeaders(guest, false) })
+    const other = await inject({ method: 'GET', url: `/api/v1/orders/${orderId}/payment`, headers: customerHeaders(stranger, false) })
+    const anonymous = await inject({ method: 'GET', url: `/api/v1/orders/${orderId}/payment` })
+    expect(own.statusCode).toBe(200)
+    expect(other.statusCode).toBe(404)
+    expect(anonymous.statusCode).toBe(401)
+  })
+
+  it('preserves a late receipt after expiry closure without reopening the order', async () => {
+    const customer = await createCustomer()
+    const orderId = await createOrder(customer)
+    const created = await createPayment(orderId, customer)
+    const attemptId = created.json().data.attempt.id as string
+    const merchantOrderNo = fixture.orders().at(-1)!.merchantOrderNo
+
+    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
+    try {
+      await db.updateTable('orders').set({ unpaid_expires_at: new Date(Date.now() - 2_000) }).where('id', '=', orderId).execute()
+    } finally {
+      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+    }
+    // The provider has conclusively expired this attempt; keep its immutable
+    // future deadline and move only through the allowed pending -> expired state.
+    await db.updateTable('payment_attempts').set({ status: 'expired' }).where('id', '=', attemptId).execute()
+
+    const callback = fixture.setPaid(merchantOrderNo)
+    await Promise.all([
+      expireDueUnpaidOrders(db),
+      inject({ method: 'GET', url: callbackUrl(callback) }),
+    ])
+
+    const currentOrder = await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()
+    const attempt = await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()
+    const receipt = await db.selectFrom('payment_receipts').select('disposition').where('payment_attempt_id', '=', attemptId).executeTakeFirstOrThrow()
+    expect(currentOrder.status).toBe('closed')
+    expect(attempt.status).toBe('late_succeeded')
+    expect(receipt.disposition).toBe('late')
+  })
+
+  it('re-encrypts channel credentials and historical attempt snapshots during key rotation', async () => {
+    const customer = await createCustomer()
+    const orderId = await createOrder(customer)
+    const created = await createPayment(orderId, customer)
+    const attemptId = created.json().data.attempt.id as string
+    const merchantOrderNo = fixture.orders().at(-1)!.merchantOrderNo
+
+    config.paymentCredentialKeyRing = {
+      activeKeyId: 'test-b',
+      keys: { 'test-a': encryptionKeyA, 'test-b': encryptionKeyB },
+    }
+    const rotated = await inject({ method: 'POST', url: '/api/v1/admin/payment-channels/reencrypt', headers: adminHeaders() })
+    expect(rotated.statusCode).toBe(200)
+    expect(rotated.json().data.activeKeyId).toBe('test-b')
+    expect(rotated.json().data.channelsReencrypted).toBeGreaterThan(0)
+    expect(rotated.json().data.attemptsReencrypted).toBeGreaterThan(0)
+
+    const channel = await db.selectFrom('payment_channels').select('config_key_id').where('id', '=', channelId).executeTakeFirstOrThrow()
+    const secret = await db.selectFrom('payment_attempt_secrets').select(['key_id', 'envelope_version'])
+      .where('payment_attempt_id', '=', attemptId).orderBy('envelope_version', 'desc').executeTakeFirstOrThrow()
+    expect(channel.config_key_id).toBe('test-b')
+    expect(secret.key_id).toBe('test-b')
+    expect(secret.envelope_version).toBe(2)
+
+    const callback = fixture.setPaid(merchantOrderNo)
+    const accepted = await inject({ method: 'GET', url: callbackUrl(callback) })
+    expect(accepted.statusCode).toBe(200)
+    expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status)
+      .toBe('succeeded')
+  })
+
+  it('allows a definitive service provider rejection to fail without inventing a receipt', async () => {
+    const customer = await createCustomer()
+    const rejectedOrder = await createOrder(customer, `__reject__${randomUUID().slice(0, 8)}`)
+    const rejected = await createPayment(rejectedOrder, customer)
+    expect(rejected.statusCode).toBe(201)
+    expect(rejected.json().data.attempt).toMatchObject({ status: 'failed', providerState: 'failed', action: null })
+    expect(await db.selectFrom('payment_receipts').select('payment_receipts.id')
+      .innerJoin('payment_attempts', 'payment_attempts.id', 'payment_receipts.payment_attempt_id')
+      .where('payment_attempts.order_id', '=', rejectedOrder).execute()).toHaveLength(0)
+  })
+})

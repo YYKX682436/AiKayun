@@ -95,6 +95,7 @@ export function useCustomerApi() {
     return path.includes('/api/v1/customer/')
       || path === '/api/v1/checkout/quote'
       || path.startsWith('/api/v1/checkout/orders')
+      || path.startsWith('/api/v1/orders/')
       || path.startsWith('/api/v1/guest/')
   }
 
@@ -103,6 +104,7 @@ export function useCustomerApi() {
       || path.includes('/api/v1/customer/orders')
       || path === '/api/v1/checkout/quote'
       || path.startsWith('/api/v1/checkout/orders')
+      || path.startsWith('/api/v1/orders/')
       || path.startsWith('/api/v1/guest/')
   }
 

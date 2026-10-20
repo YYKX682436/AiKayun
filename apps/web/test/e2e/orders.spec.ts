@@ -165,7 +165,7 @@ test('creates a zero-value order, completes actual private delivery, and cancels
   await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
   const paidOrderUrl = page.url()
   await expect(page.locator('[data-slot="title"]').filter({ hasText: '等待付款' })).toBeVisible()
-  await expect(page.getByText('当前尚未开放支付宝或微信支付')).toBeVisible()
+  await expect(page.getByText('暂时没有可用支付通道')).toBeVisible()
   await expect(page.getByRole('button', { name: '付款', exact: true })).toHaveCount(0)
   await page.reload()
   await expect(page.locator('[data-slot="title"]').filter({ hasText: '等待付款' })).toBeVisible()

@@ -1232,7 +1232,12 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
           .where('product_variant_id', '=', variantId).execute(),
       }
 
-      const currentMigrator = new Migrator({ db, provider: new AppMigrationProvider() })
+      // Keep this frozen ④-6 upgrade/rollback regression anchored at the pre-payment
+      // schema. The ④-7 migration intentionally has no destructive down migration.
+      const prePaymentMigrations = await new AppMigrationProvider().getMigrations()
+      delete prePaymentMigrations['202610200002_online_payments']
+      const prePaymentProvider = { getMigrations: async () => prePaymentMigrations }
+      const currentMigrator = new Migrator({ db, provider: prePaymentProvider })
       const upgradeResult = await currentMigrator.migrateToLatest()
       if (upgradeResult.error) throw upgradeResult.error
       expect(upgradeResult.results?.map((result) => result.migrationName)).toContain('202610180001_trade_foundation')
@@ -1245,7 +1250,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
       expect(await db.selectFrom('product_variant_inventory_adjustments').select(['operation_id', 'quantity_before', 'quantity_after', 'quantity_delta'])
         .where('product_variant_id', '=', variantId).execute()).toEqual(before.adjustments)
 
-      const rollbackMigrator = new Migrator({ db, provider: new AppMigrationProvider() })
+      const rollbackMigrator = new Migrator({ db, provider: prePaymentProvider })
       const purchaseLimitsRollback = await rollbackMigrator.migrateDown()
       if (purchaseLimitsRollback.error) throw purchaseLimitsRollback.error
       expect(purchaseLimitsRollback.results?.map((result) => result.migrationName)).toContain('202610200001_purchase_limits')

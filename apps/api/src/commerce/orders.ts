@@ -52,7 +52,7 @@ import {
 import type { Database, OrderStatus as DbOrderStatus } from '../db/types.js'
 import { CheckoutQuoteError, checkoutRequestHash, normalizeCheckoutItems, quoteCheckoutItems } from './checkout-quote.js'
 
-const guestSessionCookie = 'aikayun_guest_order_session'
+export const guestSessionCookie = 'aikayun_guest_order_session'
 const guestSessionTtlSeconds = 60 * 60 * 24 * 180
 const defaultPageSize = 20
 const maxPageSize = 100
@@ -223,7 +223,7 @@ export async function loadOrderDetail(db: Db, id: string): Promise<OrderDetail |
   }
 }
 
-async function assertCustomerSession(
+export async function assertCustomerSession(
   trx: Transaction<Database>,
   customer: AuthenticatedCustomer,
   purchaseLock = false,
@@ -247,7 +247,7 @@ async function assertCustomerSession(
   if (!session) throw new OrderError(401, 'UNAUTHORIZED', '顾客登录状态已失效，请重新登录。')
 }
 
-async function assertGuestSession(trx: Transaction<Database>, token: string | undefined): Promise<string> {
+export async function assertGuestSession(trx: Transaction<Database>, token: string | undefined): Promise<string> {
   if (!token || !/^[A-Za-z0-9_-]{43}$/u.test(token)) {
     throw new OrderError(401, 'GUEST_SESSION_REQUIRED', '请刷新页面后继续，系统会自动恢复游客订单会话。')
   }
@@ -720,6 +720,78 @@ async function adminOrderDetail(db: Kysely<Database>, orderId: string): Promise<
     .groupBy('attempt.id')
     .execute()
   const deliveryCounts = new Map(attemptCounts.map(item => [item.attempt_id, item.delivery_count]))
+  const paymentAttempts = await db.selectFrom('payment_attempts as attempt')
+    .leftJoin('payment_attempt_provider_state as provider_state', 'provider_state.payment_attempt_id', 'attempt.id')
+    .select([
+      'attempt.id', 'attempt.provider_type_snapshot', 'attempt.payment_method_snapshot',
+      'attempt.payment_channel_name_snapshot', 'attempt.merchant_order_no', 'attempt.status',
+      'attempt.amount', 'attempt.created_at', 'attempt.expires_at', 'attempt.completed_at',
+      'provider_state.state as provider_state', 'provider_state.provider_order_id as provider_order_id',
+      'provider_state.last_error_code as provider_error_code',
+      sql<string | null>`(SELECT receipt.amount::text FROM payment_receipts AS receipt
+        WHERE receipt.payment_attempt_id = attempt.id AND receipt.source_bucket = 'external'
+        ORDER BY receipt.received_at, receipt.id LIMIT 1)`.as('actual_amount'),
+      sql<string | null>`(SELECT receipt.provider_transaction_id FROM payment_receipts AS receipt
+        WHERE receipt.payment_attempt_id = attempt.id AND receipt.source_bucket = 'external'
+        ORDER BY receipt.received_at, receipt.id LIMIT 1)`.as('provider_transaction_id'),
+      sql<string | null>`(SELECT receipt.disposition FROM payment_receipts AS receipt
+        WHERE receipt.payment_attempt_id = attempt.id AND receipt.source_bucket = 'external'
+        ORDER BY receipt.received_at, receipt.id LIMIT 1)`.as('receipt_disposition'),
+    ])
+    .where('attempt.order_id', '=', orderId)
+    .where('attempt.payment_channel_id', 'is not', null)
+    .orderBy('attempt.created_at').orderBy('attempt.id')
+    .execute()
+  const paymentAttemptIds = paymentAttempts.map(attempt => attempt.id)
+  const providerEvents = paymentAttemptIds.length
+    ? await db.selectFrom('payment_provider_events').selectAll()
+      .where('payment_attempt_id', 'in', paymentAttemptIds)
+      .orderBy('received_at').orderBy('id').execute()
+    : []
+  const providerEventsByAttempt = new Map<string, typeof providerEvents>()
+  for (const event of providerEvents) {
+    const events = providerEventsByAttempt.get(event.payment_attempt_id) ?? []
+    events.push(event)
+    providerEventsByAttempt.set(event.payment_attempt_id, events)
+  }
+  const payments = {
+    needsReconciliation: paymentAttempts.some(attempt =>
+      attempt.status === 'late_succeeded' || attempt.status === 'reconciliation_required'
+      || (providerEventsByAttempt.get(attempt.id) ?? []).some(event =>
+        event.verification === 'unverified' || event.disposition === 'reconciliation_required'
+          || event.disposition === 'pending_confirmation' || event.disposition === 'unknown')),
+    attempts: paymentAttempts.map(attempt => ({
+      id: attempt.id,
+      providerType: attempt.provider_type_snapshot ?? 'zpay_epay_v1',
+      paymentMethod: attempt.payment_method_snapshot,
+      channelName: attempt.payment_channel_name_snapshot,
+      merchantOrderNo: attempt.merchant_order_no,
+      status: attempt.status,
+      providerState: attempt.provider_state,
+      providerOrderId: attempt.provider_order_id,
+      providerErrorCode: attempt.provider_error_code,
+      expectedAmount: attempt.amount,
+      actualAmount: attempt.actual_amount,
+      providerTransactionId: attempt.provider_transaction_id,
+      receiptDisposition: attempt.receipt_disposition as AdminOrderDetail['payments']['attempts'][number]['receiptDisposition'],
+      createdAt: attempt.created_at.toISOString(),
+      expiresAt: attempt.expires_at?.toISOString() ?? null,
+      completedAt: attempt.completed_at?.toISOString() ?? null,
+      events: (providerEventsByAttempt.get(attempt.id) ?? []).map(event => ({
+        id: event.id,
+        source: event.source,
+        verification: event.verification,
+        disposition: event.disposition,
+        providerStatus: event.provider_status,
+        providerTransactionId: event.provider_transaction_id,
+        reportedAmount: event.reported_amount,
+        providerTimeText: event.provider_time_text,
+        errorCode: event.error_code,
+        eventSha256: event.event_sha256.trim(),
+        receivedAt: event.received_at.toISOString(),
+      })),
+    })),
+  }
   return {
     order: detail,
     owner: {
@@ -749,6 +821,7 @@ async function adminOrderDetail(db: Kysely<Database>, orderId: string): Promise<
       completedAt: attempt.completed_at?.toISOString() ?? null,
       deliveryCount: deliveryCounts.get(attempt.id) ?? 0,
     })),
+    payments,
   }
 }
 

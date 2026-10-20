@@ -5,7 +5,13 @@ import { startUnpaidOrderExpiryWorker } from './commerce/unpaid-order-expiry.js'
 
 const config = readConfig()
 const db = createDatabase()
-const app = await createApp({ db, config })
+const app = await createApp({
+  db,
+  config,
+  ...(process.env.PAYMENT_PROVIDER_BASE_URL_FOR_TESTS
+    ? { paymentProviderBaseUrlForTests: process.env.PAYMENT_PROVIDER_BASE_URL_FOR_TESTS }
+    : {}),
+})
 const stopUnpaidOrderExpiry = startUnpaidOrderExpiryWorker(db, app.log)
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {

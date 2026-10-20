@@ -979,6 +979,149 @@ export const OrderStatusSchema = Type.Union([
   Type.Literal('pending_payment'), Type.Literal('processing'),
   Type.Literal('completed'), Type.Literal('closed'),
 ])
+export const ExternalPaymentMethodSchema = Type.Union([Type.Literal('alipay'), Type.Literal('wechat')])
+export const PaymentProviderTypeSchema = Type.Union([
+  Type.Literal('zpay_epay_v1'), Type.Literal('codepay_unconfigured'),
+])
+export const PaymentActionSchema = Type.Union([
+  Type.Object({ type: Type.Literal('qr_code'), value: Type.String({ minLength: 1, maxLength: 2048 }) }, { additionalProperties: false }),
+  Type.Object({ type: Type.Literal('redirect'), url: Type.String({ format: 'uri', maxLength: 2048 }) }, { additionalProperties: false }),
+])
+export const PublicPaymentChannelSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 80 }),
+  paymentMethods: Type.Array(ExternalPaymentMethodSchema, { minItems: 1, maxItems: 2 }),
+}, { additionalProperties: false })
+export const PublicPaymentChannelListSchema = Type.Object({
+  items: Type.Array(PublicPaymentChannelSchema),
+}, { additionalProperties: false })
+export const CustomerPaymentAttemptSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  status: Type.Union([
+    Type.Literal('created'), Type.Literal('pending'), Type.Literal('succeeded'),
+    Type.Literal('failed'), Type.Literal('expired'), Type.Literal('cancelled'),
+    Type.Literal('late_succeeded'), Type.Literal('reconciliation_required'),
+  ]),
+  providerState: Type.Union([
+    Type.Literal('requesting'), Type.Literal('ready'), Type.Literal('unknown'), Type.Literal('failed'), Type.Null(),
+  ]),
+  paymentMethod: Type.Union([ExternalPaymentMethodSchema, Type.Null()]),
+  channelName: Type.Union([Type.String({ minLength: 1, maxLength: 80 }), Type.Null()]),
+  action: Type.Union([PaymentActionSchema, Type.Null()]),
+  expiresAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  errorCode: Type.Union([Type.String({ maxLength: 64 }), Type.Null()]),
+}, { additionalProperties: false })
+export const CustomerOrderPaymentSchema = Type.Object({
+  orderId: Type.String({ format: 'uuid' }),
+  orderStatus: OrderStatusSchema,
+  paymentStatus: Type.Union([
+    Type.Literal('unpaid'), Type.Literal('pending'), Type.Literal('paid'),
+    Type.Literal('late_paid'), Type.Literal('reconciliation_required'), Type.Literal('not_payable'),
+  ]),
+  totalAmount: SettlementAmountSchema,
+  confirmedAmount: SettlementAmountSchema,
+  currency: Type.Literal('CNY'),
+  unpaidExpiresAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  channels: Type.Array(PublicPaymentChannelSchema),
+  attempt: Type.Union([CustomerPaymentAttemptSchema, Type.Null()]),
+}, { additionalProperties: false })
+export const CreateOrderPaymentBodySchema = Type.Object({
+  idempotencyKey: Type.String({ format: 'uuid' }),
+  channelId: Type.String({ format: 'uuid' }),
+  paymentMethod: ExternalPaymentMethodSchema,
+}, { additionalProperties: false })
+export const PaymentOrderIdParamsSchema = Type.Object({ id: Type.String({ format: 'uuid' }) })
+
+export const AdminPaymentChannelSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  providerType: PaymentProviderTypeSchema,
+  providerAvailable: Type.Boolean(),
+  name: Type.String({ minLength: 1, maxLength: 80 }),
+  enabled: Type.Boolean(),
+  paymentMethods: Type.Array(ExternalPaymentMethodSchema, { maxItems: 2 }),
+  displayOrder: Type.Integer({ minimum: 0, maximum: 100000 }),
+  merchantIdMasked: Type.Union([Type.String({ maxLength: 120 }), Type.Null()]),
+  credentialsConfigured: Type.Boolean(),
+  credentialVersion: Type.Integer({ minimum: 0 }),
+  updatedAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const AdminPaymentChannelListSchema = Type.Object({
+  items: Type.Array(AdminPaymentChannelSchema),
+}, { additionalProperties: false })
+export const CreatePaymentChannelBodySchema = Type.Object({
+  providerType: PaymentProviderTypeSchema,
+  name: Type.String({ minLength: 1, maxLength: 80 }),
+  enabled: Type.Boolean(),
+  paymentMethods: Type.Array(ExternalPaymentMethodSchema, { maxItems: 2 }),
+  displayOrder: Type.Integer({ minimum: 0, maximum: 100000 }),
+  merchantId: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  merchantKey: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
+}, { additionalProperties: false })
+export const UpdatePaymentChannelBodySchema = Type.Object({
+  name: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+  enabled: Type.Optional(Type.Boolean()),
+  paymentMethods: Type.Optional(Type.Array(ExternalPaymentMethodSchema, { maxItems: 2 })),
+  displayOrder: Type.Optional(Type.Integer({ minimum: 0, maximum: 100000 })),
+  merchantId: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  merchantKey: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
+}, { additionalProperties: false, minProperties: 1 })
+export const PaymentChannelIdParamsSchema = Type.Object({ id: Type.String({ format: 'uuid' }) })
+export const PaymentChannelMutationResultSchema = Type.Object({
+  channel: AdminPaymentChannelSchema,
+}, { additionalProperties: false })
+export const PaymentChannelTestResultSchema = Type.Object({
+  valid: Type.Boolean(),
+  message: Type.String({ maxLength: 160 }),
+}, { additionalProperties: false })
+export const PaymentCredentialReencryptionResultSchema = Type.Object({
+  channelsReencrypted: Type.Integer({ minimum: 0 }),
+  attemptsReencrypted: Type.Integer({ minimum: 0 }),
+  activeKeyId: Type.String({ minLength: 1, maxLength: 48 }),
+}, { additionalProperties: false })
+export const AdminPaymentProviderEventSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  source: Type.Union([Type.Literal('callback'), Type.Literal('query')]),
+  verification: Type.Union([Type.Literal('verified'), Type.Literal('unverified')]),
+  disposition: Type.Union([
+    Type.Literal('settled'), Type.Literal('duplicate'), Type.Literal('not_paid'),
+    Type.Literal('pending_confirmation'), Type.Literal('reconciliation_required'), Type.Literal('unknown'),
+  ]),
+  providerStatus: Type.Union([
+    Type.Literal('paid'), Type.Literal('pending'), Type.Literal('failed'), Type.Literal('unknown'),
+  ]),
+  providerTransactionId: Type.Union([Type.String({ maxLength: 200 }), Type.Null()]),
+  reportedAmount: Type.Union([SettlementAmountSchema, Type.Null()]),
+  providerTimeText: Type.Union([Type.String({ maxLength: 64 }), Type.Null()]),
+  errorCode: Type.Union([Type.String({ maxLength: 64 }), Type.Null()]),
+  eventSha256: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+  receivedAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const AdminPaymentAttemptSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  providerType: PaymentProviderTypeSchema,
+  paymentMethod: Type.Union([ExternalPaymentMethodSchema, Type.Null()]),
+  channelName: Type.Union([Type.String({ maxLength: 80 }), Type.Null()]),
+  merchantOrderNo: Type.Union([Type.String({ maxLength: 32 }), Type.Null()]),
+  status: CustomerPaymentAttemptSchema.properties.status,
+  providerState: CustomerPaymentAttemptSchema.properties.providerState,
+  providerOrderId: Type.Union([Type.String({ maxLength: 200 }), Type.Null()]),
+  providerErrorCode: Type.Union([Type.String({ maxLength: 64 }), Type.Null()]),
+  expectedAmount: SettlementAmountSchema,
+  actualAmount: Type.Union([SettlementAmountSchema, Type.Null()]),
+  providerTransactionId: Type.Union([Type.String({ maxLength: 200 }), Type.Null()]),
+  receiptDisposition: Type.Union([
+    Type.Literal('on_time'), Type.Literal('late'), Type.Literal('excess'), Type.Literal('amount_mismatch'), Type.Null(),
+  ]),
+  createdAt: Type.String({ format: 'date-time' }),
+  expiresAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  events: Type.Array(AdminPaymentProviderEventSchema),
+}, { additionalProperties: false })
+export const AdminOrderPaymentsSchema = Type.Object({
+  needsReconciliation: Type.Boolean(),
+  attempts: Type.Array(AdminPaymentAttemptSchema),
+}, { additionalProperties: false })
 export const OrderPaymentStatusSchema = Type.Union([
   Type.Literal('not_required'), Type.Literal('unpaid'), Type.Literal('paid'),
 ])
@@ -1126,6 +1269,7 @@ export const AdminOrderDetailSchema = Type.Object({
   }, { additionalProperties: false }),
   inventory: Type.Array(AdminOrderItemInventorySchema),
   fulfillmentAttempts: Type.Array(AdminFulfillmentAttemptSchema),
+  payments: AdminOrderPaymentsSchema,
 }, { additionalProperties: false })
 export const UpdateManualFulfillmentBodySchema = Type.Object({
   enabled: Type.Boolean(),
@@ -1576,6 +1720,19 @@ export type CheckoutQuoteReason = Static<typeof CheckoutQuoteReasonSchema>
 export type CheckoutQuoteItem = Static<typeof CheckoutQuoteItemSchema>
 export type CheckoutQuote = Static<typeof CheckoutQuoteSchema>
 export type CreateOrderBody = Static<typeof CreateOrderBodySchema>
+export type ExternalPaymentMethod = Static<typeof ExternalPaymentMethodSchema>
+export type PaymentProviderType = Static<typeof PaymentProviderTypeSchema>
+export type PaymentAction = Static<typeof PaymentActionSchema>
+export type CustomerPaymentAttempt = Static<typeof CustomerPaymentAttemptSchema>
+export type CustomerOrderPayment = Static<typeof CustomerOrderPaymentSchema>
+export type CreateOrderPaymentBody = Static<typeof CreateOrderPaymentBodySchema>
+export type AdminPaymentChannel = Static<typeof AdminPaymentChannelSchema>
+export type CreatePaymentChannelBody = Static<typeof CreatePaymentChannelBodySchema>
+export type UpdatePaymentChannelBody = Static<typeof UpdatePaymentChannelBodySchema>
+export type PaymentCredentialReencryptionResult = Static<typeof PaymentCredentialReencryptionResultSchema>
+export type AdminOrderPayments = Static<typeof AdminOrderPaymentsSchema>
+export type AdminPaymentAttempt = Static<typeof AdminPaymentAttemptSchema>
+export type AdminPaymentProviderEvent = Static<typeof AdminPaymentProviderEventSchema>
 export type CreateOrderResult = Static<typeof CreateOrderResultSchema>
 export type OrderStatus = Static<typeof OrderStatusSchema>
 export type OrderSummary = Static<typeof OrderSummarySchema>

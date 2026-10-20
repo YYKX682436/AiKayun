@@ -270,6 +270,88 @@ export interface PaymentAttemptsTable {
   created_at: Generated<Date>
   expires_at: Date | null
   completed_at: Date | null
+  payment_channel_id: Generated<string | null>
+  provider_type_snapshot: Generated<'zpay_epay_v1' | null>
+  payment_method_snapshot: Generated<'alipay' | 'wechat' | null>
+  payment_channel_name_snapshot: Generated<string | null>
+  channel_credential_version: Generated<number | null>
+  merchant_order_no: Generated<string | null>
+}
+
+export type PaymentProviderType = 'zpay_epay_v1' | 'codepay_unconfigured'
+export type ExternalPaymentMethod = 'alipay' | 'wechat'
+
+export interface PaymentChannelsTable {
+  id: string
+  provider_type: PaymentProviderType
+  name: string
+  enabled: boolean
+  payment_methods: ColumnType<string[], string[], string[]>
+  display_order: number
+  config_ciphertext: Buffer | null
+  config_nonce: Buffer | null
+  config_auth_tag: Buffer | null
+  config_key_id: string | null
+  credential_version: number
+  created_by_admin_id: string
+  updated_by_admin_id: string
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
+
+export interface PaymentChannelAuditEventsTable {
+  id: string
+  payment_channel_id: string
+  administrator_id: string
+  action: 'created' | 'updated' | 'encryption_reencrypted'
+  summary: ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>
+  created_at: Generated<Date>
+}
+
+export interface PaymentAttemptSecretsTable {
+  payment_attempt_id: string
+  envelope_version: number
+  config_version: number
+  key_id: string
+  nonce: Buffer
+  ciphertext: Buffer
+  auth_tag: Buffer
+  created_at: Generated<Date>
+}
+
+export type PaymentProviderRequestState = 'requesting' | 'ready' | 'unknown' | 'failed'
+
+export interface PaymentAttemptProviderStateTable {
+  payment_attempt_id: string
+  state: PaymentProviderRequestState
+  action: ColumnType<Record<string, unknown> | null, Record<string, unknown> | null, Record<string, unknown> | null>
+  provider_order_id: string | null
+  last_error_code: string | null
+  request_started_at: Generated<Date>
+  last_query_at: Date | null
+  updated_at: Generated<Date>
+}
+
+export type ProviderEventSource = 'callback' | 'query'
+export type ProviderEventDisposition =
+  | 'settled' | 'duplicate' | 'not_paid' | 'pending_confirmation' | 'reconciliation_required' | 'unknown'
+
+export interface PaymentProviderEventsTable {
+  id: string
+  payment_attempt_id: string
+  source: ProviderEventSource
+  event_sha256: string
+  verification: 'verified' | 'unverified'
+  disposition: ProviderEventDisposition
+  provider_status: 'paid' | 'pending' | 'failed' | 'unknown'
+  provider_transaction_id: string | null
+  reported_amount: ColumnType<string | null, string | null, string | null>
+  currency: Generated<'CNY'>
+  provider_paid_at: Date | null
+  provider_time_text: string | null
+  payload: ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>
+  error_code: string | null
+  received_at: Generated<Date>
 }
 
 export type PaymentReceiptBucket = 'external' | 'cash' | 'gift'
@@ -566,6 +648,11 @@ export interface Database {
   wallet_operations: WalletOperationsTable
   payment_attempts: PaymentAttemptsTable
   payment_receipts: PaymentReceiptsTable
+  payment_channels: PaymentChannelsTable
+  payment_channel_audit_events: PaymentChannelAuditEventsTable
+  payment_attempt_secrets: PaymentAttemptSecretsTable
+  payment_attempt_provider_state: PaymentAttemptProviderStateTable
+  payment_provider_events: PaymentProviderEventsTable
   order_refunds: OrderRefundsTable
   order_refund_allocations: OrderRefundAllocationsTable
   wallet_ledger_entries: WalletLedgerEntriesTable

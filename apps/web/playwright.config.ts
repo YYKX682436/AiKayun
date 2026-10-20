@@ -33,6 +33,19 @@ export default defineConfig({
   globalSetup: './test/e2e/global-setup.ts',
   webServer: useExternalServer ? undefined : [
     {
+      command: 'pnpm --filter @aikayun/api exec tsx test/fixtures/zpay-http-server.ts --serve',
+      url: 'http://127.0.0.1:3099/__fixture/health',
+      reuseExistingServer: false,
+      timeout: 30_000,
+      env: {
+        NODE_ENV: 'test',
+        AIKAYUN_TEST_ZPAY_FIXTURE: 'true',
+        ZPAY_FIXTURE_PORT: '3099',
+        ZPAY_FIXTURE_MERCHANT_ID: 'playwright-fixture-merchant',
+        ZPAY_FIXTURE_MERCHANT_KEY: 'playwright-only-secret-never-returned',
+      },
+    },
+    {
       command: 'pnpm --filter @aikayun/api dev',
       url: `http://127.0.0.1:${apiPort}/api/v1/health/live`,
       reuseExistingServer: false,
@@ -45,6 +58,11 @@ export default defineConfig({
         MEDIA_ROOT: mediaRoot,
         COOKIE_SECURE: 'false',
         TRUST_PROXY: 'true',
+        PAYMENT_CREDENTIAL_KEY_RING: JSON.stringify({
+          activeKeyId: 'playwright-v1',
+          keys: { 'playwright-v1': 'Kys1KGV3aLVP4dWZV0nZ3QXxSbg7g4lWIMHFAsrK6fI=' },
+        }),
+        PAYMENT_PROVIDER_BASE_URL_FOR_TESTS: 'http://127.0.0.1:3099',
       },
     },
     {

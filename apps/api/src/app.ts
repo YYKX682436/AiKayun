@@ -36,14 +36,27 @@ import { registerProductMediaRoutes } from './media/admin.js'
 import { registerPublicProductRoutes } from './catalog/public-products.js'
 import { registerCustomerCartRoutes } from './commerce/customer-cart.js'
 import { registerOrderRoutes } from './commerce/orders.js'
+import { registerPaymentRoutes } from './payments/routes.js'
+import { ZpayEpayProvider } from './payments/zpay-epay.js'
 
 export async function createApp(options: {
   db: Kysely<Database>
   config: AppConfig
   logger?: boolean
   productIdentityFactory?: ProductIdentityFactory
+  /** Loopback-only service endpoint for integration tests; rejected outside NODE_ENV=test. */
+  paymentProviderBaseUrlForTests?: string
 }) {
   const { db, config } = options
+  let paymentProviderBaseUrl = 'https://zpayz.cn'
+  if (options.paymentProviderBaseUrlForTests) {
+    const testProviderUrl = new URL(options.paymentProviderBaseUrlForTests)
+    if (config.nodeEnv !== 'test' || testProviderUrl.protocol !== 'http:'
+      || !['127.0.0.1', 'localhost'].includes(testProviderUrl.hostname)) {
+      throw new Error('The payment provider test endpoint is restricted to loopback HTTP in NODE_ENV=test')
+    }
+    paymentProviderBaseUrl = options.paymentProviderBaseUrlForTests
+  }
   const app = Fastify({
     logger: options.logger === false ? false : {
       level: config.nodeEnv === 'production' ? 'info' : 'debug',
@@ -75,6 +88,8 @@ export async function createApp(options: {
         { name: 'catalog', description: 'Product and SKU administration' },
         { name: 'customers', description: 'Protected customer administration and audit' },
         { name: 'public-catalog', description: 'Public product and visible category reads' },
+        { name: 'payments', description: 'Customer payment attempts and provider callbacks' },
+        { name: 'admin-payments', description: 'Protected payment channel configuration and reconciliation evidence' },
       ],
     },
   })
@@ -150,6 +165,7 @@ export async function createApp(options: {
   registerCustomerAuthRoutes(app, db, config, dummyPasswordHash)
   registerCustomerCartRoutes(app, db, config)
   registerOrderRoutes(app, db, config)
+  registerPaymentRoutes(app, db, config, new ZpayEpayProvider(paymentProviderBaseUrl))
   registerCustomerPolicyRoutes(app, db, config)
   registerAdminCustomerRoutes(app, db, config)
   const identityFactory = options.productIdentityFactory ?? defaultProductIdentityFactory

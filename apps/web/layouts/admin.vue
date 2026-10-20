@@ -23,6 +23,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     to: '/admin/orders',
   },
   {
+    label: '支付通道',
+    icon: 'i-lucide-credit-card',
+    to: '/admin/payment-channels',
+  },
+  {
     label: '顾客设置',
     icon: 'i-lucide-user-round-cog',
     to: '/admin/storefront/customer-policy',

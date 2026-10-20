@@ -23,6 +23,8 @@ Logo URL 仅接受站内根路径或 HTTPS 地址；主色仅接受 `#RGB` 或 `
 
 所有真实密钥仅从 `.env` 或部署平台密钥注入，不能提交到仓库。不要将数据库端口暴露到公网；Compose 默认只绑定到 `127.0.0.1`。正式部署必须显式设置公开绑定地址、HTTPS 域名与 Secure Cookie。
 
+启用在线支付前，在 API 容器环境配置 `PAYMENT_CREDENTIAL_KEY_RING`。每个独立部署实例各自生成 AES-256-GCM 密钥，不要让 web 容器接收该值。完整格式、通道管理和密钥轮换步骤见[在线支付协议与运行手册](./online-payments.md)。
+
 ## 启动与管理员初始化
 
 ```sh

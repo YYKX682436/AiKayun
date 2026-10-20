@@ -37,6 +37,12 @@ export interface AppConfig {
   sessionTtlSeconds: number
   mediaRoot: string
   database: PoolConfig
+  paymentCredentialKeyRing: PaymentCredentialKeyRing | null
+}
+
+export interface PaymentCredentialKeyRing {
+  activeKeyId: string
+  keys: Record<string, Buffer>
 }
 
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {
@@ -44,6 +50,43 @@ function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (value === 'true') return true
   if (value === 'false') return false
   throw new Error('Boolean environment values must be true or false')
+}
+
+function parsePaymentCredentialKeyRing(value: string | undefined): PaymentCredentialKeyRing | null {
+  if (!value) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value) as unknown
+  } catch {
+    throw new Error('PAYMENT_CREDENTIAL_KEY_RING must be valid JSON')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('PAYMENT_CREDENTIAL_KEY_RING must contain an activeKeyId and keys object')
+  }
+  const record = parsed as { activeKeyId?: unknown; keys?: unknown }
+  if (typeof record.activeKeyId !== 'string' || !/^[A-Za-z0-9_-]{1,48}$/u.test(record.activeKeyId)
+    || !record.keys || typeof record.keys !== 'object' || Array.isArray(record.keys)) {
+    throw new Error('PAYMENT_CREDENTIAL_KEY_RING must contain an activeKeyId and keys object')
+  }
+  const keyEntries = Object.entries(record.keys as Record<string, unknown>)
+  if (keyEntries.length < 1 || keyEntries.length > 16) {
+    throw new Error('PAYMENT_CREDENTIAL_KEY_RING must contain between 1 and 16 keys')
+  }
+  const keys: Record<string, Buffer> = {}
+  for (const [keyId, encoded] of keyEntries) {
+    if (!/^[A-Za-z0-9_-]{1,48}$/u.test(keyId) || typeof encoded !== 'string') {
+      throw new Error('PAYMENT_CREDENTIAL_KEY_RING contains an invalid key entry')
+    }
+    const key = Buffer.from(encoded, 'base64')
+    if (key.length !== 32 || key.toString('base64') !== encoded) {
+      throw new Error('Payment credential encryption keys must be canonical base64 encoded 32-byte values')
+    }
+    keys[keyId] = key
+  }
+  if (!keys[record.activeKeyId]) {
+    throw new Error('PAYMENT_CREDENTIAL_KEY_RING activeKeyId must exist in keys')
+  }
+  return { activeKeyId: record.activeKeyId, keys }
 }
 
 export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -93,5 +136,6 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     sessionTtlSeconds: 60 * 60 * 12,
     mediaRoot,
     database,
+    paymentCredentialKeyRing: parsePaymentCredentialKeyRing(env.PAYMENT_CREDENTIAL_KEY_RING),
   }
 }

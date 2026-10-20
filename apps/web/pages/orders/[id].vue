@@ -1,23 +1,40 @@
 <script setup lang="ts">
-import type { OrderDetail } from '@aikayun/contracts'
+import type { CustomerOrderPayment, ExternalPaymentMethod, OrderDetail } from '@aikayun/contracts'
 import { CustomerApiError, useCustomerApi } from '~/composables/useCustomerApi'
 
 const route = useRoute()
 const customerApi = useCustomerApi()
 const orderId = computed(() => String(route.params.id))
 const order = shallowRef<OrderDetail | null>(null)
+const payment = shallowRef<CustomerOrderPayment | null>(null)
 const loading = ref(false)
 const cancelling = ref(false)
+const creatingPayment = ref(false)
+const refreshingPayment = ref(false)
 const confirmCancel = ref(false)
 const errorMessage = ref('')
 const mounted = ref(false)
+const selectedChannelId = ref('')
+const selectedPaymentMethod = ref<ExternalPaymentMethod>('alipay')
+const qrDataUrl = ref('')
+const qrError = ref('')
 let sequence = 0
+let qrSequence = 0
+let renderedQrValue = ''
 
 useSeoMeta({ title: '订单详情', description: '查看订单状态、成交快照和已完成的数字交付。', robots: 'noindex, nofollow' })
 useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 
 const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id))
-const canCancel = computed(() => order.value?.status === 'pending_payment')
+const hasActiveAttempt = computed(() => Boolean(payment.value?.attempt
+  && ['created', 'pending'].includes(payment.value.attempt.status)))
+const canCancel = computed(() => order.value?.status === 'pending_payment' && !hasActiveAttempt.value)
+const selectedChannel = computed(() => payment.value?.channels.find(channel => channel.id === selectedChannelId.value) ?? null)
+const canCreatePayment = computed(() => Boolean(payment.value?.paymentStatus === 'unpaid'
+  && !hasActiveAttempt.value && selectedChannel.value?.paymentMethods.includes(selectedPaymentMethod.value)))
+const qrAction = computed(() => payment.value?.attempt?.action?.type === 'qr_code'
+  ? payment.value.attempt.action.value
+  : '')
 
 function statusLabel(value: OrderDetail): string {
   if (value.status === 'pending_payment') return '等待付款'
@@ -57,9 +74,20 @@ async function loadOrder() {
   errorMessage.value = ''
   try {
     const path = isCustomer.value ? `/api/v1/customer/orders/${orderId.value}` : `/api/v1/guest/orders/${orderId.value}`
-    const result = await customerApi.request<OrderDetail>(path)
+    const [result, paymentResult] = await Promise.all([
+      customerApi.request<OrderDetail>(path),
+      customerApi.request<CustomerOrderPayment>(`/api/v1/orders/${orderId.value}/payment`),
+    ])
     if (currentSequence !== sequence || identityAtStart !== customerApi.identityVersion.value) return
     order.value = result
+    payment.value = paymentResult
+    if (!paymentResult.channels.some(channel => channel.id === selectedChannelId.value)) {
+      selectedChannelId.value = paymentResult.channels[0]?.id ?? ''
+    }
+    const supportedMethods = paymentResult.channels.find(channel => channel.id === selectedChannelId.value)?.paymentMethods ?? []
+    if (!supportedMethods.includes(selectedPaymentMethod.value) && supportedMethods[0]) {
+      selectedPaymentMethod.value = supportedMethods[0]
+    }
   } catch (error) {
     if (currentSequence !== sequence || identityAtStart !== customerApi.identityVersion.value) return
     errorMessage.value = error instanceof Error ? error.message : '订单暂时无法读取。'
@@ -78,6 +106,7 @@ async function cancelOrder() {
       : `/api/v1/guest/orders/${orderId.value}/cancel`
     order.value = await customerApi.request<OrderDetail>(path, { method: 'POST' })
     confirmCancel.value = false
+    await loadOrder()
   } catch (error) {
     errorMessage.value = error instanceof CustomerApiError || error instanceof Error
       ? error.message
@@ -87,6 +116,94 @@ async function cancelOrder() {
   }
 }
 
+function paymentKeyStorageKey(channelId: string, method: ExternalPaymentMethod): string {
+  return `aikayun-payment-request-v1:${customerApi.identityVersion.value}:${orderId.value}:${channelId}:${method}`
+}
+
+function paymentIdempotencyKey(channelId: string, method: ExternalPaymentMethod): string {
+  if (!import.meta.client) throw new Error('请在浏览器中发起支付。')
+  const key = paymentKeyStorageKey(channelId, method)
+  try {
+    const existing = sessionStorage.getItem(key)
+    if (existing && /^[0-9a-f-]{36}$/iu.test(existing)) return existing
+    const next = crypto.randomUUID()
+    sessionStorage.setItem(key, next)
+    return next
+  } catch {
+    throw new Error('浏览器无法安全保存支付重试标识，请启用会话存储后重试。')
+  }
+}
+
+async function createPayment() {
+  if (!canCreatePayment.value || creatingPayment.value || !selectedChannelId.value) return
+  creatingPayment.value = true
+  errorMessage.value = ''
+  const orderAtStart = orderId.value
+  const identityAtStart = customerApi.identityVersion.value
+  try {
+    const result = await customerApi.request<CustomerOrderPayment>(`/api/v1/orders/${orderAtStart}/payments`, {
+      method: 'POST',
+      body: {
+        idempotencyKey: paymentIdempotencyKey(selectedChannelId.value, selectedPaymentMethod.value),
+        channelId: selectedChannelId.value,
+        paymentMethod: selectedPaymentMethod.value,
+      },
+    })
+    if (orderAtStart !== orderId.value || identityAtStart !== customerApi.identityVersion.value) return
+    payment.value = result
+    if (result.attempt && ['failed', 'expired', 'cancelled'].includes(result.attempt.status)) {
+      try { sessionStorage.removeItem(paymentKeyStorageKey(selectedChannelId.value, selectedPaymentMethod.value)) } catch { /* The server attempt remains authoritative. */ }
+    }
+    await loadOrder()
+  } catch (error) {
+    if (orderAtStart !== orderId.value || identityAtStart !== customerApi.identityVersion.value) return
+    errorMessage.value = error instanceof Error ? error.message : '支付请求结果尚未确认，请刷新订单状态后再试。'
+  } finally {
+    creatingPayment.value = false
+  }
+}
+
+async function refreshPayment() {
+  if (!payment.value || refreshingPayment.value) return
+  refreshingPayment.value = true
+  errorMessage.value = ''
+  const orderAtStart = orderId.value
+  const identityAtStart = customerApi.identityVersion.value
+  try {
+    payment.value = await customerApi.request<CustomerOrderPayment>(`/api/v1/orders/${orderAtStart}/payment/refresh`, {
+      method: 'POST',
+    })
+    if (orderAtStart !== orderId.value || identityAtStart !== customerApi.identityVersion.value) return
+    await loadOrder()
+  } catch (error) {
+    if (orderAtStart !== orderId.value || identityAtStart !== customerApi.identityVersion.value) return
+    errorMessage.value = error instanceof Error ? error.message : '支付状态暂时无法确认，请稍后重试。'
+  } finally {
+    refreshingPayment.value = false
+  }
+}
+
+watch(qrAction, async (value) => {
+  const currentSequence = ++qrSequence
+  if (!value) {
+    renderedQrValue = ''
+    qrDataUrl.value = ''
+    qrError.value = ''
+    return
+  }
+  if (!import.meta.client || value === renderedQrValue) return
+  qrError.value = ''
+  try {
+    const QRCode = await import('qrcode')
+    const dataUrl = await QRCode.toDataURL(value, { errorCorrectionLevel: 'M', margin: 2, width: 256 })
+    if (currentSequence !== qrSequence || value !== qrAction.value) return
+    renderedQrValue = value
+    qrDataUrl.value = dataUrl
+  } catch {
+    if (currentSequence === qrSequence) qrError.value = '二维码暂时无法生成，请刷新订单后重试。'
+  }
+}, { immediate: true })
+
 onMounted(() => {
   mounted.value = true
   void loadOrder()
@@ -95,9 +212,27 @@ onMounted(() => {
 watch(() => customerApi.identityVersion.value, () => {
   if (!mounted.value) return
   order.value = null
+  payment.value = null
   confirmCancel.value = false
+  selectedChannelId.value = ''
+  qrDataUrl.value = ''
   void loadOrder()
 }, { flush: 'sync' })
+
+watch(orderId, () => {
+  if (!mounted.value) return
+  sequence++
+  order.value = null
+  payment.value = null
+  selectedChannelId.value = ''
+  confirmCancel.value = false
+  qrDataUrl.value = ''
+  void loadOrder()
+}, { flush: 'sync' })
+
+watch(() => selectedChannel.value?.paymentMethods, (methods) => {
+  if (methods?.length && !methods.includes(selectedPaymentMethod.value)) selectedPaymentMethod.value = methods[0]!
+})
 </script>
 
 <template>
@@ -213,7 +348,7 @@ watch(() => customerApi.identityVersion.value, () => {
             variant="subtle"
             icon="i-lucide-clock-3"
             title="等待付款"
-            description="当前尚未开放支付宝或微信支付。请勿向页面之外的账户付款；未付款订单会在截止时间后自动关闭并释放预留库存。"
+            description="请在本订单页面选择可用支付方式并完成付款。订单状态只会在服务端确认实际收款后更新。"
           />
           <UAlert
             v-else-if="order.status === 'processing'"
@@ -265,6 +400,225 @@ watch(() => customerApi.identityVersion.value, () => {
             </template>
           </div>
         </header>
+
+        <section
+          v-if="payment && order.status === 'pending_payment' && order.totalAmount !== '0.00'"
+          class="mt-5 rounded-2xl border border-default bg-elevated p-4 sm:p-6"
+          aria-labelledby="order-payment-title"
+        >
+          <div class="flex flex-wrap items-start justify-between gap-4">
+            <div class="min-w-0">
+              <p class="text-sm font-medium text-primary">
+                在线支付
+              </p>
+              <h2
+                id="order-payment-title"
+                class="mt-1 text-lg font-semibold text-highlighted"
+              >
+                应付 ¥{{ payment.totalAmount }}
+              </h2>
+              <p class="mt-1 text-sm text-muted">
+                人民币 · 以本订单金额为准
+              </p>
+            </div>
+            <UButton
+              v-if="hasActiveAttempt"
+              color="neutral"
+              variant="outline"
+              icon="i-lucide-refresh-cw"
+              :loading="refreshingPayment"
+              :disabled="refreshingPayment"
+              @click="refreshPayment"
+            >
+              刷新支付状态
+            </UButton>
+          </div>
+
+          <UAlert
+            v-if="payment.paymentStatus === 'paid'"
+            class="mt-4"
+            color="success"
+            variant="subtle"
+            icon="i-lucide-circle-check"
+            title="服务端已确认付款"
+            description="订单已进入等待商家交付状态。"
+          />
+          <UAlert
+            v-else-if="payment.paymentStatus === 'late_paid' || payment.paymentStatus === 'reconciliation_required'"
+            class="mt-4"
+            color="warning"
+            variant="subtle"
+            icon="i-lucide-shield-alert"
+            title="收款需要商家核对"
+            description="系统已保留服务商凭证，订单不会自动进入履约。请联系商家核对实际收款。"
+          />
+
+          <template v-else-if="hasActiveAttempt && payment.attempt">
+            <div class="mt-4 rounded-xl border border-default p-4">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div class="min-w-0">
+                  <p class="font-medium text-highlighted">
+                    {{ payment.attempt.paymentMethod === 'wechat' ? '微信支付' : '支付宝' }}
+                    <span
+                      v-if="payment.attempt.channelName"
+                      class="font-normal text-muted"
+                    >· {{ payment.attempt.channelName }}</span>
+                  </p>
+                  <p class="mt-1 text-sm text-muted">
+                    {{ payment.attempt.providerState === 'ready' ? '支付请求已创建。完成支付后返回此页并刷新状态。' : '支付创建结果尚未确认。请勿重复付款，稍后刷新以安全确认服务商状态。' }}
+                  </p>
+                  <p
+                    v-if="payment.attempt.expiresAt"
+                    class="mt-2 text-xs text-muted"
+                  >
+                    本次支付尝试截止 {{ formatDate(payment.attempt.expiresAt) }}
+                  </p>
+                </div>
+                <UBadge
+                  color="warning"
+                  variant="soft"
+                >
+                  {{ payment.attempt.providerState === 'ready' ? '待支付' : '确认中' }}
+                </UBadge>
+              </div>
+
+              <figure
+                v-if="payment.attempt.action?.type === 'qr_code' && qrDataUrl"
+                class="mx-auto mt-4 grid w-full max-w-64 justify-items-center gap-2 rounded-xl border border-default bg-default p-4"
+              >
+                <img
+                  :src="qrDataUrl"
+                  alt="本次订单的支付二维码"
+                  width="256"
+                  height="256"
+                  class="size-56 max-w-full"
+                >
+                <figcaption class="text-center text-xs text-muted">
+                  使用对应的支付应用扫码
+                </figcaption>
+              </figure>
+              <p
+                v-if="qrError"
+                class="mt-3 text-sm text-error"
+                role="alert"
+              >
+                {{ qrError }}
+              </p>
+              <a
+                v-if="payment.attempt.action?.type === 'redirect'"
+                :href="payment.attempt.action.url"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="mt-4 inline-flex min-h-11 items-center justify-center rounded-lg bg-primary px-4 py-2 text-sm font-medium text-inverted hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              >
+                打开支付页面
+              </a>
+            </div>
+          </template>
+
+          <template v-else-if="payment.paymentStatus === 'unpaid'">
+            <UAlert
+              v-if="payment.channels.length === 0"
+              class="mt-4"
+              color="neutral"
+              variant="subtle"
+              title="暂时没有可用支付通道"
+              description="请稍后重试，或联系商家确认支付配置。"
+            />
+            <div
+              v-else
+              class="mt-4 grid gap-5"
+            >
+              <fieldset class="grid gap-2">
+                <legend class="text-sm font-medium text-highlighted">
+                  选择支付通道
+                </legend>
+                <label
+                  v-for="channel in payment.channels"
+                  :key="channel.id"
+                  class="flex min-h-12 min-w-0 cursor-pointer items-center gap-3 rounded-xl border border-default px-3 py-2 transition-colors hover:bg-muted"
+                  :class="selectedChannelId === channel.id ? 'border-primary bg-primary/5' : ''"
+                >
+                  <input
+                    v-model="selectedChannelId"
+                    type="radio"
+                    name="payment-channel"
+                    :value="channel.id"
+                    class="size-4 shrink-0 accent-primary"
+                  >
+                  <span class="min-w-0 break-words text-sm font-medium text-highlighted">{{ channel.name }}</span>
+                </label>
+              </fieldset>
+
+              <fieldset
+                v-if="selectedChannel"
+                class="grid gap-2"
+              >
+                <legend class="text-sm font-medium text-highlighted">
+                  选择支付方式
+                </legend>
+                <div class="grid grid-cols-1 gap-2 min-[400px]:grid-cols-2">
+                  <label
+                    v-for="method in selectedChannel.paymentMethods"
+                    :key="method"
+                    class="flex min-h-12 cursor-pointer items-center gap-3 rounded-xl border border-default px-3 py-2 transition-colors hover:bg-muted"
+                    :class="selectedPaymentMethod === method ? 'border-primary bg-primary/5' : ''"
+                  >
+                    <input
+                      v-model="selectedPaymentMethod"
+                      type="radio"
+                      name="payment-method"
+                      :value="method"
+                      class="size-4 shrink-0 accent-primary"
+                    >
+                    <span class="text-sm font-medium text-highlighted">{{ method === 'wechat' ? '微信支付' : '支付宝' }}</span>
+                  </label>
+                </div>
+              </fieldset>
+
+              <div class="flex flex-wrap items-center justify-between gap-3 border-t border-default pt-4">
+                <p class="max-w-xl text-xs leading-5 text-muted">
+                  金额由服务器按订单快照计算。付款成功页面和浏览器返回本身不会确认收款。
+                </p>
+                <UButton
+                  color="primary"
+                  icon="i-lucide-lock-keyhole"
+                  :loading="creatingPayment"
+                  :disabled="!canCreatePayment || creatingPayment"
+                  @click="createPayment"
+                >
+                  创建支付 · ¥{{ payment.totalAmount }}
+                </UButton>
+              </div>
+            </div>
+          </template>
+
+          <p
+            v-if="payment.attempt?.errorCode"
+            class="mt-3 text-sm text-muted"
+          >
+            上次支付尝试未能创建，请重新选择通道后再试。
+          </p>
+        </section>
+
+        <UAlert
+          v-if="payment?.paymentStatus === 'paid' && order.status !== 'pending_payment'"
+          class="mt-5"
+          color="success"
+          variant="subtle"
+          icon="i-lucide-circle-check"
+          title="服务端已确认付款"
+          :description="`已验证收款 ¥${payment.confirmedAmount}，订单等待商家交付。`"
+        />
+        <UAlert
+          v-else-if="payment?.paymentStatus === 'late_paid' || payment?.paymentStatus === 'reconciliation_required'"
+          class="mt-5"
+          color="warning"
+          variant="subtle"
+          icon="i-lucide-shield-alert"
+          title="收款需要商家核对"
+          description="系统已保留服务商凭证，订单不会自动进入履约。请联系商家核对实际收款。"
+        />
 
         <section
           class="mt-6"

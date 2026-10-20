@@ -222,7 +222,7 @@ onBeforeUnmount(() => { sequence++ })
             color="warning"
             variant="subtle"
             title="等待付款"
-            description="支付渠道尚未接入。后台没有标记订单已付款的操作。"
+            description="付款状态只由已验证的服务商通知或主动查单更新。后台没有手工标记已付款的操作。"
           />
 
           <div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,0.8fr)]">
@@ -312,6 +312,174 @@ onBeforeUnmount(() => { sequence++ })
               </ul>
             </section>
           </div>
+
+          <section
+            class="mt-5 rounded-xl border border-default bg-elevated p-4 sm:p-5"
+            aria-labelledby="admin-payment-evidence-title"
+          >
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h2
+                  id="admin-payment-evidence-title"
+                  class="font-semibold text-highlighted"
+                >
+                  在线支付与收款凭证
+                </h2>
+                <p class="mt-1 text-sm text-muted">
+                  订单事实来自支付尝试、回调/查单事件与受保护的支付回执。
+                </p>
+              </div>
+              <UBadge
+                :color="data.payments.needsReconciliation ? 'warning' : 'neutral'"
+                variant="soft"
+              >
+                {{ data.payments.needsReconciliation ? '需要核对' : '无待核对异常' }}
+              </UBadge>
+            </div>
+            <UAlert
+              v-if="data.payments.needsReconciliation"
+              class="mt-4"
+              color="warning"
+              variant="subtle"
+              icon="i-lucide-shield-alert"
+              title="存在待核对支付事件"
+              description="系统已保留服务商事件和实际收款回执。请先核对交易号、金额和订单状态；此页面不能伪造付款或自动履约。"
+            />
+            <UAlert
+              v-if="!data.payments.attempts.length"
+              class="mt-4"
+              color="neutral"
+              variant="subtle"
+              title="尚无在线支付尝试"
+              description="此订单目前没有建立在线支付尝试。"
+            />
+            <ol
+              v-else
+              class="mt-4 grid gap-4"
+            >
+              <li
+                v-for="attempt in data.payments.attempts"
+                :key="attempt.id"
+                class="min-w-0 rounded-lg border border-default p-3 sm:p-4"
+              >
+                <div class="flex flex-wrap items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <p class="break-all font-mono text-xs text-muted">
+                      支付尝试 {{ attempt.id }} · {{ attempt.providerType }}
+                    </p>
+                    <p class="mt-1 break-words font-medium text-highlighted">
+                      {{ attempt.channelName ?? '未知通道' }} · {{ attempt.paymentMethod === 'wechat' ? '微信支付' : attempt.paymentMethod === 'alipay' ? '支付宝' : '未知方式' }}
+                    </p>
+                  </div>
+                  <UBadge
+                    :color="attempt.receiptDisposition === 'on_time' ? 'success' : attempt.receiptDisposition ? 'warning' : attempt.status === 'failed' ? 'error' : 'neutral'"
+                    variant="soft"
+                  >
+                    {{ attempt.receiptDisposition === 'on_time' ? '已确认收款' : attempt.receiptDisposition === 'late' ? '迟到收款' : attempt.receiptDisposition === 'excess' ? '超额收款' : attempt.receiptDisposition === 'amount_mismatch' ? '金额不符' : attempt.status }}
+                  </UBadge>
+                </div>
+                <dl class="mt-3 grid min-w-0 grid-cols-1 gap-3 border-t border-default pt-3 text-sm sm:grid-cols-2 lg:grid-cols-3">
+                  <div class="min-w-0">
+                    <dt class="text-muted">
+                      应付金额
+                    </dt>
+                    <dd class="mt-1 font-medium tabular-nums text-highlighted">
+                      ¥{{ attempt.expectedAmount }}
+                    </dd>
+                  </div>
+                  <div class="min-w-0">
+                    <dt class="text-muted">
+                      已验证实收
+                    </dt>
+                    <dd class="mt-1 font-medium tabular-nums text-highlighted">
+                      {{ attempt.actualAmount ? `¥${attempt.actualAmount}` : '尚无回执' }}
+                    </dd>
+                  </div>
+                  <div class="min-w-0">
+                    <dt class="text-muted">
+                      平台交易号
+                    </dt>
+                    <dd class="mt-1 break-all font-mono text-xs text-highlighted">
+                      {{ attempt.providerTransactionId ?? attempt.providerOrderId ?? '尚未返回' }}
+                    </dd>
+                  </div>
+                  <div class="min-w-0">
+                    <dt class="text-muted">
+                      商户订单号
+                    </dt>
+                    <dd class="mt-1 break-all font-mono text-xs text-highlighted">
+                      {{ attempt.merchantOrderNo ?? '—' }}
+                    </dd>
+                  </div>
+                  <div class="min-w-0">
+                    <dt class="text-muted">
+                      支付创建时间
+                    </dt>
+                    <dd class="mt-1 text-highlighted">
+                      {{ formatDate(attempt.createdAt) }}
+                    </dd>
+                  </div>
+                  <div class="min-w-0">
+                    <dt class="text-muted">
+                      支付完成时间
+                    </dt>
+                    <dd class="mt-1 text-highlighted">
+                      {{ attempt.completedAt ? formatDate(attempt.completedAt) : '尚未确认' }}
+                    </dd>
+                  </div>
+                </dl>
+                <UAlert
+                  v-if="attempt.providerErrorCode"
+                  class="mt-3"
+                  color="warning"
+                  variant="subtle"
+                  :title="`服务商状态：${attempt.providerErrorCode}`"
+                  description="请查看下方事件并通过服务商后台核对，不要手工改写订单付款状态。"
+                />
+                <div
+                  v-if="attempt.events.length"
+                  class="mt-4 border-t border-default pt-3"
+                >
+                  <h3 class="text-sm font-medium text-highlighted">
+                    服务商事件
+                  </h3>
+                  <ol class="mt-2 grid gap-2">
+                    <li
+                      v-for="event in attempt.events"
+                      :key="event.id"
+                      class="min-w-0 rounded-md bg-muted/50 p-3 text-xs"
+                    >
+                      <div class="flex flex-wrap justify-between gap-2">
+                        <span class="font-medium text-highlighted">{{ event.source === 'callback' ? '异步回调' : '主动查单' }} · {{ event.verification === 'verified' ? '已验证' : '未验证' }} · {{ event.disposition }}</span>
+                        <time
+                          class="text-muted"
+                          :datetime="event.receivedAt"
+                        >{{ formatDate(event.receivedAt) }}</time>
+                      </div>
+                      <p class="mt-1 break-all text-muted">
+                        状态 {{ event.providerStatus }} · 金额 {{ event.reportedAmount ? `¥${event.reportedAmount}` : '未知' }} · 交易号 {{ event.providerTransactionId ?? '未知' }}
+                      </p>
+                      <p
+                        v-if="event.providerTimeText"
+                        class="mt-1 break-all text-muted"
+                      >
+                        服务商原始完成时间 {{ event.providerTimeText }}
+                      </p>
+                      <p
+                        v-if="event.errorCode"
+                        class="mt-1 break-all text-warning"
+                      >
+                        {{ event.errorCode }}
+                      </p>
+                      <p class="mt-1 break-all font-mono text-dimmed">
+                        事件 SHA-256 {{ event.eventSha256 }}
+                      </p>
+                    </li>
+                  </ol>
+                </div>
+              </li>
+            </ol>
+          </section>
 
           <section
             class="mt-6"

@@ -15,6 +15,7 @@ import { customerManagementMigration } from './migrations/202610190002_customer_
 import { customerCartMigration } from './migrations/202610190003_customer_cart.js'
 import { ordersMigration } from './migrations/202610190004_orders.js'
 import { purchaseLimitsMigration } from './migrations/202610200001_purchase_limits.js'
+import { onlinePaymentsMigration } from './migrations/202610200002_online_payments.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -35,6 +36,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610190003_customer_cart': customerCartMigration,
       '202610190004_orders': ordersMigration,
       '202610200001_purchase_limits': purchaseLimitsMigration,
+      '202610200002_online_payments': onlinePaymentsMigration,
     }
   }
 }
