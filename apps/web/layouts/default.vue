@@ -42,7 +42,7 @@ onMounted(() => {
     </NuxtLink>
 
     <header class="border-b border-default bg-elevated">
-      <UContainer class="flex min-h-16 items-center justify-between gap-2 py-2">
+      <UContainer class="flex min-h-16 flex-wrap items-center justify-between gap-x-2 gap-y-1 py-2">
         <NuxtLink
           to="/"
           class="flex min-w-0 shrink items-center gap-2 rounded-sm font-semibold text-highlighted focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary sm:gap-2.5"
@@ -54,7 +54,7 @@ onMounted(() => {
           <span class="max-w-[3.25rem] truncate text-sm sm:max-w-[12rem] sm:text-base">{{ storeBrand.storeName }}</span>
         </NuxtLink>
 
-        <div class="flex shrink-0 items-center gap-0 sm:gap-1">
+        <div class="ml-auto flex shrink-0 items-center gap-0 sm:gap-1">
           <StorefrontCategoryNav :categories="categories" />
           <UButton
             to="/search"

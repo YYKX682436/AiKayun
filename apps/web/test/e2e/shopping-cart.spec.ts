@@ -43,7 +43,29 @@ async function noHorizontalOverflow(page: Page, width: number): Promise<void> {
     viewport: document.documentElement.clientWidth,
     page: document.documentElement.scrollWidth,
   }))
-  expect(dimensions.page).toBeLessThanOrEqual(dimensions.viewport)
+  const overflowingElements = await page.evaluate(() => {
+    const candidates = Array.from(document.querySelectorAll('body *')).map((element) => {
+      const rect = element.getBoundingClientRect()
+      const style = getComputedStyle(element)
+      return {
+        element,
+        tag: element.tagName,
+        className: typeof element.className === 'string' ? element.className.slice(0, 100) : '',
+        text: element.textContent?.trim().replace(/\s+/gu, ' ').slice(0, 56),
+        left: Math.round(rect.left),
+        right: Math.round(rect.right),
+        width: Math.round(rect.width),
+        position: style.position,
+      }
+    }).filter(element => element.right > document.documentElement.clientWidth + 1
+      && element.position !== 'fixed')
+    return candidates.filter(candidate => !Array.from(candidate.element.children).some((child) => {
+      const rect = child.getBoundingClientRect()
+      return rect.right > document.documentElement.clientWidth + 1
+    })).map(({ element: _element, ...details }) => details).slice(0, 8)
+  })
+  expect(dimensions.page, `Horizontal overflow at ${width}px: ${JSON.stringify(overflowingElements)}`)
+    .toBeLessThanOrEqual(dimensions.viewport)
 }
 
 async function csrfToken(page: Page): Promise<string> {
