@@ -1,6 +1,6 @@
 # 订单与人工数字交付
 
-阶段④-5在④-4只读结算报价上增加订单、数量库存预留、待付款订单取消/超时关闭及最小人工数字交付闭环；阶段④-6增加商品级与 SKU 级购买限制；④-7增加在线支付与异常核对；④-8在原账本上增加钱包、充值和组合支付。本文件保留订单与库存规则，支付细节见[在线支付协议与运行手册](online-payments.md)。人工履约仍未扩展成卡密池、文件、链接或外部 API 发货。
+阶段④-5在④-4只读结算报价上增加订单、数量库存预留、待付款订单取消/超时关闭及最小人工数字交付闭环；阶段④-6增加商品级与 SKU 级购买限制；④-7增加在线支付与异常核对；④-8在原账本上增加钱包、充值和组合支付；④-9A补齐退款申请、审核、资金预留与退款凭证。本文件保留订单与库存规则，资金细节见[在线支付协议与运行手册](online-payments.md)和[订单退款与售后](order-refunds.md)。人工履约仍未扩展成卡密池、文件、链接或外部 API 发货。
 
 ## 成交资格与统一报价
 
@@ -87,6 +87,16 @@ API 启动时立即执行一次未付款订单清理，然后每 60 秒执行一
 
 交付内容行数必须等于此次交付数量，每件最多 512 个字符。内容只出现在管理员订单详情和所属顾客订单详情，响应禁止缓存；数据库拒绝修改、删除或截断历史交付内容。应用日志不记录请求正文、Cookie 或会话令牌。卡密池、批量文件、可变外链和自动 API 发货不属于本阶段。
 
+## 退款及订单售后
+
+④-9A 的售后状态与订单履约状态、支付尝试状态分开保存。顾客可以申请全额或部分退款；后台显示真实回执、来源分配、预留/已退金额及操作历史。订单的 `order_financial_status` 和顾客状态投影按已确认回执与退款分配推导“部分已退款/已全额退款”，不会把 `processing` 或 `completed` 改写为退款状态。
+
+批准的顾客退款在一个 PostgreSQL 事务内按实收来源分配并写入既有钱包账本：赠送退赠送、现金退现金、支付宝/微信等外部实收退本人现金钱包。退款分配使用已有 `operation_id`、`wallet_operations`、`wallet_ledger_entries` 和回执退款累计字段，不直接改余额。审计、分配、回执与钱包流水任一写入失败都会回滚。
+
+游客没有钱包，只允许将外部收款分配到原支付来源的人工处理流程。系统不调用未验收的 ZPAY 自动退款接口；转账结果未知时继续预留，失败才可释放重试，实际转账后须录入退款流水号、确切金额、时间和证据摘要才确认成功。
+
+退款不清除成交/交付历史，不恢复已消费库存、不重复释放已释放库存，也不减少购买限额统计。开放支付对账、异常回执、未决支付或履约进行中/结果未知时，退款与订单关闭继续受数据库保护。退款、人工尝试、账本和状态审计规则见[订单退款与售后](order-refunds.md)。
+
 ## API 与页面
 
 | 方法与路径 | 用途 | 访问保护 |
@@ -100,6 +110,12 @@ API 启动时立即执行一次未付款订单清理，然后每 60 秒执行一
 | `GET /api/v1/guest/orders/:id` | 当前游客会话订单详情 | 游客 Cookie、会话归属 |
 | `POST /api/v1/guest/orders/:id/cancel` | 取消当前游客的未付款订单 | 游客 Cookie、Origin、CSRF |
 | `GET /api/v1/admin/orders`、`GET /api/v1/admin/orders/:id` | 后台分页订单、归属、成交快照、库存事件、履约审计 | 管理员会话 |
+| `GET /api/v1/customer/orders/:id/refunds`、`POST /api/v1/customer/orders/:id/refunds` | 顾客查看本人退款和提交退款申请 | 顾客会话；写入要求 Origin、CSRF、限流和幂等键 |
+| `GET /api/v1/guest/orders/:id/refunds`、`POST /api/v1/guest/orders/:id/refunds` | 游客查看本人退款和申请人工原路退款 | 游客会话 Cookie；写入要求 Origin、CSRF、限流和幂等键 |
+| `GET /api/v1/admin/orders/:id/refunds` | 查看退款申请、来源回执、分配、账本操作和审计 | 管理员会话 |
+| `POST /api/v1/admin/orders/:id/refunds/:refundId/approve`、`/reject`、`/retry` | 审核退款或重新预留已释放的游客退款金额 | 管理员权限、Origin、CSRF、幂等键 |
+| `POST /api/v1/admin/orders/:id/refunds/:refundId/allocations/:allocationId/manual-attempts` | 记录游客人工原路转账开始 | 管理员权限、Origin、CSRF、幂等键 |
+| `POST /api/v1/admin/orders/:id/refunds/:refundId/allocations/:allocationId/manual-attempts/:attemptId/resolve` | 记录游客人工退款成功、失败或结果未知 | 管理员权限、Origin、CSRF、幂等键 |
 | `POST /api/v1/admin/orders/:id/items/:itemId/fulfillments` | 录入真实人工数字交付 | 管理员权限、Origin、CSRF；限流 |
 | `GET /api/v1/admin/products/:id/manual-fulfillment` | 查看 SKU 人工交付就绪情况 | 管理员会话 |
 | `PUT /api/v1/admin/products/:id/variants/:variantId/manual-fulfillment` | 明确启用或关闭 SKU 人工交付 | 管理员权限、Origin、CSRF |
@@ -112,4 +128,4 @@ API 启动时立即执行一次未付款订单清理，然后每 60 秒执行一
 
 新增安全迁移 `202610200001_purchase_limits`：商品和 SKU 限购字段、额度历史判定函数、订单封存保护、顾客并发围栏以及订单/订单项/支付事实查询索引。仅增加顾客行版本围栏，不存储可变购买数量；计数可由订单事实重新计算。订单历史身份匿名化后外键会保留既有订单归属标识，按匿名化前的顾客 UUID 仍可正确归集已有额度；物理删除不允许破坏受保护的交易历史。
 
-④-7 和④-8 的在线支付、回调/查单对账、钱包、现金充值及组合支付已在[在线支付协议与运行手册](online-payments.md)说明。退款执行、提现、余额转账、促销优惠券、卡密池及外部自动发货仍未实现；本阶段限购规则继续按订单事实统计，不改变资金账本或库存预留流程。
+新增安全迁移 `202610200005_refunds`：扩充原退款申请/分配流程，增加只追加退款审计、游客人工原路退款尝试与状态凭证；不改冻结历史迁移、不重建资金账本。④-7/④-8在线支付、对账和钱包见[在线支付协议与运行手册](online-payments.md)，退款见[订单退款与售后](order-refunds.md)。④-9A已实现顾客钱包退款和游客人工原路退款；④-9B提现、余额转账、促销优惠券、卡密池及外部自动发货仍未实现。限购规则仍按订单事实统计，退款不恢复购买额度、已消费库存或已释放预留。

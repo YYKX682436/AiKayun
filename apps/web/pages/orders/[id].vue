@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { CustomerOrderPayment, ExternalPaymentMethod, OrderDetail } from '@aikayun/contracts'
+import type { CustomerOrderPayment, CustomerOrderRefunds, ExternalPaymentMethod, OrderDetail } from '@aikayun/contracts'
 import { CustomerApiError, useCustomerApi } from '~/composables/useCustomerApi'
 
 const route = useRoute()
@@ -7,10 +7,16 @@ const customerApi = useCustomerApi()
 const orderId = computed(() => String(route.params.id))
 const order = shallowRef<OrderDetail | null>(null)
 const payment = shallowRef<CustomerOrderPayment | null>(null)
+const refunds = shallowRef<CustomerOrderRefunds | null>(null)
 const loading = ref(false)
 const cancelling = ref(false)
 const creatingPayment = ref(false)
 const refreshingPayment = ref(false)
+const requestingRefund = ref(false)
+const refundAmountInput = ref('')
+const refundReason = ref('')
+const refundMessage = ref('')
+const refundError = ref('')
 const confirmCancel = ref(false)
 const errorMessage = ref('')
 const mounted = ref(false)
@@ -35,6 +41,45 @@ const selectedChannel = computed(() => payment.value?.channels.find(channel => c
 const qrAction = computed(() => payment.value?.attempt?.action?.type === 'qr_code'
   ? payment.value.attempt.action.value
   : '')
+
+const refundStatusNames: Record<CustomerOrderRefunds['refundStatus'], string> = {
+  none: '尚无退款',
+  requested_or_processing: '审核或处理中',
+  partially_refunded: '部分已退款',
+  refunded: '已全额退款',
+}
+
+const refundRequestAmount = computed(() => {
+  const value = refundAmountInput.value.trim()
+  if (!/^\d+(?:\.\d{1,2})?$/u.test(value)) return ''
+  const normalized = value.includes('.') ? value.padEnd(value.indexOf('.') + 3, '0') : `${value}.00`
+  return amountToCents(normalized) > 0n ? normalized : ''
+})
+
+function refundItemStatusLabel(status: CustomerOrderRefunds['items'][number]['status']): string {
+  const names: Record<typeof status, string> = {
+    requested: '等待商家审核',
+    approved: '审核通过',
+    processing: '退款处理中',
+    partially_succeeded: '部分退款成功',
+    succeeded: '退款成功',
+    failed: '退款失败',
+    cancelled: '已拒绝',
+  }
+  return names[status]
+}
+
+function refundDestinationLabel(destination: CustomerOrderRefunds['items'][number]['allocations'][number]['destination']): string {
+  if (destination === 'gift_balance') return '退回赠送余额'
+  if (destination === 'cash_balance') return '退回现金余额'
+  return '人工退回原支付来源'
+}
+
+function refundSourceLabel(source: CustomerOrderRefunds['items'][number]['allocations'][number]['sourceBucket']): string {
+  if (source === 'gift') return '赠送余额'
+  if (source === 'cash') return '现金余额'
+  return '支付宝 / 微信实收'
+}
 
 function amountToCents(value: string): bigint {
   const [whole, fraction = '00'] = value.split('.')
@@ -141,13 +186,19 @@ async function loadOrder() {
   errorMessage.value = ''
   try {
     const path = isCustomer.value ? `/api/v1/customer/orders/${orderId.value}` : `/api/v1/guest/orders/${orderId.value}`
-    const [result, paymentResult] = await Promise.all([
+    const refundPath = isCustomer.value
+      ? `/api/v1/customer/orders/${orderId.value}/refunds`
+      : `/api/v1/guest/orders/${orderId.value}/refunds`
+    const [result, paymentResult, refundResult] = await Promise.all([
       customerApi.request<OrderDetail>(path),
       customerApi.request<CustomerOrderPayment>(`/api/v1/orders/${orderId.value}/payment`),
+      customerApi.request<CustomerOrderRefunds>(refundPath),
     ])
     if (currentSequence !== sequence || identityAtStart !== customerApi.identityVersion.value) return
     order.value = result
     payment.value = paymentResult
+    refunds.value = refundResult
+    if (!refundAmountInput.value && refundResult.refundableAmount !== '0.00') refundAmountInput.value = refundResult.refundableAmount
     if (!paymentResult.channels.some(channel => channel.id === selectedChannelId.value)) {
       selectedChannelId.value = paymentResult.channels[0]?.id ?? ''
     }
@@ -160,6 +211,65 @@ async function loadOrder() {
     errorMessage.value = error instanceof Error ? error.message : '订单暂时无法读取。'
   } finally {
     if (currentSequence === sequence) loading.value = false
+  }
+}
+
+async function refundRequestKey(amount: string, reason: string): Promise<string> {
+  if (!import.meta.client) throw new Error('请在浏览器中提交退款申请。')
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({
+    orderId: orderId.value, identity: customerApi.identityVersion.value, amount, reason: reason.trim(),
+  })))
+  const hash = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
+  const storageKey = `aikayun-refund-request-v1:${hash}`
+  try {
+    const existing = sessionStorage.getItem(storageKey)
+    if (existing && /^[0-9a-f-]{36}$/iu.test(existing)) return existing
+    const next = crypto.randomUUID()
+    sessionStorage.setItem(storageKey, next)
+    return next
+  } catch {
+    throw new Error('浏览器无法保存退款重试标识，请启用会话存储后重试。')
+  }
+}
+
+async function requestRefund() {
+  if (!refunds.value?.canRequest || requestingRefund.value || !refundRequestAmount.value) return
+  if (amountToCents(refundRequestAmount.value) > amountToCents(refunds.value.refundableAmount)) {
+    refundError.value = '申请金额超过当前可退款金额，请刷新后重新填写。'
+    return
+  }
+  if (!refundReason.value.trim()) {
+    refundError.value = '请填写退款原因。'
+    return
+  }
+  requestingRefund.value = true
+  refundError.value = ''
+  refundMessage.value = ''
+  try {
+    const path = isCustomer.value
+      ? `/api/v1/customer/orders/${orderId.value}/refunds`
+      : `/api/v1/guest/orders/${orderId.value}/refunds`
+    const result = await customerApi.request<{ repeated: boolean; refunds: CustomerOrderRefunds }>(path, {
+      method: 'POST',
+      body: {
+        idempotencyKey: await refundRequestKey(refundRequestAmount.value, refundReason.value),
+        amount: refundRequestAmount.value,
+        reason: refundReason.value.trim(),
+      },
+    })
+    refunds.value = result.refunds
+    refundMessage.value = result.repeated ? '已读取这笔相同申请的最新状态。' : '退款申请已提交，实际退款仍需商家审核处理。'
+    await loadOrder()
+  } catch (error) {
+    refundError.value = error instanceof Error ? error.message : '退款申请结果尚未确认，请刷新进度后再试。'
+    try {
+      const path = isCustomer.value
+        ? `/api/v1/customer/orders/${orderId.value}/refunds`
+        : `/api/v1/guest/orders/${orderId.value}/refunds`
+      refunds.value = await customerApi.request<CustomerOrderRefunds>(path)
+    } catch { /* Keep the original error and require a deliberate refresh. */ }
+  } finally {
+    requestingRefund.value = false
   }
 }
 
@@ -284,6 +394,7 @@ watch(() => customerApi.identityVersion.value, () => {
   if (!mounted.value) return
   order.value = null
   payment.value = null
+  refunds.value = null
   confirmCancel.value = false
   selectedChannelId.value = ''
   selectedPaymentMode.value = 'external'
@@ -297,6 +408,7 @@ watch(orderId, () => {
   sequence++
   order.value = null
   payment.value = null
+  refunds.value = null
   selectedChannelId.value = ''
   selectedPaymentMode.value = 'external'
   hybridWalletAmountInput.value = ''
@@ -796,6 +908,226 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
           title="收款需要商家核对"
           description="系统已保留服务商凭证，订单不会自动进入履约。请联系商家核对实际收款。"
         />
+
+        <section
+          v-if="refunds"
+          class="mt-6 rounded-2xl border border-default bg-elevated p-4 sm:p-6"
+          aria-labelledby="order-refunds-title"
+        >
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p class="text-sm font-medium text-primary">
+                订单售后
+              </p>
+              <h2
+                id="order-refunds-title"
+                class="mt-1 text-lg font-semibold text-highlighted"
+              >
+                退款进度
+              </h2>
+            </div>
+            <UBadge
+              :color="refunds.refundStatus === 'refunded' ? 'success' : refunds.refundStatus === 'partially_refunded' ? 'warning' : refunds.refundStatus === 'requested_or_processing' ? 'primary' : 'neutral'"
+              variant="soft"
+            >
+              {{ refundStatusNames[refunds.refundStatus] }}
+            </UBadge>
+          </div>
+
+          <dl class="mt-4 grid grid-cols-2 gap-4 border-t border-default pt-4 text-sm sm:grid-cols-4">
+            <div>
+              <dt class="text-muted">
+                已确认实收
+              </dt>
+              <dd class="mt-1 font-semibold tabular-nums text-highlighted">
+                ¥{{ refunds.confirmedReceiptAmount }}
+              </dd>
+            </div>
+            <div>
+              <dt class="text-muted">
+                可申请退款
+              </dt>
+              <dd class="mt-1 font-semibold tabular-nums text-highlighted">
+                ¥{{ refunds.refundableAmount }}
+              </dd>
+            </div>
+            <div>
+              <dt class="text-muted">
+                已退款
+              </dt>
+              <dd class="mt-1 font-semibold tabular-nums text-highlighted">
+                ¥{{ refunds.refundedAmount }}
+              </dd>
+            </div>
+            <div>
+              <dt class="text-muted">
+                等待处理预留
+              </dt>
+              <dd class="mt-1 font-semibold tabular-nums text-highlighted">
+                ¥{{ refunds.refundReservedAmount }}
+              </dd>
+            </div>
+          </dl>
+
+          <UAlert
+            v-if="refunds.payoutMode === 'manual_original_source'"
+            class="mt-4"
+            color="warning"
+            variant="subtle"
+            icon="i-lucide-hand-coins"
+            title="游客订单采用人工原路退款"
+            description="游客订单没有钱包。商家会按已确认的支付宝或微信收款来源线下办理；系统不会调用自动退款接口，也不会转入任意顾客账户。款项实际退回并记录凭证前，状态不会显示为成功。"
+          />
+
+          <UAlert
+            v-if="refunds.blockedReason && refunds.blockedReason !== 'no_refundable_balance'"
+            class="mt-4"
+            color="warning"
+            variant="subtle"
+            icon="i-lucide-shield-alert"
+            :title="refunds.blockedReason === 'payment_reconciliation_required' ? '收款凭证待核对' : refunds.blockedReason === 'payment_unresolved' ? '订单存在未决支付' : '暂无可退款实收凭证'"
+            description="支付状态或服务商对账处理完成后，系统会重新计算可退款金额。退款不会改变已交付记录或订单履约状态。"
+          />
+
+          <UAlert
+            v-if="refundError"
+            class="mt-4"
+            color="error"
+            variant="soft"
+            :title="refundError"
+            role="alert"
+            aria-live="assertive"
+          />
+          <UAlert
+            v-if="refundMessage"
+            class="mt-4"
+            color="success"
+            variant="soft"
+            :title="refundMessage"
+            role="status"
+            aria-live="polite"
+          />
+
+          <form
+            v-if="refunds.canRequest"
+            class="mt-4 grid gap-3 rounded-xl border border-default bg-default/60 p-4 sm:grid-cols-[minmax(10rem,0.7fr)_minmax(0,1.3fr)_auto] sm:items-end"
+            @submit.prevent="requestRefund"
+          >
+            <UFormField
+              label="申请金额"
+              :description="`最多 ¥${refunds.refundableAmount}`"
+            >
+              <UInput
+                v-model="refundAmountInput"
+                type="text"
+                inputmode="decimal"
+                autocomplete="off"
+                maxlength="19"
+                aria-label="申请退款金额"
+                class="w-full"
+              />
+            </UFormField>
+            <UFormField label="退款原因">
+              <UTextarea
+                v-model="refundReason"
+                :maxlength="500"
+                :rows="2"
+                aria-label="退款原因"
+                placeholder="请说明申请退款的原因"
+                class="w-full"
+              />
+            </UFormField>
+            <UButton
+              type="submit"
+              color="primary"
+              icon="i-lucide-send"
+              :loading="requestingRefund"
+              :disabled="requestingRefund || !refundRequestAmount || amountToCents(refundRequestAmount) > amountToCents(refunds.refundableAmount) || !refundReason.trim()"
+            >
+              提交退款申请
+            </UButton>
+          </form>
+
+          <p class="mt-3 text-xs leading-5 text-muted">
+            审核中的金额会先预留，审核通过后按真实收款来源逐笔退款。退款不会删除成交记录、清除已交付内容、恢复已消费库存或重置限购统计。
+          </p>
+
+          <ol
+            v-if="refunds.items.length"
+            class="mt-4 grid gap-3"
+          >
+            <li
+              v-for="item in refunds.items"
+              :key="item.id"
+              class="min-w-0 rounded-xl border border-default p-3 sm:p-4"
+            >
+              <div class="flex flex-wrap items-start justify-between gap-2">
+                <div class="min-w-0">
+                  <p class="font-medium text-highlighted">
+                    申请 ¥{{ item.amount }} · {{ formatDate(item.createdAt) }}
+                  </p>
+                  <p class="mt-1 break-words text-sm text-muted">
+                    {{ item.reason }}
+                  </p>
+                </div>
+                <UBadge
+                  :color="item.status === 'succeeded' ? 'success' : item.status === 'failed' || item.status === 'cancelled' ? 'error' : item.status === 'partially_succeeded' ? 'warning' : 'primary'"
+                  variant="soft"
+                >
+                  {{ refundItemStatusLabel(item.status) }}
+                </UBadge>
+              </div>
+              <p
+                v-if="item.rejectionReason"
+                class="mt-2 text-sm text-error"
+              >
+                商家说明：{{ item.rejectionReason }}
+              </p>
+              <dl class="mt-3 grid grid-cols-2 gap-3 border-t border-default pt-3 text-sm sm:grid-cols-3">
+                <div>
+                  <dt class="text-muted">
+                    已成功
+                  </dt><dd class="mt-1 tabular-nums text-highlighted">
+                    ¥{{ item.succeededAmount }}
+                  </dd>
+                </div>
+                <div>
+                  <dt class="text-muted">
+                    预留处理中
+                  </dt><dd class="mt-1 tabular-nums text-highlighted">
+                    ¥{{ item.reservedAmount }}
+                  </dd>
+                </div>
+                <div>
+                  <dt class="text-muted">
+                    预计去向
+                  </dt><dd class="mt-1 text-highlighted">
+                    {{ item.payoutMode === 'wallet' ? '顾客本人钱包' : item.payoutMode === 'manual_original_source' ? '人工原支付来源' : '暂不可处理' }}
+                  </dd>
+                </div>
+              </dl>
+              <ul
+                v-if="item.allocations.length"
+                class="mt-3 grid gap-2"
+              >
+                <li
+                  v-for="allocation in item.allocations"
+                  :key="allocation.id"
+                  class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-muted/40 px-3 py-2 text-sm"
+                >
+                  <span class="text-highlighted">{{ refundSourceLabel(allocation.sourceBucket) }} → {{ refundDestinationLabel(allocation.destination) }}</span>
+                  <span class="tabular-nums text-muted">¥{{ allocation.amount }} · {{ allocation.status === 'succeeded' ? '已完成' : allocation.status === 'reserved' ? '处理中' : '已释放' }}</span>
+                </li>
+              </ul>
+            </li>
+          </ol>
+          <p
+            v-else
+            class="mt-4 rounded-lg border border-dashed border-default p-4 text-sm text-muted"
+          >
+            暂无退款申请。
+          </p>
+        </section>
 
         <section
           class="mt-6"

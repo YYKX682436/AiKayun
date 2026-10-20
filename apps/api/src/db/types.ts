@@ -408,6 +408,10 @@ export interface OrderRefundsTable {
   request_sha256: string
   amount: ColumnType<string, string, string>
   status: Generated<RefundStatus>
+  reason: string
+  rejection_reason: string | null
+  reviewed_by_admin_id: string | null
+  reviewed_at: Date | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }
@@ -426,6 +430,43 @@ export interface OrderRefundAllocationsTable {
   status: Generated<RefundAllocationStatus>
   provider: string | null
   provider_refund_id: string | null
+  created_at: Generated<Date>
+  completed_at: Date | null
+}
+
+export type RefundAuditActorType = 'customer' | 'guest' | 'admin' | 'system'
+
+export interface OrderRefundAuditEventsTable {
+  id: string
+  refund_id: string
+  action: string
+  actor_type: RefundAuditActorType
+  actor_customer_id: string | null
+  actor_admin_id: string | null
+  idempotency_key: string | null
+  request_sha256: string | null
+  previous_status: RefundStatus | null
+  next_status: RefundStatus | null
+  details: ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>
+  created_at: Generated<Date>
+}
+
+export type RefundManualAttemptStatus = 'started' | 'unknown' | 'succeeded' | 'failed'
+
+export interface OrderRefundManualAttemptsTable {
+  id: string
+  allocation_id: string
+  idempotency_key: string
+  request_sha256: string
+  started_by_admin_id: string
+  resolved_by_admin_id: string | null
+  status: Generated<RefundManualAttemptStatus>
+  provider_reference: string | null
+  refunded_amount: ColumnType<string | null, string | null, string | null>
+  actual_refunded_at: Date | null
+  evidence_summary: string | null
+  resolution_note: string | null
+  result_sha256: string | null
   created_at: Generated<Date>
   completed_at: Date | null
 }
@@ -681,6 +722,8 @@ export interface Database {
   payment_provider_reconciliation_cases: PaymentProviderReconciliationCasesTable
   order_refunds: OrderRefundsTable
   order_refund_allocations: OrderRefundAllocationsTable
+  order_refund_audit_events: OrderRefundAuditEventsTable
+  order_refund_manual_attempts: OrderRefundManualAttemptsTable
   wallet_ledger_entries: WalletLedgerEntriesTable
   withdrawals: WithdrawalsTable
   withdrawal_payout_attempts: WithdrawalPayoutAttemptsTable

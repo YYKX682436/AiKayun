@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { AdminOrderDetail, ManualFulfillmentResult } from '@aikayun/contracts'
+import type { AdminOrderDetail, AdminOrderRefunds, AdminOrderRefundMutation, ManualFulfillmentResult } from '@aikayun/contracts'
 import { AdminApiError, useAdminApi } from '~/composables/useAdminApi'
 
 definePageMeta({ layout: 'admin', middleware: 'admin-auth' })
@@ -10,12 +10,16 @@ const route = useRoute()
 const orderId = computed(() => String(route.params.id))
 const { request } = useAdminApi()
 const data = shallowRef<AdminOrderDetail | null>(null)
+const refunds = shallowRef<AdminOrderRefunds | null>(null)
 const loading = ref(false)
 const savingItemId = ref('')
 const reconcilingAttemptId = ref('')
 const errorMessage = ref('')
 const successMessage = ref('')
 const deliveryDrafts = reactive<Record<string, string>>({})
+const rejectionDrafts = reactive<Record<string, string>>({})
+const manualDrafts = reactive<Record<string, { providerRefundId: string; amount: string; actualRefundedAt: string; evidenceSummary: string; resolutionNote: string }>>({})
+const refundActionKey = ref('')
 let sequence = 0
 
 function statusLabel(status: AdminOrderDetail['order']['status'], paymentStatus: AdminOrderDetail['order']['paymentStatus']): string {
@@ -27,6 +31,37 @@ function statusLabel(status: AdminOrderDetail['order']['status'], paymentStatus:
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
+}
+
+function refundStatusLabel(status: AdminOrderRefunds['items'][number]['status']): string {
+  const names: Record<typeof status, string> = {
+    requested: '待审核', approved: '已通过', processing: '处理中',
+    partially_succeeded: '部分成功', succeeded: '已成功', failed: '失败', cancelled: '已拒绝',
+  }
+  return names[status]
+}
+
+function refundBucketLabel(bucket: AdminOrderRefunds['items'][number]['allocations'][number]['sourceBucket']): string {
+  if (bucket === 'gift') return '赠送余额'
+  if (bucket === 'cash') return '现金余额'
+  return '外部收款'
+}
+
+function refundDestinationLabel(destination: AdminOrderRefunds['items'][number]['allocations'][number]['destination']): string {
+  if (destination === 'gift_balance') return '赠送余额'
+  if (destination === 'cash_balance') return '现金余额'
+  return '原支付来源（人工）'
+}
+
+function manualDraft(attemptId: string, amount: string) {
+  if (!manualDrafts[attemptId]) {
+    const now = new Date()
+    const local = new Date(now.getTime() - now.getTimezoneOffset() * 60_000).toISOString().slice(0, 16)
+    manualDrafts[attemptId] = {
+      providerRefundId: '', amount, actualRefundedAt: local, evidenceSummary: '', resolutionNote: '',
+    }
+  }
+  return manualDrafts[attemptId]!
 }
 
 function stateLabel(value: string): string {
@@ -44,15 +79,118 @@ async function loadOrder() {
   loading.value = true
   errorMessage.value = ''
   try {
-    const result = await request<AdminOrderDetail>(`/api/v1/admin/orders/${orderId.value}`)
+    const [result, refundResult] = await Promise.all([
+      request<AdminOrderDetail>(`/api/v1/admin/orders/${orderId.value}`),
+      request<AdminOrderRefunds>(`/api/v1/admin/orders/${orderId.value}/refunds`),
+    ])
     if (currentSequence !== sequence) return
     data.value = result
+    refunds.value = refundResult
   } catch (error) {
     if (currentSequence !== sequence) return
     errorMessage.value = error instanceof Error ? error.message : '订单详情暂时无法加载。'
   } finally {
     if (currentSequence === sequence) loading.value = false
   }
+}
+
+async function refundIdempotencyKey(scope: string, requestBody: Record<string, unknown>): Promise<string> {
+  if (!import.meta.client) throw new Error('请在后台浏览器中处理退款。')
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({
+    orderId: orderId.value, scope, requestBody,
+  })))
+  const hash = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
+  const storageKey = `aikayun-admin-refund-v1:${hash}`
+  try {
+    const existing = sessionStorage.getItem(storageKey)
+    if (existing && /^[0-9a-f-]{36}$/iu.test(existing)) return existing
+    const next = crypto.randomUUID()
+    sessionStorage.setItem(storageKey, next)
+    return next
+  } catch {
+    throw new Error('浏览器无法保存退款操作的幂等标识，请启用会话存储后重试。')
+  }
+}
+
+async function runRefundAction(
+  scope: string,
+  path: string,
+  body: Record<string, unknown>,
+  successText: string,
+) {
+  if (refundActionKey.value) return
+  refundActionKey.value = scope
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    const result = await request<AdminOrderRefundMutation>(path, {
+      method: 'POST', body: { ...body, idempotencyKey: await refundIdempotencyKey(scope, body) },
+    })
+    refunds.value = result.refunds
+    successMessage.value = result.repeated ? '已读取这项相同操作的最新结果。' : successText
+  } catch (error) {
+    errorMessage.value = error instanceof AdminApiError || error instanceof Error
+      ? error.message
+      : '退款操作结果尚未确认，请刷新订单退款记录后检查。'
+    try { refunds.value = await request<AdminOrderRefunds>(`/api/v1/admin/orders/${orderId.value}/refunds`) } catch { /* Keep the action error visible. */ }
+  } finally {
+    refundActionKey.value = ''
+  }
+}
+
+async function approveRefund(refundId: string) {
+  await runRefundAction(`approve:${refundId}`, `/api/v1/admin/orders/${orderId.value}/refunds/${refundId}/approve`, {}, '已审核通过，退款分配已预留。顾客钱包退款已在同一事务中完成。')
+}
+
+async function rejectRefund(refundId: string) {
+  const reason = (rejectionDrafts[refundId] ?? '').trim()
+  if (!reason) {
+    errorMessage.value = '请填写拒绝原因。'
+    return
+  }
+  await runRefundAction(`reject:${refundId}`, `/api/v1/admin/orders/${orderId.value}/refunds/${refundId}/reject`, { reason }, '已拒绝此退款申请。')
+}
+
+async function retryGuestRefund(refund: AdminOrderRefunds['items'][number]) {
+  const allocationState = refund.allocations.map(allocation => `${allocation.id}:${allocation.status}`).join('|')
+  await runRefundAction(`retry:${refund.id}:${allocationState}`, `/api/v1/admin/orders/${orderId.value}/refunds/${refund.id}/retry`, {}, '已为待处理金额重新预留资金来源。')
+}
+
+async function startManualRefund(refundId: string, allocationId: string) {
+  await runRefundAction(`manual-start:${allocationId}`, `/api/v1/admin/orders/${orderId.value}/refunds/${refundId}/allocations/${allocationId}/manual-attempts`, {}, '已记录人工原路退款操作开始。请在实际完成转账后再登记结果。')
+}
+
+async function resolveManualRefund(
+  refundId: string,
+  allocationId: string,
+  attemptId: string,
+  outcome: 'succeeded' | 'failed' | 'unknown',
+) {
+  const draft = manualDrafts[attemptId]
+  if (!draft) return
+  let body: Record<string, unknown>
+  if (outcome === 'succeeded') {
+    if (!draft.providerRefundId.trim() || !draft.amount.trim() || !draft.actualRefundedAt || !draft.evidenceSummary.trim()) {
+      errorMessage.value = '确认成功必须填写实际退款流水号、精确金额、时间和证据摘要。'
+      return
+    }
+    body = {
+      outcome, providerRefundId: draft.providerRefundId.trim(), amount: draft.amount,
+      actualRefundedAt: new Date(draft.actualRefundedAt).toISOString(), evidenceSummary: draft.evidenceSummary.trim(),
+    }
+  } else {
+    if (!draft.resolutionNote.trim()) {
+      errorMessage.value = outcome === 'unknown' ? '请说明哪些情况仍无法确认。' : '请说明已核实没有实际退款的依据。'
+      return
+    }
+    body = { outcome, resolutionNote: draft.resolutionNote.trim() }
+  }
+  await runRefundAction(
+    `manual-result:${attemptId}:${outcome}`,
+    `/api/v1/admin/orders/${orderId.value}/refunds/${refundId}/allocations/${allocationId}/manual-attempts/${attemptId}/resolve`,
+    body,
+    outcome === 'succeeded' ? '已记录真实原路退款凭证并确认成功。' : outcome === 'unknown' ? '结果已标记为未知，资金继续预留，不能重复发起转账。' : '已确认未发生退款并释放本次预留。',
+  )
 }
 
 async function reconcilePayment(attemptId: string) {
@@ -537,6 +675,452 @@ onBeforeUnmount(() => { sequence++ })
                     </li>
                   </ol>
                 </div>
+              </li>
+            </ol>
+          </section>
+
+          <section
+            v-if="refunds"
+            class="mt-5 rounded-xl border border-default bg-elevated p-4 sm:p-5"
+            aria-labelledby="admin-order-refunds-title"
+          >
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h2
+                  id="admin-order-refunds-title"
+                  class="font-semibold text-highlighted"
+                >
+                  退款与订单售后
+                </h2>
+                <p class="mt-1 text-sm text-muted">
+                  退款状态由实际回执、预留和不可变账本流水推导，不会改写成交或履约状态。
+                </p>
+              </div>
+              <UBadge
+                :color="refunds.refundStatus === 'refunded' ? 'success' : refunds.refundStatus === 'partially_refunded' ? 'warning' : refunds.refundStatus === 'requested_or_processing' ? 'primary' : 'neutral'"
+                variant="soft"
+              >
+                {{ refunds.refundStatus === 'refunded' ? '全额已退' : refunds.refundStatus === 'partially_refunded' ? '部分已退' : refunds.refundStatus === 'requested_or_processing' ? '审核或退款处理中' : '尚无成功退款' }}
+              </UBadge>
+            </div>
+
+            <dl class="mt-4 grid grid-cols-2 gap-3 border-t border-default pt-4 text-sm sm:grid-cols-4">
+              <div>
+                <dt class="text-muted">
+                  确认实收
+                </dt><dd class="mt-1 font-semibold tabular-nums text-highlighted">
+                  ¥{{ refunds.confirmedReceiptAmount }}
+                </dd>
+              </div>
+              <div>
+                <dt class="text-muted">
+                  当前可退款
+                </dt><dd class="mt-1 font-semibold tabular-nums text-highlighted">
+                  ¥{{ refunds.refundableAmount }}
+                </dd>
+              </div>
+              <div>
+                <dt class="text-muted">
+                  已退款
+                </dt><dd class="mt-1 font-semibold tabular-nums text-highlighted">
+                  ¥{{ refunds.refundedAmount }}
+                </dd>
+              </div>
+              <div>
+                <dt class="text-muted">
+                  来源预留
+                </dt><dd class="mt-1 font-semibold tabular-nums text-highlighted">
+                  ¥{{ refunds.refundReservedAmount }}
+                </dd>
+              </div>
+            </dl>
+
+            <UAlert
+              v-if="refunds.payoutMode === 'manual_original_source'"
+              class="mt-4"
+              color="warning"
+              variant="subtle"
+              icon="i-lucide-hand-coins"
+              title="游客订单：人工原路退款"
+              description="请在支付宝或微信商户后台按来源回执线下办理。当前没有自动退款协议；开始操作不会联网转账，只有真实退款流水、精确金额、实际时间和证据摘要齐全后，才能登记成功。请勿改成顾客钱包退款。"
+            />
+
+            <UAlert
+              v-if="refunds.blockedReason && refunds.blockedReason !== 'no_refundable_balance'"
+              class="mt-4"
+              color="warning"
+              variant="subtle"
+              icon="i-lucide-shield-alert"
+              :title="refunds.blockedReason === 'payment_reconciliation_required' ? '支付对账异常阻止退款' : refunds.blockedReason === 'payment_unresolved' ? '未决支付阻止退款' : '没有可用于退款的确认回执'"
+              description="先解决支付尝试、钱包预留或开放对账案例。预留资金继续受数据库保护。"
+            />
+
+            <UAlert
+              v-if="errorMessage"
+              class="mt-4"
+              color="error"
+              variant="soft"
+              :title="errorMessage"
+              role="alert"
+              aria-live="assertive"
+            />
+            <UAlert
+              v-if="successMessage"
+              class="mt-4"
+              color="success"
+              variant="soft"
+              :title="successMessage"
+              role="status"
+              aria-live="polite"
+            />
+
+            <UAlert
+              v-if="!refunds.items.length"
+              class="mt-4"
+              color="neutral"
+              variant="subtle"
+              title="尚无退款申请"
+              description="顾客提交申请后，会在此显示金额、原因、资金来源和审核操作。"
+            />
+
+            <ol
+              v-else
+              class="mt-4 grid gap-4"
+            >
+              <li
+                v-for="refund in refunds.items"
+                :key="refund.id"
+                class="min-w-0 rounded-xl border border-default p-3 sm:p-4"
+              >
+                <header class="flex flex-wrap items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <p class="break-all font-mono text-xs text-muted">
+                      退款申请 {{ refund.id }}
+                    </p>
+                    <p class="mt-1 font-semibold tabular-nums text-highlighted">
+                      申请 ¥{{ refund.amount }} · 已成功 ¥{{ refund.succeededAmount }} · 预留 ¥{{ refund.reservedAmount }}
+                    </p>
+                    <p class="mt-1 break-words text-sm text-muted">
+                      原因：{{ refund.reason }}
+                    </p>
+                    <p
+                      v-if="refund.rejectionReason"
+                      class="mt-1 break-words text-sm text-error"
+                    >
+                      商家拒绝原因：{{ refund.rejectionReason }}
+                    </p>
+                  </div>
+                  <UBadge
+                    :color="refund.status === 'succeeded' ? 'success' : refund.status === 'failed' || refund.status === 'cancelled' ? 'error' : refund.status === 'partially_succeeded' ? 'warning' : 'primary'"
+                    variant="soft"
+                  >
+                    {{ refundStatusLabel(refund.status) }}
+                  </UBadge>
+                </header>
+
+                <dl class="mt-3 grid grid-cols-1 gap-2 border-t border-default pt-3 text-xs text-muted sm:grid-cols-2 lg:grid-cols-3">
+                  <div>
+                    <dt>申请时间</dt><dd class="mt-1 text-highlighted">
+                      {{ formatDate(refund.createdAt) }}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>审核人</dt><dd class="mt-1 break-all text-highlighted">
+                      {{ refund.reviewedByAdminId ?? '尚未审核' }}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>审核时间</dt><dd class="mt-1 text-highlighted">
+                      {{ refund.reviewedAt ? formatDate(refund.reviewedAt) : '—' }}
+                    </dd>
+                  </div>
+                </dl>
+
+                <div
+                  v-if="refund.status === 'requested'"
+                  class="mt-3 grid gap-3 rounded-lg border border-primary/25 bg-primary/5 p-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end"
+                >
+                  <UFormField label="拒绝原因">
+                    <UTextarea
+                      v-model="rejectionDrafts[refund.id]"
+                      :rows="2"
+                      :maxlength="500"
+                      :disabled="Boolean(refundActionKey)"
+                      placeholder="拒绝时必填；审核通过时不会使用此内容"
+                      class="w-full"
+                    />
+                  </UFormField>
+                  <div class="flex flex-wrap gap-2">
+                    <UButton
+                      color="neutral"
+                      variant="outline"
+                      icon="i-lucide-x"
+                      :loading="refundActionKey === `reject:${refund.id}`"
+                      :disabled="Boolean(refundActionKey) || !rejectionDrafts[refund.id]?.trim()"
+                      @click="rejectRefund(refund.id)"
+                    >
+                      拒绝
+                    </UButton>
+                    <UButton
+                      color="primary"
+                      icon="i-lucide-check"
+                      :loading="refundActionKey === `approve:${refund.id}`"
+                      :disabled="Boolean(refundActionKey)"
+                      @click="approveRefund(refund.id)"
+                    >
+                      审核通过
+                    </UButton>
+                  </div>
+                </div>
+
+                <div
+                  v-if="refund.allocations.length"
+                  class="mt-4 grid gap-3"
+                >
+                  <section
+                    v-for="allocation in refund.allocations"
+                    :key="allocation.id"
+                    class="min-w-0 rounded-lg bg-muted/35 p-3"
+                    :aria-labelledby="`refund-allocation-${allocation.id}`"
+                  >
+                    <div class="flex flex-wrap items-start justify-between gap-2">
+                      <div class="min-w-0">
+                        <h3
+                          :id="`refund-allocation-${allocation.id}`"
+                          class="font-medium text-highlighted"
+                        >
+                          {{ refundBucketLabel(allocation.sourceBucket) }} → {{ refundDestinationLabel(allocation.destination) }} · ¥{{ allocation.amount }}
+                        </h3>
+                        <p class="mt-1 break-all font-mono text-[11px] text-muted">
+                          收款回执 {{ allocation.sourceReceiptId }} · 原回执 ¥{{ allocation.sourceReceiptAmount }} · {{ allocation.sourceDisposition }} · {{ allocation.sourceProvider ?? '钱包' }}
+                        </p>
+                        <p
+                          v-if="allocation.sourceProviderTransactionId"
+                          class="mt-1 break-all font-mono text-[11px] text-muted"
+                        >
+                          原收款流水 {{ allocation.sourceProviderTransactionId }}
+                        </p>
+                        <p class="mt-1 break-all font-mono text-[11px] text-muted">
+                          退款操作 {{ allocation.operationId }}
+                        </p>
+                      </div>
+                      <UBadge
+                        :color="allocation.status === 'succeeded' ? 'success' : allocation.status === 'released' ? 'neutral' : 'warning'"
+                        variant="soft"
+                      >
+                        {{ allocation.status === 'succeeded' ? '已退款' : allocation.status === 'released' ? '预留已释放' : '资金已预留' }}
+                      </UBadge>
+                    </div>
+
+                    <div
+                      v-if="refund.payoutMode === 'manual_original_source' && allocation.destination === 'original_source' && allocation.status === 'reserved' && !allocation.manualAttempts.some(attempt => attempt.status === 'started' || attempt.status === 'unknown')"
+                      class="mt-3"
+                    >
+                      <UButton
+                        size="sm"
+                        color="warning"
+                        variant="soft"
+                        icon="i-lucide-hand-coins"
+                        :loading="refundActionKey === `manual-start:${allocation.id}`"
+                        :disabled="Boolean(refundActionKey) || Boolean(refunds.blockedReason && refunds.blockedReason !== 'no_refundable_balance')"
+                        @click="startManualRefund(refund.id, allocation.id)"
+                      >
+                        开始人工原路退款记录
+                      </UButton>
+                      <p class="mt-2 text-xs text-muted">
+                        此按钮只登记人工操作并保留资金，不会调用支付宝/微信或发起转账。
+                      </p>
+                    </div>
+
+                    <ol
+                      v-if="allocation.manualAttempts.length"
+                      class="mt-3 grid gap-3"
+                    >
+                      <li
+                        v-for="attempt in allocation.manualAttempts"
+                        :key="attempt.id"
+                        class="min-w-0 rounded-lg border border-default bg-elevated p-3"
+                      >
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                          <p class="break-all font-mono text-xs text-muted">
+                            人工原路退款 {{ attempt.id }}
+                          </p>
+                          <UBadge
+                            :color="attempt.status === 'succeeded' ? 'success' : attempt.status === 'failed' ? 'error' : 'warning'"
+                            variant="soft"
+                          >
+                            {{ attempt.status === 'succeeded' ? '有凭证已成功' : attempt.status === 'failed' ? '已确认未退款' : attempt.status === 'unknown' ? '结果未知，继续预留' : '操作已开始' }}
+                          </UBadge>
+                        </div>
+                        <p class="mt-1 break-all text-xs text-muted">
+                          开始管理员 {{ attempt.startedByAdminId }} · {{ formatDate(attempt.createdAt) }}<template v-if="attempt.resolvedByAdminId">
+                            · 处理管理员 {{ attempt.resolvedByAdminId }}
+                          </template>
+                        </p>
+                        <dl
+                          v-if="attempt.status === 'succeeded'"
+                          class="mt-2 grid gap-2 text-xs sm:grid-cols-2"
+                        >
+                          <div>
+                            <dt class="text-muted">
+                              实际退款流水号
+                            </dt><dd class="mt-1 break-all font-mono text-highlighted">
+                              {{ attempt.providerReference }}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt class="text-muted">
+                              真实金额与时间
+                            </dt><dd class="mt-1 tabular-nums text-highlighted">
+                              ¥{{ attempt.amount }} · {{ attempt.actualRefundedAt ? formatDate(attempt.actualRefundedAt) : '—' }}
+                            </dd>
+                          </div>
+                          <div class="sm:col-span-2">
+                            <dt class="text-muted">
+                              证据摘要
+                            </dt><dd class="mt-1 break-words text-highlighted">
+                              {{ attempt.evidenceSummary }}
+                            </dd>
+                          </div>
+                        </dl>
+                        <p
+                          v-if="attempt.resolutionNote"
+                          class="mt-2 break-words text-xs text-muted"
+                        >
+                          处理说明：{{ attempt.resolutionNote }}
+                        </p>
+
+                        <div
+                          v-if="refund.payoutMode === 'manual_original_source' && (attempt.status === 'started' || attempt.status === 'unknown')"
+                          class="mt-3 grid gap-3 border-t border-default pt-3"
+                        >
+                          <UAlert
+                            color="warning"
+                            variant="subtle"
+                            title="不要仅凭商户页面或提交结果确认退款"
+                            description="只有确认服务商已经实际退回款项，并核对本笔准确金额后，才填写成功凭证。若结果未知，保留预留并先核实流水，不能重复发起。"
+                          />
+                          <div class="grid gap-3 sm:grid-cols-2">
+                            <UFormField label="实际退款流水号">
+                              <UInput
+                                v-model="manualDraft(attempt.id, allocation.amount).providerRefundId"
+                                :maxlength="200"
+                                :disabled="Boolean(refundActionKey)"
+                                class="w-full"
+                              />
+                            </UFormField>
+                            <UFormField label="实际退款金额">
+                              <UInput
+                                v-model="manualDraft(attempt.id, allocation.amount).amount"
+                                inputmode="decimal"
+                                :disabled="Boolean(refundActionKey)"
+                                class="w-full"
+                              />
+                            </UFormField>
+                            <UFormField label="实际退款时间">
+                              <UInput
+                                v-model="manualDraft(attempt.id, allocation.amount).actualRefundedAt"
+                                type="datetime-local"
+                                :disabled="Boolean(refundActionKey)"
+                                class="w-full"
+                              />
+                            </UFormField>
+                            <UFormField label="证据摘要">
+                              <UInput
+                                v-model="manualDraft(attempt.id, allocation.amount).evidenceSummary"
+                                :maxlength="500"
+                                :disabled="Boolean(refundActionKey)"
+                                placeholder="商户退款详情、凭证或核对摘要"
+                                class="w-full"
+                              />
+                            </UFormField>
+                          </div>
+                          <UFormField label="未确认结果或未退款的核实说明">
+                            <UTextarea
+                              v-model="manualDraft(attempt.id, allocation.amount).resolutionNote"
+                              :maxlength="500"
+                              :rows="2"
+                              :disabled="Boolean(refundActionKey)"
+                              placeholder="未知时说明正在核对什么；确认未退款时说明核实依据"
+                              class="w-full"
+                            />
+                          </UFormField>
+                          <div class="flex flex-wrap gap-2">
+                            <UButton
+                              color="success"
+                              icon="i-lucide-circle-check"
+                              :loading="refundActionKey === `manual-result:${attempt.id}:succeeded`"
+                              :disabled="Boolean(refundActionKey)"
+                              @click="resolveManualRefund(refund.id, allocation.id, attempt.id, 'succeeded')"
+                            >
+                              登记实际退款成功
+                            </UButton>
+                            <UButton
+                              v-if="attempt.status === 'started'"
+                              color="warning"
+                              variant="soft"
+                              :loading="refundActionKey === `manual-result:${attempt.id}:unknown`"
+                              :disabled="Boolean(refundActionKey) || !manualDrafts[attempt.id]?.resolutionNote.trim()"
+                              @click="resolveManualRefund(refund.id, allocation.id, attempt.id, 'unknown')"
+                            >
+                              结果未知，继续预留
+                            </UButton>
+                            <UButton
+                              color="neutral"
+                              variant="outline"
+                              :loading="refundActionKey === `manual-result:${attempt.id}:failed`"
+                              :disabled="Boolean(refundActionKey) || !manualDrafts[attempt.id]?.resolutionNote.trim()"
+                              @click="resolveManualRefund(refund.id, allocation.id, attempt.id, 'failed')"
+                            >
+                              确认未退款并释放预留
+                            </UButton>
+                          </div>
+                        </div>
+                      </li>
+                    </ol>
+                  </section>
+                </div>
+
+                <div
+                  v-if="refund.payoutMode === 'manual_original_source' && (refund.status === 'failed' || refund.status === 'partially_succeeded') && refunds.refundableAmount !== '0.00'"
+                  class="mt-3"
+                >
+                  <UButton
+                    size="sm"
+                    color="warning"
+                    variant="outline"
+                    icon="i-lucide-rotate-cw"
+                    :loading="refundActionKey.startsWith(`retry:${refund.id}:`)"
+                    :disabled="Boolean(refundActionKey) || Boolean(refunds.blockedReason && refunds.blockedReason !== 'no_refundable_balance')"
+                    @click="retryGuestRefund(refund)"
+                  >
+                    重新预留已确认未退款的金额
+                  </UButton>
+                </div>
+
+                <details
+                  v-if="refund.auditEvents.length"
+                  class="mt-4 border-t border-default pt-3"
+                >
+                  <summary class="min-h-11 cursor-pointer content-center text-sm font-medium text-primary">
+                    操作与状态审计（{{ refund.auditEvents.length }}）
+                  </summary>
+                  <ol class="mt-2 grid gap-2">
+                    <li
+                      v-for="event in refund.auditEvents"
+                      :key="event.id"
+                      class="min-w-0 rounded-lg bg-muted/40 p-3 text-xs"
+                    >
+                      <p class="break-words font-medium text-highlighted">
+                        {{ event.action }} · {{ event.actorType === 'admin' ? `管理员 ${event.actorAdminId}` : event.actorType === 'customer' ? `顾客 ${event.actorCustomerId}` : event.actorType }}
+                      </p>
+                      <p class="mt-1 text-muted">
+                        {{ event.previousStatus ?? '—' }} → {{ event.nextStatus ?? '—' }} · {{ formatDate(event.createdAt) }}
+                      </p>
+                      <pre class="mt-2 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[11px] text-dimmed">{{ JSON.stringify(event.details, null, 2) }}</pre>
+                    </li>
+                  </ol>
+                </details>
               </li>
             </ol>
           </section>

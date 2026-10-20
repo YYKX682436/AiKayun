@@ -848,12 +848,11 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
         await trx.updateTable('order_refunds').set({ status: 'processing' }).where('id', '=', refundId).execute()
         await trx.insertInto('order_refund_allocations').values({
           id: allocationId, refund_id: refundId, source_payment_receipt_id: receipt.id,
-          operation_id: randomUUID(), request_sha256: digest, destination: 'original_source', amount,
+          operation_id: randomUUID(), request_sha256: digest, destination: 'cash_balance', amount,
           provider: null, provider_refund_id: null, completed_at: null,
         }).execute()
-        await trx.updateTable('order_refund_allocations').set({
-          status: 'succeeded', provider: 'epay-compatible', provider_refund_id: `refund-${randomUUID()}`,
-        }).where('id', '=', allocationId).execute()
+        await trx.updateTable('order_refund_allocations').set({ status: 'succeeded' })
+          .where('id', '=', allocationId).execute()
         await trx.updateTable('order_refunds').set({ status: 'succeeded' }).where('id', '=', refundId).execute()
       })
     }
@@ -1056,7 +1055,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
     await db.updateTable('storefront_customer_policy').set({ unpaid_order_timeout_minutes: 15 }).execute()
   })
 
-  it('records a late receipt when prior funds prevent timeout closure, then closes after full refund', async () => {
+  it('preserves a late receipt but blocks refunds and closure while a payment mismatch is unresolved', async () => {
     const customerId = await createCustomer('late-payment-existing-funds')
     const catalog = await createCatalog({ name: '已有收款的超时订单', salePrice: '10.00', stock: 2 })
     await db.updateTable('storefront_customer_policy').set({ unpaid_order_timeout_minutes: 1 }).execute()
@@ -1101,29 +1100,29 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
       .toEqual({ disposition: 'late' })
 
     const refundId = randomUUID()
-    await db.transaction().execute(async (trx) => {
+    await expect(db.transaction().execute(async (trx) => {
       await trx.insertInto('order_refunds').values({
-        id: refundId, order_id: order.id, idempotency_key: randomUUID(), request_sha256: digest, amount: '10.00',
+        id: refundId, order_id: order.id, idempotency_key: randomUUID(), request_sha256: digest, amount: '6.00',
       }).execute()
       await trx.updateTable('order_refunds').set({ status: 'approved' }).where('id', '=', refundId).execute()
       await trx.updateTable('order_refunds').set({ status: 'processing' }).where('id', '=', refundId).execute()
-      for (const [receiptId, amount] of [[mismatchReceiptId, '4.00'], [lateReceiptId, '6.00']] as const) {
-        const allocationId = randomUUID()
-        await trx.insertInto('order_refund_allocations').values({
-          id: allocationId, refund_id: refundId, source_payment_receipt_id: receiptId,
-          operation_id: randomUUID(), request_sha256: digest, destination: 'original_source', amount,
-          provider: null, provider_refund_id: null, completed_at: null,
-        }).execute()
-        await trx.updateTable('order_refund_allocations').set({
-          status: 'succeeded', provider: 'epay-compatible', provider_refund_id: `refund-${randomUUID()}`,
-        }).where('id', '=', allocationId).execute()
-      }
-      await trx.updateTable('order_refunds').set({ status: 'succeeded' }).where('id', '=', refundId).execute()
-    })
+      const allocationId = randomUUID()
+      await trx.insertInto('order_refund_allocations').values({
+        id: allocationId, refund_id: refundId, source_payment_receipt_id: lateReceiptId,
+        operation_id: randomUUID(), request_sha256: digest, destination: 'cash_balance', amount: '6.00',
+        provider: null, provider_refund_id: null, completed_at: null,
+      }).execute()
+      await trx.updateTable('order_refund_allocations').set({ status: 'succeeded' })
+        .where('id', '=', allocationId).execute()
+    })).rejects.toMatchObject({ constraint: 'order_refund_payment_unresolved' })
     expect(await db.selectFrom('orders').select('status').where('id', '=', order.id).executeTakeFirstOrThrow())
-      .toEqual({ status: 'closed' })
+      .toEqual({ status: 'pending_payment' })
+    expect(await db.selectFrom('payment_attempts').select(['status'])
+      .where('id', '=', mismatchAttemptId).executeTakeFirstOrThrow()).toEqual({ status: 'reconciliation_required' })
+    expect(await db.selectFrom('payment_receipts').select(['refunded_amount', 'refund_reserved_amount'])
+      .where('id', '=', lateReceiptId).executeTakeFirstOrThrow()).toEqual({ refunded_amount: '0.00', refund_reserved_amount: '0.00' })
     expect(await db.selectFrom('product_variant_quantity_inventory').select('reserved')
-      .where('product_variant_id', '=', catalog.variantId).executeTakeFirstOrThrow()).toEqual({ reserved: 0 })
+      .where('product_variant_id', '=', catalog.variantId).executeTakeFirstOrThrow()).toEqual({ reserved: 1 })
     await db.updateTable('storefront_customer_policy').set({ unpaid_order_timeout_minutes: 15 }).execute()
   })
 
@@ -1238,6 +1237,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
       delete prePaymentMigrations['202610200002_online_payments']
       delete prePaymentMigrations['202610200003_payment_reconciliation']
       delete prePaymentMigrations['202610200004_wallet_payments']
+      delete prePaymentMigrations['202610200005_refunds']
       const prePaymentProvider = { getMigrations: async () => prePaymentMigrations }
       const currentMigrator = new Migrator({ db, provider: prePaymentProvider })
       const upgradeResult = await currentMigrator.migrateToLatest()

@@ -1331,6 +1331,164 @@ export const OrderDetailSchema = Type.Intersect([
     statusEvents: Type.Array(OrderStatusEventSchema),
   }, { additionalProperties: false }),
 ])
+
+export const RefundStatusSchema = Type.Union([
+  Type.Literal('requested'), Type.Literal('approved'), Type.Literal('processing'),
+  Type.Literal('partially_succeeded'), Type.Literal('succeeded'), Type.Literal('failed'), Type.Literal('cancelled'),
+])
+export const RefundProgressStatusSchema = Type.Union([
+  Type.Literal('none'), Type.Literal('requested_or_processing'),
+  Type.Literal('partially_refunded'), Type.Literal('refunded'),
+])
+export const RefundSourceBucketSchema = Type.Union([
+  Type.Literal('external'), Type.Literal('cash'), Type.Literal('gift'),
+])
+export const RefundDestinationSchema = Type.Union([
+  Type.Literal('original_source'), Type.Literal('cash_balance'), Type.Literal('gift_balance'),
+])
+export const RefundAllocationStatusSchema = Type.Union([
+  Type.Literal('reserved'), Type.Literal('succeeded'), Type.Literal('released'),
+])
+export const RefundManualAttemptStatusSchema = Type.Union([
+  Type.Literal('started'), Type.Literal('unknown'), Type.Literal('succeeded'), Type.Literal('failed'),
+])
+export const RefundPayoutModeSchema = Type.Union([
+  Type.Literal('wallet'), Type.Literal('manual_original_source'), Type.Literal('unavailable'),
+])
+export const RefundBlockReasonSchema = Type.Union([
+  Type.Literal('payment_reconciliation_required'), Type.Literal('payment_unresolved'),
+  Type.Literal('no_confirmed_receipts'), Type.Literal('no_refundable_balance'),
+])
+export const RefundAmountSchema = Type.String({ pattern: '^(?:0|[1-9]\\d{0,15})\\.\\d{2}$' })
+export const RefundManualAttemptSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  status: RefundManualAttemptStatusSchema,
+  startedByAdminId: Type.String({ format: 'uuid' }),
+  resolvedByAdminId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  providerReference: Type.Union([Type.String({ maxLength: 200 }), Type.Null()]),
+  amount: Type.Union([RefundAmountSchema, Type.Null()]),
+  actualRefundedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  evidenceSummary: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
+  resolutionNote: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
+  createdAt: Type.String({ format: 'date-time' }),
+  completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+}, { additionalProperties: false })
+export const RefundAllocationSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  operationId: Type.String({ format: 'uuid' }),
+  sourceReceiptId: Type.String({ format: 'uuid' }),
+  sourceBucket: RefundSourceBucketSchema,
+  sourceReceiptAmount: RefundAmountSchema,
+  sourceDisposition: Type.Union([
+    Type.Literal('on_time'), Type.Literal('late'), Type.Literal('excess'), Type.Literal('amount_mismatch'),
+  ]),
+  sourceProvider: Type.Union([Type.String({ maxLength: 64 }), Type.Null()]),
+  sourceProviderTransactionId: Type.Union([Type.String({ maxLength: 200 }), Type.Null()]),
+  destination: RefundDestinationSchema,
+  amount: RefundAmountSchema,
+  status: RefundAllocationStatusSchema,
+  provider: Type.Union([Type.String({ maxLength: 64 }), Type.Null()]),
+  providerRefundId: Type.Union([Type.String({ maxLength: 200 }), Type.Null()]),
+  createdAt: Type.String({ format: 'date-time' }),
+  completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  manualAttempts: Type.Array(RefundManualAttemptSchema),
+}, { additionalProperties: false })
+export const CustomerOrderRefundSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  amount: RefundAmountSchema,
+  succeededAmount: RefundAmountSchema,
+  reservedAmount: RefundAmountSchema,
+  status: RefundStatusSchema,
+  reason: Type.String({ minLength: 1, maxLength: 500 }),
+  rejectionReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
+  payoutMode: RefundPayoutModeSchema,
+  createdAt: Type.String({ format: 'date-time' }),
+  updatedAt: Type.String({ format: 'date-time' }),
+  reviewedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  allocations: Type.Array(RefundAllocationSchema),
+}, { additionalProperties: false })
+export const CustomerOrderRefundsSchema = Type.Object({
+  orderId: Type.String({ format: 'uuid' }),
+  payoutMode: RefundPayoutModeSchema,
+  refundStatus: RefundProgressStatusSchema,
+  confirmedReceiptAmount: RefundAmountSchema,
+  refundableAmount: RefundAmountSchema,
+  refundedAmount: RefundAmountSchema,
+  refundReservedAmount: RefundAmountSchema,
+  activeRequestAmount: RefundAmountSchema,
+  canRequest: Type.Boolean(),
+  blockedReason: Type.Union([RefundBlockReasonSchema, Type.Null()]),
+  items: Type.Array(CustomerOrderRefundSchema),
+}, { additionalProperties: false })
+export const AdminOrderRefundAuditEventSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  action: Type.String({ maxLength: 48 }),
+  actorType: Type.Union([Type.Literal('customer'), Type.Literal('guest'), Type.Literal('admin'), Type.Literal('system')]),
+  actorCustomerId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  actorAdminId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  previousStatus: Type.Union([RefundStatusSchema, Type.Null()]),
+  nextStatus: Type.Union([RefundStatusSchema, Type.Null()]),
+  details: Type.Record(Type.String(), Type.Unknown()),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const AdminOrderRefundSchema = Type.Intersect([
+  CustomerOrderRefundSchema,
+  Type.Object({
+    reviewedByAdminId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+    auditEvents: Type.Array(AdminOrderRefundAuditEventSchema),
+  }, { additionalProperties: false }),
+])
+export const AdminOrderRefundsSchema = Type.Intersect([
+  CustomerOrderRefundsSchema,
+  Type.Object({ items: Type.Array(AdminOrderRefundSchema) }, { additionalProperties: false }),
+])
+export const CreateOrderRefundBodySchema = Type.Object({
+  idempotencyKey: Type.String({ format: 'uuid' }),
+  amount: RefundAmountSchema,
+  reason: Type.String({ minLength: 1, maxLength: 500, pattern: '.*\\S.*' }),
+}, { additionalProperties: false })
+export const AdminRefundActionBodySchema = Type.Object({
+  idempotencyKey: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+export const AdminRefundRejectionBodySchema = Type.Object({
+  idempotencyKey: Type.String({ format: 'uuid' }),
+  reason: Type.String({ minLength: 1, maxLength: 500, pattern: '.*\\S.*' }),
+}, { additionalProperties: false })
+export const AdminRefundManualAttemptBodySchema = Type.Object({
+  idempotencyKey: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+export const AdminRefundManualResolutionBodySchema = Type.Union([
+  Type.Object({
+    idempotencyKey: Type.String({ format: 'uuid' }),
+    outcome: Type.Literal('succeeded'),
+    providerRefundId: Type.String({ minLength: 1, maxLength: 200, pattern: '.*\\S.*' }),
+    amount: RefundAmountSchema,
+    actualRefundedAt: Type.String({ format: 'date-time' }),
+    evidenceSummary: Type.String({ minLength: 1, maxLength: 500, pattern: '.*\\S.*' }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    idempotencyKey: Type.String({ format: 'uuid' }),
+    outcome: Type.Union([Type.Literal('unknown'), Type.Literal('failed')]),
+    resolutionNote: Type.String({ minLength: 1, maxLength: 500, pattern: '.*\\S.*' }),
+  }, { additionalProperties: false }),
+])
+export const OrderRefundIdParamsSchema = Type.Object({ id: Type.String({ format: 'uuid' }), refundId: Type.String({ format: 'uuid' }) })
+export const OrderRefundAllocationParamsSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }), refundId: Type.String({ format: 'uuid' }), allocationId: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+export const OrderRefundManualAttemptParamsSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }), refundId: Type.String({ format: 'uuid' }), allocationId: Type.String({ format: 'uuid' }),
+  attemptId: Type.String({ format: 'uuid' }),
+}, { additionalProperties: false })
+export const CustomerOrderRefundMutationSchema = Type.Object({
+  repeated: Type.Boolean(),
+  refunds: CustomerOrderRefundsSchema,
+}, { additionalProperties: false })
+export const AdminOrderRefundMutationSchema = Type.Object({
+  repeated: Type.Boolean(),
+  refunds: AdminOrderRefundsSchema,
+}, { additionalProperties: false })
+
 export const CreateOrderResultSchema = Type.Object({
   created: Type.Boolean(),
   order: OrderDetailSchema,
@@ -1899,6 +2057,18 @@ export type OrderSummary = Static<typeof OrderSummarySchema>
 export type OrderItem = Static<typeof OrderItemSchema>
 export type OrderDetail = Static<typeof OrderDetailSchema>
 export type OrderPage = Static<typeof OrderPageSchema>
+export type RefundStatus = Static<typeof RefundStatusSchema>
+export type RefundProgressStatus = Static<typeof RefundProgressStatusSchema>
+export type RefundPayoutMode = Static<typeof RefundPayoutModeSchema>
+export type CustomerOrderRefund = Static<typeof CustomerOrderRefundSchema>
+export type CustomerOrderRefunds = Static<typeof CustomerOrderRefundsSchema>
+export type AdminOrderRefunds = Static<typeof AdminOrderRefundsSchema>
+export type CreateOrderRefundBody = Static<typeof CreateOrderRefundBodySchema>
+export type AdminRefundActionBody = Static<typeof AdminRefundActionBodySchema>
+export type AdminRefundRejectionBody = Static<typeof AdminRefundRejectionBodySchema>
+export type AdminRefundManualResolutionBody = Static<typeof AdminRefundManualResolutionBodySchema>
+export type CustomerOrderRefundMutation = Static<typeof CustomerOrderRefundMutationSchema>
+export type AdminOrderRefundMutation = Static<typeof AdminOrderRefundMutationSchema>
 export type AdminOrderPage = Static<typeof AdminOrderPageSchema>
 export type AdminOrderDetail = Static<typeof AdminOrderDetailSchema>
 export type UpdateManualFulfillmentBody = Static<typeof UpdateManualFulfillmentBodySchema>

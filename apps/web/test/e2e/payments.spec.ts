@@ -282,3 +282,113 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     }
   }
 })
+
+test('customer requests a full refund and an administrator approves it without changing delivered order history', async ({ page }) => {
+  test.setTimeout(180_000)
+  page.setDefaultTimeout(10_000)
+  const unique = randomUUID().slice(0, 8)
+  const channelName = `退款浏览器验收通道-${unique}`
+  const productName = `退款浏览器验收商品-${unique}`
+  const username = `refund${randomUUID().replaceAll('-', '').slice(0, 14)}`
+  const testIp = `198.51.100.${(Number.parseInt(unique.slice(0, 2), 16) % 200) + 20}`
+  let createdChannelId = ''
+  const consoleMessages: string[] = []
+  page.on('console', message => {
+    if (message.type() === 'error') consoleMessages.push(message.text())
+  })
+  await page.route('**/api/v1/**', route => route.continue({
+    headers: { ...route.request().headers(), 'x-forwarded-for': testIp },
+  }))
+
+  try {
+    await attachAdmin(page)
+    const channelCreated = await page.request.post('/api/v1/admin/payment-channels', {
+      headers: await adminHeaders(page),
+      data: {
+        providerType: 'zpay_epay_v1', name: channelName, enabled: true,
+        paymentMethods: ['alipay', 'wechat'], displayOrder: 10, merchantId, merchantKey,
+      },
+    })
+    expect(channelCreated.status()).toBe(201)
+    createdChannelId = (await channelCreated.json()).data.channel.id as string
+
+    const product = await createProduct(page, productName)
+    await registerCustomer(page, username)
+    await addProductToCart(page, product)
+    await page.goto('/cart')
+    await page.getByRole('link', { name: '查看结算报价' }).click()
+    await page.getByRole('button', { name: '提交订单' }).click()
+    await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
+    const orderId = page.url().split('/').at(-1)!
+    await expect(page.getByText('外部支付', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: /创建外部支付/u }).click()
+    await expect(page.getByAltText('本次订单的支付二维码')).toBeVisible()
+
+    const fixturePort = process.env.ZPAY_FIXTURE_PORT ?? '3099'
+    const fixtureBaseUrl = `http://127.0.0.1:${fixturePort}`
+    const fixtureOrders = await page.request.get(`${fixtureBaseUrl}/__fixture/orders`)
+    expect(fixtureOrders.status()).toBe(200)
+    const merchantOrderNo = (await fixtureOrders.json()).items.at(-1).merchantOrderNo as string
+    const paid = await page.request.post(`${fixtureBaseUrl}/__fixture/mark-paid`, { data: { merchantOrderNo } })
+    expect(paid.status()).toBe(200)
+    const callback = (await paid.json()).callback as Record<string, string>
+    const apiPort = process.env.AIKAYUN_TEST_API_PORT ?? '3001'
+    const callbackResponse = await page.request.get(
+      `http://127.0.0.1:${apiPort}/api/v1/payments/callback/zpay?${new URLSearchParams(callback).toString()}`,
+    )
+    expect(callbackResponse.status()).toBe(200)
+    expect(await callbackResponse.text()).toBe('success')
+    await page.getByRole('button', { name: '刷新支付状态' }).click()
+    await expect(page.getByText('等待商家交付').first()).toBeVisible()
+
+    await page.goto(`/admin/orders/${orderId}`)
+    await expect(page.getByRole('heading', { name: '退款与订单售后' })).toBeVisible()
+    await page.getByRole('textbox', { name: `${productName}实际交付内容，每行一件` }).fill('REFUND-E2E-DELIVERED-CONTENT')
+    await page.getByRole('button', { name: '确认实际交付' }).click()
+    await expect(page.getByText('已完成', { exact: true })).toBeVisible()
+
+    await page.goto(`/orders/${orderId}`)
+    await expect(page.getByRole('heading', { name: '退款进度' })).toBeVisible()
+    await page.getByLabel('申请退款金额').fill('5.00')
+    await page.getByLabel('退款原因').fill('浏览器验收全额退款申请')
+    await page.getByRole('button', { name: '提交退款申请' }).click()
+    await expect(page.getByRole('status')).toContainText('退款申请已提交')
+    await expect(page.getByText('审核或处理中', { exact: true })).toBeVisible()
+
+    await page.goto(`/admin/orders/${orderId}`)
+    await expect(page.getByText('原因：浏览器验收全额退款申请')).toBeVisible()
+    await page.getByRole('button', { name: '审核通过' }).click()
+    await expect(page.getByRole('region', { name: '退款与订单售后' }).getByRole('status')).toContainText('已审核通过')
+    await expect(page.getByText('外部收款 → 现金余额', { exact: false })).toBeVisible()
+    await expect(page.getByText('全额已退', { exact: true })).toBeVisible()
+    await expect(page.getByText('退款操作', { exact: false })).toBeVisible()
+
+    await page.goto(`/orders/${orderId}`)
+    await expect(page.getByText('订单已完成')).toBeVisible()
+    await expect(page.getByText('已全额退款', { exact: true })).toBeVisible()
+    await expect(page.getByText('REFUND-E2E-DELIVERED-CONTENT')).toBeVisible()
+    await expect(page.getByText('支付宝 / 微信实收 → 退回现金余额')).toBeVisible()
+    const wallet = await page.request.get('/api/v1/customer/wallet')
+    expect(wallet.status()).toBe(200)
+    expect((await wallet.json()).data.cashAvailable).toBe('5.00')
+
+    const ssrResponse = await page.request.get(`/orders/${orderId}`)
+    expect(ssrResponse.status()).toBe(200)
+    expect(ssrResponse.headers()['cache-control']).toContain('no-store')
+    for (const width of [320, 390, 768, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      const dimensions = await page.evaluate(() => ({
+        viewport: document.documentElement.clientWidth,
+        page: document.documentElement.scrollWidth,
+      }))
+      expect(dimensions.page).toBeLessThanOrEqual(dimensions.viewport)
+    }
+    expect(consoleMessages.join('\n')).toBe('')
+  } finally {
+    if (createdChannelId) {
+      await page.request.patch(`/api/v1/admin/payment-channels/${createdChannelId}`, {
+        headers: await adminHeaders(page), data: { enabled: false },
+      })
+    }
+  }
+})

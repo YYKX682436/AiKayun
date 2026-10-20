@@ -251,17 +251,20 @@ async function settleAndRefundExternally(orderId: string, amount: string): Promi
     provider_transaction_id: `purchase-limit-receipt-${receiptId}`, wallet_operation_id: null,
     wallet_line_no: null, amount,
   }).execute()
+  await db.updateTable('payment_attempts').set({ status: 'succeeded' }).where('id', '=', attemptId).execute()
+  const reviewingAdminId = (await db.selectFrom('admin_users').select('id').executeTakeFirstOrThrow()).id
   await db.insertInto('order_refunds').values({
     id: refundId, order_id: orderId, idempotency_key: randomUUID(), request_sha256: digest, amount,
   }).execute()
-  await db.updateTable('order_refunds').set({ status: 'approved' }).where('id', '=', refundId).execute()
+  await db.updateTable('order_refunds').set({ status: 'approved', reviewed_by_admin_id: reviewingAdminId })
+    .where('id', '=', refundId).execute()
   await db.insertInto('order_refund_allocations').values({
     id: allocationId, refund_id: refundId, source_payment_receipt_id: receiptId,
-    operation_id: randomUUID(), request_sha256: digest, destination: 'original_source', amount,
+    operation_id: randomUUID(), request_sha256: digest, destination: 'cash_balance', amount,
   }).execute()
   await db.updateTable('order_refunds').set({ status: 'processing' }).where('id', '=', refundId).execute()
   await db.updateTable('order_refund_allocations').set({
-    status: 'succeeded', provider: 'integration', provider_refund_id: `refund-${allocationId}`,
+    status: 'succeeded',
   }).where('id', '=', allocationId).execute()
   await db.updateTable('order_refunds').set({ status: 'succeeded' }).where('id', '=', refundId).execute()
 }
@@ -2261,6 +2264,26 @@ describe('purchase limit acceptance on PostgreSQL', () => {
     const orderId = created.json().data.order.id as string
     await settleAndRefundExternally(orderId, '1.25')
     await db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute()
+
+    const spendCatalog = await createCatalog({ name: '退款现金正常消费', price: '1.25', mode: 'unlimited' })
+    await enableManual(spendCatalog, admin)
+    const spendItems = [{ skuId: spendCatalog.skuId, quantity: 1 }]
+    const spendQuote = await quote(spendItems, customer)
+    const spendOrder = await createOrder(spendItems, spendQuote.json().data.quoteToken, customer)
+    expect(spendOrder.statusCode).toBe(201)
+    const spendOrderId = spendOrder.json().data.order.id as string
+    const walletPayment = await inject({
+      method: 'POST', url: `/api/v1/orders/${spendOrderId}/payments`, headers: customerHeaders(customer),
+      payload: { idempotencyKey: randomUUID(), walletAmount: '1.25' },
+    })
+    expect(walletPayment.statusCode).toBe(201)
+    const spendItemId = spendOrder.json().data.order.items[0].id as string
+    const delivered = await inject({
+      method: 'POST', url: `/api/v1/admin/orders/${spendOrderId}/items/${spendItemId}/fulfillments`,
+      headers: adminHeaders(admin), payload: { operationId: randomUUID(), deliveries: [{ content: 'legitimate-wallet-purchase' }] },
+    })
+    expect(delivered.statusCode).toBe(200)
+    expect(delivered.json().data.order.status).toBe('completed')
 
     const deleted = await inject({ method: 'DELETE', url: `/api/v1/admin/customers/${customer.id}`, headers: adminHeaders(admin) })
     expect(deleted.statusCode).toBe(200)

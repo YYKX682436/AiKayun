@@ -44,6 +44,17 @@ function remoteAddress(): string {
   return `198.51.100.${value}`
 }
 
+async function waitForPgLockWaits(expectedCount: number, queryFragment: string): Promise<void> {
+  await expect.poll(async () => {
+    const result = await sql<{ count: string }>`
+      SELECT count(*)::text AS count FROM pg_stat_activity
+      WHERE datname = current_database() AND wait_event_type = 'Lock'
+        AND query ILIKE ${`%${queryFragment}%`}
+    `.execute(db)
+    return Number(result.rows[0]?.count ?? 0)
+  }).toBe(expectedCount)
+}
+
 function inject(options: InjectOptions) {
   return app.inject({ ...options, remoteAddress: remoteAddress() })
 }
@@ -1111,7 +1122,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
     expect((await inject({ method: 'GET', url: callbackUrl(callback) })).body).toBe('success')
     const after = await inject({ method: 'GET', url: '/api/v1/customer/wallet', headers: customerHeaders(customer, false) })
     expect(after.json().data).toMatchObject({ cashAvailable: '10.00', giftAvailable: '0.00', totalAvailable: '10.00' })
-    expect(await db.selectFrom('wallet_ledger_entries').select('id')
+    expect(await db.selectFrom('wallet_ledger_entries').select('wallet_ledger_entries.id')
       .where('payment_attempt_id', '=', created.attemptId).where('bucket', '=', 'cash').execute()).toHaveLength(1)
     expect(await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', created.attemptId).execute())
       .toHaveLength(1)
@@ -1480,5 +1491,481 @@ describe('online payment settlement through a real local HTTP provider and Postg
       .innerJoin('order_items as item', 'item.id', 'reservation.order_item_id')
       .select('inventory.reserved').where('item.order_id', '=', orderId).executeTakeFirstOrThrow()
     expect(inventory.reserved).toBe(1)
+  })
+
+  it('returns a single cash, gift or external order receipt to the correct wallet bucket', async () => {
+    await db.updateTable('storefront_customer_policy').set({
+      wallet_top_up_enabled: true, wallet_top_up_min_amount: '1.00', wallet_top_up_max_amount: '1000.00',
+    }).where('singleton', '=', true).execute()
+
+    for (const source of ['cash', 'gift', 'external'] as const) {
+      const customer = await createCustomer()
+      if (source === 'cash') {
+        const topUp = await createWalletTopUp(customer, { amount: '5.00' })
+        expect(topUp.response.statusCode).toBe(201)
+        const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+          .where('id', '=', topUp.attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+        expect((await inject({ method: 'GET', url: callbackUrl(fixture.setPaid(merchantNo)) })).body).toBe('success')
+      } else if (source === 'gift') {
+        await creditGiftFixture(customer, '5.00')
+      }
+
+      const orderId = await createOrder(customer, `单来源退款-${source}-${randomUUID().slice(0, 8)}`, { amount: '5.00' })
+      const payment = await createPayment(orderId, customer, source === 'external' ? {} : { walletAmount: '5.00' })
+      expect(payment.statusCode).toBe(201)
+      if (source === 'external') {
+        const attemptId = payment.json().data.attempt.id as string
+        const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+          .where('id', '=', attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+        expect((await inject({ method: 'GET', url: callbackUrl(fixture.setPaid(merchantNo)) })).body).toBe('success')
+      }
+
+      const request = await inject({
+        method: 'POST', url: `/api/v1/customer/orders/${orderId}/refunds`, headers: customerHeaders(customer),
+        payload: { idempotencyKey: randomUUID(), amount: '5.00', reason: `退回${source}单来源` },
+      })
+      expect(request.statusCode).toBe(201)
+      const refundId = request.json().data.refunds.items[0].id as string
+      const approved = await inject({
+        method: 'POST', url: `/api/v1/admin/orders/${orderId}/refunds/${refundId}/approve`, headers: adminHeaders(),
+        payload: { idempotencyKey: randomUUID() },
+      })
+      expect(approved.statusCode).toBe(200)
+      expect(approved.json().data.refunds).toMatchObject({ refundStatus: 'refunded', refundedAmount: '5.00' })
+      expect(approved.json().data.refunds.items[0].allocations).toMatchObject([{
+        sourceBucket: source, destination: source === 'gift' ? 'gift_balance' : 'cash_balance', amount: '5.00', status: 'succeeded',
+      }])
+      expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+        .toBe('processing')
+      const refundLines = await db.selectFrom('wallet_ledger_entries')
+        .innerJoin('order_refund_allocations', 'order_refund_allocations.id', 'wallet_ledger_entries.refund_allocation_id')
+        .select(['wallet_ledger_entries.bucket', 'wallet_ledger_entries.action', 'wallet_ledger_entries.amount'])
+        .where('order_refund_allocations.refund_id', '=', refundId).execute()
+      expect(refundLines).toEqual([{
+        bucket: source === 'gift' ? 'gift' : 'cash', action: 'credit_available', amount: '5.00',
+      }])
+      await expectWalletMatchesLedger(customer.id)
+    }
+  })
+
+  it('refunds a completed hybrid order by each original bucket and serializes capped partial approvals', async () => {
+    await db.updateTable('storefront_customer_policy').set({
+      wallet_top_up_enabled: true, wallet_top_up_min_amount: '1.00', wallet_top_up_max_amount: '1000.00',
+    }).where('singleton', '=', true).execute()
+    const customer = await createCustomer()
+    await creditGiftFixture(customer, '2.00')
+    const topUp = await createWalletTopUp(customer, { amount: '3.00' })
+    expect(topUp.response.statusCode).toBe(201)
+    const topUpNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', topUp.attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+    expect((await inject({ method: 'GET', url: callbackUrl(fixture.setPaid(topUpNo)) })).body).toBe('success')
+
+    const orderId = await createOrder(customer, `组合支付完成后退款-${randomUUID().slice(0, 8)}`, {
+      amount: '10.00', quantityStock: 2,
+    })
+    const payment = await createPayment(orderId, customer, { walletAmount: '5.00' })
+    expect(payment.statusCode).toBe(201)
+    expect(payment.json().data.attempt).toMatchObject({ amount: '5.00', walletGiftAmount: '2.00', walletCashAmount: '3.00' })
+    const paymentAttemptId = payment.json().data.attempt.id as string
+    const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', paymentAttemptId).executeTakeFirstOrThrow()).merchant_order_no!
+    expect((await inject({ method: 'GET', url: callbackUrl(fixture.setPaid(merchantNo)) })).body).toBe('success')
+
+    const orderItemId = (await db.selectFrom('order_items').select('id').where('order_id', '=', orderId).executeTakeFirstOrThrow()).id
+    const delivered = await inject({
+      method: 'POST', url: `/api/v1/admin/orders/${orderId}/items/${orderItemId}/fulfillments`,
+      headers: adminHeaders(), payload: { operationId: randomUUID(), deliveries: [{ content: 'refund-test-delivery' }] },
+    })
+    expect(delivered.statusCode).toBe(200)
+    expect(delivered.json().data.order.status).toBe('completed')
+
+    const refundPath = `/api/v1/customer/orders/${orderId}/refunds`
+    const firstKey = randomUUID()
+    const firstBody = { idempotencyKey: firstKey, amount: '4.00', reason: '部分退款后保留已交付记录' }
+    const first = await inject({ method: 'POST', url: refundPath, headers: customerHeaders(customer), payload: firstBody })
+    expect(first.statusCode).toBe(201)
+    expect(first.json().data.refunds).toMatchObject({ refundableAmount: '6.00', refundStatus: 'requested_or_processing' })
+    const replay = await inject({ method: 'POST', url: refundPath, headers: customerHeaders(customer), payload: firstBody })
+    expect(replay.statusCode).toBe(200)
+    expect(replay.json().data.repeated).toBe(true)
+    const firstRefundId = first.json().data.refunds.items[0].id as string
+
+    const secondKey = randomUUID()
+    const second = await inject({
+      method: 'POST', url: refundPath, headers: customerHeaders(customer),
+      payload: { idempotencyKey: secondKey, amount: '6.00', reason: '剩余实际收款退款' },
+    })
+    expect(second.statusCode).toBe(201)
+    const secondRefundId = second.json().data.refunds.items.find((item: { id: string }) => item.id !== firstRefundId).id as string
+    const over = await inject({
+      method: 'POST', url: refundPath, headers: customerHeaders(customer),
+      payload: { idempotencyKey: randomUUID(), amount: '0.01', reason: '超出收款总额' },
+    })
+    expect(over.statusCode).toBe(409)
+    expect(over.json().error.code).toBe('REFUND_AMOUNT_UNAVAILABLE')
+
+    const secondAdmin = await createAdmin()
+    const approvePath = `/api/v1/admin/orders/${orderId}/refunds/${firstRefundId}/approve`
+    let releaseCustomerLock!: () => void
+    let signalCustomerLock!: () => void
+    const customerLockReady = new Promise<void>(resolve => { signalCustomerLock = resolve })
+    const customerLockRelease = new Promise<void>(resolve => { releaseCustomerLock = resolve })
+    const lockCustomer = db.transaction().execute(async (trx) => {
+      await trx.selectFrom('customers').select('id').where('id', '=', customer.id).forUpdate().executeTakeFirstOrThrow()
+      signalCustomerLock()
+      await customerLockRelease
+    })
+    await customerLockReady
+    const approveRequests = Promise.all([
+      inject({ method: 'POST', url: approvePath, headers: adminHeaders(), payload: { idempotencyKey: randomUUID() } }),
+      inject({ method: 'POST', url: approvePath, headers: {
+        origin: testOrigin, cookie: `${secondAdmin.cookie}; ${secondAdmin.csrfCookie}`, 'x-csrf-token': secondAdmin.csrfToken,
+      }, payload: { idempotencyKey: randomUUID() } }),
+    ])
+    try {
+      await waitForPgLockWaits(2, 'FROM "customers"')
+    } finally {
+      releaseCustomerLock()
+      await lockCustomer
+      await approveRequests.catch(() => undefined)
+    }
+    const [approveA, approveB] = await approveRequests
+    expect([approveA.statusCode, approveB.statusCode].sort()).toEqual([200, 409])
+
+    const secondApprovalKey = randomUUID()
+    const secondApprovalPath = `/api/v1/admin/orders/${orderId}/refunds/${secondRefundId}/approve`
+    const secondApproval = await inject({
+      method: 'POST', url: secondApprovalPath,
+      headers: adminHeaders(), payload: { idempotencyKey: secondApprovalKey },
+    })
+    expect(secondApproval.statusCode).toBe(200)
+    const replayApproval = await inject({
+      method: 'POST', url: secondApprovalPath,
+      headers: adminHeaders(), payload: { idempotencyKey: secondApprovalKey },
+    })
+    expect(replayApproval.statusCode).toBe(200)
+    expect(replayApproval.json().data.repeated).toBe(true)
+
+    const allocations = await db.selectFrom('order_refund_allocations as allocation')
+      .innerJoin('payment_receipts as receipt', 'receipt.id', 'allocation.source_payment_receipt_id')
+      .innerJoin('payment_attempts as attempt', 'attempt.id', 'receipt.payment_attempt_id')
+      .select(['receipt.source_bucket', 'allocation.destination', 'allocation.amount', 'allocation.status'])
+      .where('allocation.refund_id', 'in', [firstRefundId, secondRefundId]).orderBy('receipt.source_bucket').execute()
+    expect(allocations.every(allocation => allocation.status === 'succeeded')).toBe(true)
+    expect(allocations.filter(allocation => allocation.source_bucket === 'gift')
+      .every(allocation => allocation.destination === 'gift_balance')).toBe(true)
+    expect(allocations.filter(allocation => allocation.source_bucket === 'cash')
+      .every(allocation => allocation.destination === 'cash_balance')).toBe(true)
+    expect(allocations.filter(allocation => allocation.source_bucket === 'external')
+      .every(allocation => allocation.destination === 'cash_balance')).toBe(true)
+    const sourceTotals = await sql<{ source_bucket: string; amount: string }>`
+      SELECT receipt.source_bucket, sum(allocation.amount)::text AS amount
+      FROM order_refund_allocations AS allocation
+      JOIN payment_receipts AS receipt ON receipt.id = allocation.source_payment_receipt_id
+      JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
+      WHERE attempt.order_id = ${orderId}::uuid AND allocation.status = 'succeeded'
+      GROUP BY receipt.source_bucket ORDER BY receipt.source_bucket
+    `.execute(db)
+    expect(sourceTotals.rows).toEqual([
+      { source_bucket: 'cash', amount: '3.00' },
+      { source_bucket: 'external', amount: '5.00' },
+      { source_bucket: 'gift', amount: '2.00' },
+    ])
+    const walletRefundTotals = await sql<{ bucket: string; amount: string }>`
+      SELECT entry.bucket, sum(entry.amount)::text AS amount
+      FROM wallet_ledger_entries AS entry
+      JOIN order_refund_allocations AS allocation ON allocation.id = entry.refund_allocation_id
+      WHERE allocation.refund_id IN (${firstRefundId}::uuid, ${secondRefundId}::uuid)
+        AND entry.action = 'credit_available'
+      GROUP BY entry.bucket ORDER BY entry.bucket
+    `.execute(db)
+    expect(walletRefundTotals.rows).toEqual([{ bucket: 'cash', amount: '8.00' }, { bucket: 'gift', amount: '2.00' }])
+    expect(await db.selectFrom('wallet_ledger_entries').select('wallet_ledger_entries.id')
+      .innerJoin('order_refund_allocations', 'order_refund_allocations.id', 'wallet_ledger_entries.refund_allocation_id')
+      .where('order_refund_allocations.refund_id', 'in', [firstRefundId, secondRefundId]).execute()).toHaveLength(4)
+    await expectWalletMatchesLedger(customer.id)
+
+    const currentOrder = await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()
+    expect(currentOrder.status).toBe('completed')
+    expect(await db.selectFrom('order_items').select(['fulfilled_quantity', 'fulfillment_status'])
+      .where('id', '=', orderItemId).executeTakeFirstOrThrow()).toEqual({ fulfilled_quantity: 1, fulfillment_status: 'completed' })
+    const inventory = await db.selectFrom('product_variant_quantity_inventory as inventory')
+      .innerJoin('order_inventory_reservations as reservation', 'reservation.product_variant_id', 'inventory.product_variant_id')
+      .innerJoin('order_items as item', 'item.id', 'reservation.order_item_id')
+      .select(['inventory.stocked', 'inventory.reserved'])
+      .where('item.order_id', '=', orderId).executeTakeFirstOrThrow()
+    expect(inventory).toEqual({ stocked: 1, reserved: 0 })
+    expect((await sql<{ counts: boolean }>`SELECT order_counts_as_purchase(${orderId}::uuid) AS counts`.execute(db)).rows[0]?.counts)
+      .toBe(true)
+    expect((await sql<{ refund_status: string }>`SELECT refund_status FROM order_financial_status WHERE order_id = ${orderId}::uuid`.execute(db)).rows[0]?.refund_status)
+      .toBe('refunded')
+    expect((await inject({ method: 'GET', url: `/api/v1/admin/orders/${orderId}/refunds`, headers: adminHeaders() })).json().data)
+      .toMatchObject({ refundStatus: 'refunded', refundedAmount: '10.00', refundableAmount: '0.00' })
+  })
+
+  it('serializes a refund credit against a concurrent wallet-only purchase without a negative balance', async () => {
+    const customer = await createCustomer()
+    const refundOrderId = await createOrder(customer, `退款与钱包消费并发-${randomUUID().slice(0, 8)}`, { amount: '5.00' })
+    const externalPayment = await createPayment(refundOrderId, customer)
+    expect(externalPayment.statusCode).toBe(201)
+    const externalAttemptId = externalPayment.json().data.attempt.id as string
+    const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', externalAttemptId).executeTakeFirstOrThrow()).merchant_order_no!
+    expect((await inject({ method: 'GET', url: callbackUrl(fixture.setPaid(merchantNo)) })).body).toBe('success')
+
+    const request = await inject({
+      method: 'POST', url: `/api/v1/customer/orders/${refundOrderId}/refunds`, headers: customerHeaders(customer),
+      payload: { idempotencyKey: randomUUID(), amount: '5.00', reason: '与钱包消费并发验收' },
+    })
+    expect(request.statusCode).toBe(201)
+    const refundId = request.json().data.refunds.items[0].id as string
+    const spendingOrderId = await createOrder(customer, `并发钱包消费订单-${randomUUID().slice(0, 8)}`, { amount: '5.00' })
+
+    let releaseCustomerLock!: () => void
+    let signalCustomerLock!: () => void
+    const customerLockReady = new Promise<void>((resolve) => { signalCustomerLock = resolve })
+    const customerLockRelease = new Promise<void>((resolve) => { releaseCustomerLock = resolve })
+    const lockCustomer = db.transaction().execute(async (trx) => {
+      await trx.selectFrom('customers').select('id').where('id', '=', customer.id).forUpdate().executeTakeFirstOrThrow()
+      signalCustomerLock()
+      await customerLockRelease
+    })
+    await customerLockReady
+    const approval = inject({
+      method: 'POST', url: `/api/v1/admin/orders/${refundOrderId}/refunds/${refundId}/approve`,
+      headers: adminHeaders(), payload: { idempotencyKey: randomUUID() },
+    })
+    let spendingPayment: ReturnType<typeof createPayment> | undefined
+    try {
+      await waitForPgLockWaits(1, 'FROM "customers"')
+      spendingPayment = createPayment(spendingOrderId, customer, { walletAmount: '5.00' })
+      await waitForPgLockWaits(2, 'FROM "customers"')
+    } finally {
+      releaseCustomerLock()
+      await lockCustomer
+      await Promise.all([approval, ...(spendingPayment ? [spendingPayment] : [])]).catch(() => undefined)
+    }
+    const [approved, spent] = await Promise.all([approval, spendingPayment!])
+    expect(approved.statusCode).toBe(200)
+    expect(spent.statusCode).toBe(201)
+    expect(spent.json().data.attempt).toMatchObject({ source: 'wallet', amount: '5.00', status: 'succeeded' })
+    const wallet = await db.selectFrom('wallet_accounts')
+      .select(['cash_available', 'cash_frozen', 'gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()
+    expect(wallet).toEqual({ cash_available: '0.00', cash_frozen: '0.00', gift_available: '0.00', gift_frozen: '0.00' })
+    expect((await db.selectFrom('orders').select('status').where('id', '=', spendingOrderId).executeTakeFirstOrThrow()).status)
+      .toBe('processing')
+    expect(await db.selectFrom('payment_receipts').select(['refunded_amount', 'refund_reserved_amount'])
+      .where('payment_attempt_id', '=', externalAttemptId).executeTakeFirstOrThrow())
+      .toEqual({ refunded_amount: '5.00', refund_reserved_amount: '0.00' })
+    await expectWalletMatchesLedger(customer.id)
+  })
+
+  it('uses manual original-source refund records for guests and never credits an arbitrary wallet', async () => {
+    const guest = await createGuestSession()
+    const orderId = await createOrder(guest, `游客人工退款-${randomUUID().slice(0, 8)}`, { amount: '8.00' })
+    const payment = await createPayment(orderId, guest)
+    expect(payment.statusCode).toBe(201)
+    const attemptId = payment.json().data.attempt.id as string
+    const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+    expect((await inject({ method: 'GET', url: callbackUrl(fixture.setPaid(merchantNo)) })).body).toBe('success')
+
+    const refundPath = `/api/v1/guest/orders/${orderId}/refunds`
+    const requestBody = { idempotencyKey: randomUUID(), amount: '8.00', reason: '游客申请原支付来源退款' }
+    const unauthorized = await inject({ method: 'POST', url: refundPath, headers: customerHeaders(guest, false), payload: requestBody })
+    expect(unauthorized.statusCode).toBe(403)
+    const forgedOwner = await inject({
+      method: 'POST', url: refundPath, headers: customerHeaders(guest), payload: { ...requestBody, customerId: randomUUID() },
+    })
+    expect(forgedOwner.statusCode).toBe(400)
+
+    const requested = await inject({ method: 'POST', url: refundPath, headers: customerHeaders(guest), payload: requestBody })
+    expect(requested.statusCode).toBe(201)
+    const refundId = requested.json().data.refunds.items[0].id as string
+    const admin = await createAdmin()
+    const approvalPath = `/api/v1/admin/orders/${orderId}/refunds/${refundId}/approve`
+    const noAdminCsrf = await inject({
+      method: 'POST', url: approvalPath, headers: { origin: testOrigin, cookie: admin.cookie }, payload: { idempotencyKey: randomUUID() },
+    })
+    expect(noAdminCsrf.statusCode).toBe(403)
+
+    const receipt = await db.selectFrom('payment_receipts').innerJoin('payment_attempts', 'payment_attempts.id', 'payment_receipts.payment_attempt_id')
+      .select('payment_receipts.id').where('payment_attempts.order_id', '=', orderId).executeTakeFirstOrThrow()
+    await expect(db.transaction().execute(async (trx) => {
+      await trx.updateTable('order_refunds').set({ status: 'approved', reviewed_by_admin_id: admin.id })
+        .where('id', '=', refundId).execute()
+      await trx.updateTable('order_refunds').set({ status: 'processing' }).where('id', '=', refundId).execute()
+      await trx.insertInto('order_refund_allocations').values({
+        id: randomUUID(), refund_id: refundId, source_payment_receipt_id: receipt.id,
+        operation_id: randomUUID(), request_sha256: digest, destination: 'cash_balance', amount: '8.00',
+        status: 'reserved', provider: null, provider_refund_id: null,
+      }).execute()
+    })).rejects.toMatchObject({ constraint: 'order_refund_guest_wallet_forbidden' })
+
+    const approved = await inject({
+      method: 'POST', url: approvalPath, headers: {
+        origin: testOrigin, cookie: `${admin.cookie}; ${admin.csrfCookie}`, 'x-csrf-token': admin.csrfToken,
+      }, payload: { idempotencyKey: randomUUID() },
+    })
+    expect(approved.statusCode).toBe(200)
+    const allocation = approved.json().data.refunds.items[0].allocations[0]
+    expect(allocation).toMatchObject({ destination: 'original_source', sourceBucket: 'external', amount: '8.00', status: 'reserved' })
+    expect(await db.selectFrom('payment_receipts').select(['refunded_amount', 'refund_reserved_amount']).where('id', '=', receipt.id)
+      .executeTakeFirstOrThrow()).toEqual({ refunded_amount: '0.00', refund_reserved_amount: '8.00' })
+    const allocationId = allocation.id as string
+    const startPath = `/api/v1/admin/orders/${orderId}/refunds/${refundId}/allocations/${allocationId}/manual-attempts`
+    const started = await inject({
+      method: 'POST', url: startPath, headers: {
+        origin: testOrigin, cookie: `${admin.cookie}; ${admin.csrfCookie}`, 'x-csrf-token': admin.csrfToken,
+      }, payload: { idempotencyKey: randomUUID() },
+    })
+    expect(started.statusCode).toBe(200)
+    const attemptIdForRefund = started.json().data.refunds.items[0].allocations[0].manualAttempts[0].id as string
+    const resolvePath = `${startPath}/${attemptIdForRefund}/resolve`
+    const badSuccess = await inject({
+      method: 'POST', url: resolvePath, headers: {
+        origin: testOrigin, cookie: `${admin.cookie}; ${admin.csrfCookie}`, 'x-csrf-token': admin.csrfToken,
+      }, payload: {
+        idempotencyKey: randomUUID(), outcome: 'succeeded', providerRefundId: '', amount: '8.00',
+        actualRefundedAt: new Date().toISOString(), evidenceSummary: '',
+      },
+    })
+    expect(badSuccess.statusCode).toBe(400)
+    const mismatchedAmount = await inject({
+      method: 'POST', url: resolvePath, headers: {
+        origin: testOrigin, cookie: `${admin.cookie}; ${admin.csrfCookie}`, 'x-csrf-token': admin.csrfToken,
+      }, payload: {
+        idempotencyKey: randomUUID(), outcome: 'succeeded', providerRefundId: 'manual-refund-mismatch', amount: '7.99',
+        actualRefundedAt: new Date().toISOString(), evidenceSummary: '仅测试，不存在真实转账',
+      },
+    })
+    expect(mismatchedAmount.statusCode).toBe(409)
+
+    const unknown = await inject({
+      method: 'POST', url: resolvePath, headers: {
+        origin: testOrigin, cookie: `${admin.cookie}; ${admin.csrfCookie}`, 'x-csrf-token': admin.csrfToken,
+      }, payload: { idempotencyKey: randomUUID(), outcome: 'unknown', resolutionNote: '商户退款流水尚未核实。' },
+    })
+    expect(unknown.statusCode).toBe(200)
+    expect(unknown.json().data.refunds.items[0]).toMatchObject({ status: 'processing', reservedAmount: '8.00', succeededAmount: '0.00' })
+    expect(await db.selectFrom('payment_receipts').select(['refunded_amount', 'refund_reserved_amount']).where('id', '=', receipt.id)
+      .executeTakeFirstOrThrow()).toEqual({ refunded_amount: '0.00', refund_reserved_amount: '8.00' })
+
+    const failed = await inject({
+      method: 'POST', url: resolvePath, headers: {
+        origin: testOrigin, cookie: `${admin.cookie}; ${admin.csrfCookie}`, 'x-csrf-token': admin.csrfToken,
+      }, payload: { idempotencyKey: randomUUID(), outcome: 'failed', resolutionNote: '已核对未发生实际转账。' },
+    })
+    expect(failed.statusCode).toBe(200)
+    expect(failed.json().data.refunds.items[0]).toMatchObject({ status: 'failed', reservedAmount: '0.00', succeededAmount: '0.00' })
+    expect(await db.selectFrom('order_refund_allocations').select('status').where('refund_id', '=', refundId).execute())
+      .toEqual([{ status: 'released' }])
+    expect(await db.selectFrom('payment_receipts').select(['refunded_amount', 'refund_reserved_amount']).where('id', '=', receipt.id)
+      .executeTakeFirstOrThrow()).toEqual({ refunded_amount: '0.00', refund_reserved_amount: '0.00' })
+
+    const retried = await inject({
+      method: 'POST', url: `/api/v1/admin/orders/${orderId}/refunds/${refundId}/retry`, headers: {
+        origin: testOrigin, cookie: `${admin.cookie}; ${admin.csrfCookie}`, 'x-csrf-token': admin.csrfToken,
+      }, payload: { idempotencyKey: randomUUID() },
+    })
+    expect(retried.statusCode).toBe(200)
+    const retryAllocation = retried.json().data.refunds.items[0].allocations.find((item: { status: string }) => item.status === 'reserved')
+    expect(retryAllocation).toMatchObject({ destination: 'original_source', sourceBucket: 'external', amount: '8.00', status: 'reserved' })
+    const retryAllocationId = retryAllocation.id as string
+    const retryStartPath = `/api/v1/admin/orders/${orderId}/refunds/${refundId}/allocations/${retryAllocationId}/manual-attempts`
+    const retryStarted = await inject({
+      method: 'POST', url: retryStartPath, headers: {
+        origin: testOrigin, cookie: `${admin.cookie}; ${admin.csrfCookie}`, 'x-csrf-token': admin.csrfToken,
+      }, payload: { idempotencyKey: randomUUID() },
+    })
+    expect(retryStarted.statusCode).toBe(200)
+    const retryAttemptId = retryStarted.json().data.refunds.items[0].allocations
+      .find((item: { id: string }) => item.id === retryAllocationId).manualAttempts[0].id as string
+    const retryResolvePath = `${retryStartPath}/${retryAttemptId}/resolve`
+
+    const confirmed = await inject({
+      method: 'POST', url: retryResolvePath, headers: {
+        origin: testOrigin, cookie: `${admin.cookie}; ${admin.csrfCookie}`, 'x-csrf-token': admin.csrfToken,
+      }, payload: {
+        idempotencyKey: randomUUID(), outcome: 'succeeded', providerRefundId: `manual-${randomUUID()}`,
+        amount: '8.00', actualRefundedAt: new Date().toISOString(), evidenceSummary: '真实转账凭证由管理员核对并登记',
+      },
+    })
+    expect(confirmed.statusCode).toBe(200)
+    expect(confirmed.json().data.refunds).toMatchObject({ refundStatus: 'refunded', refundedAmount: '8.00' })
+    const finalAllocations = confirmed.json().data.refunds.items[0].allocations
+    expect(finalAllocations.map((item: { status: string }) => item.status).sort()).toEqual(['released', 'succeeded'])
+    expect(finalAllocations.flatMap((item: { manualAttempts: Array<{ status: string }> }) => item.manualAttempts)
+      .map((item: { status: string }) => item.status).sort()).toEqual(['failed', 'succeeded'])
+    expect((await db.selectFrom('order_refund_audit_events').select('action').where('refund_id', '=', refundId).execute())
+      .map(event => event.action)).toContain('manual_attempt_unknown')
+    expect(await db.selectFrom('wallet_ledger_entries').select('id').where('wallet_operation_id', '=', allocation.operationId).execute())
+      .toHaveLength(0)
+    expect(await db.selectFrom('wallet_operations').select('id').where('id', '=', allocation.operationId).execute()).toHaveLength(0)
+    expect(await db.selectFrom('payment_receipts').select(['refunded_amount', 'refund_reserved_amount']).where('id', '=', receipt.id)
+      .executeTakeFirstOrThrow()).toEqual({ refunded_amount: '8.00', refund_reserved_amount: '0.00' })
+  })
+
+  it('serializes refund request against a real payment callback and blocks approval after reconciliation opens', async () => {
+    const customer = await createCustomer()
+    const orderId = await createOrder(customer, `并发到账与退款申请-${randomUUID().slice(0, 8)}`, { amount: '5.00' })
+    const payment = await createPayment(orderId, customer)
+    expect(payment.statusCode).toBe(201)
+    const attemptId = payment.json().data.attempt.id as string
+    const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+      .where('id', '=', attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+    const refundPath = `/api/v1/customer/orders/${orderId}/refunds`
+    const requestBody = { idempotencyKey: randomUUID(), amount: '5.00', reason: '测试到账并发时的资金保护' }
+    let releaseOrderLock!: () => void
+    let signalOrderLock!: () => void
+    const orderLockReady = new Promise<void>(resolve => { signalOrderLock = resolve })
+    const orderLockRelease = new Promise<void>(resolve => { releaseOrderLock = resolve })
+    const lockOrder = db.transaction().execute(async (trx) => {
+      await trx.selectFrom('orders').select('id').where('id', '=', orderId).forUpdate().executeTakeFirstOrThrow()
+      signalOrderLock()
+      await orderLockRelease
+    })
+    await orderLockReady
+    const concurrentRequests = Promise.all([
+      inject({ method: 'GET', url: callbackUrl(fixture.setPaid(merchantNo)) }),
+      inject({ method: 'POST', url: refundPath, headers: customerHeaders(customer), payload: requestBody }),
+    ])
+    try {
+      await waitForPgLockWaits(2, 'FROM "orders"')
+    } finally {
+      releaseOrderLock()
+      await lockOrder
+      await concurrentRequests.catch(() => undefined)
+    }
+    const [callback, initialRequest] = await concurrentRequests
+    expect(callback.statusCode).toBe(200)
+    expect(callback.body).toBe('success')
+    expect([201, 409]).toContain(initialRequest.statusCode)
+    if (initialRequest.statusCode === 201) {
+      expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId)
+        .executeTakeFirstOrThrow()).status).toBe('succeeded')
+    }
+    const requested = initialRequest.statusCode === 201
+      ? initialRequest
+      : await inject({ method: 'POST', url: refundPath, headers: customerHeaders(customer), payload: requestBody })
+    expect(requested.statusCode).toBe(201)
+    const refundId = requested.json().data.refunds.items[0].id as string
+
+    expect((await inject({ method: 'GET', url: callbackUrl(signedConflictingCallback(merchantNo)) })).body).toBe('success')
+    const reconciliation = await db.selectFrom('payment_provider_reconciliation_cases').select('state')
+      .where('payment_attempt_id', '=', attemptId).executeTakeFirstOrThrow()
+    expect(reconciliation.state).toBe('open')
+    const approval = await inject({
+      method: 'POST', url: `/api/v1/admin/orders/${orderId}/refunds/${refundId}/approve`,
+      headers: adminHeaders(), payload: { idempotencyKey: randomUUID() },
+    })
+    expect(approval.statusCode).toBe(409)
+    expect(approval.json().error.code).toBe('REFUND_PAYMENT_UNRESOLVED')
+    expect(await db.selectFrom('order_refund_allocations').select('id').where('refund_id', '=', refundId).execute()).toHaveLength(0)
+    expect(await db.selectFrom('payment_receipts').select(['refunded_amount', 'refund_reserved_amount'])
+      .innerJoin('payment_attempts', 'payment_attempts.id', 'payment_receipts.payment_attempt_id')
+      .where('payment_attempts.order_id', '=', orderId).executeTakeFirstOrThrow())
+      .toEqual({ refunded_amount: '0.00', refund_reserved_amount: '0.00' })
   })
 })

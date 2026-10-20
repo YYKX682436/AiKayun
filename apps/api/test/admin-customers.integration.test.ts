@@ -176,7 +176,7 @@ async function createLateReceipt(customerId: string) {
   return { ...order, attemptId, receiptId }
 }
 
-async function createReceiptRefund(orderId: string, receiptId: string, amount: string, destination: 'original_source' | 'cash_balance' = 'original_source') {
+async function createReceiptRefund(orderId: string, receiptId: string, amount: string, destination: 'original_source' | 'cash_balance' = 'cash_balance') {
   return createRefund(orderId, [{ receiptId, amount }], amount, destination)
 }
 
@@ -184,7 +184,7 @@ async function createRefund(
   orderId: string,
   sources: Array<{ receiptId: string; amount: string }>,
   amount: string,
-  destination: 'original_source' | 'cash_balance' = 'original_source',
+  destination: 'original_source' | 'cash_balance' = 'cash_balance',
 ) {
   const refundId = randomUUID()
   const allocationIds: string[] = []
@@ -261,14 +261,6 @@ async function createExceptionalReceipt(customerId: string, kind: 'mismatch' | '
   })
   receiptIds.push({ receiptId, amount: receivedAmount })
   return { ...order, attemptId, receiptId, receivedAmount, receiptIds }
-}
-
-async function createFullyRefundedExceptionalOrder(customerId: string, kind: 'mismatch' | 'excess') {
-  const exceptional = await createExceptionalReceipt(customerId, kind)
-  await new Promise(resolve => setTimeout(resolve, 1_100))
-  const total = exceptional.receiptIds.reduce((sum, receipt) => sum + Number(receipt.amount), 0).toFixed(2)
-  const refund = await createRefund(exceptional.id, exceptional.receiptIds, total)
-  return { ...exceptional, ...refund }
 }
 
 async function waitForLock(queryFragment: string) {
@@ -664,7 +656,7 @@ describe('④-3 admin customer management on PostgreSQL', () => {
     expect((await app.inject({ url: '/api/v1/customer/profile', headers: { cookie: historicalSession.cookie } })).statusCode).toBe(401)
   })
 
-  it('allows anonymization after an exceptional late receipt is fully refunded', async () => {
+  it('protects refunded cash from anonymization until the wallet balance is spent', async () => {
     const customerId = await createCustomer('Delete-Fully-Refunded-Late')
     const history = await createFullyRefundedLateOrder(customerId)
     const auth = await adminAuth()
@@ -677,10 +669,14 @@ describe('④-3 admin customer management on PostgreSQL', () => {
       .toEqual({ payment_status: 'refunded', refund_status: 'refunded' })
 
     const response = await app.inject({ method: 'DELETE', url: `/api/v1/admin/customers/${customerId}`, headers: headers(auth) })
-    expect(response.statusCode).toBe(200)
+    expect(response.statusCode).toBe(409)
+    expect(response.json().error.code).toBe('CUSTOMER_HAS_WALLET_BALANCE')
     expect((await db.selectFrom('customers').select(['status', 'username', 'password_hash', 'email', 'phone'])
       .where('id', '=', customerId).executeTakeFirstOrThrow()))
-      .toEqual({ status: 'deleted', username: null, password_hash: null, email: null, phone: null })
+      .toMatchObject({ status: 'active', username: expect.any(String), password_hash: expect.any(String) })
+    expect((await db.selectFrom('wallet_accounts').select(['cash_available', 'gift_available'])
+      .where('customer_id', '=', customerId).executeTakeFirstOrThrow()))
+      .toEqual({ cash_available: '10.00', gift_available: '0.00' })
     expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', history.attemptId).executeTakeFirstOrThrow())
       .status).toBe('late_succeeded')
     expect(await db.selectFrom('payment_receipts').select('id').where('id', '=', history.receiptId).execute()).toHaveLength(1)
@@ -692,7 +688,7 @@ describe('④-3 admin customer management on PostgreSQL', () => {
       .toEqual({ status: 'succeeded', amount: '10.00' })
     expect(await db.selectFrom('customer_management_audit').select(['administrator_id', 'customer_id', 'action'])
       .where('customer_id', '=', customerId).execute())
-      .toContainEqual({ administrator_id: adminId, customer_id: customerId, action: 'deleted' })
+      .not.toContainEqual({ administrator_id: adminId, customer_id: customerId, action: 'deleted' })
   })
 
   it('blocks anomalous receipts while any amount remains unpaid, and allows resolved mismatches or excess', async () => {
@@ -721,16 +717,18 @@ describe('④-3 admin customer management on PostgreSQL', () => {
 
     for (const kind of ['mismatch', 'excess'] as const) {
       const customerId = await createCustomer(`Delete-${kind}-Refunded`)
-      const history = await createFullyRefundedExceptionalOrder(customerId, kind)
+      const history = await createExceptionalReceipt(customerId, kind)
+      await new Promise(resolve => setTimeout(resolve, 1_100))
       const response = await app.inject({ method: 'DELETE', url: `/api/v1/admin/customers/${customerId}`, headers: headers(auth) })
-      expect(response.statusCode).toBe(200)
+      expect(response.statusCode).toBe(409)
+      expect(response.json().error.code).toBe('CUSTOMER_HAS_UNFINISHED_ORDERS')
       expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', history.attemptId).executeTakeFirstOrThrow())
         .status).toBe('reconciliation_required')
       expect((await db.selectFrom('payment_receipts').select(['disposition', 'refunded_amount'])
         .where('id', '=', history.receiptId).executeTakeFirstOrThrow()))
-        .toEqual({ disposition: kind === 'mismatch' ? 'amount_mismatch' : 'excess', refunded_amount: history.receivedAmount })
+        .toEqual({ disposition: kind === 'mismatch' ? 'amount_mismatch' : 'excess', refunded_amount: '0.00' })
       expect((await db.selectFrom('order_financial_status').select('payment_status').where('order_id', '=', history.id)
-        .executeTakeFirstOrThrow()).payment_status).toBe('refunded')
+        .executeTakeFirstOrThrow()).payment_status).toBe(kind === 'mismatch' ? 'requires_reconciliation' : 'overpaid')
     }
   })
 
@@ -747,7 +745,7 @@ describe('④-3 admin customer management on PostgreSQL', () => {
       .executeTakeFirstOrThrow()).cash_available).toBe('10.00')
   })
 
-  it('still blocks an exceptional refund that is settled when another refund allocation is reserved', async () => {
+  it('still blocks customer deletion when another refund allocation is reserved', async () => {
     const customerId = await createCustomer('Delete-Settled-Exception-Other-Refund')
     const late = await createLateReceipt(customerId)
     await createReceiptRefund(late.id, late.receiptId, '10.00')
@@ -764,7 +762,7 @@ describe('④-3 admin customer management on PostgreSQL', () => {
       await trx.updateTable('order_refunds').set({ status: 'processing' }).where('id', '=', refundId).execute()
       await trx.insertInto('order_refund_allocations').values({
         id: randomUUID(), refund_id: refundId, source_payment_receipt_id: receipt.id,
-        operation_id: randomUUID(), request_sha256: digest, destination: 'original_source', amount: '1.00',
+        operation_id: randomUUID(), request_sha256: digest, destination: 'cash_balance', amount: '1.00',
         provider: null, provider_refund_id: null, completed_at: null,
       }).execute()
     })

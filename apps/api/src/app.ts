@@ -37,6 +37,7 @@ import { registerPublicProductRoutes } from './catalog/public-products.js'
 import { registerCustomerCartRoutes } from './commerce/customer-cart.js'
 import { registerOrderRoutes } from './commerce/orders.js'
 import { registerPaymentRoutes } from './payments/routes.js'
+import { registerRefundRoutes } from './commerce/refunds.js'
 import { ZpayEpayProvider } from './payments/zpay-epay.js'
 
 export async function createApp(options: {
@@ -165,6 +166,7 @@ export async function createApp(options: {
   registerCustomerAuthRoutes(app, db, config, dummyPasswordHash)
   registerCustomerCartRoutes(app, db, config)
   registerOrderRoutes(app, db, config)
+  registerRefundRoutes(app, db, config)
   registerPaymentRoutes(app, db, config, new ZpayEpayProvider(paymentProviderBaseUrl))
   registerCustomerPolicyRoutes(app, db, config)
   registerAdminCustomerRoutes(app, db, config)
