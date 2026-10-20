@@ -2,6 +2,38 @@
 # The browser tests assign a distinct synthetic client IP to each isolated auth flow;
 # this lets the real API rate limiter exercise those flows independently.
 services:
+  # The API test process shares this loopback namespace with a real HTTP provider fixture.
+  # This override is only loaded in CI; production compose keeps NODE_ENV=production.
+  api:
+    environment:
+      NODE_ENV: test
+      PAYMENT_PROVIDER_BASE_URL_FOR_TESTS: http://127.0.0.1:${ZPAY_FIXTURE_PORT:-3099}
+    ports:
+      - "127.0.0.1:${API_PORT:-3001}:3001"
+      - "127.0.0.1:${ZPAY_FIXTURE_PORT:-3099}:${ZPAY_FIXTURE_PORT:-3099}"
+
+  payment-fixture:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: ["node", "--experimental-strip-types", "/app/test/fixtures/zpay-http-server.ts", "--serve"]
+    network_mode: service:api
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NODE_ENV: test
+      AIKAYUN_TEST_ZPAY_FIXTURE: "true"
+      AIKAYUN_TEST_ZPAY_FIXTURE_ALLOW_PUBLIC_BIND: "true"
+      AIKAYUN_TEST_ZPAY_PROVIDER_MODULE: file:///app/dist/payments/zpay-epay.js
+      ZPAY_FIXTURE_HOST: 0.0.0.0
+      ZPAY_FIXTURE_PORT: ${ZPAY_FIXTURE_PORT:-3099}
+      ZPAY_FIXTURE_MERCHANT_ID: playwright-fixture-merchant
+      ZPAY_FIXTURE_MERCHANT_KEY: playwright-only-secret-never-returned
+    volumes:
+      - ./apps/api/test/fixtures/zpay-http-server.ts:/app/test/fixtures/zpay-http-server.ts:ro
+    restart: "no"
+
   caddy:
     volumes:
       - ./deploy/Caddyfile.e2e:/etc/caddy/Caddyfile:ro

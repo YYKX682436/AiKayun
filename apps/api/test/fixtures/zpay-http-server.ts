@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import type { AddressInfo, IncomingMessage, ServerResponse } from 'node:http'
 import { pathToFileURL } from 'node:url'
-import { verifyZpaySignature, createZpaySignature } from '../../src/payments/zpay-epay.js'
+
+type ZpaySignatureHelpers = Pick<typeof import('../../src/payments/zpay-epay.js'), 'verifyZpaySignature' | 'createZpaySignature'>
+const zpaySignatureHelpers: ZpaySignatureHelpers = process.env.AIKAYUN_TEST_ZPAY_PROVIDER_MODULE
+  ? await import(process.env.AIKAYUN_TEST_ZPAY_PROVIDER_MODULE)
+  : await import('../../src/payments/zpay-epay.js')
+const { verifyZpaySignature, createZpaySignature } = zpaySignatureHelpers
 
 interface FixtureOrder {
   merchantOrderNo: string
@@ -85,7 +90,14 @@ function signedCallback(order: FixtureOrder): Record<string, string> {
 
 export async function startZpayHttpFixture(options: FixtureOptions = {}): Promise<ZpayHttpFixture> {
   const host = options.host ?? '127.0.0.1'
-  if (host !== '127.0.0.1' && host !== '::1') throw new Error('The test provider fixture must bind to loopback')
+  const loopback = host === '127.0.0.1' || host === '::1'
+  const explicitlyPublishedComposeTestFixture = host === '0.0.0.0'
+    && process.env.NODE_ENV === 'test'
+    && process.env.AIKAYUN_TEST_ZPAY_FIXTURE === 'true'
+    && process.env.AIKAYUN_TEST_ZPAY_FIXTURE_ALLOW_PUBLIC_BIND === 'true'
+  if (!loopback && !explicitlyPublishedComposeTestFixture) {
+    throw new Error('The test provider fixture must bind to loopback unless explicitly enabled for isolated Compose E2E')
+  }
   const ordersByMerchantNo = new Map<string, FixtureOrder>()
   const merchantCredentials = options.merchantCredentials ?? {}
   let creates = 0
@@ -263,11 +275,12 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     throw new Error('The local payment provider fixture can only run when explicitly enabled in NODE_ENV=test')
   }
   const port = Number(process.env.ZPAY_FIXTURE_PORT ?? '3099')
+  const host = process.env.ZPAY_FIXTURE_HOST ?? '127.0.0.1'
   const fixtureMerchantId = process.env.ZPAY_FIXTURE_MERCHANT_ID ?? ''
   const fixtureMerchantKey = process.env.ZPAY_FIXTURE_MERCHANT_KEY ?? ''
   if (!fixtureMerchantId || !fixtureMerchantKey) throw new Error('Test fixture merchant credentials must be supplied explicitly')
   const fixture = await startZpayHttpFixture({
-    host: '127.0.0.1', port,
+    host, port,
     merchantCredentials: { [fixtureMerchantId]: fixtureMerchantKey },
   })
   process.stdout.write(`test-only ZPAY HTTP fixture listening on ${fixture.baseUrl}\n`)

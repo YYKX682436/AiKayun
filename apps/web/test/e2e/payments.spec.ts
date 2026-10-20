@@ -144,7 +144,8 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     for (const width of [320, 390, 768, 1440]) await noHorizontalOverflow(page, width)
     await page.setViewportSize({ width: 1280, height: 900 })
 
-    const fixtureBaseUrl = 'http://127.0.0.1:3099'
+    const fixturePort = process.env.ZPAY_FIXTURE_PORT ?? '3099'
+    const fixtureBaseUrl = `http://127.0.0.1:${fixturePort}`
     const fixtureOrdersResponse = await page.request.get(`${fixtureBaseUrl}/__fixture/orders`)
     expect(fixtureOrdersResponse.status()).toBe(200)
     const merchantOrderNo = (await fixtureOrdersResponse.json()).items.at(-1).merchantOrderNo as string
