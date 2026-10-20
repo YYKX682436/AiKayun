@@ -865,7 +865,7 @@ watch(activeQrAction, async (value) => {
                   </ul>
                 </div>
                 <div
-                  v-if="['pending_review', 'pending_transfer'].includes(item.status)"
+                  v-if="item.status === 'pending_review'"
                   class="mt-3 flex justify-end"
                 >
                   <UButton

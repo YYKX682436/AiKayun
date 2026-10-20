@@ -21,7 +21,7 @@
 
 单次申请在一个 PostgreSQL 事务内依次检查身份、锁顾客和钱包、检查幂等键、锁读商家设置、验证方式/限额/余额、计算手续费、绑定私有二维码（如有），再创建提现和唯一钱包操作。插入 `pending_review` 会调用④-1既有触发器，冻结完整提现金额。若任一步失败，申请、冻结、二维码绑定和审计一同回滚；同一顾客同一幂等键及相同请求重放时返回原申请，不重复冻结。数据库钱包行锁及不可为负约束保护多设备竞争。
 
-例如申请100元、手续费2元、预计到账98元：创建时现金可用减少100元、现金冻结增加100元；成功打款时账本只扣冻结100元；拒绝、允许取消的待审核/待打款申请则通过触发器解冻100元。顾客开始打款后不能取消。审核通过保留冻结，审核拒绝必须记录拒绝理由、管理员与时间。
+例如申请100元、手续费2元、预计到账98元：创建时现金可用减少100元、现金冻结增加100元；成功打款时账本只扣冻结100元；拒绝或顾客在待审核期间取消则通过触发器解冻100元。审核通过后顾客不能取消，冻结保持到后续打款处理。审核拒绝必须记录拒绝理由、管理员与时间。
 
 ## 收款资料与二维码隐私
 
@@ -38,7 +38,6 @@ stateDiagram-v2
   pending_review --> rejected: 管理员拒绝并写理由
   pending_review --> cancelled: 顾客取消
   pending_transfer --> transfer_processing: 持久化打款操作
-  pending_transfer --> cancelled: 顾客取消
   transfer_processing --> completed: 记录确认成功
   transfer_processing --> pending_transfer: 确认未转账并记失败
   transfer_processing --> transfer_uncertain: 结果未知
@@ -70,7 +69,7 @@ API 冲突或服务重启不自动判成功/失败；处理中记录能通过管
 
 ## 页面与 API
 
-顾客 `/wallet` 提供现金可提现余额、当前手续费说明、金额及方式、收款账号/银行字段、二维码上传、净到账预览、提交确认、服务端状态与历史、以及 `pending_review`/`pending_transfer` 时可用的取消。页面禁用重复提交并刷新后从 API 恢复状态。后台提供 `/admin/withdrawals` 待审核/待打款/处理中/未知/完成/拒绝/取消筛选、`/admin/withdrawals/settings` 设置页和 `/admin/withdrawals/:id` 单笔审核及打款操作页。管理写入继续走现有管理员会话、Origin 与 CSRF 验证。
+顾客 `/wallet` 提供现金可提现余额、当前手续费说明、金额及方式、收款账号/银行字段、二维码上传、净到账预览、提交确认、服务端状态与历史，以及仅在 `pending_review` 时可用的取消。页面禁用重复提交并刷新后从 API 恢复状态。后台提供 `/admin/withdrawals` 待审核/待打款/处理中/未知/完成/拒绝/取消筛选、`/admin/withdrawals/settings` 设置页和 `/admin/withdrawals/:id` 单笔审核及打款操作页。管理写入继续走现有管理员会话、Origin 与 CSRF 验证。
 
 主要接口：
 
@@ -78,7 +77,7 @@ API 冲突或服务重启不自动判成功/失败；处理中记录能通过管
 | --- | --- | --- |
 | `GET /api/v1/customer/wallet/withdrawals` | 当前顾客余额、公开策略和本人历史 | 顾客会话、本人 ID、`no-store` |
 | `POST /api/v1/customer/wallet/withdrawals` | 提交现金提现并冻结全额 | 顾客会话、Origin、双提交 CSRF、限流、幂等键 |
-| `POST /api/v1/customer/wallet/withdrawals/:id/cancel` | 取消未开始打款的本人申请 | 顾客会话、Origin、CSRF、幂等键 |
+| `POST /api/v1/customer/wallet/withdrawals/:id/cancel` | 取消待审核的本人申请 | 顾客会话、Origin、CSRF、幂等键 |
 | `POST /api/v1/customer/wallet/withdrawal-qr` | 上传私有收款二维码 | 顾客会话、Origin、CSRF、文件约束 |
 | `GET /api/v1/customer/wallet/withdrawal-qr/:id` | 读取本人私有二维码 | 顾客会话、文件归属、`no-store` |
 | `GET/PUT /api/v1/admin/withdrawals/settings` | 读取/修改提现设置 | 管理员会话；PUT 另需 Origin、CSRF |

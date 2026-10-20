@@ -408,8 +408,8 @@ async function cancelCustomerWithdrawal(
       .where('id', '=', withdrawalId).where('customer_id', '=', customer.id).forUpdate().executeTakeFirst()
     if (!withdrawal) throw new WithdrawalError(404, 'WITHDRAWAL_NOT_FOUND', '提现申请不存在。')
     if (await actionReplay(trx, withdrawalId, body.idempotencyKey, action, hash)) return true
-    if (!['pending_review', 'pending_transfer'].includes(withdrawal.status)) {
-      throw new WithdrawalError(409, 'WITHDRAWAL_CANNOT_CANCEL', '提现已开始打款或已经结束，不能由顾客取消。')
+    if (withdrawal.status !== 'pending_review') {
+      throw new WithdrawalError(409, 'WITHDRAWAL_CANNOT_CANCEL', '只有待审核的提现申请可以由顾客取消。')
     }
     await trx.updateTable('withdrawals').set({ status: 'cancelled' }).where('id', '=', withdrawalId).execute()
     await appendActionEvent(trx, {
@@ -774,7 +774,7 @@ export async function registerWithdrawalRoutes(app: FastifyInstance, db: Kysely<
     logLevel: 'silent', preHandler: [customerAuth, customerCsrf],
     config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
     schema: {
-      tags: ['customer'], summary: 'Cancel a withdrawal before a manual transfer has started',
+      tags: ['customer'], summary: 'Cancel a withdrawal that is still pending administrator review',
       params: WithdrawalIdParamsSchema, body: AdminWithdrawalActionBodySchema,
       response: { 200: ApiSuccessSchemaOf(CustomerWithdrawalMutationSchema), 401: ApiErrorSchema, 403: ApiErrorSchema,
         404: ApiErrorSchema, 409: ApiErrorSchema, 429: ApiErrorSchema },
