@@ -170,14 +170,31 @@ export interface ProductVariantFulfillmentVersionsTable {
   id: string
   product_variant_id: string
   version_number: number
-  method: 'fixed_content' | 'link'
-  encrypted_content: Buffer
-  content_nonce: Buffer
-  content_auth_tag: Buffer
-  encryption_key_id: string
+  method: 'fixed_content' | 'link' | 'file'
+  encrypted_content: Buffer | null
+  content_nonce: Buffer | null
+  content_auth_tag: Buffer | null
+  encryption_key_id: string | null
   content_sha256: string
+  private_file_object_id: string | null
+  display_filename: string | null
   created_by_admin_id: string
   created_at: Generated<Date>
+}
+
+export type PrivateFileObjectStatus = 'uploading' | 'staged' | 'available' | 'missing' | 'corrupt' | 'failed'
+
+export interface PrivateFileObjectsTable {
+  id: string
+  uploaded_by_admin_id: string
+  upload_filename: string
+  status: PrivateFileObjectStatus
+  media_type: string | null
+  size_bytes: number | null
+  sha256: string | null
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+  expires_at: Date
 }
 
 export type OrderStatus = 'pending_payment' | 'processing' | 'completed' | 'closed'
@@ -661,7 +678,7 @@ export interface OrderItemFulfillmentAttemptsTable {
   started_by_admin_id: string | null
   status: Generated<FulfillmentAttemptStatus>
   result_sha256: string | null
-  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link'>
+  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link' | 'file'>
   failure_code: string | null
   retry_after: Date | null
   created_at: Generated<Date>
@@ -675,7 +692,7 @@ export interface OrderItemFulfillmentDeliveriesTable {
   unit_index: number
   content: string | null
   content_sha256: string
-  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link'>
+  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link' | 'file'>
   encrypted_content: Buffer | null
   content_nonce: Buffer | null
   content_auth_tag: Buffer | null
@@ -843,6 +860,7 @@ export interface Database {
   guest_order_sessions: GuestOrderSessionsTable
   product_variant_fulfillment: ProductVariantFulfillmentTable
   product_variant_fulfillment_versions: ProductVariantFulfillmentVersionsTable
+  private_file_objects: PrivateFileObjectsTable
   orders: OrdersTable
   order_items: OrderItemsTable
   order_inventory_reservations: OrderInventoryReservationsTable

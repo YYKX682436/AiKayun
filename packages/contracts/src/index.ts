@@ -1529,10 +1529,14 @@ export const OrderFulfillmentStatusSchema = Type.Union([
 export const OrderDeliverySchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
   unitIndex: Type.Integer({ minimum: 1 }),
-  content: Type.String({ minLength: 1, maxLength: 20_000 }),
-  contentFormat: Type.Union([Type.Literal('plain_text'), Type.Literal('markdown'), Type.Literal('link')]),
+  content: Type.Union([Type.String({ minLength: 1, maxLength: 20_000 }), Type.Null()]),
+  contentFormat: Type.Union([Type.Literal('plain_text'), Type.Literal('markdown'), Type.Literal('link'), Type.Literal('file')]),
   title: Type.Union([Type.String({ minLength: 1, maxLength: 160 }), Type.Null()]),
   accessInstructions: Type.Union([Type.String({ maxLength: 4_000 }), Type.Null()]),
+  fileName: Type.Union([Type.String({ minLength: 1, maxLength: 255 }), Type.Null()]),
+  fileSizeBytes: Type.Union([Type.Integer({ minimum: 1, maximum: 104_857_600 }), Type.Null()]),
+  fileMediaType: Type.Union([Type.String({ minLength: 1, maxLength: 96 }), Type.Null()]),
+  downloadUrl: Type.Union([Type.String({ minLength: 1, maxLength: 1024 }), Type.Null()]),
   createdAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
 export const OrderFulfillmentAttemptSchema = Type.Object({
@@ -1825,7 +1829,7 @@ export const AdminFulfillmentAttemptSchema = Type.Object({
   quantity: Type.Integer({ minimum: 1 }),
   status: Type.Union([Type.Literal('processing'), Type.Literal('unknown'), Type.Literal('succeeded'), Type.Literal('failed')]),
   deliverySource: Type.Union([
-    Type.Literal('manual'), Type.Literal('code_pool'), Type.Literal('fixed_content'), Type.Literal('link'),
+    Type.Literal('manual'), Type.Literal('code_pool'), Type.Literal('fixed_content'), Type.Literal('link'), Type.Literal('file'),
   ]),
   failureCode: Type.Union([Type.Null(),
     Type.Literal('CODE_POOL_DATA_INCONSISTENT'),
@@ -1837,6 +1841,10 @@ export const AdminFulfillmentAttemptSchema = Type.Object({
     Type.Literal('FIXED_DELIVERY_DECRYPTION_FAILED'),
     Type.Literal('FIXED_DELIVERY_VERSION_UNAVAILABLE'),
     Type.Literal('FIXED_DELIVERY_PAYMENT_UNRESOLVED'),
+    Type.Literal('FILE_DELIVERY_DATA_INCONSISTENT'),
+    Type.Literal('FILE_DELIVERY_OBJECT_UNAVAILABLE'),
+    Type.Literal('FILE_DELIVERY_INTEGRITY_FAILED'),
+    Type.Literal('FILE_DELIVERY_PAYMENT_UNRESOLVED'),
   ]),
   retryAfter: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
   resultSha256: Type.Union([Type.String({ pattern: '^[0-9a-f]{64}$' }), Type.Null()]),
@@ -1928,6 +1936,72 @@ export const SaveFixedDeliveryVersionBodySchema = Type.Union([
 export const UpdateFixedDeliveryReadinessBodySchema = Type.Object({
   expectedRevision: Type.Integer({ minimum: 0 }),
   enabled: Type.Boolean(),
+}, { additionalProperties: false })
+export const PrivateFileIntegrityStatusSchema = Type.Union([
+  Type.Literal('verified'), Type.Literal('missing'), Type.Literal('corrupt'), Type.Literal('unknown'),
+])
+export const PrivateFileVersionSummarySchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  versionNumber: Type.Integer({ minimum: 1 }),
+  displayFilename: Type.String({ minLength: 1, maxLength: 255 }),
+  fileSizeBytes: Type.Integer({ minimum: 1, maximum: 104_857_600 }),
+  fileMediaType: Type.String({ minLength: 1, maxLength: 96 }),
+  sha256: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const PrivateFileVersionSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  versionNumber: Type.Integer({ minimum: 1 }),
+  displayFilename: Type.String({ minLength: 1, maxLength: 255 }),
+  fileSizeBytes: Type.Integer({ minimum: 1, maximum: 104_857_600 }),
+  fileMediaType: Type.String({ minLength: 1, maxLength: 96 }),
+  sha256: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+  createdAt: Type.String({ format: 'date-time' }),
+  integrityStatus: PrivateFileIntegrityStatusSchema,
+}, { additionalProperties: false })
+export const PrivateFileUploadSchema = Type.Object({
+  uploadId: Type.String({ format: 'uuid' }),
+  uploadFilename: Type.String({ minLength: 1, maxLength: 255 }),
+  fileSizeBytes: Type.Integer({ minimum: 1, maximum: 104_857_600 }),
+  fileMediaType: Type.String({ minLength: 1, maxLength: 96 }),
+  sha256: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+  status: Type.Literal('staged'),
+}, { additionalProperties: false })
+export const PrivateFileVersionsPageSchema = Type.Object({
+  items: Type.Array(PrivateFileVersionSummarySchema, { maxItems: 50 }),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 50 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const PrivateFileConfigSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  skuId: Type.String({ format: 'uuid' }),
+  productType: ProductTypeSchema,
+  method: Type.Union([FulfillmentMethodSchema, Type.Null()]),
+  automaticDeliveryReady: Type.Boolean(),
+  configurationRevision: Type.Integer({ minimum: 0 }),
+  updatedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  integrityStatus: PrivateFileIntegrityStatusSchema,
+  currentVersion: Type.Union([PrivateFileVersionSchema, Type.Null()]),
+}, { additionalProperties: false })
+export const PrivateFileVersionsQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+}, { additionalProperties: false })
+export const SavePrivateFileVersionBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 0 }),
+  uploadId: Type.String({ format: 'uuid' }),
+  displayFilename: Type.String({ minLength: 1, maxLength: 255, pattern: '.*\\S.*' }),
+}, { additionalProperties: false })
+export const UpdatePrivateFileReadinessBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 0 }),
+  enabled: Type.Boolean(),
+}, { additionalProperties: false })
+export const PrivateFileDownloadParamsSchema = Type.Object({
+  orderId: Type.String({ format: 'uuid' }),
+  itemId: Type.String({ format: 'uuid' }),
+  deliveryId: Type.String({ format: 'uuid' }),
 }, { additionalProperties: false })
 export const GuestOrderSessionSchema = Type.Object({
   expiresAt: Type.String({ format: 'date-time' }),
@@ -2563,6 +2637,16 @@ export type FixedDeliveryVersionsPage = Static<typeof FixedDeliveryVersionsPageS
 export type FixedDeliveryVersionsQuery = Static<typeof FixedDeliveryVersionsQuerySchema>
 export type SaveFixedDeliveryVersionBody = Static<typeof SaveFixedDeliveryVersionBodySchema>
 export type UpdateFixedDeliveryReadinessBody = Static<typeof UpdateFixedDeliveryReadinessBodySchema>
+export type PrivateFileIntegrityStatus = Static<typeof PrivateFileIntegrityStatusSchema>
+export type PrivateFileVersionSummary = Static<typeof PrivateFileVersionSummarySchema>
+export type PrivateFileVersion = Static<typeof PrivateFileVersionSchema>
+export type PrivateFileUpload = Static<typeof PrivateFileUploadSchema>
+export type PrivateFileVersionsPage = Static<typeof PrivateFileVersionsPageSchema>
+export type PrivateFileConfig = Static<typeof PrivateFileConfigSchema>
+export type PrivateFileVersionsQuery = Static<typeof PrivateFileVersionsQuerySchema>
+export type SavePrivateFileVersionBody = Static<typeof SavePrivateFileVersionBodySchema>
+export type UpdatePrivateFileReadinessBody = Static<typeof UpdatePrivateFileReadinessBodySchema>
+export type PrivateFileDownloadParams = Static<typeof PrivateFileDownloadParamsSchema>
 export type GuestOrderSession = Static<typeof GuestOrderSessionSchema>
 export type ManualFulfillmentDeliveryBody = Static<typeof ManualFulfillmentDeliveryBodySchema>
 export type CodePoolFormat = Static<typeof CodePoolFormatSchema>

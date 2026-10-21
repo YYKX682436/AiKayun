@@ -8,8 +8,11 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   if (process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true') return
 
   const mediaRoot = join(tmpdir(), 'aikayun-d7-playwright-media')
+  const privateFileRoot = join(tmpdir(), 'aikayun-private-file-playwright')
   rmSync(mediaRoot, { recursive: true, force: true })
+  rmSync(privateFileRoot, { recursive: true, force: true })
   mkdirSync(mediaRoot, { recursive: true })
+  mkdirSync(privateFileRoot, { recursive: true, mode: 0o700 })
 
   const testDatabaseUrl = process.env.TEST_DATABASE_URL
     ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'

@@ -933,7 +933,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       'order_refunds', 'order_status_events', 'orders',
       'payment_attempt_provider_state', 'payment_attempt_secrets', 'payment_attempts',
       'payment_channel_audit_events', 'payment_channels', 'payment_provider_events',
-      'payment_provider_reconciliation_cases', 'payment_receipts',
+      'payment_provider_reconciliation_cases', 'payment_receipts', 'private_file_objects',
       'product_attributes', 'product_categories', 'product_category_assignments',
       'product_category_tree_guard', 'product_management_audit_events',
       'product_media', 'product_media_references', 'product_media_variants',

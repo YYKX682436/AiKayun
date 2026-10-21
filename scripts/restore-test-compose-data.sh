@@ -19,8 +19,13 @@ esac
 
 backup_directory="$1"
 if [[ ! -f "$backup_directory/database.dump" || ! -f "$backup_directory/media.tar.gz" \
+  || ! -f "$backup_directory/private-files.tar.gz" \
   || ! -f "$backup_directory/SHA256SUMS" || ! -f "$backup_directory/manifest.txt" ]]; then
   printf 'The backup is incomplete.\n' >&2
+  exit 2
+fi
+if ! grep -Fxq 'format=aikayun-compose-backup-v2' "$backup_directory/manifest.txt"; then
+  printf 'The backup manifest format is unsupported; expected v2 with private files.\n' >&2
   exit 2
 fi
 (cd "$backup_directory" && sha256sum -c SHA256SUMS)
@@ -36,9 +41,15 @@ if [[ -z "$api_container" ]]; then
   exit 2
 fi
 media_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.MEDIA_ROOT || "")')"
+private_file_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.PRIVATE_FILE_ROOT || "")')"
 media_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$media_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
+private_file_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$private_file_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
 if [[ "$media_volume" != "${COMPOSE_PROJECT_NAME}_product_media" ]]; then
   printf 'Refusing restore because the media volume is not the project-scoped product_media volume.\n' >&2
+  exit 2
+fi
+if [[ "$private_file_volume" != "${COMPOSE_PROJECT_NAME}_private_files" ]]; then
+  printf 'Refusing restore because the private-file volume is not the project-scoped private_files volume.\n' >&2
   exit 2
 fi
 
@@ -50,5 +61,8 @@ docker compose exec -T db sh -lc \
 docker compose run --rm --no-deps -T --entrypoint sh api -c \
   'node -e '\''const fs=require("node:fs"),path=require("node:path"),root=process.env.MEDIA_ROOT;for(const name of fs.readdirSync(root))fs.rmSync(path.join(root,name),{recursive:true,force:true})'\'' && tar -xzf - -C "$MEDIA_ROOT"' \
   < "$backup_directory/media.tar.gz"
+docker compose run --rm --no-deps -T --entrypoint sh api -c \
+  'node -e '\''const fs=require("node:fs"),path=require("node:path"),root=process.env.PRIVATE_FILE_ROOT;for(const name of fs.readdirSync(root))fs.rmSync(path.join(root,name),{recursive:true,force:true})'\'' && tar -xzf - -C "$PRIVATE_FILE_ROOT"' \
+  < "$backup_directory/private-files.tar.gz"
 docker compose start api web caddy
 printf 'Restored the verified backup into isolated database %s.\n' "$database_name"

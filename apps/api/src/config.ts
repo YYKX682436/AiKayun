@@ -36,6 +36,7 @@ export interface AppConfig {
   trustProxy: boolean
   sessionTtlSeconds: number
   mediaRoot: string
+  privateFileRoot: string
   database: PoolConfig
   paymentCredentialKeyRing: PaymentCredentialKeyRing | null
   codePoolEncryptionKeyRing: PaymentCredentialKeyRing | null
@@ -149,9 +150,20 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const xdgDataHome = env.XDG_DATA_HOME ?? join(homedir(), '.local', 'share')
   if (!isAbsolute(xdgDataHome)) throw new Error('XDG_DATA_HOME must be an absolute path')
   const mediaRoot = resolve(configuredMediaRoot ?? join(xdgDataHome, 'aikayun', 'media'))
+  const configuredPrivateFileRoot = env.PRIVATE_FILE_ROOT
+  if (configuredPrivateFileRoot && !isAbsolute(configuredPrivateFileRoot)) {
+    throw new Error('PRIVATE_FILE_ROOT must be an absolute path')
+  }
+  const privateFileRoot = resolve(configuredPrivateFileRoot ?? join(xdgDataHome, 'aikayun', 'private-files'))
   const repo = repositoryRoot()
   if (repo && isWithin(repo, mediaRoot)) {
     throw new Error('MEDIA_ROOT must be outside the repository')
+  }
+  if (repo && isWithin(repo, privateFileRoot)) {
+    throw new Error('PRIVATE_FILE_ROOT must be outside the repository')
+  }
+  if (isWithin(mediaRoot, privateFileRoot) || isWithin(privateFileRoot, mediaRoot)) {
+    throw new Error('PRIVATE_FILE_ROOT and MEDIA_ROOT must use isolated storage namespaces')
   }
 
   const database: PoolConfig = env.DATABASE_URL
@@ -173,6 +185,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     trustProxy: parseBoolean(env.TRUST_PROXY, false),
     sessionTtlSeconds: 60 * 60 * 12,
     mediaRoot,
+    privateFileRoot,
     database,
     paymentCredentialKeyRing: parsePaymentCredentialKeyRing(env.PAYMENT_CREDENTIAL_KEY_RING),
     codePoolEncryptionKeyRing: parseCodePoolEncryptionKeyRing(env.CODE_POOL_ENCRYPTION_KEY_RING),

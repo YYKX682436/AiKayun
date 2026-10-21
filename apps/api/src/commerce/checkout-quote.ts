@@ -12,7 +12,9 @@ import {
   parseUnitAmount,
   settleAmount,
 } from '@aikayun/money'
+import type { AppConfig } from '../config.js'
 import type { Database, ProductInventoryMode, ProductStatus, ProductType } from '../db/types.js'
+import { PrivateFileError, PrivateFileStorage } from '../media/private-file-storage.js'
 import { variantOptionCombinationValid } from '../catalog/public-products.js'
 
 const maxCartLines = 50
@@ -47,6 +49,10 @@ type QuoteSkuRow = {
   automatic_delivery_ready: boolean
   fulfillment_revision: number | null
   fulfillment_version_id: string | null
+  fulfillment_version_method: string | null
+  private_file_object_id: string | null
+  private_file_status: string | null
+  private_file_size_bytes: number | null
   code_pool_inventory_consistent: boolean
   combination_valid: boolean | null
   options: CheckoutQuoteItem['options']
@@ -110,7 +116,10 @@ function reasonForSku(row: QuoteSkuRow): CheckoutQuoteReason | null {
       && (row.inventory_mode !== 'quantity' || !row.code_pool_delivery_ready))
     || ((row.fulfillment_method === 'fixed_content' || row.fulfillment_method === 'link')
       && (!row.automatic_delivery_ready || !row.fulfillment_version_id))
-    || !['manual', 'code_pool', 'fixed_content', 'link'].includes(row.fulfillment_method ?? '')) {
+    || (row.fulfillment_method === 'file' && (!row.automatic_delivery_ready
+      || !row.fulfillment_version_id || row.fulfillment_version_method !== 'file'
+      || row.private_file_status !== 'available'))
+    || !['manual', 'code_pool', 'fixed_content', 'link', 'file'].includes(row.fulfillment_method ?? '')) {
     return 'fulfillment_not_ready'
   }
   return null
@@ -153,6 +162,7 @@ export async function quoteCheckoutItems(
   db: Db,
   inputItems: CartSkuQuantity[],
   customerId: string | null,
+  config: AppConfig,
 ): Promise<CheckoutQuote> {
   const customerAuthenticated = customerId !== null
   const items = normalizeCheckoutItems(inputItems)
@@ -221,6 +231,10 @@ export async function quoteCheckoutItems(
       COALESCE(fulfillment.automatic_delivery_ready, false) AS automatic_delivery_ready,
       fulfillment.configuration_revision AS fulfillment_revision,
       fulfillment.current_content_version_id AS fulfillment_version_id,
+      version.method AS fulfillment_version_method,
+      private_file.id AS private_file_object_id,
+      private_file.status AS private_file_status,
+      private_file.size_bytes AS private_file_size_bytes,
       CASE WHEN fulfillment.method = 'code_pool'
         THEN assert_code_pool_inventory_consistency(variant.id)
         ELSE true
@@ -261,6 +275,10 @@ export async function quoteCheckoutItems(
     LEFT JOIN product_variant_quantity_inventory AS inventory
       ON inventory.product_id = variant.product_id AND inventory.product_variant_id = variant.id
     LEFT JOIN product_variant_fulfillment AS fulfillment ON fulfillment.product_variant_id = variant.id
+    LEFT JOIN product_variant_fulfillment_versions AS version
+      ON version.id = fulfillment.current_content_version_id
+    LEFT JOIN private_file_objects AS private_file
+      ON private_file.id = version.private_file_object_id AND version.method = 'file'
     LEFT JOIN product_purchase_counts ON product_purchase_counts.product_id = product.id
     LEFT JOIN sku_purchase_counts ON sku_purchase_counts.product_variant_id = variant.id
     CROSS JOIN storefront_customer_policy AS policy
@@ -269,6 +287,44 @@ export async function quoteCheckoutItems(
   `.execute(db)
 
   if (result.rows.length !== items.length) throw new Error('The storefront customer policy row is missing')
+
+  const privateFileStorage = new PrivateFileStorage(config.privateFileRoot)
+  for (const row of result.rows) {
+    if (row.fulfillment_method !== 'file' || !row.automatic_delivery_ready) continue
+    const versionIsAvailable = row.fulfillment_version_id
+      && row.fulfillment_version_method === 'file'
+      && row.private_file_object_id
+      && row.private_file_status === 'available'
+      && row.private_file_size_bytes !== null
+    let nextStatus: 'missing' | 'corrupt' | undefined
+    if (versionIsAvailable) {
+      try {
+        await privateFileStorage.assertObjectAvailable(row.private_file_object_id!, {
+          sizeBytes: row.private_file_size_bytes!,
+        })
+      } catch (error) {
+        nextStatus = error instanceof PrivateFileError && error.code === 'PRIVATE_FILE_INTEGRITY_FAILED'
+          ? 'corrupt'
+          : 'missing'
+      }
+    } else {
+      nextStatus = row.private_file_status === 'corrupt' ? 'corrupt' : 'missing'
+    }
+    if (nextStatus) {
+      if (row.fulfillment_version_id) {
+        await db.updateTable('product_variant_fulfillment').set({ automatic_delivery_ready: false })
+          .where('product_variant_id', '=', row.sku_id).where('method', '=', 'file')
+          .where('current_content_version_id', '=', row.fulfillment_version_id)
+          .where('automatic_delivery_ready', '=', true).execute()
+      }
+      if (row.private_file_object_id) {
+        await db.updateTable('private_file_objects').set({ status: nextStatus })
+          .where('id', '=', row.private_file_object_id).where('status', '=', 'available').execute()
+      }
+      row.private_file_status = nextStatus
+      row.automatic_delivery_ready = false
+    }
+  }
 
   let subtotal = '0.00'
   const requestedProductQuantities = new Map<string, number>()

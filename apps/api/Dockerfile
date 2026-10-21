@@ -20,7 +20,9 @@ FROM node:24.22.0-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659b
 
 ENV NODE_ENV=production
 WORKDIR /app
-RUN mkdir -p /var/lib/aikayun/media && chown node:node /var/lib/aikayun/media
+RUN mkdir -p /var/lib/aikayun/media /var/lib/aikayun/private-files \
+  && chown node:node /var/lib/aikayun/media /var/lib/aikayun/private-files \
+  && chmod 700 /var/lib/aikayun/private-files
 COPY --from=build --chown=node:node /prod/api/ ./
 USER node
 EXPOSE 3001

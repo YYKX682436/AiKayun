@@ -126,7 +126,7 @@ export function useAdminApi() {
       xhr.upload.onprogress = (event) => {
         if (event.lengthComputable) onProgress?.(Math.min(99, Math.round((event.loaded / event.total) * 100)))
       }
-      xhr.onerror = () => reject(new AdminApiError(0, 'NETWORK_ERROR', '图片上传失败，网络连接中断；可以使用相同操作重试。'))
+      xhr.onerror = () => reject(new AdminApiError(0, 'NETWORK_ERROR', '文件上传失败，网络连接中断；可以使用相同操作重试。'))
       xhr.onload = async () => {
         let payload: ApiSuccess<T> | ApiErrorBody
         try {

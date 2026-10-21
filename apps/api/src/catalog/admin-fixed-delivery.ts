@@ -288,17 +288,19 @@ export function registerAdminFixedDeliveryRoutes(
     const pageSize = Math.min(query.pageSize ?? 20, 50)
     const count = await db.selectFrom('product_variant_fulfillment_versions')
       .select(sql<number>`count(*)::integer`.as('count'))
-      .where('product_variant_id', '=', params.variantId).executeTakeFirstOrThrow()
+      .where('product_variant_id', '=', params.variantId)
+      .where('method', 'in', ['fixed_content', 'link']).executeTakeFirstOrThrow()
     const rows = await db.selectFrom('product_variant_fulfillment_versions')
       .select(['id', 'version_number', 'method', 'created_at'])
       .where('product_variant_id', '=', params.variantId)
+      .where('method', 'in', ['fixed_content', 'link'])
       .orderBy('version_number', 'desc').limit(pageSize).offset((page - 1) * pageSize).execute()
     const totalPages = count.count === 0 ? 0 : Math.ceil(count.count / pageSize)
     const result: FixedDeliveryVersionsPage = {
       items: rows.map(row => ({
         id: row.id,
         versionNumber: row.version_number,
-        method: row.method,
+        method: row.method as FixedDeliveryMethod,
         createdAt: row.created_at.toISOString(),
       })),
       total: count.count,
@@ -331,9 +333,19 @@ export function registerAdminFixedDeliveryRoutes(
           'version.encryption_key_id', 'version.created_at',
         ])
         .where('variant.product_id', '=', params.id).where('version.product_variant_id', '=', params.variantId)
-        .where('version.id', '=', params.versionId).executeTakeFirst()
-      if (!row) return reply.code(404).send(failure('FULFILLMENT_VERSION_NOT_FOUND', '找不到此 SKU 的履约版本。', request.id))
-      const version = decryptVersion(config, row)
+        .where('version.id', '=', params.versionId).where('version.method', 'in', ['fixed_content', 'link']).executeTakeFirst()
+      if (!row || (row.method !== 'fixed_content' && row.method !== 'link')
+        || !row.encrypted_content || !row.content_nonce || !row.content_auth_tag || !row.encryption_key_id) {
+        return reply.code(404).send(failure('FULFILLMENT_VERSION_NOT_FOUND', '找不到此 SKU 的履约版本。', request.id))
+      }
+      const version = decryptVersion(config, {
+        ...row,
+        method: row.method as FixedDeliveryMethod,
+        encrypted_content: row.encrypted_content!,
+        content_nonce: row.content_nonce!,
+        content_auth_tag: row.content_auth_tag!,
+        encryption_key_id: row.encryption_key_id!,
+      })
       reply.header('cache-control', 'private, no-store')
       return success(version, request.id)
     } catch (error) {
@@ -446,9 +458,19 @@ export function registerAdminFixedDeliveryRoutes(
             .select([
               'id', 'version_number', 'method', 'product_variant_id', 'encrypted_content',
               'content_nonce', 'content_auth_tag', 'encryption_key_id', 'created_at',
-            ]).where('id', '=', locked.currentVersionId).executeTakeFirst()
-          if (!current) throw new FixedDeliveryAdminError(409, 'FIXED_DELIVERY_VERSION_UNAVAILABLE', '当前版本记录不可用，已阻止开启。')
-          decryptVersion(config, current)
+            ]).where('id', '=', locked.currentVersionId).where('method', 'in', ['fixed_content', 'link']).executeTakeFirst()
+          if (!current || (current.method !== 'fixed_content' && current.method !== 'link')
+            || !current.encrypted_content || !current.content_nonce || !current.content_auth_tag || !current.encryption_key_id) {
+            throw new FixedDeliveryAdminError(409, 'FIXED_DELIVERY_VERSION_UNAVAILABLE', '当前版本记录不可用，已阻止开启。')
+          }
+          decryptVersion(config, {
+            ...current,
+            method: current.method as FixedDeliveryMethod,
+            encrypted_content: current.encrypted_content!,
+            content_nonce: current.content_nonce!,
+            content_auth_tag: current.content_auth_tag!,
+            encryption_key_id: current.encryption_key_id!,
+          })
         }
         await trx.updateTable('product_variant_fulfillment').set({
           automatic_delivery_ready: body.enabled,

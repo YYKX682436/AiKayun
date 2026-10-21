@@ -34,10 +34,12 @@ import { registerAdminProductPriceRoutes } from './catalog/admin-product-prices.
 import { registerAdminInventoryRoutes } from './catalog/admin-inventory.js'
 import { registerAdminCodePoolRoutes } from './catalog/admin-code-pool.js'
 import { registerAdminFixedDeliveryRoutes } from './catalog/admin-fixed-delivery.js'
+import { registerAdminPrivateFileDeliveryRoutes } from './catalog/admin-private-file-delivery.js'
 import { registerProductMediaRoutes } from './media/admin.js'
 import { registerPublicProductRoutes } from './catalog/public-products.js'
 import { registerCustomerCartRoutes } from './commerce/customer-cart.js'
 import { registerOrderRoutes } from './commerce/orders.js'
+import { registerPrivateFileDownloadRoutes } from './commerce/private-file-downloads.js'
 import { registerPaymentRoutes } from './payments/routes.js'
 import { registerRefundRoutes } from './commerce/refunds.js'
 import { registerWithdrawalRoutes } from './commerce/withdrawals.js'
@@ -169,6 +171,7 @@ export async function createApp(options: {
   registerCustomerAuthRoutes(app, db, config, dummyPasswordHash)
   registerCustomerCartRoutes(app, db, config)
   registerOrderRoutes(app, db, config)
+  registerPrivateFileDownloadRoutes(app, db, config)
   registerRefundRoutes(app, db, config)
   await registerWithdrawalRoutes(app, db, config)
   registerPaymentRoutes(app, db, config, new ZpayEpayProvider(paymentProviderBaseUrl))
@@ -184,6 +187,7 @@ export async function createApp(options: {
   registerAdminInventoryRoutes(app, db, config)
   registerAdminCodePoolRoutes(app, db, config)
   registerAdminFixedDeliveryRoutes(app, db, config)
+  await registerAdminPrivateFileDeliveryRoutes(app, db, config)
   await registerProductMediaRoutes(app, db, config)
   registerPublicProductRoutes(app, db)
   return app

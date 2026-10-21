@@ -58,7 +58,7 @@ function emptyCart(): CustomerCart {
   }
 }
 
-async function cartSnapshot(db: Db, customerId: string): Promise<CustomerCart> {
+async function cartSnapshot(db: Db, customerId: string, config: AppConfig): Promise<CustomerCart> {
   const saved = await db.selectFrom('customer_cart_items')
     .select(['sku_id', 'quantity'])
     .where('customer_id', '=', customerId)
@@ -67,7 +67,7 @@ async function cartSnapshot(db: Db, customerId: string): Promise<CustomerCart> {
     .execute()
   if (!saved.length) return emptyCart()
 
-  const quote = await quoteCheckoutItems(db, saved.map(row => ({ skuId: row.sku_id, quantity: row.quantity })), customerId)
+  const quote = await quoteCheckoutItems(db, saved.map(row => ({ skuId: row.sku_id, quantity: row.quantity })), customerId, config)
   return {
     items: quote.items,
     itemCount: saved.length,
@@ -150,7 +150,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
       const customer = request.customer!
       const cart = await db.transaction().execute(async (trx) => {
         await lockCustomer(trx, customer, false)
-        return cartSnapshot(trx, customer.id)
+        return cartSnapshot(trx, customer.id, config)
       })
       reply.header('cache-control', 'no-store')
       return success(cart, request.id)
@@ -207,7 +207,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           quantity: nextQuantity,
           updated_at: new Date(),
         })).execute()
-        return cartSnapshot(trx, customer.id)
+        return cartSnapshot(trx, customer.id, config)
       })
       reply.header('cache-control', 'no-store')
       const result: CustomerCartMutation = { changed: true, merged: false, skippedSkuIds: [], cart }
@@ -242,7 +242,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           .returning('sku_id')
           .executeTakeFirst()
         if (!updated) throw new CartError(404, 'CART_ITEM_NOT_FOUND', '购物车中没有该商品规格。')
-        return cartSnapshot(trx, customer.id)
+        return cartSnapshot(trx, customer.id, config)
       })
       reply.header('cache-control', 'no-store')
       return success({ changed: true, merged: false, skippedSkuIds: [], cart } satisfies CustomerCartMutation, request.id)
@@ -272,7 +272,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           .where('customer_id', '=', customer.id)
           .where('sku_id', '=', skuId)
           .executeTakeFirst()
-        return { cart: await cartSnapshot(trx, customer.id), changed: deleted.numDeletedRows > 0n }
+        return { cart: await cartSnapshot(trx, customer.id, config), changed: deleted.numDeletedRows > 0n }
       })
       reply.header('cache-control', 'no-store')
       return success({ ...cart, merged: false, skippedSkuIds: [] } satisfies CustomerCartMutation, request.id)
@@ -298,7 +298,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
         await lockCustomer(trx, customer, true)
         const deleted = await trx.deleteFrom('customer_cart_items')
           .where('customer_id', '=', customer.id).executeTakeFirst()
-        return { changed: deleted.numDeletedRows > 0n, cart: await cartSnapshot(trx, customer.id) }
+        return { changed: deleted.numDeletedRows > 0n, cart: await cartSnapshot(trx, customer.id, config) }
       })
       reply.header('cache-control', 'no-store')
       return success({ ...result, merged: false, skippedSkuIds: [] } satisfies CustomerCartMutation, request.id)
@@ -340,7 +340,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           return {
             changed: false,
             skippedSkuIds: previous.skipped_sku_ids,
-            cart: await cartSnapshot(trx, customer.id),
+            cart: await cartSnapshot(trx, customer.id, config),
           }
         }
 
@@ -385,7 +385,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           .where('customer_id', '=', customer.id)
           .where('merge_id', '=', body.mergeId)
           .execute()
-        return { changed: accepted.length > 0, skippedSkuIds, cart: await cartSnapshot(trx, customer.id) }
+        return { changed: accepted.length > 0, skippedSkuIds, cart: await cartSnapshot(trx, customer.id, config) }
       })
 
       reply.header('cache-control', 'no-store')
@@ -411,7 +411,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
       const items = (request.body as { items: CartSkuQuantity[] }).items
       const quote = await db.transaction().execute(async (trx) => {
         if (request.customer) await lockCustomer(trx, request.customer, false)
-        return quoteCheckoutItems(trx, items, request.customer?.id ?? null)
+        return quoteCheckoutItems(trx, items, request.customer?.id ?? null, config)
       })
       reply.header('cache-control', 'no-store')
       return success(quote, request.id)

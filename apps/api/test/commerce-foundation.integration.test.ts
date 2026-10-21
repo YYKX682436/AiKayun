@@ -1259,6 +1259,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
       delete prePaymentMigrations['202610210002_code_pool']
       delete prePaymentMigrations['202610210003_code_pool_operation_key']
       delete prePaymentMigrations['202610210004_fixed_delivery']
+      delete prePaymentMigrations['202610210005_private_file_delivery']
       const prePaymentProvider = { getMigrations: async () => prePaymentMigrations }
       const currentMigrator = new Migrator({ db, provider: prePaymentProvider })
       const upgradeResult = await currentMigrator.migrateToLatest()

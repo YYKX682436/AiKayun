@@ -100,6 +100,7 @@ const inventorySummary = shallowRef<AdminProductInventorySummary | null>(null)
 const manualFulfillment = ref<ManualFulfillmentConfigPage>([])
 const manualFulfillmentLoading = ref(false)
 const fixedDeliverySkuId = ref('')
+const fileDeliverySkuId = ref('')
 const fixedDeliveryConfig = shallowRef<FixedDeliveryConfig | null>(null)
 const fixedDeliveryVersions = shallowRef<FixedDeliveryVersionsPage | null>(null)
 const fixedDeliveryHistoryDetail = shallowRef<FixedDeliveryVersion | null>(null)
@@ -289,6 +290,7 @@ const fulfillmentMethodOptions = [
   { label: '卡密池', value: 'code_pool' },
   { label: '固定文本', value: 'fixed_content' },
   { label: '固定链接', value: 'link' },
+  { label: '私有文件', value: 'file' },
 ]
 const fixedDeliverySkuOptions = computed(() => (inventorySummary.value?.variants ?? []).map(row => ({
   label: `${row.skuCode}${row.retiredAt ? ' · 已退役' : ''}`,
@@ -495,6 +497,12 @@ watch(fixedDeliverySkuId, () => {
   fixedDeliveryMessage.value = ''
   if (fixedDeliverySkuId.value && product.value?.productType === 'digital') void loadFixedDeliveryConfig()
 })
+watch(inventorySummary, (summary) => {
+  if (!summary?.variants.length) return
+  if (!summary.variants.some(row => row.skuId === fileDeliverySkuId.value)) {
+    fileDeliverySkuId.value = summary.variants[0]!.skuId
+  }
+}, { immediate: true })
 
 async function selectFulfillmentMethod(skuId: string, method: string) {
   const current = manualFulfillmentForSku(skuId)
@@ -512,6 +520,12 @@ async function selectFulfillmentMethod(skuId: string, method: string) {
     fixedDeliveryMessage.value = '先保存一个新版本，再单独启用自动交付。保存不会自动上架。'
     await nextTick()
     document.getElementById('fixed-delivery-title')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    return
+  }
+  if (method === 'file') {
+    fileDeliverySkuId.value = skuId
+    await nextTick()
+    scrollToSection('private-file-title')
     return
   }
   const inventory = inventoryForSku(skuId)
@@ -608,6 +622,7 @@ function fulfillmentMethodLabel(method: ManualFulfillmentConfig['method']): stri
   if (method === 'code_pool') return '卡密池'
   if (method === 'fixed_content') return '固定文本'
   if (method === 'link') return '固定链接'
+  if (method === 'file') return '私有文件'
   return '未配置'
 }
 
@@ -3374,6 +3389,16 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                           编辑版本
                         </UButton>
                         <UButton
+                          v-else-if="manualFulfillmentForSku(row.skuId)?.method === 'file'"
+                          size="sm"
+                          color="neutral"
+                          variant="outline"
+                          icon="i-lucide-file-down"
+                          @click="fileDeliverySkuId = row.skuId; scrollToSection('private-file-title')"
+                        >
+                          管理私有文件
+                        </UButton>
+                        <UButton
                           v-else-if="manualFulfillmentForSku(row.skuId)?.method === 'code_pool'"
                           size="sm"
                           color="neutral"
@@ -3393,6 +3418,15 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     请使用上方库存分页逐页配置 SKU。资格切换会立即保存。
                   </p>
                 </section>
+
+                <AdminPrivateFileDeliveryPanel
+                  v-if="product?.productType === 'digital' && inventorySummary"
+                  v-model:sku-id="fileDeliverySkuId"
+                  :product-id="productId"
+                  :sku-options="fixedDeliverySkuOptions"
+                  :archived="isArchived"
+                  @updated="loadManualFulfillment"
+                />
 
                 <section
                   v-if="product?.productType === 'digital' && inventorySummary"

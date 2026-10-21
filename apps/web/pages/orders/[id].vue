@@ -27,6 +27,7 @@ const hybridWalletAmountInput = ref('')
 const qrDataUrl = ref('')
 const qrError = ref('')
 const copiedDeliveryId = ref('')
+const fileDownloadRequested = reactive<Record<string, boolean>>({})
 const deliveryCopyMessage = ref('')
 let sequence = 0
 let qrSequence = 0
@@ -41,7 +42,7 @@ const hasActiveAttempt = computed(() => Boolean(payment.value?.attempt
   && ['created', 'pending', 'reconciliation_required'].includes(payment.value.attempt.status)))
 const canCancel = computed(() => order.value?.status === 'pending_payment' && !hasActiveAttempt.value)
 const automaticDeliveryPending = computed(() => order.value?.items.some(item =>
-  ['code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity) ?? false)
+  ['code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity) ?? false)
 const selectedChannel = computed(() => payment.value?.channels.find(channel => channel.id === selectedChannelId.value) ?? null)
 const qrAction = computed(() => payment.value?.attempt?.action?.type === 'qr_code'
   ? payment.value.attempt.action.value
@@ -156,7 +157,7 @@ function selectPaymentMode(mode: 'external' | 'wallet' | 'hybrid') {
 function statusLabel(value: OrderDetail): string {
   if (value.status === 'pending_payment') return '等待付款'
   if (value.status === 'processing' && value.items.some(item =>
-    ['code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity)) {
+    ['code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity)) {
     return value.paymentStatus === 'not_required' ? '自动交付处理中' : '付款成功 · 自动交付处理中'
   }
   if (value.status === 'processing') return value.paymentStatus === 'not_required' ? '等待发货' : '付款成功 · 等待发货'
@@ -188,6 +189,12 @@ function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
 }
 
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`
+}
+
 async function copyDelivery(deliveryId: string, content: string) {
   deliveryCopyMessage.value = ''
   try {
@@ -213,13 +220,15 @@ function safeDeliveryHref(value: string): string {
 
 function hasPendingAutomaticDelivery(): boolean {
   return order.value?.status === 'processing' && order.value.items.some(item =>
-    ['code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity)
+    ['code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity)
 }
 
 function fulfillmentFailureHint(code: string | null): string {
   if (code === 'FIXED_DELIVERY_KEY_UNAVAILABLE' || code === 'CODE_POOL_KEY_UNAVAILABLE') return '系统交付密钥暂不可用，内容已保护，后台正在重试。'
   if (code === 'FIXED_DELIVERY_DECRYPTION_FAILED' || code === 'CODE_POOL_DECRYPTION_FAILED') return '交付内容完整性校验未通过，系统已阻止错误交付并正在重试。'
   if (code === 'FIXED_DELIVERY_PAYMENT_UNRESOLVED' || code === 'CODE_POOL_PAYMENT_UNRESOLVED') return '付款或对账仍需核验，确认完成后系统会继续交付。'
+  if (code === 'FILE_DELIVERY_OBJECT_UNAVAILABLE' || code === 'FILE_DELIVERY_INTEGRITY_FAILED') return '文件暂时不可用或校验未通过，系统已阻止交付并会在恢复后重试。'
+  if (code === 'FILE_DELIVERY_PAYMENT_UNRESOLVED') return '付款或对账仍需核验，确认完成后系统会继续交付。'
   return '系统暂时未能完成交付，正在安全重试；请稍后刷新订单。'
 }
 
@@ -602,7 +611,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
             variant="subtle"
             icon="i-lucide-circle-check"
             title="订单已完成"
-            :description="order.items.some(item => ['code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod)) ? '数字交付内容已按订单绑定版本安全记录在下方。退款不会清除已交付历史。' : '订单中的人工数字交付内容已记录在下方订单项。'"
+            :description="order.items.some(item => ['code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod)) ? '数字交付已按订单绑定版本安全记录在下方。文件下载由服务端逐次授权；退款不会删除历史交付记录。' : '订单中的人工数字交付内容已记录在下方订单项。'"
           />
 
           <div
@@ -1241,13 +1250,13 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                   <dt class="text-muted">
                     交付方式
                   </dt><dd class="mt-1 text-highlighted">
-                    {{ item.fulfillmentMethod === 'manual' ? '人工数字交付' : item.fulfillmentMethod === 'code_pool' ? 'SKU 卡密池自动发货' : item.fulfillmentMethod === 'fixed_content' ? '固定文本自动交付' : item.fulfillmentMethod === 'link' ? '固定链接自动交付' : '尚未开放' }}
+                    {{ item.fulfillmentMethod === 'manual' ? '人工数字交付' : item.fulfillmentMethod === 'code_pool' ? 'SKU 卡密池自动发货' : item.fulfillmentMethod === 'fixed_content' ? '固定文本自动交付' : item.fulfillmentMethod === 'link' ? '固定链接自动交付' : item.fulfillmentMethod === 'file' ? '私有文件自动交付' : '尚未开放' }}
                   </dd>
                 </div>
               </dl>
 
               <UAlert
-                v-if="['code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod) && order.status === 'processing' && item.fulfilledQuantity < item.quantity"
+                v-if="['code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod) && order.status === 'processing' && item.fulfilledQuantity < item.quantity"
                 class="mt-4"
                 color="info"
                 variant="soft"
@@ -1279,12 +1288,13 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                       <div class="flex flex-wrap items-center gap-2">
                         <time :datetime="delivery.createdAt">{{ formatDate(delivery.createdAt) }}</time>
                         <UButton
+                          v-if="delivery.contentFormat !== 'file' && delivery.content !== null"
                           color="neutral"
                           variant="outline"
                           size="xs"
                           icon="i-lucide-copy"
                           :aria-label="`复制第 ${delivery.unitIndex} 件交付内容`"
-                          @click="copyDelivery(delivery.id, delivery.content)"
+                          @click="copyDelivery(delivery.id, delivery.content ?? '')"
                         >
                           {{ copiedDeliveryId === delivery.id ? '已复制' : delivery.contentFormat === 'link' ? '复制链接' : '复制内容' }}
                         </UButton>
@@ -1296,10 +1306,44 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                     >
                       {{ delivery.title }}
                     </p>
+                    <div
+                      v-if="delivery.contentFormat === 'file'"
+                      class="mt-3 flex min-w-0 flex-col gap-3 rounded-md border border-default bg-default p-3 sm:flex-row sm:items-center sm:justify-between"
+                    >
+                      <div class="min-w-0">
+                        <p class="break-all text-sm font-medium text-highlighted">
+                          {{ delivery.fileName }}
+                        </p>
+                        <p class="mt-1 text-xs text-muted">
+                          {{ delivery.fileSizeBytes ? formatBytes(delivery.fileSizeBytes) : '文件大小未知' }} · 已通过服务端完整性校验
+                        </p>
+                      </div>
+                      <UButton
+                        as="a"
+                        external
+                        :href="delivery.downloadUrl ?? undefined"
+                        :download="delivery.fileName ?? true"
+                        color="primary"
+                        icon="i-lucide-download"
+                        :disabled="!delivery.downloadUrl"
+                        class="shrink-0"
+                        @click="fileDownloadRequested[delivery.id] = true"
+                      >
+                        {{ fileDownloadRequested[delivery.id] ? '重新下载' : '下载文件' }}
+                      </UButton>
+                    </div>
+                    <p
+                      v-if="delivery.contentFormat === 'file' && fileDownloadRequested[delivery.id]"
+                      class="mt-2 text-xs text-muted"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      如果下载中断或未完成，可以再次点击“重新下载”。服务端会重新验证订单权限与文件摘要。
+                    </p>
                     <a
-                      v-if="delivery.contentFormat === 'link' && safeDeliveryHref(delivery.content)"
+                      v-else-if="delivery.contentFormat === 'link' && safeDeliveryHref(delivery.content ?? '')"
                       class="mt-2 inline-block break-all text-primary underline underline-offset-2"
-                      :href="safeDeliveryHref(delivery.content)"
+                      :href="safeDeliveryHref(delivery.content ?? '')"
                       target="_blank"
                       rel="noopener noreferrer nofollow"
                     >
@@ -1314,17 +1358,17 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                     <SafeMarkdown
                       v-else-if="delivery.contentFormat === 'markdown'"
                       class="mt-2"
-                      :content="delivery.content"
+                      :content="delivery.content ?? ''"
                     />
                     <pre
-                      v-else
+                      v-else-if="delivery.contentFormat !== 'file'"
                       class="mt-2 overflow-x-auto whitespace-pre-wrap break-all font-mono text-sm text-highlighted"
-                    >{{ delivery.content }}</pre>
+                    >{{ delivery.content ?? '' }}</pre>
                     <p
                       v-if="delivery.contentFormat === 'link'"
                       class="mt-2 break-all font-mono text-sm text-muted"
                     >
-                      {{ delivery.content }}
+                      {{ delivery.content ?? '' }}
                     </p>
                     <p
                       v-if="delivery.accessInstructions"

@@ -201,11 +201,15 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
   const deliveries = itemIds.length
     ? await db.selectFrom('order_item_fulfillment_deliveries as delivery')
       .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'delivery.fulfillment_attempt_id')
+      .leftJoin('product_variant_fulfillment_versions as version', 'version.id', 'delivery.fulfillment_content_version_id')
+      .leftJoin('private_file_objects as object', 'object.id', 'version.private_file_object_id')
       .select([
         'attempt.order_item_id as order_item_id', 'delivery.id', 'delivery.unit_index',
         'delivery.content', 'delivery.delivery_source', 'delivery.encrypted_content', 'delivery.content_nonce',
         'delivery.content_auth_tag', 'delivery.encryption_key_id', 'delivery.code_pool_entry_id',
         'delivery.fulfillment_content_version_id', 'delivery.created_at',
+        'version.method as version_method', 'version.display_filename',
+        'object.size_bytes as file_size_bytes', 'object.media_type as file_media_type',
       ])
       .where('attempt.order_item_id', 'in', itemIds)
       .where('attempt.status', '=', 'succeeded')
@@ -218,6 +222,10 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
     let contentFormat: OrderDetail['items'][number]['deliveries'][number]['contentFormat'] = 'plain_text'
     let title: string | null = null
     let accessInstructions: string | null = null
+    let fileName: string | null = null
+    let fileSizeBytes: number | null = null
+    let fileMediaType: string | null = null
+    let downloadUrl: string | null = null
     if (delivery.delivery_source === 'code_pool') {
       const item = itemRows.find(row => row.id === delivery.order_item_id)
       if (!config || !item || !delivery.encrypted_content || !delivery.content_nonce || !delivery.content_auth_tag
@@ -252,8 +260,24 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
       contentFormat = payload.method === 'fixed_content' ? 'markdown' : 'link'
       title = payload.method === 'link' ? payload.title : null
       accessInstructions = payload.method === 'link' ? payload.accessInstructions : null
+    } else if (delivery.delivery_source === 'file') {
+      const item = itemRows.find(row => row.id === delivery.order_item_id)
+      if (!item || item.fulfillment_method_snapshot !== 'file'
+        || !item.fulfillment_content_version_id
+        || delivery.fulfillment_content_version_id !== item.fulfillment_content_version_id
+        || delivery.version_method !== 'file'
+        || !delivery.display_filename || delivery.file_size_bytes === null || !delivery.file_media_type) {
+        throw new Error('File delivery version does not match the immutable order snapshot')
+      }
+      content = null
+      contentFormat = 'file'
+      fileName = delivery.display_filename
+      fileSizeBytes = delivery.file_size_bytes
+      fileMediaType = delivery.file_media_type
+      const ownerPath = order.customer_id ? 'customer' : 'guest'
+      downloadUrl = `/api/v1/${ownerPath}/orders/${order.id}/items/${item.id}/deliveries/${delivery.id}/file`
     }
-    if (content === null) throw new Error('Fulfillment delivery content is missing')
+    if (content === null && contentFormat !== 'file') throw new Error('Fulfillment delivery content is missing')
     const rows = deliveriesByItem.get(delivery.order_item_id) ?? []
     rows.push({
       id: delivery.id,
@@ -262,6 +286,10 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
       contentFormat,
       title,
       accessInstructions,
+      fileName,
+      fileSizeBytes,
+      fileMediaType,
+      downloadUrl,
       createdAt: delivery.created_at.toISOString(),
     })
     deliveriesByItem.set(delivery.order_item_id, rows)
@@ -464,7 +492,7 @@ async function createOrderTransaction(
   await trx.selectFrom('storefront_customer_policy').select('singleton')
     .where('singleton', '=', true).forShare().executeTakeFirstOrThrow()
   await lockCheckoutCatalog(trx, items.map(item => item.skuId))
-  const currentQuote = await quoteCheckoutItems(trx, items, customer?.id ?? null)
+  const currentQuote = await quoteCheckoutItems(trx, items, customer?.id ?? null, config)
   if (currentQuote.quoteToken !== body.quoteToken) {
     throw new CheckoutConflict('CHECKOUT_QUOTE_CHANGED', '价格、商品状态、库存、限购规则或可购额度已变化，请核对最新报价后重新提交。', currentQuote)
   }
@@ -497,7 +525,7 @@ async function createOrderTransaction(
     const inventoryMode = item.inventoryMode
     if (!item.productId || !item.productName || !item.productType || !item.skuCode || !item.unitPrice || !item.lineTotal
       || (inventoryMode !== 'quantity' && inventoryMode !== 'unlimited')
-      || !['manual', 'code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod ?? '')) {
+      || !['manual', 'code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod ?? '')) {
       throw new Error('Eligible checkout item is missing required transaction snapshot fields')
     }
     const orderItemId = randomUUID()
@@ -1347,7 +1375,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
       method: variant.method,
       enabled: variant.method === 'manual' && variant.manual_delivery_ready === true && product.product_type === 'digital',
       codePoolDeliveryReady: variant.method === 'code_pool' && variant.code_pool_delivery_ready === true,
-      automaticDeliveryReady: variant.method === 'fixed_content' || variant.method === 'link'
+      automaticDeliveryReady: variant.method === 'fixed_content' || variant.method === 'link' || variant.method === 'file'
         ? variant.automatic_delivery_ready === true
         : false,
       configurationRevision: variant.configuration_revision ?? 0,
@@ -1421,7 +1449,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
           method: saved.method,
           enabled: saved.method === 'manual' && saved.manual_delivery_ready && product.product_type === 'digital',
           codePoolDeliveryReady: saved.method === 'code_pool' && saved.code_pool_delivery_ready,
-          automaticDeliveryReady: (saved.method === 'fixed_content' || saved.method === 'link') && saved.automatic_delivery_ready,
+          automaticDeliveryReady: (saved.method === 'fixed_content' || saved.method === 'link' || saved.method === 'file') && saved.automatic_delivery_ready,
           configurationRevision: saved.configuration_revision,
           currentVersionNumber: saved.version_number ?? null,
           updatedAt: saved.updated_at.toISOString(),

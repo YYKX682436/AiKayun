@@ -46,6 +46,18 @@ services:
       - product_media:${MEDIA_ROOT:-/var/lib/aikayun/media}
     restart: "no"
 
+  private-file-init:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p \"$$PRIVATE_FILE_ROOT\" && chown node:node \"$$PRIVATE_FILE_ROOT\" && chmod 700 \"$$PRIVATE_FILE_ROOT\""]
+    environment:
+      PRIVATE_FILE_ROOT: ${PRIVATE_FILE_ROOT:-/var/lib/aikayun/private-files}
+    volumes:
+      - private_files:${PRIVATE_FILE_ROOT:-/var/lib/aikayun/private-files}
+    restart: "no"
+
   api:
     build:
       context: .
@@ -65,10 +77,12 @@ services:
       PGUSER: ${POSTGRES_USER:-aikayun}
       PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       MEDIA_ROOT: ${MEDIA_ROOT:-/var/lib/aikayun/media}
+      PRIVATE_FILE_ROOT: ${PRIVATE_FILE_ROOT:-/var/lib/aikayun/private-files}
     expose:
       - "3001"
     volumes:
       - product_media:${MEDIA_ROOT:-/var/lib/aikayun/media}
+      - private_files:${PRIVATE_FILE_ROOT:-/var/lib/aikayun/private-files}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
@@ -81,6 +95,8 @@ services:
       migrate:
         condition: service_completed_successfully
       media-init:
+        condition: service_completed_successfully
+      private-file-init:
         condition: service_completed_successfully
     restart: unless-stopped
 
@@ -129,5 +145,6 @@ services:
 volumes:
   postgres_data:
   product_media:
+  private_files:
   caddy_data:
   caddy_config:

@@ -10,6 +10,7 @@ const webPort = new URL(baseURL).port || '3100'
 const useExternalServer = process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true'
 const useProductionBuild = process.env.PLAYWRIGHT_USE_PRODUCTION_SERVER === 'true'
 const mediaRoot = join(tmpdir(), 'aikayun-d7-playwright-media')
+const privateFileRoot = join(tmpdir(), 'aikayun-private-file-playwright')
 
 export default defineConfig({
   testDir: './test/e2e',
@@ -56,6 +57,7 @@ export default defineConfig({
         NODE_ENV: 'test',
         PUBLIC_ORIGIN: baseURL,
         MEDIA_ROOT: mediaRoot,
+        PRIVATE_FILE_ROOT: privateFileRoot,
         COOKIE_SECURE: 'false',
         TRUST_PROXY: 'true',
         PAYMENT_CREDENTIAL_KEY_RING: JSON.stringify({

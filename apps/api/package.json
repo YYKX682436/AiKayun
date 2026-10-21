@@ -12,7 +12,9 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "db:reset:test": "tsx src/db/reset-test-database.ts",
     "admin:init": "tsx src/admin-init.ts",
-    "media:check": "tsx src/media/reconcile-cli.ts --check"
+    "media:check": "tsx src/media/reconcile-cli.ts --check",
+    "private-files:check": "tsx src/media/private-file-reconcile-cli.ts --check",
+    "private-files:repair": "tsx src/media/private-file-reconcile-cli.ts --repair"
   },
   "dependencies": {
     "@aikayun/contracts": "workspace:*",

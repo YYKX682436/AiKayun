@@ -19,7 +19,9 @@
     "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && PLAYWRIGHT_USE_PRODUCTION_SERVER=true pnpm e2e && pnpm --filter @aikayun/web test:e2e:production-brand",
     "db:migrate": "pnpm --filter @aikayun/api db:migrate",
     "admin:init": "pnpm --filter @aikayun/api admin:init",
-    "media:check": "pnpm --filter @aikayun/api media:check"
+    "media:check": "pnpm --filter @aikayun/api media:check",
+    "private-files:check": "pnpm --filter @aikayun/api private-files:check",
+    "private-files:repair": "pnpm --filter @aikayun/api private-files:repair"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
