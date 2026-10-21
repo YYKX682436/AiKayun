@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { sql, type Kysely, type Transaction } from 'kysely'
 import { Migrator } from 'kysely/migration'
 import type { FastifyInstance, InjectOptions } from 'fastify'
@@ -13,7 +13,7 @@ import { expireDueUnpaidOrders } from '../src/commerce/orders.js'
 import { startUnpaidOrderExpiryWorker } from '../src/commerce/unpaid-order-expiry.js'
 import { startCodePoolDeliveryWorker } from '../src/commerce/code-pool-delivery-worker.js'
 import type { AppConfig } from '../src/config.js'
-import { decryptCodePoolContent } from '../src/commerce/code-pool-crypto.js'
+import { codePoolFingerprint, decryptCodePoolContent } from '../src/commerce/code-pool-crypto.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const testOrigin = 'http://localhost:3000'
@@ -23,6 +23,7 @@ const digest = 'a'.repeat(64)
 let app: FastifyInstance
 let db: Kysely<Database>
 let appConfig: AppConfig
+let initialCodePoolKeyRing: AppConfig['codePoolEncryptionKeyRing']
 let nextIp = 1
 
 type Customer = { id: string; username: string; cookie: string; csrfToken: string; csrfCookie: string }
@@ -36,6 +37,10 @@ function remoteAddress(): string {
 
 function inject(options: InjectOptions) {
   return app.inject({ ...options, remoteAddress: remoteAddress() })
+}
+
+function injectInto(target: FastifyInstance, options: InjectOptions) {
+  return target.inject({ ...options, remoteAddress: remoteAddress() })
 }
 
 function cookieFrom(response: { headers: Record<string, string | string[] | undefined> }, name: string): string {
@@ -406,7 +411,11 @@ async function setCodePoolReadiness(catalog: Catalog, admin: Admin, enabled: boo
 }
 
 async function importCodePool(catalog: Catalog, admin: Admin, sourceText: string, operationId = randomUUID()) {
-  return inject({
+  return importCodePoolInto(app, catalog, admin, sourceText, operationId)
+}
+
+async function importCodePoolInto(target: FastifyInstance, catalog: Catalog, admin: Admin, sourceText: string, operationId = randomUUID()) {
+  return injectInto(target, {
     method: 'POST',
     url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/batches`,
     headers: adminHeaders(admin),
@@ -651,8 +660,13 @@ beforeAll(async () => {
       keys: { 'test-v1': Buffer.alloc(32, 0x51).toString('base64') },
     }),
   })
+  initialCodePoolKeyRing = appConfig.codePoolEncryptionKeyRing
   app = await createApp({ db, config: appConfig, logger: false })
   await app.ready()
+})
+
+afterEach(() => {
+  if (appConfig) appConfig.codePoolEncryptionKeyRing = initialCodePoolKeyRing
 })
 
 afterAll(async () => {
@@ -1994,6 +2008,170 @@ describe('per-SKU encrypted code-pool fulfillment on PostgreSQL', () => {
     })
     expect(deleteArchived.statusCode).toBe(409)
     expect(deleteArchived.json().error.code).toBe('PRODUCT_HAS_CODE_POOL_HISTORY')
+  })
+
+  it('replays import and withdrawal batches after active-key rotation without repeating effects', async () => {
+    const admin = await createAdmin()
+    const catalog = await createCatalog({ price: '0.00', mode: 'quantity', stock: 0 })
+    expect((await setCodePoolReadiness(catalog, admin, false)).statusCode).toBe(200)
+    const originalRing = appConfig.codePoolEncryptionKeyRing!
+    const keyA = originalRing.keys[originalRing.activeKeyId]!
+    const keyB = Buffer.alloc(32, 0x62)
+    const ring = (activeKeyId: string) => ({ activeKeyId, keys: { 'test-v1': keyA, 'test-v2': keyB } })
+    const importOperationId = randomUUID()
+    const importBody = 'ROTATION-IMPORT-CODE'
+    const originalImport = await importCodePool(catalog, admin, importBody, importOperationId)
+    expect(originalImport.statusCode).toBe(201)
+    const importBatchId = originalImport.json().data.batch.id as string
+    const originalImportBatch = await db.selectFrom('code_pool_batches').select(['request_sha256', 'request_fingerprint_key_id'])
+      .where('id', '=', importBatchId).executeTakeFirstOrThrow()
+    expect(originalImportBatch.request_fingerprint_key_id).toBe('test-v1')
+    await expect(db.updateTable('code_pool_batches').set({ request_sha256: 'b'.repeat(64) })
+      .where('id', '=', importBatchId).execute()).rejects.toMatchObject({ constraint: 'code_pool_batches_immutable' })
+    await expect(db.updateTable('code_pool_batches').set({ request_fingerprint_key_id: 'test-v2' })
+      .where('id', '=', importBatchId).execute()).rejects.toMatchObject({ constraint: 'code_pool_batches_immutable' })
+    const importEventCount = await db.selectFrom('order_inventory_events').select(sql<number>`count(*)::integer`.as('count'))
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()
+    const legacyOperationId = randomUUID()
+    const legacyBatchId = randomUUID()
+    const legacyRequest = JSON.stringify({ format: 'paste', sourceText: importBody })
+    await db.insertInto('code_pool_batches').values({
+      id: legacyBatchId,
+      product_id: catalog.productId,
+      product_variant_id: catalog.skuId,
+      operation_id: legacyOperationId,
+      kind: 'import',
+      request_sha256: codePoolFingerprint(appConfig, legacyRequest),
+      request_fingerprint_key_id: null,
+      requested_count: 1,
+      accepted_count: 0,
+      duplicate_count: 1,
+      invalid_count: 0,
+      reason: null,
+      created_by_admin_id: admin.id,
+    }).execute()
+
+    appConfig.codePoolEncryptionKeyRing = ring('test-v2')
+    const repeatedImport = await importCodePool(catalog, admin, importBody, importOperationId)
+    const repeatedLegacyImport = await importCodePool(catalog, admin, importBody, legacyOperationId)
+    const changedImport = await importCodePool(catalog, admin, `${importBody}-CHANGED`, importOperationId)
+    const duplicateAcrossKeys = await importCodePool(catalog, admin, importBody)
+    expect(duplicateAcrossKeys.json().data.batch).toMatchObject({ acceptedCount: 0, duplicateCount: 1 })
+    expect(await db.selectFrom('code_pool_batches').select(['request_sha256', 'request_fingerprint_key_id'])
+      .where('id', '=', importBatchId).executeTakeFirstOrThrow()).toEqual(originalImportBatch)
+
+    const withdrawalEntry = await db.selectFrom('code_pool_entries').select('id')
+      .where('import_batch_id', '=', importBatchId).executeTakeFirstOrThrow()
+    const withdrawalOperationId = randomUUID()
+    const withdrawalBody = {
+      operationId: withdrawalOperationId,
+      entryIds: [withdrawalEntry.id],
+      reason: '轮换后幂等回归',
+      confirmation: 'REVOKE_UNSOLD_CODES',
+    }
+    const originalWithdrawal = await inject({
+      method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/withdrawals`,
+      headers: adminHeaders(admin), payload: withdrawalBody,
+    })
+    expect(originalWithdrawal.statusCode).toBe(201)
+    const withdrawalBatchId = originalWithdrawal.json().data.batch.id as string
+    expect((await db.selectFrom('code_pool_batches').select('request_fingerprint_key_id')
+      .where('id', '=', withdrawalBatchId).executeTakeFirstOrThrow()).request_fingerprint_key_id).toBe('test-v2')
+
+    appConfig.codePoolEncryptionKeyRing = ring(originalRing.activeKeyId)
+    const repeatedWithdrawal = await inject({
+      method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/withdrawals`,
+      headers: adminHeaders(admin), payload: withdrawalBody,
+    })
+    const changedWithdrawal = await inject({
+      method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/withdrawals`,
+      headers: adminHeaders(admin), payload: { ...withdrawalBody, reason: 'different request' },
+    })
+
+    expect({ import: repeatedImport.statusCode, withdrawal: repeatedWithdrawal.statusCode }).toEqual({ import: 200, withdrawal: 200 })
+    expect(repeatedImport.json().data.batch.id).toBe(importBatchId)
+    expect(repeatedLegacyImport.statusCode).toBe(200)
+    expect(repeatedLegacyImport.json().data.batch.id).toBe(legacyBatchId)
+    expect(repeatedWithdrawal.json().data.batch.id).toBe(withdrawalBatchId)
+    expect(changedImport.statusCode).toBe(409)
+    expect(changedImport.json().error.code).toBe('CODE_POOL_OPERATION_CONFLICT')
+    expect(changedWithdrawal.statusCode).toBe(409)
+    expect(changedWithdrawal.json().error.code).toBe('CODE_POOL_OPERATION_CONFLICT')
+    appConfig.codePoolEncryptionKeyRing = { activeKeyId: 'test-v2', keys: { 'test-v2': keyB } }
+    const missingImportKey = await importCodePool(catalog, admin, importBody, importOperationId)
+    appConfig.codePoolEncryptionKeyRing = { activeKeyId: 'test-v1', keys: { 'test-v1': keyA } }
+    const missingWithdrawalKey = await inject({
+      method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/withdrawals`,
+      headers: adminHeaders(admin), payload: withdrawalBody,
+    })
+    expect(missingImportKey.statusCode).toBe(409)
+    expect(missingImportKey.json().error.code).toBe('CODE_POOL_KEY_HISTORY_UNAVAILABLE')
+    expect(missingWithdrawalKey.statusCode).toBe(409)
+    expect(missingWithdrawalKey.json().error.code).toBe('CODE_POOL_KEY_HISTORY_UNAVAILABLE')
+
+    appConfig.codePoolEncryptionKeyRing = ring('test-v1')
+    const secondInstance = await createApp({
+      db,
+      config: { ...appConfig, codePoolEncryptionKeyRing: ring('test-v2') },
+      logger: false,
+    })
+    await secondInstance.ready()
+    const parallelOperationId = randomUUID()
+    const [instanceA, instanceB] = await Promise.all([
+      importCodePool(catalog, admin, 'MULTI-INSTANCE-ROTATION-CODE', parallelOperationId),
+      importCodePoolInto(secondInstance, catalog, admin, 'MULTI-INSTANCE-ROTATION-CODE', parallelOperationId),
+    ])
+    expect([instanceA.statusCode, instanceB.statusCode].sort()).toEqual([200, 201])
+    expect(instanceA.json().data.batch.id).toBe(instanceB.json().data.batch.id)
+    const parallelBatchId = instanceA.json().data.batch.id as string
+    expect(await db.selectFrom('code_pool_batches').select('id').where('operation_id', '=', parallelOperationId).execute()).toHaveLength(1)
+    expect(await db.selectFrom('code_pool_entries').select('id').where('import_batch_id', '=', parallelBatchId).execute()).toHaveLength(1)
+    expect((await db.selectFrom('order_inventory_events').select(sql<number>`count(*)::integer`.as('count'))
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).count).toBe(importEventCount.count + 2)
+    expect((await sql<{ consistent: boolean }>`
+      SELECT assert_code_pool_inventory_consistency(${catalog.skuId}::uuid) AS consistent
+    `.execute(db)).rows[0]?.consistent).toBe(true)
+    await secondInstance.close()
+    expect(await db.selectFrom('code_pool_batches').select('id').where('operation_id', '=', importOperationId).execute()).toHaveLength(1)
+    expect(await db.selectFrom('code_pool_batches').select('id').where('operation_id', '=', withdrawalOperationId).execute()).toHaveLength(1)
+  })
+
+  it('decrypts existing customer delivery history after rotating the active key', async () => {
+    const originalRing = appConfig.codePoolEncryptionKeyRing!
+    const keyA = originalRing.keys[originalRing.activeKeyId]!
+    const keyB = Buffer.alloc(32, 0x63)
+    try {
+      const admin = await createAdmin()
+      const catalog = await createCatalog({ price: '0.00', mode: 'quantity', stock: 0 })
+      expect((await setCodePoolReadiness(catalog, admin, false)).statusCode).toBe(200)
+      expect((await importCodePool(catalog, admin, 'PRE-ROTATION-DELIVERY')).statusCode).toBe(201)
+      expect((await setCodePoolReadiness(catalog, admin, true)).statusCode).toBe(200)
+      const customer = await createCustomer()
+      const items = [{ skuId: catalog.skuId, quantity: 1 }]
+      const currentQuote = await quote(items, customer)
+      const created = await createOrder(items, currentQuote.json().data.quoteToken, customer)
+      expect(created.statusCode).toBe(201)
+      const orderId = created.json().data.order.id as string
+      const itemId = created.json().data.order.items[0].id as string
+      const stopWorker = startCodePoolDeliveryWorker(db, appConfig, app.log)
+      await waitForCodePoolOrder(orderId, itemId, 1)
+      await stopWorker()
+
+      appConfig.codePoolEncryptionKeyRing = {
+        activeKeyId: 'test-v2', keys: { 'test-v1': keyA, 'test-v2': keyB },
+      }
+      const detail = await inject({
+        method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie },
+      })
+      expect(detail.statusCode).toBe(200)
+      expect(detail.json().data.items[0].deliveries.map((delivery: { content: string }) => delivery.content))
+        .toEqual(['PRE-ROTATION-DELIVERY'])
+      expect((await sql<{ consistent: boolean }>`
+        SELECT assert_code_pool_inventory_consistency(${catalog.skuId}::uuid) AS consistent
+      `.execute(db)).rows[0]?.consistent).toBe(true)
+    } finally {
+      appConfig.codePoolEncryptionKeyRing = originalRing
+    }
   })
 
   it('serializes last-code checkout against another order and safe withdrawal, and releases unpaid cancellation', async () => {

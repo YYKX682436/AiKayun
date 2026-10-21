@@ -34,6 +34,7 @@ import {
   CodePoolKeyUnavailableError,
   codePoolFingerprint,
   codePoolFingerprints,
+  codePoolOperationFingerprints,
   encryptCodePoolContent,
   requiredCodePoolKeyRing,
 } from '../commerce/code-pool-crypto.js'
@@ -209,6 +210,25 @@ async function assertCodePoolKeyHistoryAvailable(db: Db, config: AppConfig, skuI
   if (result.rows.some(row => !ring.keys[row.encryption_key_id] || !ring.keys[row.fingerprint_key_id])) {
     throw new CodePoolError(409, 'CODE_POOL_KEY_HISTORY_UNAVAILABLE', '密钥环缺少历史卡密所用密钥。恢复所有历史密钥后才能导入或开启销售。')
   }
+}
+
+function matchesOperationRequest(
+  config: AppConfig,
+  request: string,
+  existing: { request_sha256: string; request_fingerprint_key_id: string | null },
+): boolean {
+  const ring = requiredCodePoolKeyRing(config)
+  if (existing.request_fingerprint_key_id) {
+    if (!ring.keys[existing.request_fingerprint_key_id]) {
+      throw new CodePoolError(409, 'CODE_POOL_KEY_HISTORY_UNAVAILABLE', '密钥环缺少此历史批次操作摘要所用密钥，已阻止重放操作。')
+    }
+    return codePoolFingerprint(config, request, existing.request_fingerprint_key_id) === existing.request_sha256
+  }
+
+  // Legacy batches do not identify the HMAC key; verify their immutable digest
+  // against each retained key rather than treating an unknown key as a match.
+  return codePoolOperationFingerprints(config, request)
+    .some(candidate => candidate.fingerprint === existing.request_sha256)
 }
 
 function batchDto(row: {
@@ -482,11 +502,13 @@ export function registerAdminCodePoolRoutes(app: FastifyInstance, db: Kysely<Dat
           throw new CodePoolError(409, 'CODE_POOL_NOT_CONFIGURED', '请先为数字商品 SKU 配置 quantity 卡密池。')
         }
         await assertCodePoolKeyHistoryAvailable(trx, config, params.variantId)
-        const requestHash = codePoolFingerprint(config, JSON.stringify({ format: body.format, sourceText: body.sourceText }))
+        const request = JSON.stringify({ format: body.format, sourceText: body.sourceText })
+        const ring = requiredCodePoolKeyRing(config)
+        const requestHash = codePoolFingerprint(config, request, ring.activeKeyId)
         const existing = await trx.selectFrom('code_pool_batches').selectAll()
           .where('product_variant_id', '=', params.variantId).where('operation_id', '=', body.operationId).executeTakeFirst()
         if (existing) {
-          if (existing.kind !== 'import' || existing.request_sha256 !== requestHash) {
+          if (existing.kind !== 'import' || !matchesOperationRequest(config, request, existing)) {
             throw new CodePoolError(409, 'CODE_POOL_OPERATION_CONFLICT', '该操作标识已用于不同的卡密导入请求。')
           }
           const status = await readCodePoolStatus(trx, params.id, params.variantId)
@@ -507,6 +529,7 @@ export function registerAdminCodePoolRoutes(app: FastifyInstance, db: Kysely<Dat
           operation_id: body.operationId,
           kind: 'import',
           request_sha256: requestHash,
+          request_fingerprint_key_id: ring.activeKeyId,
           requested_count: preview.rowCount,
           accepted_count: preview.acceptedCount,
           duplicate_count: preview.duplicateCount,
@@ -514,7 +537,6 @@ export function registerAdminCodePoolRoutes(app: FastifyInstance, db: Kysely<Dat
           reason: null,
           created_by_admin_id: administratorId,
         }).execute()
-        const ring = requiredCodePoolKeyRing(config)
         const activeKeyId = ring.activeKeyId
         const entryValues = accepted.map((row) => {
           const code = row.code!
@@ -588,13 +610,16 @@ export function registerAdminCodePoolRoutes(app: FastifyInstance, db: Kysely<Dat
         if (locked.method !== 'code_pool' || locked.sku.inventory_mode !== 'quantity' || !locked.inventory) {
           throw new CodePoolError(409, 'CODE_POOL_NOT_CONFIGURED', '此 SKU 尚未配置 quantity 卡密池。')
         }
-        const requestHash = codePoolFingerprint(config, JSON.stringify({
+        await assertCodePoolKeyHistoryAvailable(trx, config, params.variantId)
+        const request = JSON.stringify({
           entryIds: [...body.entryIds].sort(), reason: body.reason.trim(), confirmation: body.confirmation,
-        }))
+        })
+        const ring = requiredCodePoolKeyRing(config)
+        const requestHash = codePoolFingerprint(config, request, ring.activeKeyId)
         const existing = await trx.selectFrom('code_pool_batches').selectAll()
           .where('product_variant_id', '=', params.variantId).where('operation_id', '=', body.operationId).executeTakeFirst()
         if (existing) {
-          if (existing.kind !== 'withdrawal' || existing.request_sha256 !== requestHash) {
+          if (existing.kind !== 'withdrawal' || !matchesOperationRequest(config, request, existing)) {
             throw new CodePoolError(409, 'CODE_POOL_OPERATION_CONFLICT', '该操作标识已用于不同的卡密撤回请求。')
           }
           const status = await readCodePoolStatus(trx, params.id, params.variantId)
@@ -618,6 +643,7 @@ export function registerAdminCodePoolRoutes(app: FastifyInstance, db: Kysely<Dat
           operation_id: body.operationId,
           kind: 'withdrawal',
           request_sha256: requestHash,
+          request_fingerprint_key_id: ring.activeKeyId,
           requested_count: entries.length,
           accepted_count: entries.length,
           duplicate_count: 0,

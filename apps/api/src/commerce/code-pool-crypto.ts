@@ -49,6 +49,14 @@ export function codePoolFingerprint(config: AppConfig, value: string, keyId = re
   return createHmac('sha256', purposeKey(keyFor(config, keyId), 'operation')).update(value, 'utf8').digest('hex')
 }
 
+export function codePoolOperationFingerprints(config: AppConfig, value: string): Array<{ keyId: string; fingerprint: string }> {
+  const ring = requiredCodePoolKeyRing(config)
+  return Object.entries(ring.keys).map(([keyId, key]) => ({
+    keyId,
+    fingerprint: createHmac('sha256', purposeKey(key, 'operation')).update(value, 'utf8').digest('hex'),
+  }))
+}
+
 export function codePoolContentDigest(config: AppConfig, value: string, keyId = requiredCodePoolKeyRing(config).activeKeyId): string {
   return createHmac('sha256', purposeKey(keyFor(config, keyId), 'delivery-digest')).update(value, 'utf8').digest('hex')
 }

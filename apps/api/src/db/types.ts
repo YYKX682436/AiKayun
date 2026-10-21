@@ -241,6 +241,7 @@ export interface CodePoolBatchesTable {
   operation_id: string
   kind: CodePoolBatchKind
   request_sha256: string
+  request_fingerprint_key_id: string | null
   requested_count: number
   accepted_count: number
   duplicate_count: number
