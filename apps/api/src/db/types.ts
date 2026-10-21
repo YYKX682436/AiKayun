@@ -160,7 +160,24 @@ export interface ProductVariantFulfillmentTable {
   method: FulfillmentMethod
   manual_delivery_ready: Generated<boolean>
   code_pool_delivery_ready: Generated<boolean>
+  automatic_delivery_ready: Generated<boolean>
+  current_content_version_id: string | null
+  configuration_revision: Generated<number>
   updated_at: Generated<Date>
+}
+
+export interface ProductVariantFulfillmentVersionsTable {
+  id: string
+  product_variant_id: string
+  version_number: number
+  method: 'fixed_content' | 'link'
+  encrypted_content: Buffer
+  content_nonce: Buffer
+  content_auth_tag: Buffer
+  encryption_key_id: string
+  content_sha256: string
+  created_by_admin_id: string
+  created_at: Generated<Date>
 }
 
 export type OrderStatus = 'pending_payment' | 'processing' | 'completed' | 'closed'
@@ -202,6 +219,7 @@ export interface OrderItemsTable {
   sku_snapshot: ColumnType<OrderSkuOptionSnapshot[], string | OrderSkuOptionSnapshot[] | undefined, string | OrderSkuOptionSnapshot[]>
   inventory_mode_snapshot: InventoryModeSnapshot
   fulfillment_method_snapshot: FulfillmentMethod
+  fulfillment_content_version_id: string | null
   unit_price: ColumnType<string, string, string>
   quantity: number
   line_amount: ColumnType<string, string, string>
@@ -643,7 +661,7 @@ export interface OrderItemFulfillmentAttemptsTable {
   started_by_admin_id: string | null
   status: Generated<FulfillmentAttemptStatus>
   result_sha256: string | null
-  delivery_source: Generated<'manual' | 'code_pool'>
+  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link'>
   failure_code: string | null
   retry_after: Date | null
   created_at: Generated<Date>
@@ -657,12 +675,13 @@ export interface OrderItemFulfillmentDeliveriesTable {
   unit_index: number
   content: string | null
   content_sha256: string
-  delivery_source: Generated<'manual' | 'code_pool'>
+  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link'>
   encrypted_content: Buffer | null
   content_nonce: Buffer | null
   content_auth_tag: Buffer | null
   encryption_key_id: string | null
   code_pool_entry_id: string | null
+  fulfillment_content_version_id: string | null
   created_at: Generated<Date>
 }
 
@@ -823,6 +842,7 @@ export interface Database {
   customer_cart_merge_requests: CustomerCartMergeRequestsTable
   guest_order_sessions: GuestOrderSessionsTable
   product_variant_fulfillment: ProductVariantFulfillmentTable
+  product_variant_fulfillment_versions: ProductVariantFulfillmentVersionsTable
   orders: OrdersTable
   order_items: OrderItemsTable
   order_inventory_reservations: OrderInventoryReservationsTable

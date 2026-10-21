@@ -298,6 +298,11 @@ export const ProductInventoryModeSchema = Type.Union([
   Type.Literal('external'),
 ])
 
+export const FulfillmentMethodSchema = Type.Union([
+  Type.Literal('manual'), Type.Literal('code_pool'), Type.Literal('fixed_content'),
+  Type.Literal('link'), Type.Literal('file'), Type.Literal('api'),
+])
+
 export const NullableProductInventoryModeSchema = Type.Union([
   ProductInventoryModeSchema,
   Type.Null(),
@@ -953,6 +958,8 @@ export const CheckoutQuoteItemSchema = Type.Object({
   lineTotal: Type.Union([SettlementAmountSchema, Type.Null()]),
   inventoryMode: Type.Union([NullableProductInventoryModeSchema, Type.Null()]),
   fulfillmentMethod: Type.Union([Type.String({ minLength: 1, maxLength: 24 }), Type.Null()]),
+  fulfillmentRevision: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  fulfillmentVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   availableQuantity: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
   identityValid: Type.Boolean(),
   purchaseLimits: CheckoutPurchaseLimitsSchema,
@@ -1522,8 +1529,19 @@ export const OrderFulfillmentStatusSchema = Type.Union([
 export const OrderDeliverySchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
   unitIndex: Type.Integer({ minimum: 1 }),
-  content: Type.String({ minLength: 1, maxLength: 512 }),
+  content: Type.String({ minLength: 1, maxLength: 20_000 }),
+  contentFormat: Type.Union([Type.Literal('plain_text'), Type.Literal('markdown'), Type.Literal('link')]),
+  title: Type.Union([Type.String({ minLength: 1, maxLength: 160 }), Type.Null()]),
+  accessInstructions: Type.Union([Type.String({ maxLength: 4_000 }), Type.Null()]),
   createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const OrderFulfillmentAttemptSchema = Type.Object({
+  status: Type.Union([Type.Literal('processing'), Type.Literal('unknown'), Type.Literal('succeeded'), Type.Literal('failed')]),
+  quantity: Type.Integer({ minimum: 1 }),
+  failureCode: Type.Union([Type.Null(), Type.String({ minLength: 1, maxLength: 48 })]),
+  retryAfter: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  createdAt: Type.String({ format: 'date-time' }),
+  completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
 }, { additionalProperties: false })
 export const OrderItemSchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
@@ -1541,6 +1559,7 @@ export const OrderItemSchema = Type.Object({
   fulfillmentStatus: OrderFulfillmentStatusSchema,
   fulfilledQuantity: Type.Integer({ minimum: 0 }),
   fulfillmentReservedQuantity: Type.Integer({ minimum: 0 }),
+  fulfillmentAttempts: Type.Array(OrderFulfillmentAttemptSchema),
   deliveries: Type.Array(OrderDeliverySchema),
 }, { additionalProperties: false })
 export const OrderStatusEventSchema = Type.Object({
@@ -1805,12 +1824,19 @@ export const AdminFulfillmentAttemptSchema = Type.Object({
   administratorId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   quantity: Type.Integer({ minimum: 1 }),
   status: Type.Union([Type.Literal('processing'), Type.Literal('unknown'), Type.Literal('succeeded'), Type.Literal('failed')]),
-  deliverySource: Type.Union([Type.Literal('manual'), Type.Literal('code_pool')]),
+  deliverySource: Type.Union([
+    Type.Literal('manual'), Type.Literal('code_pool'), Type.Literal('fixed_content'), Type.Literal('link'),
+  ]),
   failureCode: Type.Union([Type.Null(),
     Type.Literal('CODE_POOL_DATA_INCONSISTENT'),
     Type.Literal('CODE_POOL_KEY_UNAVAILABLE'),
     Type.Literal('CODE_POOL_DECRYPTION_FAILED'),
     Type.Literal('CODE_POOL_PAYMENT_UNRESOLVED'),
+    Type.Literal('FIXED_DELIVERY_DATA_INCONSISTENT'),
+    Type.Literal('FIXED_DELIVERY_KEY_UNAVAILABLE'),
+    Type.Literal('FIXED_DELIVERY_DECRYPTION_FAILED'),
+    Type.Literal('FIXED_DELIVERY_VERSION_UNAVAILABLE'),
+    Type.Literal('FIXED_DELIVERY_PAYMENT_UNRESOLVED'),
   ]),
   retryAfter: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
   resultSha256: Type.Union([Type.String({ pattern: '^[0-9a-f]{64}$' }), Type.Null()]),
@@ -1837,11 +1863,72 @@ export const ManualFulfillmentConfigSchema = Type.Object({
   productId: Type.String({ format: 'uuid' }),
   skuId: Type.String({ format: 'uuid' }),
   productType: ProductTypeSchema,
-  method: Type.Union([Type.Literal('manual'), Type.Null()]),
+  method: Type.Union([FulfillmentMethodSchema, Type.Null()]),
   enabled: Type.Boolean(),
+  codePoolDeliveryReady: Type.Boolean(),
+  automaticDeliveryReady: Type.Boolean(),
+  configurationRevision: Type.Integer({ minimum: 0 }),
+  currentVersionNumber: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
   updatedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
 }, { additionalProperties: false })
 export const ManualFulfillmentConfigPageSchema = Type.Array(ManualFulfillmentConfigSchema)
+export const FixedDeliveryMethodSchema = Type.Union([Type.Literal('fixed_content'), Type.Literal('link')])
+export const FixedDeliveryVersionSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  versionNumber: Type.Integer({ minimum: 1 }),
+  method: FixedDeliveryMethodSchema,
+  content: Type.String({ minLength: 1, maxLength: 20_000 }),
+  title: Type.Union([Type.String({ minLength: 1, maxLength: 160 }), Type.Null()]),
+  accessInstructions: Type.Union([Type.String({ maxLength: 4_000 }), Type.Null()]),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const FixedDeliveryVersionSummarySchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  versionNumber: Type.Integer({ minimum: 1 }),
+  method: FixedDeliveryMethodSchema,
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const FixedDeliveryConfigSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  skuId: Type.String({ format: 'uuid' }),
+  productType: ProductTypeSchema,
+  method: Type.Union([FulfillmentMethodSchema, Type.Null()]),
+  automaticDeliveryReady: Type.Boolean(),
+  configurationRevision: Type.Integer({ minimum: 0 }),
+  updatedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  currentVersion: Type.Union([FixedDeliveryVersionSchema, Type.Null()]),
+}, { additionalProperties: false })
+export const FixedDeliveryVersionsPageSchema = Type.Object({
+  items: Type.Array(FixedDeliveryVersionSummarySchema, { maxItems: 50 }),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 50 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const FixedDeliveryVersionsQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+}, { additionalProperties: false })
+export const SaveFixedDeliveryContentBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 0 }),
+  method: Type.Literal('fixed_content'),
+  content: Type.String({ minLength: 1, maxLength: 20_000, pattern: '.*\\S.*' }),
+}, { additionalProperties: false })
+export const SaveFixedDeliveryLinkBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 0 }),
+  method: Type.Literal('link'),
+  url: Type.String({ minLength: 9, maxLength: 2_048, pattern: '^https://[^\\s]+$' }),
+  title: Type.String({ minLength: 1, maxLength: 160, pattern: '.*\\S.*' }),
+  accessInstructions: Type.Optional(Type.String({ maxLength: 4_000 })),
+}, { additionalProperties: false })
+export const SaveFixedDeliveryVersionBodySchema = Type.Union([
+  SaveFixedDeliveryContentBodySchema,
+  SaveFixedDeliveryLinkBodySchema,
+])
+export const UpdateFixedDeliveryReadinessBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 0 }),
+  enabled: Type.Boolean(),
+}, { additionalProperties: false })
 export const GuestOrderSessionSchema = Type.Object({
   expiresAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
@@ -2447,6 +2534,7 @@ export type CreateOrderResult = Static<typeof CreateOrderResultSchema>
 export type OrderStatus = Static<typeof OrderStatusSchema>
 export type OrderSummary = Static<typeof OrderSummarySchema>
 export type OrderItem = Static<typeof OrderItemSchema>
+export type OrderFulfillmentAttempt = Static<typeof OrderFulfillmentAttemptSchema>
 export type OrderDetail = Static<typeof OrderDetailSchema>
 export type OrderPage = Static<typeof OrderPageSchema>
 export type RefundStatus = Static<typeof RefundStatusSchema>
@@ -2467,6 +2555,14 @@ export type UpdateManualFulfillmentBody = Static<typeof UpdateManualFulfillmentB
 export type ManualFulfillmentConfig = Static<typeof ManualFulfillmentConfigSchema>
 export type ManualFulfillmentConfigPage = Static<typeof ManualFulfillmentConfigPageSchema>
 export type ManualFulfillmentResult = Static<typeof ManualFulfillmentResultSchema>
+export type FixedDeliveryMethod = Static<typeof FixedDeliveryMethodSchema>
+export type FixedDeliveryVersion = Static<typeof FixedDeliveryVersionSchema>
+export type FixedDeliveryVersionSummary = Static<typeof FixedDeliveryVersionSummarySchema>
+export type FixedDeliveryConfig = Static<typeof FixedDeliveryConfigSchema>
+export type FixedDeliveryVersionsPage = Static<typeof FixedDeliveryVersionsPageSchema>
+export type FixedDeliveryVersionsQuery = Static<typeof FixedDeliveryVersionsQuerySchema>
+export type SaveFixedDeliveryVersionBody = Static<typeof SaveFixedDeliveryVersionBodySchema>
+export type UpdateFixedDeliveryReadinessBody = Static<typeof UpdateFixedDeliveryReadinessBodySchema>
 export type GuestOrderSession = Static<typeof GuestOrderSessionSchema>
 export type ManualFulfillmentDeliveryBody = Static<typeof ManualFulfillmentDeliveryBodySchema>
 export type CodePoolFormat = Static<typeof CodePoolFormatSchema>

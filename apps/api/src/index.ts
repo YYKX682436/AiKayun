@@ -2,7 +2,7 @@ import { createApp } from './app.js'
 import { readConfig } from './config.js'
 import { createDatabase } from './db/pool.js'
 import { startUnpaidOrderExpiryWorker } from './commerce/unpaid-order-expiry.js'
-import { startCodePoolDeliveryWorker } from './commerce/code-pool-delivery-worker.js'
+import { startDigitalDeliveryWorker } from './commerce/code-pool-delivery-worker.js'
 
 const config = readConfig()
 const db = createDatabase()
@@ -14,12 +14,12 @@ const app = await createApp({
     : {}),
 })
 const stopUnpaidOrderExpiry = startUnpaidOrderExpiryWorker(db, app.log)
-const stopCodePoolDelivery = startCodePoolDeliveryWorker(db, config, app.log)
+const stopDigitalDelivery = startDigitalDeliveryWorker(db, config, app.log)
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, async () => {
     await stopUnpaidOrderExpiry()
-    await stopCodePoolDelivery()
+    await stopDigitalDelivery()
     await app.close()
     await db.destroy()
     process.exit(0)

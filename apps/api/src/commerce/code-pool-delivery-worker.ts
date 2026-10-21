@@ -11,6 +11,16 @@ import {
   encryptCodePoolContent,
   requiredCodePoolKeyRing,
 } from './code-pool-crypto.js'
+import {
+  decryptFixedDeliveryPayload,
+  encryptFixedDeliveryPayload,
+  fixedDeliveryPayloadDigest,
+  FixedDeliveryDecryptionError,
+  FixedDeliveryKeyUnavailableError,
+  fixedDeliveryDeliveryContext,
+  fixedDeliveryVersionContext,
+  type FixedDeliveryMethod,
+} from './fixed-delivery-crypto.js'
 
 const pollIntervalMs = 1_000
 const batchSize = 20
@@ -19,6 +29,9 @@ const maxRetryDelayMs = 5 * 60_000
 type Db = Kysely<Database> | Transaction<Database>
 type FailureCode = 'CODE_POOL_DATA_INCONSISTENT' | 'CODE_POOL_KEY_UNAVAILABLE'
   | 'CODE_POOL_DECRYPTION_FAILED' | 'CODE_POOL_PAYMENT_UNRESOLVED'
+  | 'FIXED_DELIVERY_DATA_INCONSISTENT' | 'FIXED_DELIVERY_KEY_UNAVAILABLE'
+  | 'FIXED_DELIVERY_DECRYPTION_FAILED' | 'FIXED_DELIVERY_VERSION_UNAVAILABLE'
+  | 'FIXED_DELIVERY_PAYMENT_UNRESOLVED'
 
 interface Candidate { order_id: string; order_item_id: string }
 
@@ -39,16 +52,16 @@ async function candidates(db: Db, now: Date): Promise<Candidate[]> {
     FROM orders AS order_row
     JOIN order_items AS item ON item.order_id = order_row.id
     WHERE order_row.status = 'processing'
-      AND item.fulfillment_method_snapshot = 'code_pool'
+      AND item.fulfillment_method_snapshot IN ('code_pool', 'fixed_content', 'link')
       AND item.fulfilled_quantity + item.fulfillment_reserved_quantity < item.quantity
       AND NOT EXISTS (
         SELECT 1 FROM order_item_fulfillment_attempts AS attempt
-        WHERE attempt.order_item_id = item.id AND attempt.delivery_source = 'code_pool'
+        WHERE attempt.order_item_id = item.id AND attempt.delivery_source = item.fulfillment_method_snapshot
           AND attempt.status IN ('processing', 'unknown')
       )
       AND COALESCE((
         SELECT attempt.retry_after FROM order_item_fulfillment_attempts AS attempt
-        WHERE attempt.order_item_id = item.id AND attempt.delivery_source = 'code_pool'
+        WHERE attempt.order_item_id = item.id AND attempt.delivery_source = item.fulfillment_method_snapshot
           AND attempt.status = 'failed'
         ORDER BY attempt.created_at DESC, attempt.id DESC LIMIT 1
       ), '-infinity'::timestamptz) <= ${now}
@@ -59,7 +72,6 @@ async function candidates(db: Db, now: Date): Promise<Candidate[]> {
 }
 
 async function paymentAllowsDelivery(trx: Transaction<Database>, orderId: string, totalAmount: string): Promise<boolean> {
-  if (totalAmount === '0.00') return true
   const evidence = await sql<{ valid: boolean }>`
     SELECT NOT order_has_unresolved_payment_attempts(${orderId}::uuid)
       AND NOT EXISTS (
@@ -68,13 +80,13 @@ async function paymentAllowsDelivery(trx: Transaction<Database>, orderId: string
           ON reconciliation.payment_attempt_id = attempt.id
         WHERE attempt.order_id = ${orderId}::uuid AND reconciliation.state = 'open'
       )
-      AND COALESCE((
+      AND (${totalAmount}::numeric = 0 OR COALESCE((
         SELECT sum(receipt.amount)
         FROM payment_attempts AS attempt
         JOIN payment_receipts AS receipt ON receipt.payment_attempt_id = attempt.id
         WHERE attempt.order_id = ${orderId}::uuid AND attempt.status = 'succeeded'
           AND receipt.disposition = 'on_time'
-      ), 0) = ${totalAmount}::numeric AS valid
+      ), 0) = ${totalAmount}::numeric) AS valid
   `.execute(trx)
   return evidence.rows[0]?.valid === true
 }
@@ -96,16 +108,17 @@ async function recordUnexpectedFailure(
     const item = await trx.selectFrom('order_items')
       .select(['id', 'quantity', 'fulfilled_quantity', 'fulfillment_reserved_quantity', 'fulfillment_method_snapshot'])
       .where('id', '=', itemId).where('order_id', '=', orderId).forUpdate().executeTakeFirst()
-    if (!item || item.fulfillment_method_snapshot !== 'code_pool') return 'skipped'
+    if (!item || !['code_pool', 'fixed_content', 'link'].includes(item.fulfillment_method_snapshot)) return 'skipped'
+    const source = item.fulfillment_method_snapshot as 'code_pool' | 'fixed_content' | 'link'
     const remaining = item.quantity - item.fulfilled_quantity - item.fulfillment_reserved_quantity
     if (remaining <= 0) return 'skipped'
     const active = await trx.selectFrom('order_item_fulfillment_attempts').select('id')
-      .where('order_item_id', '=', item.id).where('delivery_source', '=', 'code_pool')
+      .where('order_item_id', '=', item.id).where('delivery_source', '=', source)
       .where('status', 'in', ['processing', 'unknown']).executeTakeFirst()
     if (active) return 'skipped'
     const priorFailures = await trx.selectFrom('order_item_fulfillment_attempts')
       .select(sql<number>`count(*)::integer`.as('count'))
-      .where('order_item_id', '=', item.id).where('delivery_source', '=', 'code_pool')
+      .where('order_item_id', '=', item.id).where('delivery_source', '=', source)
       .where('status', '=', 'failed').executeTakeFirstOrThrow()
     const attemptId = randomUUID()
     await trx.insertInto('order_item_fulfillment_attempts').values({
@@ -114,7 +127,7 @@ async function recordUnexpectedFailure(
       operation_id: operationId,
       quantity: remaining,
       started_by_admin_id: null,
-      delivery_source: 'code_pool',
+      delivery_source: source,
       status: 'processing',
       failure_code: null,
       retry_after: null,
@@ -123,7 +136,7 @@ async function recordUnexpectedFailure(
     }).execute()
     await trx.updateTable('order_item_fulfillment_attempts').set({
       status: 'failed',
-      failure_code: 'CODE_POOL_DATA_INCONSISTENT',
+      failure_code: source === 'code_pool' ? 'CODE_POOL_DATA_INCONSISTENT' : 'FIXED_DELIVERY_DATA_INCONSISTENT',
       retry_after: new Date(Date.now() + retryDelay(Number(priorFailures.count) + 1)),
       completed_at: new Date(),
     }).where('id', '=', attemptId).execute()
@@ -131,7 +144,7 @@ async function recordUnexpectedFailure(
   })
 }
 
-async function attemptDelivery(
+async function attemptCodePoolDelivery(
   db: Kysely<Database>,
   config: AppConfig,
   orderId: string,
@@ -282,13 +295,202 @@ async function attemptDelivery(
   }
 }
 
+interface FixedDeliveryRecord {
+  id: string
+  unitIndex: number
+  encrypted: ReturnType<typeof encryptFixedDeliveryPayload>
+  digest: string
+}
+
+async function attemptFixedDelivery(
+  db: Kysely<Database>,
+  config: AppConfig,
+  orderId: string,
+  itemId: string,
+): Promise<'delivered' | 'failed' | 'skipped'> {
+  const operationId = randomUUID()
+  try {
+    return await db.transaction().execute(async (trx) => {
+      const order = await trx.selectFrom('orders').select(['id', 'status', 'total_amount'])
+        .where('id', '=', orderId).forUpdate().skipLocked().executeTakeFirst()
+      if (!order || order.status !== 'processing') return 'skipped'
+      const item = await trx.selectFrom('order_items')
+        .select([
+          'id', 'order_id', 'product_id', 'product_variant_id', 'quantity', 'fulfilled_quantity',
+          'fulfillment_reserved_quantity', 'fulfillment_method_snapshot', 'fulfillment_content_version_id',
+          'inventory_mode_snapshot',
+        ])
+        .where('id', '=', itemId).where('order_id', '=', orderId).forUpdate().executeTakeFirst()
+      if (!item || (item.fulfillment_method_snapshot !== 'fixed_content' && item.fulfillment_method_snapshot !== 'link')) {
+        return 'skipped'
+      }
+      const source = item.fulfillment_method_snapshot as FixedDeliveryMethod
+      const remaining = item.quantity - item.fulfilled_quantity - item.fulfillment_reserved_quantity
+      if (remaining <= 0) return 'skipped'
+      const activeAttempt = await trx.selectFrom('order_item_fulfillment_attempts').select('id')
+        .where('order_item_id', '=', item.id).where('delivery_source', '=', source)
+        .where('status', 'in', ['processing', 'unknown']).executeTakeFirst()
+      if (activeAttempt) return 'skipped'
+
+      // Keep the checkout and worker catalog lock order: order → item → product → SKU → inventory → config.
+      await trx.selectFrom('products').select('id').where('id', '=', item.product_id).forShare().executeTakeFirst()
+      await trx.selectFrom('product_variants').select('id').where('id', '=', item.product_variant_id)
+        .forUpdate().executeTakeFirst()
+      const inventory = item.inventory_mode_snapshot === 'quantity'
+        ? await trx.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+          .where('product_variant_id', '=', item.product_variant_id).forUpdate().executeTakeFirst()
+        : undefined
+      await trx.selectFrom('product_variant_fulfillment').select('product_variant_id')
+        .where('product_variant_id', '=', item.product_variant_id).forShare().executeTakeFirst()
+
+      let failureCode: FailureCode | undefined
+      if (item.inventory_mode_snapshot === 'quantity') {
+        const reservation = await trx.selectFrom('order_inventory_reservations')
+          .select(['id', 'quantity']).where('order_item_id', '=', item.id).executeTakeFirst()
+        const eventTotals = reservation ? await sql<{ active_quantity: number; reserve_count: number }>`
+          SELECT COALESCE(sum(quantity) FILTER (WHERE action = 'reserve'), 0)
+            - COALESCE(sum(quantity) FILTER (WHERE action IN ('release', 'consume')), 0) AS active_quantity,
+            count(*) FILTER (WHERE action = 'reserve')::integer AS reserve_count
+          FROM order_inventory_events WHERE reservation_id = ${reservation.id}::uuid
+        `.execute(trx) : null
+        const activeQuantity = Number(eventTotals?.rows[0]?.active_quantity ?? 0)
+        if (!inventory || !reservation || reservation.quantity !== item.quantity
+          || eventTotals?.rows[0]?.reserve_count !== 1 || activeQuantity !== remaining
+          || Number(inventory.reserved) < remaining || Number(inventory.stocked) < remaining) {
+          failureCode = 'FIXED_DELIVERY_DATA_INCONSISTENT'
+        }
+      } else if (item.inventory_mode_snapshot !== 'unlimited'
+        || await trx.selectFrom('order_inventory_reservations').select('id')
+          .where('order_item_id', '=', item.id).executeTakeFirst()) {
+        failureCode = 'FIXED_DELIVERY_DATA_INCONSISTENT'
+      }
+      if (!failureCode && !await paymentAllowsDelivery(trx, order.id, order.total_amount)) {
+        failureCode = 'FIXED_DELIVERY_PAYMENT_UNRESOLVED'
+      }
+
+      const version = item.fulfillment_content_version_id
+        ? await trx.selectFrom('product_variant_fulfillment_versions')
+          .select([
+            'id', 'method', 'product_variant_id', 'encrypted_content', 'content_nonce',
+            'content_auth_tag', 'encryption_key_id',
+          ])
+          .where('id', '=', item.fulfillment_content_version_id)
+          .where('product_variant_id', '=', item.product_variant_id)
+          .where('method', '=', source).executeTakeFirst()
+        : undefined
+      if (!failureCode && !version) failureCode = 'FIXED_DELIVERY_VERSION_UNAVAILABLE'
+
+      const priorFailures = await trx.selectFrom('order_item_fulfillment_attempts')
+        .select(sql<number>`count(*)::integer`.as('count'))
+        .where('order_item_id', '=', item.id).where('delivery_source', '=', source)
+        .where('status', '=', 'failed').executeTakeFirstOrThrow()
+      const attemptId = randomUUID()
+      await trx.insertInto('order_item_fulfillment_attempts').values({
+        id: attemptId,
+        order_item_id: item.id,
+        operation_id: operationId,
+        quantity: remaining,
+        started_by_admin_id: null,
+        delivery_source: source,
+        status: 'processing',
+        failure_code: null,
+        retry_after: null,
+        result_sha256: null,
+        completed_at: null,
+      }).execute()
+
+      if (!failureCode && version && item.fulfillment_content_version_id) {
+        try {
+          const payload = decryptFixedDeliveryPayload(config,
+            fixedDeliveryVersionContext(item.product_variant_id, version.id, source),
+            source, {
+              keyId: version.encryption_key_id,
+              nonce: version.content_nonce,
+              ciphertext: version.encrypted_content,
+              authTag: version.content_auth_tag,
+            })
+          const prepared: FixedDeliveryRecord[] = []
+          for (let index = 0; index < remaining; index += 1) {
+            const deliveryId = randomUUID()
+            prepared.push({
+              id: deliveryId,
+              unitIndex: item.fulfilled_quantity + index + 1,
+              encrypted: encryptFixedDeliveryPayload(config,
+                fixedDeliveryDeliveryContext(item.id, deliveryId, version.id, source), payload),
+              digest: fixedDeliveryPayloadDigest(config, payload),
+            })
+          }
+          for (const delivery of prepared) {
+            await trx.insertInto('order_item_fulfillment_deliveries').values({
+              id: delivery.id,
+              fulfillment_attempt_id: attemptId,
+              started_by_admin_id: null,
+              unit_index: delivery.unitIndex,
+              content: null,
+              content_sha256: delivery.digest,
+              delivery_source: source,
+              encrypted_content: delivery.encrypted.ciphertext,
+              content_nonce: delivery.encrypted.nonce,
+              content_auth_tag: delivery.encrypted.authTag,
+              encryption_key_id: delivery.encrypted.keyId,
+              code_pool_entry_id: null,
+              fulfillment_content_version_id: version.id,
+            }).execute()
+          }
+          const resultDigest = createHash('sha256')
+            .update(prepared.map(delivery => `${delivery.id}:${version.id}`).join('\n'))
+            .digest('hex')
+          await trx.updateTable('order_item_fulfillment_attempts').set({
+            status: 'succeeded', result_sha256: resultDigest, completed_at: new Date(),
+          }).where('id', '=', attemptId).execute()
+          return 'delivered'
+        } catch (error) {
+          failureCode = error instanceof FixedDeliveryKeyUnavailableError
+            ? 'FIXED_DELIVERY_KEY_UNAVAILABLE'
+            : error instanceof FixedDeliveryDecryptionError
+              ? 'FIXED_DELIVERY_DECRYPTION_FAILED'
+              : 'FIXED_DELIVERY_DATA_INCONSISTENT'
+        }
+      }
+
+      await trx.updateTable('order_item_fulfillment_attempts').set({
+        status: 'failed',
+        failure_code: failureCode ?? 'FIXED_DELIVERY_DATA_INCONSISTENT',
+        retry_after: new Date(Date.now() + retryDelay(Number(priorFailures.count) + 1)),
+        completed_at: new Date(),
+      }).where('id', '=', attemptId).execute()
+      return 'failed'
+    })
+  } catch (error) {
+    try {
+      return await recordUnexpectedFailure(db, orderId, itemId, operationId)
+    } catch {
+      throw error
+    }
+  }
+}
+
+async function attemptDelivery(
+  db: Kysely<Database>, config: AppConfig, orderId: string, itemId: string,
+): Promise<'delivered' | 'failed' | 'skipped'> {
+  const item = await db.selectFrom('order_items').select('fulfillment_method_snapshot')
+    .where('id', '=', itemId).where('order_id', '=', orderId).executeTakeFirst()
+  if (item?.fulfillment_method_snapshot === 'code_pool') {
+    return attemptCodePoolDelivery(db, config, orderId, itemId)
+  }
+  if (item?.fulfillment_method_snapshot === 'fixed_content' || item?.fulfillment_method_snapshot === 'link') {
+    return attemptFixedDelivery(db, config, orderId, itemId)
+  }
+  return 'skipped'
+}
+
 /**
  * Database-only delivery is safe to retry: reservations and deliveries commit
  * with the existing fulfillment-attempt transition and inventory consumption.
  * SKIP LOCKED distributes orders between API instances; first startup pass
  * resumes any processing item without a live or scheduled attempt.
  */
-export function startCodePoolDeliveryWorker(
+export function startDigitalDeliveryWorker(
   db: Kysely<Database>,
   config: AppConfig,
   logger: FastifyBaseLogger,
@@ -313,7 +515,7 @@ export function startCodePoolDeliveryWorker(
           try {
             const result = await attemptDelivery(db, config, candidate.order_id, candidate.order_item_id)
             if (result === 'failed') {
-              logger.warn({ orderId: candidate.order_id, orderItemId: candidate.order_item_id }, 'code-pool delivery requires retry')
+              logger.warn({ orderId: candidate.order_id, orderItemId: candidate.order_item_id }, 'digital delivery requires retry')
             }
           } catch (error) {
             const candidateError = error && typeof error === 'object'
@@ -324,7 +526,7 @@ export function startCodePoolDeliveryWorker(
               orderItemId: candidate.order_item_id,
               errorName: typeof candidateError.name === 'string' ? candidateError.name : 'unknown',
               databaseCode: typeof candidateError.code === 'string' ? candidateError.code : undefined,
-            }, 'code-pool delivery transaction failed; item remains eligible for recovery')
+            }, 'digital delivery transaction failed; item remains eligible for recovery')
           }
         }
       } catch (error) {
@@ -334,7 +536,7 @@ export function startCodePoolDeliveryWorker(
         logger.warn({
           errorName: typeof candidateError.name === 'string' ? candidateError.name : 'unknown',
           databaseCode: typeof candidateError.code === 'string' ? candidateError.code : undefined,
-        }, 'code-pool delivery recovery scan failed')
+        }, 'digital delivery recovery scan failed')
       } finally {
         activeRun = undefined
         schedule()
@@ -350,3 +552,6 @@ export function startCodePoolDeliveryWorker(
     await activeRun
   }
 }
+
+/** @deprecated Kept as a source-compatible alias for existing ⑤-1 tests and callers. */
+export const startCodePoolDeliveryWorker = startDigitalDeliveryWorker

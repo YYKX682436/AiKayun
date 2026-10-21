@@ -420,6 +420,7 @@ export function registerAdminCodePoolRoutes(app: FastifyInstance, db: Kysely<Dat
             code_pool_delivery_ready: true,
           }).onConflict(conflict => conflict.column('product_variant_id').doUpdateSet({
             method: 'code_pool', manual_delivery_ready: false, code_pool_delivery_ready: true,
+            automatic_delivery_ready: false, current_content_version_id: null,
           })).execute()
         } else if (locked.method === 'code_pool') {
           await trx.updateTable('product_variant_fulfillment').set({ code_pool_delivery_ready: false })
@@ -435,6 +436,7 @@ export function registerAdminCodePoolRoutes(app: FastifyInstance, db: Kysely<Dat
             code_pool_delivery_ready: false,
           }).onConflict(conflict => conflict.column('product_variant_id').doUpdateSet({
             method: 'code_pool', manual_delivery_ready: false, code_pool_delivery_ready: false,
+            automatic_delivery_ready: false, current_content_version_id: null,
           })).execute()
         }
         const current = await readCodePoolStatus(trx, params.id, params.variantId)

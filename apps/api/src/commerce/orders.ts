@@ -49,9 +49,16 @@ import {
   hashToken,
   verifyDoubleSubmitCsrf,
 } from '../auth/security.js'
-import type { Database, OrderStatus as DbOrderStatus } from '../db/types.js'
+import type { Database, FulfillmentMethod, OrderStatus as DbOrderStatus } from '../db/types.js'
 import { CheckoutQuoteError, checkoutRequestHash, normalizeCheckoutItems, quoteCheckoutItems } from './checkout-quote.js'
 import { CodePoolDecryptionError, CodePoolKeyUnavailableError, decryptCodePoolContent } from './code-pool-crypto.js'
+import {
+  decryptFixedDeliveryPayload,
+  FixedDeliveryDecryptionError,
+  FixedDeliveryKeyUnavailableError,
+  fixedDeliveryDeliveryContext,
+  type FixedDeliveryMethod,
+} from './fixed-delivery-crypto.js'
 
 export const guestSessionCookie = 'aikayun_guest_order_session'
 const guestSessionTtlSeconds = 60 * 60 * 24 * 180
@@ -101,6 +108,12 @@ function handleOrderError(error: unknown, reply: FastifyReply, requestId: string
   }
   if (error instanceof CodePoolDecryptionError) {
     return reply.code(503).send(failure('CODE_POOL_DECRYPTION_FAILED', '此订单的交付凭证完整性校验失败，已记录请求编号供管理员排查。', requestId))
+  }
+  if (error instanceof FixedDeliveryKeyUnavailableError) {
+    return reply.code(503).send(failure('FIXED_DELIVERY_KEY_UNAVAILABLE', '服务暂时无法读取此订单的数字交付内容，请稍后重试。', requestId))
+  }
+  if (error instanceof FixedDeliveryDecryptionError) {
+    return reply.code(503).send(failure('FIXED_DELIVERY_DECRYPTION_FAILED', '此订单的数字交付内容完整性校验失败，已记录请求编号供排查。', requestId))
   }
   if (error instanceof OrderError || error instanceof CheckoutQuoteError) {
     return reply.code(error.status).send(failure(error.code, error.message, requestId))
@@ -177,6 +190,7 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
     .select([
       'id', 'product_id', 'product_variant_id', 'product_name_snapshot', 'product_type_snapshot',
       'sku_code_snapshot', 'sku_snapshot', 'inventory_mode_snapshot', 'fulfillment_method_snapshot',
+      'fulfillment_content_version_id',
       'unit_price', 'quantity', 'line_amount', 'fulfillment_status', 'fulfilled_quantity',
       'fulfillment_reserved_quantity',
     ])
@@ -190,7 +204,8 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
       .select([
         'attempt.order_item_id as order_item_id', 'delivery.id', 'delivery.unit_index',
         'delivery.content', 'delivery.delivery_source', 'delivery.encrypted_content', 'delivery.content_nonce',
-        'delivery.content_auth_tag', 'delivery.encryption_key_id', 'delivery.code_pool_entry_id', 'delivery.created_at',
+        'delivery.content_auth_tag', 'delivery.encryption_key_id', 'delivery.code_pool_entry_id',
+        'delivery.fulfillment_content_version_id', 'delivery.created_at',
       ])
       .where('attempt.order_item_id', 'in', itemIds)
       .where('attempt.status', '=', 'succeeded')
@@ -200,6 +215,9 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
   const deliveriesByItem = new Map<string, OrderDetail['items'][number]['deliveries']>()
   for (const delivery of deliveries) {
     let content = delivery.content
+    let contentFormat: OrderDetail['items'][number]['deliveries'][number]['contentFormat'] = 'plain_text'
+    let title: string | null = null
+    let accessInstructions: string | null = null
     if (delivery.delivery_source === 'code_pool') {
       const item = itemRows.find(row => row.id === delivery.order_item_id)
       if (!config || !item || !delivery.encrypted_content || !delivery.content_nonce || !delivery.content_auth_tag
@@ -213,6 +231,27 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
           ciphertext: delivery.encrypted_content,
           authTag: delivery.content_auth_tag,
         })
+    } else if (delivery.delivery_source === 'fixed_content' || delivery.delivery_source === 'link') {
+      const item = itemRows.find(row => row.id === delivery.order_item_id)
+      const method = delivery.delivery_source as FixedDeliveryMethod
+      if (!config || !item || !item.fulfillment_content_version_id
+        || delivery.fulfillment_content_version_id !== item.fulfillment_content_version_id
+        || !delivery.encrypted_content || !delivery.content_nonce || !delivery.content_auth_tag
+        || !delivery.encryption_key_id) {
+        throw new FixedDeliveryDecryptionError()
+      }
+      const payload = decryptFixedDeliveryPayload(config,
+        fixedDeliveryDeliveryContext(item.id, delivery.id, item.fulfillment_content_version_id, method),
+        method, {
+          keyId: delivery.encryption_key_id,
+          nonce: delivery.content_nonce,
+          ciphertext: delivery.encrypted_content,
+          authTag: delivery.content_auth_tag,
+        })
+      content = payload.method === 'fixed_content' ? payload.content : payload.url
+      contentFormat = payload.method === 'fixed_content' ? 'markdown' : 'link'
+      title = payload.method === 'link' ? payload.title : null
+      accessInstructions = payload.method === 'link' ? payload.accessInstructions : null
     }
     if (content === null) throw new Error('Fulfillment delivery content is missing')
     const rows = deliveriesByItem.get(delivery.order_item_id) ?? []
@@ -220,9 +259,42 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
       id: delivery.id,
       unitIndex: delivery.unit_index,
       content,
+      contentFormat,
+      title,
+      accessInstructions,
       createdAt: delivery.created_at.toISOString(),
     })
     deliveriesByItem.set(delivery.order_item_id, rows)
+  }
+  const attemptRows = itemIds.length
+    ? await sql<{
+      order_item_id: string; status: OrderDetail['items'][number]['fulfillmentAttempts'][number]['status'];
+      quantity: number; failure_code: string | null; retry_after: Date | null; created_at: Date; completed_at: Date | null;
+    }>`
+      SELECT order_item_id, status, quantity, failure_code, retry_after, created_at, completed_at
+      FROM (
+        SELECT attempt.order_item_id, attempt.status, attempt.quantity, attempt.failure_code,
+          attempt.retry_after, attempt.created_at, attempt.completed_at,
+          row_number() OVER (PARTITION BY attempt.order_item_id ORDER BY attempt.created_at DESC, attempt.id DESC) AS rank
+        FROM order_item_fulfillment_attempts AS attempt
+        WHERE attempt.order_item_id = ANY(${itemIds}::uuid[])
+      ) AS recent
+      WHERE rank <= 10
+      ORDER BY order_item_id, created_at DESC
+    `.execute(db)
+    : { rows: [] }
+  const attemptsByItem = new Map<string, OrderDetail['items'][number]['fulfillmentAttempts']>()
+  for (const attempt of attemptRows.rows) {
+    const rows = attemptsByItem.get(attempt.order_item_id) ?? []
+    rows.push({
+      status: attempt.status,
+      quantity: attempt.quantity,
+      failureCode: attempt.failure_code,
+      retryAfter: attempt.retry_after?.toISOString() ?? null,
+      createdAt: attempt.created_at.toISOString(),
+      completedAt: attempt.completed_at?.toISOString() ?? null,
+    })
+    attemptsByItem.set(attempt.order_item_id, rows)
   }
   const statusEvents = await db.selectFrom('order_status_events')
     .select(['previous_status', 'next_status', 'created_at'])
@@ -256,6 +328,7 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
       fulfillmentStatus: item.fulfillment_status,
       fulfilledQuantity: item.fulfilled_quantity,
       fulfillmentReservedQuantity: item.fulfillment_reserved_quantity,
+      fulfillmentAttempts: attemptsByItem.get(item.id) ?? [],
       deliveries: deliveriesByItem.get(item.id) ?? [],
     })),
     statusEvents: statusEvents.map(event => ({
@@ -424,7 +497,7 @@ async function createOrderTransaction(
     const inventoryMode = item.inventoryMode
     if (!item.productId || !item.productName || !item.productType || !item.skuCode || !item.unitPrice || !item.lineTotal
       || (inventoryMode !== 'quantity' && inventoryMode !== 'unlimited')
-      || (item.fulfillmentMethod !== 'manual' && item.fulfillmentMethod !== 'code_pool')) {
+      || !['manual', 'code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod ?? '')) {
       throw new Error('Eligible checkout item is missing required transaction snapshot fields')
     }
     const orderItemId = randomUUID()
@@ -438,7 +511,8 @@ async function createOrderTransaction(
       sku_code_snapshot: item.skuCode,
       sku_snapshot: JSON.stringify(item.options),
       inventory_mode_snapshot: inventoryMode,
-      fulfillment_method_snapshot: item.fulfillmentMethod,
+      fulfillment_method_snapshot: item.fulfillmentMethod as FulfillmentMethod,
+      fulfillment_content_version_id: item.fulfillmentVersionId,
       unit_price: item.unitPrice,
       quantity: item.quantity,
       line_amount: item.lineTotal,
@@ -1256,7 +1330,12 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
     if (!product) return reply.code(404).send(failure('PRODUCT_NOT_FOUND', '商品不存在。', request.id))
     const variants = await db.selectFrom('product_variants as variant')
       .leftJoin('product_variant_fulfillment as fulfillment', 'fulfillment.product_variant_id', 'variant.id')
-      .select(['variant.id as sku_id', 'fulfillment.method', 'fulfillment.manual_delivery_ready', 'fulfillment.updated_at'])
+      .leftJoin('product_variant_fulfillment_versions as version', 'version.id', 'fulfillment.current_content_version_id')
+      .select([
+        'variant.id as sku_id', 'fulfillment.method', 'fulfillment.manual_delivery_ready',
+        'fulfillment.code_pool_delivery_ready', 'fulfillment.automatic_delivery_ready',
+        'fulfillment.configuration_revision', 'version.version_number', 'fulfillment.updated_at',
+      ])
       .where('variant.product_id', '=', product.id)
       .orderBy('variant.id')
       .execute()
@@ -1265,8 +1344,14 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
       productId: product.id,
       skuId: variant.sku_id,
       productType: product.product_type,
-      method: variant.method === 'manual' ? 'manual' as const : null,
+      method: variant.method,
       enabled: variant.method === 'manual' && variant.manual_delivery_ready === true && product.product_type === 'digital',
+      codePoolDeliveryReady: variant.method === 'code_pool' && variant.code_pool_delivery_ready === true,
+      automaticDeliveryReady: variant.method === 'fixed_content' || variant.method === 'link'
+        ? variant.automatic_delivery_ready === true
+        : false,
+      configurationRevision: variant.configuration_revision ?? 0,
+      currentVersionNumber: variant.version_number ?? null,
       updatedAt: variant.updated_at?.toISOString() ?? null,
     })), request.id)
   })
@@ -1309,6 +1394,8 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
             method: 'manual',
             manual_delivery_ready: body.enabled,
             code_pool_delivery_ready: false,
+            automatic_delivery_ready: false,
+            current_content_version_id: null,
             updated_at: new Date(),
           }).where('product_variant_id', '=', variant.id).execute()
         } else {
@@ -1320,14 +1407,23 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
           }).execute()
         }
         const saved = await trx.selectFrom('product_variant_fulfillment')
-          .select(['method', 'manual_delivery_ready', 'updated_at'])
-          .where('product_variant_id', '=', variant.id).executeTakeFirstOrThrow()
+          .leftJoin('product_variant_fulfillment_versions as version', 'version.id', 'product_variant_fulfillment.current_content_version_id')
+          .select([
+            'product_variant_fulfillment.method', 'product_variant_fulfillment.manual_delivery_ready',
+            'product_variant_fulfillment.code_pool_delivery_ready', 'product_variant_fulfillment.automatic_delivery_ready',
+            'product_variant_fulfillment.configuration_revision', 'version.version_number', 'product_variant_fulfillment.updated_at',
+          ])
+          .where('product_variant_fulfillment.product_variant_id', '=', variant.id).executeTakeFirstOrThrow()
         return {
           productId: product.id,
           skuId: variant.id,
           productType: product.product_type,
-          method: saved.method === 'manual' ? 'manual' as const : null,
+          method: saved.method,
           enabled: saved.method === 'manual' && saved.manual_delivery_ready && product.product_type === 'digital',
+          codePoolDeliveryReady: saved.method === 'code_pool' && saved.code_pool_delivery_ready,
+          automaticDeliveryReady: (saved.method === 'fixed_content' || saved.method === 'link') && saved.automatic_delivery_ready,
+          configurationRevision: saved.configuration_revision,
+          currentVersionNumber: saved.version_number ?? null,
           updatedAt: saved.updated_at.toISOString(),
         }
       })

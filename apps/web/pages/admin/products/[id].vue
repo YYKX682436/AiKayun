@@ -11,6 +11,10 @@ import type {
   CodePoolImportPreview,
   CodePoolMutationResult,
   CodePoolStatus,
+  FixedDeliveryConfig,
+  FixedDeliveryMethod,
+  FixedDeliveryVersion,
+  FixedDeliveryVersionsPage,
   CreateInventoryAdjustmentBody,
   InventoryAdjustmentPage,
   ManualFulfillmentConfig,
@@ -22,7 +26,9 @@ import type {
   ProductMediaMetadata,
   ProductRichContent,
   PurchaseLimitSettings,
+  SaveFixedDeliveryVersionBody,
   SkuPurchaseLimitSettings,
+  UpdateFixedDeliveryReadinessBody,
   ProductVariantMatrixBody,
   ProductVariantMatrixPreview,
   ProductVariantMatrixSaveResult,
@@ -93,6 +99,26 @@ const bulkSalePrice = ref('')
 const inventorySummary = shallowRef<AdminProductInventorySummary | null>(null)
 const manualFulfillment = ref<ManualFulfillmentConfigPage>([])
 const manualFulfillmentLoading = ref(false)
+const fixedDeliverySkuId = ref('')
+const fixedDeliveryConfig = shallowRef<FixedDeliveryConfig | null>(null)
+const fixedDeliveryVersions = shallowRef<FixedDeliveryVersionsPage | null>(null)
+const fixedDeliveryHistoryDetail = shallowRef<FixedDeliveryVersion | null>(null)
+const fixedDeliveryDraftMethod = ref<FixedDeliveryMethod>('fixed_content')
+const fixedDeliveryContentDraft = ref('')
+const fixedDeliveryTitleDraft = ref('')
+const fixedDeliveryInstructionsDraft = ref('')
+const fixedDeliveryPreview = ref(false)
+const fixedDeliveryPreviewHref = computed(() => {
+  try {
+    const value = new URL(fixedDeliveryContentDraft.value)
+    return value.protocol === 'https:' && !value.username && !value.password ? value.href : ''
+  } catch {
+    return ''
+  }
+})
+const fixedDeliveryLoading = ref(false)
+const fixedDeliveryError = ref('')
+const fixedDeliveryMessage = ref('')
 const codePoolSkuId = ref('')
 const codePoolStatus = shallowRef<CodePoolStatus | null>(null)
 const codePoolBatches = shallowRef<CodePoolBatchPage | null>(null)
@@ -258,6 +284,16 @@ const codePoolSkuOptions = computed(() => (inventorySummary.value?.variants ?? [
   label: `${row.skuCode} · ${row.inventory.mode === 'quantity' ? `数量库存 ${row.inventory.stocked}` : '需要 quantity 库存'}`,
   value: row.skuId,
 })))
+const fulfillmentMethodOptions = [
+  { label: '人工交付', value: 'manual' },
+  { label: '卡密池', value: 'code_pool' },
+  { label: '固定文本', value: 'fixed_content' },
+  { label: '固定链接', value: 'link' },
+]
+const fixedDeliverySkuOptions = computed(() => (inventorySummary.value?.variants ?? []).map(row => ({
+  label: `${row.skuCode}${row.retiredAt ? ' · 已退役' : ''}`,
+  value: row.skuId,
+})))
 const codePoolInventoryRow = computed(() => inventoryForSku(codePoolSkuId.value))
 const canConfigureCodePool = computed(() => product.value?.productType === 'digital'
   && Boolean(codePoolInventoryRow.value?.enabled && !codePoolInventoryRow.value.retiredAt
@@ -406,6 +442,177 @@ async function loadManualFulfillment() {
 
 function manualFulfillmentForSku(skuId: string): ManualFulfillmentConfig | undefined {
   return manualFulfillment.value.find(row => row.skuId === skuId)
+}
+
+function fixedDeliveryPath(skuId = fixedDeliverySkuId.value): string {
+  return `/api/v1/admin/products/${productId.value}/variants/${skuId}/fixed-delivery`
+}
+
+async function loadFixedDeliveryConfig() {
+  const skuId = fixedDeliverySkuId.value
+  if (!skuId || product.value?.productType !== 'digital') return
+  fixedDeliveryLoading.value = true
+  fixedDeliveryError.value = ''
+  try {
+    const [config, versions] = await Promise.all([
+      request<FixedDeliveryConfig>(fixedDeliveryPath(skuId)),
+      request<FixedDeliveryVersionsPage>(`${fixedDeliveryPath(skuId)}/versions?page=1&pageSize=20`),
+    ])
+    if (skuId !== fixedDeliverySkuId.value) return
+    fixedDeliveryConfig.value = config
+    fixedDeliveryVersions.value = versions
+    if (config.currentVersion) {
+      fixedDeliveryDraftMethod.value = config.currentVersion.method
+      if (config.currentVersion.method === 'fixed_content') {
+        fixedDeliveryContentDraft.value = config.currentVersion.content
+        fixedDeliveryTitleDraft.value = ''
+        fixedDeliveryInstructionsDraft.value = ''
+      } else {
+        fixedDeliveryContentDraft.value = config.currentVersion.content
+        fixedDeliveryTitleDraft.value = config.currentVersion.title ?? ''
+        fixedDeliveryInstructionsDraft.value = config.currentVersion.accessInstructions ?? ''
+      }
+    } else if (config.method === 'link' || config.method === 'fixed_content') {
+      fixedDeliveryDraftMethod.value = config.method
+    }
+  } catch (error) {
+    fixedDeliveryError.value = error instanceof Error ? error.message : '固定交付配置暂时无法读取。'
+  } finally {
+    fixedDeliveryLoading.value = false
+  }
+}
+
+watch(inventorySummary, (summary) => {
+  if (product.value?.productType !== 'digital' || !summary?.variants.length) return
+  if (!summary.variants.some(row => row.skuId === fixedDeliverySkuId.value)) {
+    fixedDeliverySkuId.value = summary.variants[0]!.skuId
+  }
+}, { immediate: true })
+watch(fixedDeliverySkuId, () => {
+  fixedDeliveryConfig.value = null
+  fixedDeliveryVersions.value = null
+  fixedDeliveryHistoryDetail.value = null
+  fixedDeliveryMessage.value = ''
+  if (fixedDeliverySkuId.value && product.value?.productType === 'digital') void loadFixedDeliveryConfig()
+})
+
+async function selectFulfillmentMethod(skuId: string, method: string) {
+  const current = manualFulfillmentForSku(skuId)
+  if (saving.value || method === '') return
+  if (current?.method === method) return
+  const variant = product.value?.variants.find(row => row.id === skuId)
+  if (method === 'manual') {
+    await setManualFulfillment(skuId, false)
+    return
+  }
+  if (method === 'fixed_content' || method === 'link') {
+    fixedDeliverySkuId.value = skuId
+    fixedDeliveryDraftMethod.value = method
+    fixedDeliveryError.value = ''
+    fixedDeliveryMessage.value = '先保存一个新版本，再单独启用自动交付。保存不会自动上架。'
+    await nextTick()
+    document.getElementById('fixed-delivery-title')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    return
+  }
+  const inventory = inventoryForSku(skuId)
+  if (!variant || !inventory || inventory.inventory.mode !== 'quantity') {
+    sectionErrors.inventory = '卡密池只支持 quantity 数量库存，请先检查 SKU 的库存模式。'
+    return
+  }
+  if (!window.confirm(`将 SKU ${variant.skuCode} 切换为卡密池。切换后请在卡密池中补足库存并单独启用销售；已有固定交付订单仍按其绑定版本履约。继续吗？`)) return
+  saving.value = `fulfillment-method-${skuId}`
+  sectionErrors.inventory = ''
+  try {
+    await request<CodePoolStatus>(`/api/v1/admin/products/${productId.value}/variants/${skuId}/code-pool/readiness`, {
+      method: 'PUT',
+      body: { enabled: false, expectedSkuRevision: inventory.skuRevision, expectedInventoryRevision: inventory.inventoryRevision },
+    })
+    await Promise.all([loadManualFulfillment(), loadInventory()])
+    codePoolSkuId.value = skuId
+    sectionSuccess.inventory = `SKU ${variant.skuCode} 已切换为卡密池；新订单销售资格保持关闭，已有固定交付订单不受影响。`
+  } catch (error) {
+    await handleSectionError('inventory', error)
+    await loadManualFulfillment().catch(() => undefined)
+  } finally {
+    saving.value = ''
+  }
+}
+
+async function saveFixedDeliveryVersion() {
+  const config = fixedDeliveryConfig.value
+  const skuId = fixedDeliverySkuId.value
+  if (!config || !skuId || fixedDeliveryLoading.value) return
+  fixedDeliveryLoading.value = true
+  fixedDeliveryError.value = ''
+  fixedDeliveryMessage.value = ''
+  try {
+    const body: SaveFixedDeliveryVersionBody = fixedDeliveryDraftMethod.value === 'fixed_content'
+      ? { expectedRevision: config.configurationRevision, method: 'fixed_content', content: fixedDeliveryContentDraft.value }
+      : {
+          expectedRevision: config.configurationRevision,
+          method: 'link',
+          url: fixedDeliveryContentDraft.value,
+          title: fixedDeliveryTitleDraft.value,
+          accessInstructions: fixedDeliveryInstructionsDraft.value,
+        }
+    const saved = await request<FixedDeliveryConfig>(`${fixedDeliveryPath(skuId)}/versions`, { method: 'POST', body })
+    fixedDeliveryConfig.value = saved
+    fixedDeliveryMessage.value = `版本 ${saved.currentVersion?.versionNumber ?? ''} 已保存，自动交付仍处于暂停状态。`
+    await Promise.all([loadFixedDeliveryConfig(), loadManualFulfillment()])
+  } catch (error) {
+    fixedDeliveryError.value = error instanceof AdminApiError && error.code === 'FULFILLMENT_REVISION_CONFLICT'
+      ? '此 SKU 的履约配置已被其他管理员修改。你的输入仍保留；请刷新当前版本和历史后再决定是否重新保存。'
+      : error instanceof Error ? error.message : '固定交付版本保存失败。'
+  } finally {
+    fixedDeliveryLoading.value = false
+  }
+}
+
+async function setFixedDeliveryReadiness(enabled: boolean) {
+  const config = fixedDeliveryConfig.value
+  if (!config || !fixedDeliverySkuId.value || fixedDeliveryLoading.value) return
+  if (enabled && !window.confirm('确认启用此 SKU 的固定内容自动交付销售？已保存版本将用于新订单，历史订单仍使用各自绑定的版本。')) return
+  fixedDeliveryLoading.value = true
+  fixedDeliveryError.value = ''
+  fixedDeliveryMessage.value = ''
+  try {
+    fixedDeliveryConfig.value = await request<FixedDeliveryConfig>(`${fixedDeliveryPath()}/readiness`, {
+      method: 'PUT',
+      body: { expectedRevision: config.configurationRevision, enabled } satisfies UpdateFixedDeliveryReadinessBody,
+    })
+    fixedDeliveryMessage.value = enabled
+      ? '自动交付已启用；顾客新订单会绑定当前版本。'
+      : '自动交付已暂停；已创建订单仍按其绑定版本履约。'
+    await Promise.all([loadManualFulfillment(), loadInventory()])
+  } catch (error) {
+    fixedDeliveryError.value = error instanceof AdminApiError && error.code === 'FULFILLMENT_REVISION_CONFLICT'
+      ? '履约配置已被其他管理员修改。请刷新后确认当前版本和销售状态。'
+      : error instanceof Error ? error.message : '自动交付状态更新失败。'
+  } finally {
+    fixedDeliveryLoading.value = false
+  }
+}
+
+async function loadFixedDeliveryHistory(versionId: string) {
+  if (!fixedDeliverySkuId.value) return
+  fixedDeliveryError.value = ''
+  try {
+    fixedDeliveryHistoryDetail.value = await request<FixedDeliveryVersion>(`${fixedDeliveryPath()}/versions/${versionId}`)
+  } catch (error) {
+    fixedDeliveryError.value = error instanceof Error ? error.message : '历史版本暂时无法读取。'
+  }
+}
+
+function fulfillmentMethodLabel(method: ManualFulfillmentConfig['method']): string {
+  if (method === 'manual') return '人工交付'
+  if (method === 'code_pool') return '卡密池'
+  if (method === 'fixed_content') return '固定文本'
+  if (method === 'link') return '固定链接'
+  return '未配置'
+}
+
+function scrollToSection(id: string) {
+  if (import.meta.client) document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 async function loadCodePoolEntries() {
@@ -3082,10 +3289,10 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                         id="manual-delivery-title"
                         class="font-semibold text-highlighted"
                       >
-                        人工数字交付资格
+                        SKU 数字履约方式
                       </h3>
                       <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
-                        默认关闭。只有商家确认此数字商品有可实际提供的内容，并且后台人员能在订单详情页录入交付内容后，才为对应 SKU 开启。开启后顾客即可下单；未配置的 SKU 仍不可购买。
+                        每个 SKU 仅使用一种履约方式。配置保存与销售启用是两个明确步骤；切换方式不会改写已经创建订单绑定的履约方式或内容版本。
                       </p>
                     </div>
                     <UBadge
@@ -3127,23 +3334,54 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                           {{ manualFulfillmentReadinessText(row) }}
                         </p>
                       </div>
-                      <div class="flex flex-wrap items-center gap-2 sm:justify-end">
+                      <div class="grid w-full min-w-0 gap-2 sm:max-w-xl sm:grid-cols-[minmax(0,1fr)_auto_auto] sm:items-center">
+                        <USelect
+                          :model-value="manualFulfillmentForSku(row.skuId)?.method ?? '__unconfigured__'"
+                          :items="[{ label: '未配置', value: '__unconfigured__' }, ...fulfillmentMethodOptions]"
+                          class="w-full"
+                          :disabled="Boolean(saving) || manualFulfillmentLoading || isArchived || product?.productType !== 'digital'"
+                          :aria-label="`${row.skuCode} 履约方式`"
+                          @update:model-value="value => selectFulfillmentMethod(row.skuId, String(value) === '__unconfigured__' ? '' : String(value))"
+                        />
                         <UBadge
-                          :color="manualFulfillmentForSku(row.skuId)?.enabled ? 'success' : 'neutral'"
+                          :color="manualFulfillmentForSku(row.skuId)?.enabled || manualFulfillmentForSku(row.skuId)?.codePoolDeliveryReady || manualFulfillmentForSku(row.skuId)?.automaticDeliveryReady ? 'success' : 'neutral'"
                           variant="soft"
                         >
-                          {{ manualFulfillmentForSku(row.skuId)?.enabled ? '人工交付已就绪' : '未开启' }}
+                          {{ manualFulfillmentForSku(row.skuId)?.method ? fulfillmentMethodLabel(manualFulfillmentForSku(row.skuId)?.method ?? null) : '未配置' }}
+                          ·
+                          {{ manualFulfillmentForSku(row.skuId)?.enabled || manualFulfillmentForSku(row.skuId)?.codePoolDeliveryReady || manualFulfillmentForSku(row.skuId)?.automaticDeliveryReady ? '销售已启用' : '销售已暂停' }}
                         </UBadge>
                         <UButton
+                          v-if="manualFulfillmentForSku(row.skuId)?.method === 'manual'"
                           size="sm"
                           :color="manualFulfillmentForSku(row.skuId)?.enabled ? 'neutral' : 'primary'"
                           :variant="manualFulfillmentForSku(row.skuId)?.enabled ? 'outline' : 'solid'"
-                          :disabled="Boolean(saving) || manualFulfillmentLoading || (product?.productType !== 'digital') || (!manualFulfillmentForSku(row.skuId)?.enabled && !canEnableManualFulfillment(row.skuId))"
+                          :disabled="Boolean(saving) || manualFulfillmentLoading || (product?.productType !== 'digital') || (!manualFulfillmentForSku(row.skuId)?.enabled && !canEnableManualFulfillment(row.skuId)) || isArchived"
                           :loading="saving === `manual-fulfillment-${row.skuId}`"
                           :aria-pressed="manualFulfillmentForSku(row.skuId)?.enabled ?? false"
                           @click="setManualFulfillment(row.skuId, !manualFulfillmentForSku(row.skuId)?.enabled)"
                         >
                           {{ manualFulfillmentForSku(row.skuId)?.enabled ? '关闭资格' : '明确开启' }}
+                        </UButton>
+                        <UButton
+                          v-else-if="manualFulfillmentForSku(row.skuId)?.method === 'fixed_content' || manualFulfillmentForSku(row.skuId)?.method === 'link'"
+                          size="sm"
+                          color="neutral"
+                          variant="outline"
+                          icon="i-lucide-pencil"
+                          @click="fixedDeliverySkuId = row.skuId; scrollToSection('fixed-delivery-title')"
+                        >
+                          编辑版本
+                        </UButton>
+                        <UButton
+                          v-else-if="manualFulfillmentForSku(row.skuId)?.method === 'code_pool'"
+                          size="sm"
+                          color="neutral"
+                          variant="outline"
+                          icon="i-lucide-key-round"
+                          @click="codePoolSkuId = row.skuId; scrollToSection('code-pool-title')"
+                        >
+                          管理卡密池
                         </UButton>
                       </div>
                     </li>
@@ -3154,6 +3392,286 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                   >
                     请使用上方库存分页逐页配置 SKU。资格切换会立即保存。
                   </p>
+                </section>
+
+                <section
+                  v-if="product?.productType === 'digital' && inventorySummary"
+                  class="mt-6 rounded-xl border border-primary/25 bg-primary/5 p-4 sm:p-5"
+                  aria-labelledby="fixed-delivery-title"
+                >
+                  <div class="flex flex-wrap items-start justify-between gap-3">
+                    <div class="min-w-0">
+                      <h3
+                        id="fixed-delivery-title"
+                        class="font-semibold text-highlighted"
+                      >
+                        固定文本与固定链接
+                      </h3>
+                      <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
+                        保存会创建不可覆盖的新版本，并自动保持暂停。启用销售是单独操作；历史订单继续读取各自绑定版本。私有内容加密保存，不会进入公开商品信息。
+                      </p>
+                    </div>
+                    <UBadge
+                      :color="fixedDeliveryConfig?.automaticDeliveryReady ? 'success' : 'neutral'"
+                      variant="soft"
+                    >
+                      {{ fixedDeliveryConfig?.automaticDeliveryReady ? '自动交付已启用' : '已保存配置与销售资格分开' }}
+                    </UBadge>
+                  </div>
+
+                  <div class="mt-4 grid min-w-0 gap-4 lg:grid-cols-2">
+                    <div class="min-w-0 space-y-3">
+                      <UFormField label="SKU">
+                        <USelect
+                          v-model="fixedDeliverySkuId"
+                          :items="fixedDeliverySkuOptions"
+                          class="w-full"
+                          :disabled="fixedDeliveryLoading"
+                        />
+                      </UFormField>
+                      <UFormField label="履约内容类型">
+                        <USelect
+                          v-model="fixedDeliveryDraftMethod"
+                          :items="[{ label: '固定文本（支持 Markdown）', value: 'fixed_content' }, { label: '固定 HTTPS 链接', value: 'link' }]"
+                          class="w-full"
+                          :disabled="fixedDeliveryLoading"
+                        />
+                      </UFormField>
+                      <template v-if="fixedDeliveryDraftMethod === 'fixed_content'">
+                        <UFormField
+                          label="固定文本（Markdown）"
+                          hint="最多 20,000 个字符；HTML 会按纯文本处理，图片不会从远程加载。"
+                        >
+                          <UTextarea
+                            v-model="fixedDeliveryContentDraft"
+                            :rows="10"
+                            class="w-full font-mono"
+                            :disabled="fixedDeliveryLoading"
+                            placeholder="输入说明、兑换信息或授权教程…"
+                          />
+                        </UFormField>
+                      </template>
+                      <template v-else>
+                        <UFormField
+                          label="HTTPS 链接"
+                          hint="仅保存并展示链接，不会由服务器抓取或下载内容。"
+                        >
+                          <UInput
+                            v-model="fixedDeliveryContentDraft"
+                            type="url"
+                            class="w-full"
+                            :disabled="fixedDeliveryLoading"
+                            placeholder="https://example.com/…"
+                          />
+                        </UFormField>
+                        <UFormField label="链接标题">
+                          <UInput
+                            v-model="fixedDeliveryTitleDraft"
+                            class="w-full"
+                            :disabled="fixedDeliveryLoading"
+                            placeholder="打开授权页面"
+                          />
+                        </UFormField>
+                        <UFormField
+                          label="提取码或访问说明"
+                          hint="可留空；最多 4,000 个字符。"
+                        >
+                          <UTextarea
+                            v-model="fixedDeliveryInstructionsDraft"
+                            :rows="3"
+                            class="w-full"
+                            :disabled="fixedDeliveryLoading"
+                            placeholder="例如：提取码为订单号后六位。"
+                          />
+                        </UFormField>
+                      </template>
+                      <div class="flex flex-wrap gap-2">
+                        <UButton
+                          :loading="fixedDeliveryLoading"
+                          :disabled="isArchived || !fixedDeliveryConfig || !fixedDeliveryContentDraft.trim()"
+                          icon="i-lucide-save"
+                          @click="saveFixedDeliveryVersion"
+                        >
+                          保存为新版本
+                        </UButton>
+                        <UButton
+                          v-if="fixedDeliveryConfig?.method === 'fixed_content' || fixedDeliveryConfig?.method === 'link'"
+                          color="neutral"
+                          variant="outline"
+                          :loading="fixedDeliveryLoading"
+                          :disabled="isArchived || !fixedDeliveryConfig.currentVersion"
+                          @click="setFixedDeliveryReadiness(!fixedDeliveryConfig.automaticDeliveryReady)"
+                        >
+                          {{ fixedDeliveryConfig.automaticDeliveryReady ? '暂停新销售' : '明确启用自动交付' }}
+                        </UButton>
+                        <UButton
+                          color="neutral"
+                          variant="ghost"
+                          :disabled="fixedDeliveryLoading"
+                          @click="fixedDeliveryPreview = !fixedDeliveryPreview"
+                        >
+                          {{ fixedDeliveryPreview ? '隐藏预览' : '预览展示' }}
+                        </UButton>
+                      </div>
+                      <UAlert
+                        v-if="fixedDeliveryError"
+                        color="error"
+                        variant="soft"
+                        icon="i-lucide-circle-alert"
+                        :title="fixedDeliveryError"
+                        role="alert"
+                      />
+                      <UAlert
+                        v-if="fixedDeliveryMessage"
+                        color="success"
+                        variant="soft"
+                        icon="i-lucide-circle-check"
+                        :title="fixedDeliveryMessage"
+                        role="status"
+                      />
+                    </div>
+
+                    <div class="min-w-0 space-y-4">
+                      <div class="rounded-lg border border-default bg-elevated p-3">
+                        <h4 class="font-medium text-highlighted">
+                          当前已保存版本
+                        </h4>
+                        <p
+                          v-if="fixedDeliveryLoading"
+                          class="mt-2 text-sm text-muted"
+                          aria-busy="true"
+                        >
+                          正在读取私有配置…
+                        </p>
+                        <template v-else-if="fixedDeliveryConfig?.currentVersion">
+                          <p class="mt-1 text-sm text-muted">
+                            {{ fixedDeliveryConfig.currentVersion.method === 'fixed_content' ? '固定文本' : '固定链接' }} · v{{ fixedDeliveryConfig.currentVersion.versionNumber }} · 修订 {{ fixedDeliveryConfig.configurationRevision }}
+                          </p>
+                          <p
+                            v-if="fixedDeliveryConfig.currentVersion.method === 'link'"
+                            class="mt-2 break-all text-sm text-primary"
+                          >
+                            {{ fixedDeliveryConfig.currentVersion.title }} · {{ fixedDeliveryConfig.currentVersion.content }}
+                          </p>
+                          <p
+                            v-else
+                            class="mt-2 line-clamp-4 whitespace-pre-wrap break-words text-sm text-muted"
+                          >
+                            {{ fixedDeliveryConfig.currentVersion.content }}
+                          </p>
+                        </template>
+                        <p
+                          v-else
+                          class="mt-2 text-sm text-muted"
+                        >
+                          当前 SKU 尚无固定交付版本。输入内容后保存会创建第一个版本，且不会自动启用销售。
+                        </p>
+                      </div>
+
+                      <div
+                        v-if="fixedDeliveryPreview"
+                        class="rounded-lg border border-default bg-elevated p-3"
+                      >
+                        <h4 class="mb-2 font-medium text-highlighted">
+                          顾客展示预览
+                        </h4>
+                        <SafeMarkdown
+                          v-if="fixedDeliveryDraftMethod === 'fixed_content'"
+                          :content="fixedDeliveryContentDraft"
+                        />
+                        <div
+                          v-else
+                          class="space-y-2 break-words text-sm"
+                        >
+                          <a
+                            v-if="fixedDeliveryPreviewHref"
+                            :href="fixedDeliveryPreviewHref"
+                            target="_blank"
+                            rel="noopener noreferrer nofollow"
+                            class="text-primary underline"
+                          >{{ fixedDeliveryTitleDraft || fixedDeliveryContentDraft }}</a>
+                          <p
+                            v-else
+                            class="break-all text-muted"
+                          >
+                            {{ fixedDeliveryTitleDraft || '链接' }} · {{ fixedDeliveryContentDraft }}（请输入有效 HTTPS 地址后可点击预览）
+                          </p>
+                          <p class="whitespace-pre-wrap text-muted">
+                            {{ fixedDeliveryInstructionsDraft }}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div class="rounded-lg border border-default bg-elevated p-3">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                          <h4 class="font-medium text-highlighted">
+                            历史内容版本
+                          </h4>
+                          <span class="text-xs text-muted">{{ fixedDeliveryVersions?.total ?? 0 }} 个版本</span>
+                        </div>
+                        <ul
+                          v-if="fixedDeliveryVersions?.items.length"
+                          class="mt-2 divide-y divide-default"
+                        >
+                          <li
+                            v-for="version in fixedDeliveryVersions.items"
+                            :key="version.id"
+                            class="flex flex-wrap items-center justify-between gap-2 py-2 text-sm"
+                          >
+                            <span class="text-muted">v{{ version.versionNumber }} · {{ version.method === 'fixed_content' ? '固定文本' : '固定链接' }} · {{ formatDate(version.createdAt) }}</span>
+                            <UButton
+                              size="xs"
+                              color="neutral"
+                              variant="outline"
+                              @click="loadFixedDeliveryHistory(version.id)"
+                            >
+                              查看
+                            </UButton>
+                          </li>
+                        </ul>
+                        <p
+                          v-else
+                          class="mt-2 text-sm text-muted"
+                        >
+                          暂无历史版本。
+                        </p>
+                        <div
+                          v-if="fixedDeliveryHistoryDetail"
+                          class="mt-3 border-t border-default pt-3"
+                        >
+                          <p class="text-sm font-medium text-highlighted">
+                            历史版本 v{{ fixedDeliveryHistoryDetail.versionNumber }} · {{ fixedDeliveryHistoryDetail.method === 'fixed_content' ? '固定文本' : '固定链接' }}
+                          </p>
+                          <SafeMarkdown
+                            v-if="fixedDeliveryHistoryDetail.method === 'fixed_content'"
+                            class="mt-2"
+                            :content="fixedDeliveryHistoryDetail.content"
+                          />
+                          <div
+                            v-else
+                            class="mt-2 break-all text-sm"
+                          >
+                            <a
+                              v-if="fixedDeliveryHistoryDetail.content.startsWith('https://')"
+                              :href="fixedDeliveryHistoryDetail.content"
+                              target="_blank"
+                              rel="noopener noreferrer nofollow"
+                              class="text-primary underline"
+                            >{{ fixedDeliveryHistoryDetail.title }}</a>
+                            <p
+                              v-else
+                              class="break-all text-muted"
+                            >
+                              {{ fixedDeliveryHistoryDetail.title }} · {{ fixedDeliveryHistoryDetail.content }}
+                            </p>
+                            <p class="mt-2 whitespace-pre-wrap text-muted">
+                              {{ fixedDeliveryHistoryDetail.accessInstructions }}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 </section>
 
                 <section
@@ -3609,7 +4127,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                         库存调整
                       </h3>
                       <p class="mt-1 text-sm text-muted">
-                        SKU {{ product.variants.find(variant => variant.id === historySkuId)?.skuCode }} · 当前服务端库存为准
+                        SKU {{ product?.variants.find(variant => variant.id === historySkuId)?.skuCode }} · 当前服务端库存为准
                       </p>
                     </div>
                     <UButton
@@ -3879,7 +4397,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 />
                 <div class="mt-4 flex flex-wrap gap-2">
                   <UButton
-                    v-if="product.status === 'draft'"
+                    v-if="product?.status === 'draft'"
                     :loading="saving === 'lifecycle'"
                     :disabled="saving !== ''"
                     @click="changeLifecycle('active')"
@@ -3887,7 +4405,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     发布商品
                   </UButton>
                   <UButton
-                    v-if="product.status === 'active'"
+                    v-if="product?.status === 'active'"
                     color="warning"
                     variant="outline"
                     :loading="saving === 'lifecycle'"
@@ -3897,7 +4415,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     暂停销售
                   </UButton>
                   <UButton
-                    v-if="product.status === 'paused'"
+                    v-if="product?.status === 'paused'"
                     :loading="saving === 'lifecycle'"
                     :disabled="saving !== ''"
                     @click="changeLifecycle('active')"
@@ -3905,7 +4423,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     重新上架
                   </UButton>
                   <UButton
-                    v-if="product.status !== 'archived'"
+                    v-if="product && product.status !== 'archived'"
                     color="neutral"
                     variant="outline"
                     :loading="saving === 'lifecycle'"
@@ -3915,7 +4433,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     归档
                   </UButton>
                   <UButton
-                    v-if="product.status === 'archived'"
+                    v-if="product?.status === 'archived'"
                     :loading="saving === 'lifecycle'"
                     :disabled="saving !== ''"
                     @click="changeLifecycle('draft')"
@@ -3989,9 +4507,9 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     更新时间
                   </p>
                   <time
-                    :datetime="product.updatedAt"
+                    :datetime="product?.updatedAt ?? ''"
                     class="mt-1 block text-sm text-highlighted"
-                  >{{ formatDate(product.updatedAt) }}</time>
+                  >{{ product ? formatDate(product.updatedAt) : '' }}</time>
                 </div>
                 <UButton
                   class="mt-4 w-full"

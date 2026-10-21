@@ -22,6 +22,7 @@ import { refundsMigration } from './migrations/202610200005_refunds.js'
 import { withdrawalsMigration } from './migrations/202610210001_withdrawals.js'
 import { codePoolMigration } from './migrations/202610210002_code_pool.js'
 import { codePoolOperationKeyMigration } from './migrations/202610210003_code_pool_operation_key.js'
+import { fixedDeliveryMigration } from './migrations/202610210004_fixed_delivery.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -49,6 +50,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610210001_withdrawals': withdrawalsMigration,
       '202610210002_code_pool': codePoolMigration,
       '202610210003_code_pool_operation_key': codePoolOperationKeyMigration,
+      '202610210004_fixed_delivery': fixedDeliveryMigration,
     }
   }
 }

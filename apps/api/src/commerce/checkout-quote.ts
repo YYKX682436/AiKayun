@@ -44,6 +44,9 @@ type QuoteSkuRow = {
   fulfillment_method: string | null
   manual_delivery_ready: boolean
   code_pool_delivery_ready: boolean
+  automatic_delivery_ready: boolean
+  fulfillment_revision: number | null
+  fulfillment_version_id: string | null
   code_pool_inventory_consistent: boolean
   combination_valid: boolean | null
   options: CheckoutQuoteItem['options']
@@ -105,7 +108,9 @@ function reasonForSku(row: QuoteSkuRow): CheckoutQuoteReason | null {
     || (row.fulfillment_method === 'manual' && !row.manual_delivery_ready)
     || (row.fulfillment_method === 'code_pool'
       && (row.inventory_mode !== 'quantity' || !row.code_pool_delivery_ready))
-    || (row.fulfillment_method !== 'manual' && row.fulfillment_method !== 'code_pool')) {
+    || ((row.fulfillment_method === 'fixed_content' || row.fulfillment_method === 'link')
+      && (!row.automatic_delivery_ready || !row.fulfillment_version_id))
+    || !['manual', 'code_pool', 'fixed_content', 'link'].includes(row.fulfillment_method ?? '')) {
     return 'fulfillment_not_ready'
   }
   return null
@@ -213,6 +218,9 @@ export async function quoteCheckoutItems(
       fulfillment.method AS fulfillment_method,
       COALESCE(fulfillment.manual_delivery_ready, false) AS manual_delivery_ready,
       COALESCE(fulfillment.code_pool_delivery_ready, false) AS code_pool_delivery_ready,
+      COALESCE(fulfillment.automatic_delivery_ready, false) AS automatic_delivery_ready,
+      fulfillment.configuration_revision AS fulfillment_revision,
+      fulfillment.current_content_version_id AS fulfillment_version_id,
       CASE WHEN fulfillment.method = 'code_pool'
         THEN assert_code_pool_inventory_consistency(variant.id)
         ELSE true
@@ -313,6 +321,8 @@ export async function quoteCheckoutItems(
       lineTotal,
       inventoryMode: row.inventory_mode,
       fulfillmentMethod: row.fulfillment_method,
+      fulfillmentRevision: row.fulfillment_revision,
+      fulfillmentVersionId: row.fulfillment_version_id,
       availableQuantity: row.available_quantity,
       identityValid: row.product_id !== null && row.product_status !== null,
       purchaseLimits: {

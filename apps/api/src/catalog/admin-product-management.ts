@@ -677,7 +677,10 @@ async function copyProduct(
         sale_price: sourceVariant.sale_price,
         compare_at_price: sourceVariant.compare_at_price,
         cost_price: sourceVariant.cost_price,
-        enabled: copiedVariants.length === 0 ? false : sourceVariant.enabled,
+        // A copy stays a draft and starts with every SKU explicitly disabled.
+        // Inventory, fulfillment readiness, and private delivery versions are
+        // intentionally not copied from the source product.
+        enabled: false,
         retired_at: null,
         inventory_mode: null,
         inventory_revision: 0,

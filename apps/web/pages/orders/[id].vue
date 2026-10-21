@@ -40,8 +40,8 @@ const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id
 const hasActiveAttempt = computed(() => Boolean(payment.value?.attempt
   && ['created', 'pending', 'reconciliation_required'].includes(payment.value.attempt.status)))
 const canCancel = computed(() => order.value?.status === 'pending_payment' && !hasActiveAttempt.value)
-const codePoolDeliveryPending = computed(() => order.value?.items.some(item =>
-  item.fulfillmentMethod === 'code_pool' && item.fulfilledQuantity < item.quantity) ?? false)
+const automaticDeliveryPending = computed(() => order.value?.items.some(item =>
+  ['code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity) ?? false)
 const selectedChannel = computed(() => payment.value?.channels.find(channel => channel.id === selectedChannelId.value) ?? null)
 const qrAction = computed(() => payment.value?.attempt?.action?.type === 'qr_code'
   ? payment.value.attempt.action.value
@@ -156,8 +156,8 @@ function selectPaymentMode(mode: 'external' | 'wallet' | 'hybrid') {
 function statusLabel(value: OrderDetail): string {
   if (value.status === 'pending_payment') return '等待付款'
   if (value.status === 'processing' && value.items.some(item =>
-    item.fulfillmentMethod === 'code_pool' && item.fulfilledQuantity < item.quantity)) {
-    return value.paymentStatus === 'not_required' ? '卡密自动发放中' : '付款成功 · 卡密自动发放中'
+    ['code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity)) {
+    return value.paymentStatus === 'not_required' ? '自动交付处理中' : '付款成功 · 自动交付处理中'
   }
   if (value.status === 'processing') return value.paymentStatus === 'not_required' ? '等待发货' : '付款成功 · 等待发货'
   if (value.status === 'completed') return '已完成'
@@ -193,18 +193,34 @@ async function copyDelivery(deliveryId: string, content: string) {
   try {
     await navigator.clipboard.writeText(content)
     copiedDeliveryId.value = deliveryId
-    deliveryCopyMessage.value = '卡密已复制到剪贴板。'
+    deliveryCopyMessage.value = '交付内容已复制到剪贴板。'
     window.setTimeout(() => {
       if (copiedDeliveryId.value === deliveryId) copiedDeliveryId.value = ''
     }, 1800)
   } catch {
-    deliveryCopyMessage.value = '浏览器未允许复制，请手动选择卡密内容。'
+    deliveryCopyMessage.value = '浏览器未允许复制，请手动选择交付内容。'
   }
 }
 
-function hasPendingCodePoolDelivery(): boolean {
+function safeDeliveryHref(value: string): string {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' && !url.username && !url.password ? url.href : ''
+  } catch {
+    return ''
+  }
+}
+
+function hasPendingAutomaticDelivery(): boolean {
   return order.value?.status === 'processing' && order.value.items.some(item =>
-    item.fulfillmentMethod === 'code_pool' && item.fulfilledQuantity < item.quantity)
+    ['code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity)
+}
+
+function fulfillmentFailureHint(code: string | null): string {
+  if (code === 'FIXED_DELIVERY_KEY_UNAVAILABLE' || code === 'CODE_POOL_KEY_UNAVAILABLE') return '系统交付密钥暂不可用，内容已保护，后台正在重试。'
+  if (code === 'FIXED_DELIVERY_DECRYPTION_FAILED' || code === 'CODE_POOL_DECRYPTION_FAILED') return '交付内容完整性校验未通过，系统已阻止错误交付并正在重试。'
+  if (code === 'FIXED_DELIVERY_PAYMENT_UNRESOLVED' || code === 'CODE_POOL_PAYMENT_UNRESOLVED') return '付款或对账仍需核验，确认完成后系统会继续交付。'
+  return '系统暂时未能完成交付，正在安全重试；请稍后刷新订单。'
 }
 
 async function loadOrder() {
@@ -417,7 +433,7 @@ onMounted(() => {
   mounted.value = true
   void loadOrder()
   deliveryPollTimer = window.setInterval(() => {
-    if (mounted.value && !loading.value && hasPendingCodePoolDelivery()) void loadOrder()
+    if (mounted.value && !loading.value && hasPendingAutomaticDelivery()) void loadOrder()
   }, 3000)
 })
 
@@ -577,8 +593,8 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
             color="info"
             variant="subtle"
             icon="i-lucide-package-check"
-            :title="codePoolDeliveryPending ? (order.paymentStatus === 'not_required' ? '零元订单，卡密正在自动发放' : '付款已确认，卡密正在自动发放') : (order.paymentStatus === 'not_required' ? '零元订单，等待商家交付' : '付款已确认，等待商家交付')"
-            :description="codePoolDeliveryPending ? '卡密已预留给此订单，系统正在安全发放，完成后会显示在下方。付款确认前不会展示卡密。' : '订单正在履约。商家完成人工数字交付后，交付内容会安全显示在此订单详情中。'"
+            :title="automaticDeliveryPending ? (order.paymentStatus === 'not_required' ? '零元订单，自动交付处理中' : '付款已确认，自动交付处理中') : (order.paymentStatus === 'not_required' ? '零元订单，等待商家交付' : '付款已确认，等待商家交付')"
+            :description="automaticDeliveryPending ? '系统正在按此订单绑定的履约版本安全交付，完成后会显示在下方。付款确认前不会展示内容。' : '订单正在履约。商家完成人工数字交付后，交付内容会安全显示在此订单详情中。'"
           />
           <UAlert
             v-else-if="order.status === 'completed'"
@@ -586,7 +602,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
             variant="subtle"
             icon="i-lucide-circle-check"
             title="订单已完成"
-            :description="order.items.some(item => item.fulfillmentMethod === 'code_pool') ? '卡密及其他数字交付内容已安全记录在下方订单项。退款不会清除已交付内容。' : '订单中的人工数字交付内容已记录在下方订单项。'"
+            :description="order.items.some(item => ['code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod)) ? '数字交付内容已按订单绑定版本安全记录在下方。退款不会清除已交付历史。' : '订单中的人工数字交付内容已记录在下方订单项。'"
           />
 
           <div
@@ -1225,19 +1241,19 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                   <dt class="text-muted">
                     交付方式
                   </dt><dd class="mt-1 text-highlighted">
-                    {{ item.fulfillmentMethod === 'manual' ? '人工数字交付' : item.fulfillmentMethod === 'code_pool' ? 'SKU 卡密池自动发货' : '尚未开放' }}
+                    {{ item.fulfillmentMethod === 'manual' ? '人工数字交付' : item.fulfillmentMethod === 'code_pool' ? 'SKU 卡密池自动发货' : item.fulfillmentMethod === 'fixed_content' ? '固定文本自动交付' : item.fulfillmentMethod === 'link' ? '固定链接自动交付' : '尚未开放' }}
                   </dd>
                 </div>
               </dl>
 
               <UAlert
-                v-if="item.fulfillmentMethod === 'code_pool' && order.status === 'processing' && item.fulfilledQuantity < item.quantity"
+                v-if="['code_pool', 'fixed_content', 'link'].includes(item.fulfillmentMethod) && order.status === 'processing' && item.fulfilledQuantity < item.quantity"
                 class="mt-4"
                 color="info"
                 variant="soft"
                 icon="i-lucide-loader-circle"
-                :title="item.fulfillmentStatus === 'failed' ? '自动交付正在安全重试' : '卡密正在自动交付'"
-                description="卡密预留给此订单，页面会自动刷新交付状态。付款确认前不会展示卡密。"
+                :title="item.fulfillmentStatus === 'failed' ? '自动交付正在安全重试' : '自动交付处理中'"
+                :description="item.fulfillmentAttempts.some(attempt => attempt.status === 'failed') ? fulfillmentFailureHint(item.fulfillmentAttempts.find(attempt => attempt.status === 'failed')?.failureCode ?? null) : '交付仅使用订单绑定版本，页面会自动刷新进度；付款确认前不会展示内容。'"
                 role="status"
               />
 
@@ -1267,14 +1283,55 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                           variant="outline"
                           size="xs"
                           icon="i-lucide-copy"
-                          :aria-label="`复制第 ${delivery.unitIndex} 件卡密`"
+                          :aria-label="`复制第 ${delivery.unitIndex} 件交付内容`"
                           @click="copyDelivery(delivery.id, delivery.content)"
                         >
-                          {{ copiedDeliveryId === delivery.id ? '已复制' : '复制卡密' }}
+                          {{ copiedDeliveryId === delivery.id ? '已复制' : delivery.contentFormat === 'link' ? '复制链接' : '复制内容' }}
                         </UButton>
                       </div>
                     </div>
-                    <pre class="mt-2 overflow-x-auto whitespace-pre-wrap break-all font-mono text-sm text-highlighted">{{ delivery.content }}</pre>
+                    <p
+                      v-if="delivery.title"
+                      class="mt-3 font-medium text-highlighted"
+                    >
+                      {{ delivery.title }}
+                    </p>
+                    <a
+                      v-if="delivery.contentFormat === 'link' && safeDeliveryHref(delivery.content)"
+                      class="mt-2 inline-block break-all text-primary underline underline-offset-2"
+                      :href="safeDeliveryHref(delivery.content)"
+                      target="_blank"
+                      rel="noopener noreferrer nofollow"
+                    >
+                      打开安全链接
+                    </a>
+                    <p
+                      v-else-if="delivery.contentFormat === 'link'"
+                      class="mt-2 break-all text-sm text-error"
+                    >
+                      链接校验失败，已隐藏点击入口。请联系商家核验。
+                    </p>
+                    <SafeMarkdown
+                      v-else-if="delivery.contentFormat === 'markdown'"
+                      class="mt-2"
+                      :content="delivery.content"
+                    />
+                    <pre
+                      v-else
+                      class="mt-2 overflow-x-auto whitespace-pre-wrap break-all font-mono text-sm text-highlighted"
+                    >{{ delivery.content }}</pre>
+                    <p
+                      v-if="delivery.contentFormat === 'link'"
+                      class="mt-2 break-all font-mono text-sm text-muted"
+                    >
+                      {{ delivery.content }}
+                    </p>
+                    <p
+                      v-if="delivery.accessInstructions"
+                      class="mt-3 whitespace-pre-wrap break-words text-sm text-muted"
+                    >
+                      {{ delivery.accessInstructions }}
+                    </p>
                   </li>
                 </ol>
                 <p

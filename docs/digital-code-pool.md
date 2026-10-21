@@ -1,6 +1,6 @@
 # 数字商品卡密池与自动发卡
 
-⑤-1为每个数字商品 SKU 增加独立、加密、可审计的卡密池。卡密复用现有订单、订单项、`order_inventory_reservations`、`order_inventory_events`、`order_item_fulfillment_attempts` 和 `order_item_fulfillment_deliveries`；没有第二套卡密订单或库存流水，也不修改阶段④冻结迁移。实现由前向迁移 `202610210002_code_pool` 开始。
+⑤-1为每个数字商品 SKU 增加独立、加密、可审计的卡密池。卡密复用现有订单、订单项、`order_inventory_reservations`、`order_inventory_events`、`order_item_fulfillment_attempts` 和 `order_item_fulfillment_deliveries`；没有第二套卡密订单或库存流水，也不修改阶段④冻结迁移。实现由前向迁移 `202610210002_code_pool` 开始。⑤-2将同一 API worker 扩展为通用数字交付调度器，并增加固定文本与固定链接版本；其加密、版本和顾客展示说明见[固定内容与固定链接自动交付](digital-fixed-delivery.md)。
 
 ## 数据和状态
 
@@ -56,7 +56,7 @@ quantity_inventory.reserved = reserved 卡密数
 
 ## 自动发货、重试与恢复
 
-API 启动时立即运行 PostgreSQL worker，之后每秒轮询，每轮最多领取 20 个订单项。worker 使用 `FOR UPDATE SKIP LOCKED` 锁订单，多实例可以并行处理不同订单；同一订单不会被重复交付。对每个订单项，在一个短数据库事务中验证订单/收款、卡密/库存账实、将已有履约尝试置为处理中、写入加密交付记录并将尝试置为成功。原数据库触发器随后将预留库存记为消耗，转移卡密状态，并在全部订单项完成时完成订单。
+API 启动时立即运行 PostgreSQL 数字交付 worker，之后每秒轮询，每轮最多领取 20 个订单项。worker 使用 `FOR UPDATE SKIP LOCKED` 锁订单，多实例可以并行处理不同订单；同一订单不会被重复交付。对每个订单项，在一个短数据库事务中验证订单/收款、卡密/库存账实、将已有履约尝试置为处理中、写入加密交付记录并将尝试置为成功。原数据库触发器随后将预留库存记为消耗，转移卡密状态，并在全部订单项完成时完成订单。该调度器也处理 `fixed_content` 与 `link`；固定文本不减少可重复售卖的内容数量，仍通过现有订单库存事件消费 quantity SKU 的实际库存，且不会为 unlimited SKU 创建库存事件。
 
 服务仅在 PostgreSQL 执行，不依赖 Redis 或消息队列。事务中途进程退出会整体回滚，订单的卡密仍保持原预留事实；数据库已经提交但 API 响应丢失时，订单/交付历史就是幂等结果，后续读取不会重新分配卡密。可恢复的失败会写入原履约尝试并记录原因及 `retry_after`，以 1 秒起始、指数退避、最长 5 分钟的有界重试恢复；数据库异常若导致主事务回滚，会在独立事务中尽量补记失败尝试。尝试状态不会被伪造为成功。
 

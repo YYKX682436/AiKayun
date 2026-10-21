@@ -444,6 +444,29 @@ async function waitForCodePoolOrder(orderId: string, itemId: string, expectedFul
   throw new Error(`Timed out waiting for code-pool order ${orderId} to fulfill ${expectedFulfilled} units`)
 }
 
+async function waitForFixedDeliveryOrder(
+  orderId: string, itemId: string, expectedFulfilled: number, timeoutMs = 5_000,
+) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const [order, item, attempts] = await Promise.all([
+      db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirst(),
+      db.selectFrom('order_items').select(['fulfilled_quantity', 'fulfillment_status'])
+        .where('id', '=', itemId).executeTakeFirst(),
+      db.selectFrom('order_item_fulfillment_attempts').select(['status', 'failure_code'])
+        .where('order_item_id', '=', itemId).where('delivery_source', 'in', ['fixed_content', 'link'])
+        .orderBy('created_at', 'desc').orderBy('id', 'desc').execute(),
+    ])
+    if (item?.fulfilled_quantity === expectedFulfilled && (expectedFulfilled === 0
+      ? attempts.some(attempt => attempt.status === 'failed')
+      : order?.status === 'completed' && item.fulfillment_status === 'completed')) {
+      return { order, item, attempts }
+    }
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error(`Timed out waiting for fixed digital delivery ${orderId} to fulfill ${expectedFulfilled} units`)
+}
+
 async function attachPendingPaymentWithoutExpiry(orderId: string, amount: string): Promise<string> {
   const attemptId = randomUUID()
   await db.transaction().execute(async (trx) => {
@@ -2431,6 +2454,443 @@ describe('per-SKU encrypted code-pool fulfillment on PostgreSQL', () => {
       .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).state).toBe('delivered')
     expect((await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
       .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow())).toEqual({ stocked: 0, reserved: 0 })
+  })
+})
+
+describe('versioned fixed-content and link delivery on PostgreSQL', () => {
+  it('binds immutable versions to orders, invalidates old quotes, consumes quantity stock once, and recovers across workers and key rotation', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '0.00', mode: 'quantity', stock: 5 })
+    const configUrl = `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/fixed-delivery`
+    const initialConfig = await inject({ method: 'GET', url: configUrl, headers: { cookie: admin.cookie } })
+    expect(initialConfig.statusCode).toBe(200)
+    expect(initialConfig.headers['cache-control']).toContain('no-store')
+    const initialHistory = await inject({
+      method: 'GET', url: `${configUrl}/versions?page=1&pageSize=20`, headers: { cookie: admin.cookie },
+    })
+    expect(initialHistory.statusCode).toBe(200)
+    expect(initialHistory.json().data).toMatchObject({ items: [], page: 1, pageSize: 20, totalPages: 0 })
+    const firstText = '**Version one**\n\n<script>PRIVATE-V1-XSS</script>\n[unsafe](javascript:alert(1))'
+    const savedV1 = await inject({
+      method: 'POST', url: `${configUrl}/versions`, headers: adminHeaders(admin),
+      payload: { expectedRevision: initialConfig.json().data.configurationRevision, method: 'fixed_content', content: firstText },
+    })
+    expect(savedV1.statusCode).toBe(200)
+    expect(savedV1.json().data).toMatchObject({ automaticDeliveryReady: false, currentVersion: { versionNumber: 1, content: firstText } })
+    expect(savedV1.headers['cache-control']).toContain('no-store')
+    const versionIdV1 = savedV1.json().data.currentVersion.id as string
+    const storedVersionV1 = await db.selectFrom('product_variant_fulfillment_versions')
+      .select(['encrypted_content', 'content_nonce', 'content_auth_tag', 'encryption_key_id'])
+      .where('id', '=', versionIdV1).executeTakeFirstOrThrow()
+    expect(Buffer.from(storedVersionV1.encrypted_content).includes(Buffer.from('PRIVATE-V1-XSS'))).toBe(false)
+    expect(storedVersionV1.content_nonce).toHaveLength(12)
+    expect(storedVersionV1.content_auth_tag).toHaveLength(16)
+
+    const publicBeforeOrder = await inject({ method: 'GET', url: `/api/v1/public/products/${catalog.productId}` })
+    expect(publicBeforeOrder.statusCode).toBe(200)
+    expect(JSON.stringify(publicBeforeOrder.json())).not.toContain('PRIVATE-V1-XSS')
+    expect(JSON.stringify(publicBeforeOrder.json())).not.toContain('Version one')
+
+    const enabledV1 = await inject({
+      method: 'PUT', url: `${configUrl}/readiness`, headers: adminHeaders(admin),
+      payload: { expectedRevision: savedV1.json().data.configurationRevision, enabled: true },
+    })
+    expect(enabledV1.statusCode).toBe(200)
+    expect(enabledV1.json().data.automaticDeliveryReady).toBe(true)
+
+    const itemsV1 = [{ skuId: catalog.skuId, quantity: 2 }]
+    const quoteV1 = await quote(itemsV1, customer)
+    expect(quoteV1.json().data.canContinue).toBe(true)
+    expect(quoteV1.json().data.items[0]).toMatchObject({ fulfillmentMethod: 'fixed_content', fulfillmentRevision: enabledV1.json().data.configurationRevision, fulfillmentVersionId: versionIdV1 })
+    const createdV1 = await createOrder(itemsV1, quoteV1.json().data.quoteToken, customer)
+    expect(createdV1.statusCode).toBe(201)
+    const orderIdV1 = createdV1.json().data.order.id as string
+    const itemIdV1 = createdV1.json().data.order.items[0].id as string
+    expect(createdV1.json().data.order.status).toBe('processing')
+    expect(createdV1.json().data.order.items[0].deliveries).toEqual([])
+    expect((await db.selectFrom('order_items').select('fulfillment_content_version_id')
+      .where('id', '=', itemIdV1).executeTakeFirstOrThrow()).fulfillment_content_version_id).toBe(versionIdV1)
+    expect((await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderIdV1}`, headers: { cookie: customer.cookie } }))
+      .json().data.items[0].deliveries).toEqual([])
+
+    const staleQuote = await quote([{ skuId: catalog.skuId, quantity: 1 }], customer)
+    const secondText = '## Version two\n\nNew authorization instructions.'
+    const savedV2 = await inject({
+      method: 'POST', url: `${configUrl}/versions`, headers: adminHeaders(admin),
+      payload: { expectedRevision: enabledV1.json().data.configurationRevision, method: 'fixed_content', content: secondText },
+    })
+    expect(savedV2.statusCode).toBe(200)
+    expect(savedV2.json().data).toMatchObject({ automaticDeliveryReady: false, currentVersion: { versionNumber: 2, content: secondText } })
+
+    const sourceProductRevision = await db.selectFrom('products').select('revision')
+      .where('id', '=', catalog.productId).executeTakeFirstOrThrow()
+    const copiedProduct = await inject({
+      method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/copy`, headers: adminHeaders(admin),
+      payload: { expectedRevision: sourceProductRevision.revision },
+    })
+    expect(copiedProduct.statusCode).toBe(201)
+    expect(copiedProduct.json().data.status).toBe('draft')
+    const copiedSkuId = copiedProduct.json().data.variants[0].id as string
+    expect(copiedProduct.json().data.variants[0].enabled).toBe(false)
+    expect(await db.selectFrom('product_variant_fulfillment_versions').select('id')
+      .where('product_variant_id', '=', copiedSkuId).execute()).toEqual([])
+    const copiedConfig = await inject({
+      method: 'GET',
+      url: `/api/v1/admin/products/${copiedProduct.json().data.id}/variants/${copiedSkuId}/fixed-delivery`,
+      headers: { cookie: admin.cookie },
+    })
+    expect(copiedConfig.statusCode).toBe(200)
+    expect(copiedConfig.json().data).toMatchObject({ method: null, automaticDeliveryReady: false, currentVersion: null })
+
+    const oldQuoteOrder = await createOrder([{ skuId: catalog.skuId, quantity: 1 }], staleQuote.json().data.quoteToken, customer)
+    expect(oldQuoteOrder.statusCode).toBe(409)
+    expect(oldQuoteOrder.json().error.code).toBe('CHECKOUT_QUOTE_CHANGED')
+    const enabledV2 = await inject({
+      method: 'PUT', url: `${configUrl}/readiness`, headers: adminHeaders(admin),
+      payload: { expectedRevision: savedV2.json().data.configurationRevision, enabled: true },
+    })
+    expect(enabledV2.statusCode).toBe(200)
+    const quoteV2 = await quote([{ skuId: catalog.skuId, quantity: 1 }], customer)
+    expect(quoteV2.json().data.canContinue).toBe(true)
+    expect(quoteV2.json().data.items[0].fulfillmentVersionId).toBe(savedV2.json().data.currentVersion.id)
+    const createdV2 = await createOrder([{ skuId: catalog.skuId, quantity: 1 }], quoteV2.json().data.quoteToken, customer)
+    expect(createdV2.statusCode).toBe(201)
+    const orderIdV2 = createdV2.json().data.order.id as string
+    const itemIdV2 = createdV2.json().data.order.items[0].id as string
+
+    const stopWorkerA = startCodePoolDeliveryWorker(db, appConfig, app.log)
+    const stopWorkerB = startCodePoolDeliveryWorker(db, appConfig, app.log)
+    await Promise.all([
+      waitForFixedDeliveryOrder(orderIdV1, itemIdV1, 2),
+      waitForFixedDeliveryOrder(orderIdV2, itemIdV2, 1),
+    ])
+    await Promise.all([stopWorkerA(), stopWorkerB()])
+
+    const detailV1 = await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderIdV1}`, headers: { cookie: customer.cookie } })
+    const detailV2 = await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderIdV2}`, headers: { cookie: customer.cookie } })
+    expect(detailV1.statusCode).toBe(200)
+    expect(detailV1.json().data.items[0].deliveries).toHaveLength(2)
+    expect(detailV1.json().data.items[0].deliveries.map((row: { content: string; contentFormat: string }) => [row.content, row.contentFormat]))
+      .toEqual([[firstText, 'markdown'], [firstText, 'markdown']])
+    expect(detailV2.json().data.items[0].deliveries.map((row: { content: string }) => row.content)).toEqual([secondText])
+    expect(detailV1.json().data.status).toBe('completed')
+    expect(detailV2.json().data.status).toBe('completed')
+    const stranger = await createCustomer()
+    expect((await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderIdV1}`, headers: { cookie: stranger.cookie } })).statusCode).toBe(404)
+
+    const storedDeliveries = await db.selectFrom('order_item_fulfillment_deliveries as delivery')
+      .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'delivery.fulfillment_attempt_id')
+      .select(['attempt.order_item_id as item_id', 'delivery.content', 'delivery.encrypted_content', 'delivery.fulfillment_content_version_id', 'delivery.encryption_key_id'])
+      .where('attempt.order_item_id', 'in', [itemIdV1, itemIdV2]).orderBy('delivery.unit_index').execute()
+    expect(storedDeliveries).toHaveLength(3)
+    expect(storedDeliveries.every(row => row.content === null && row.encrypted_content !== null)).toBe(true)
+    expect(storedDeliveries.filter(row => row.item_id === itemIdV1).map(row => row.fulfillment_content_version_id)).toEqual([versionIdV1, versionIdV1])
+    expect(storedDeliveries.filter(row => row.item_id === itemIdV2).map(row => row.fulfillment_content_version_id)).toEqual([savedV2.json().data.currentVersion.id])
+    expect(storedDeliveries.some(row => Buffer.from(row.encrypted_content!).includes(Buffer.from('PRIVATE-V1-XSS')))).toBe(false)
+    expect(await db.selectFrom('order_item_fulfillment_attempts').select('id').where('order_item_id', '=', itemIdV1).execute()).toHaveLength(1)
+    expect(await db.selectFrom('order_item_fulfillment_attempts').select('id').where('order_item_id', '=', itemIdV2).execute()).toHaveLength(1)
+    const inventory = await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()
+    expect(inventory).toEqual({ stocked: 2, reserved: 0 })
+    expect(await db.selectFrom('order_inventory_events as event')
+      .innerJoin('order_inventory_reservations as reservation', 'reservation.id', 'event.reservation_id')
+      .innerJoin('order_items as item', 'item.id', 'reservation.order_item_id')
+      .select(['event.action', sql<number>`sum(event.quantity)::integer`.as('quantity')])
+      .where('item.product_variant_id', '=', catalog.skuId).groupBy('event.action').execute())
+      .toEqual(expect.arrayContaining([{ action: 'reserve', quantity: 3 }, { action: 'consume', quantity: 3 }]))
+    await expect(db.updateTable('product_variant_fulfillment_versions').set({ encrypted_content: Buffer.from('overwrite') })
+      .where('id', '=', versionIdV1).execute()).rejects.toMatchObject({ constraint: 'fulfillment_content_version_immutable' })
+    await expect(db.deleteFrom('product_variant_fulfillment_versions').where('id', '=', versionIdV1).execute())
+      .rejects.toMatchObject({ constraint: 'fulfillment_content_version_immutable' })
+
+    const originalRing = appConfig.codePoolEncryptionKeyRing!
+    const oldKey = originalRing.keys[originalRing.activeKeyId]!
+    const newKey = Buffer.alloc(32, 0x67)
+    try {
+      appConfig.codePoolEncryptionKeyRing = { activeKeyId: 'test-v2', keys: { 'test-v1': oldKey, 'test-v2': newKey } }
+      expect((await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderIdV1}`, headers: { cookie: customer.cookie } })).statusCode).toBe(200)
+      appConfig.codePoolEncryptionKeyRing = { activeKeyId: 'test-v2', keys: { 'test-v2': newKey } }
+      const missingKey = await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderIdV1}`, headers: { cookie: customer.cookie } })
+      expect(missingKey.statusCode).toBe(503)
+      expect(missingKey.json().error.code).toBe('FIXED_DELIVERY_KEY_UNAVAILABLE')
+      expect(JSON.stringify(missingKey.json())).not.toContain('PRIVATE-V1-XSS')
+      appConfig.codePoolEncryptionKeyRing = { activeKeyId: 'test-v2', keys: { 'test-v1': oldKey, 'test-v2': newKey } }
+      expect((await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderIdV1}`, headers: { cookie: customer.cookie } })).json().data.items[0].deliveries[0].content)
+        .toBe(firstText)
+
+      appConfig.codePoolEncryptionKeyRing = {
+        activeKeyId: 'test-v1', keys: { 'test-v1': Buffer.alloc(32, 0x39), 'test-v2': newKey },
+      }
+      const invalidAuthenticationTag = await inject({
+        method: 'GET', url: `/api/v1/customer/orders/${orderIdV1}`, headers: { cookie: customer.cookie },
+      })
+      expect(invalidAuthenticationTag.statusCode).toBe(503)
+      expect(invalidAuthenticationTag.json().error.code).toBe('FIXED_DELIVERY_DECRYPTION_FAILED')
+      expect(JSON.stringify(invalidAuthenticationTag.json())).not.toContain('PRIVATE-V1-XSS')
+    } finally {
+      appConfig.codePoolEncryptionKeyRing = originalRing
+    }
+  })
+
+  it('serializes checkout against a concurrent content revision and never binds an unquoted version', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '0.00', mode: 'quantity', stock: 2 })
+    const configUrl = `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/fixed-delivery`
+    const initial = await inject({ method: 'GET', url: configUrl, headers: { cookie: admin.cookie } })
+    const savedV1 = await inject({
+      method: 'POST', url: `${configUrl}/versions`, headers: adminHeaders(admin),
+      payload: { expectedRevision: initial.json().data.configurationRevision, method: 'fixed_content', content: 'RACE-VERSION-ONE' },
+    })
+    const enabled = await inject({
+      method: 'PUT', url: `${configUrl}/readiness`, headers: adminHeaders(admin),
+      payload: { expectedRevision: savedV1.json().data.configurationRevision, enabled: true },
+    })
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteBeforeEdit = await quote(items, customer)
+    const [checkout, edit] = await Promise.all([
+      createOrder(items, quoteBeforeEdit.json().data.quoteToken, customer),
+      inject({
+        method: 'POST', url: `${configUrl}/versions`, headers: adminHeaders(admin),
+        payload: {
+          expectedRevision: enabled.json().data.configurationRevision,
+          method: 'fixed_content', content: 'RACE-VERSION-TWO',
+        },
+      }),
+    ])
+    expect(edit.statusCode).toBe(200)
+    expect(edit.json().data.automaticDeliveryReady).toBe(false)
+    if (checkout.statusCode === 201) {
+      const itemId = checkout.json().data.order.items[0].id as string
+      expect((await db.selectFrom('order_items').select('fulfillment_content_version_id')
+        .where('id', '=', itemId).executeTakeFirstOrThrow()).fulfillment_content_version_id)
+        .toBe(savedV1.json().data.currentVersion.id)
+    } else {
+      expect(checkout.statusCode).toBe(409)
+      expect(checkout.json().error.code).toBe('CHECKOUT_QUOTE_CHANGED')
+      expect(await db.selectFrom('order_items').select('id').where('product_variant_id', '=', catalog.skuId).execute())
+        .toHaveLength(0)
+    }
+  })
+
+  it('blocks fixed delivery when an otherwise settled payment has an open provider reconciliation case', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    const configUrl = `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/fixed-delivery`
+    const initial = await inject({ method: 'GET', url: configUrl, headers: { cookie: admin.cookie } })
+    const saved = await inject({
+      method: 'POST', url: `${configUrl}/versions`, headers: adminHeaders(admin),
+      payload: { expectedRevision: initial.json().data.configurationRevision, method: 'fixed_content', content: 'RECONCILIATION-HOLD-SECRET' },
+    })
+    const enabled = await inject({
+      method: 'PUT', url: `${configUrl}/readiness`, headers: adminHeaders(admin),
+      payload: { expectedRevision: saved.json().data.configurationRevision, enabled: true },
+    })
+    expect(enabled.statusCode).toBe(200)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteBeforePayment = await quote(items, customer)
+    const created = await createOrder(items, quoteBeforePayment.json().data.quoteToken, customer)
+    const orderId = created.json().data.order.id as string
+    const itemId = created.json().data.order.items[0].id as string
+    const attemptId = randomUUID()
+    const receiptId = randomUUID()
+    await db.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+      topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
+      provider_payment_id: `fixed-reconciliation-${attemptId}`, wallet_operation_id: null, wallet_hold_operation_id: null,
+      requested_wallet_amount: null, expires_at: new Date(Date.now() + 60 * 60_000), completed_at: null,
+    }).execute()
+    await db.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+    await db.insertInto('payment_receipts').values({
+      id: receiptId, payment_attempt_id: attemptId, source_bucket: 'external', provider: 'integration',
+      provider_transaction_id: `fixed-reconciliation-receipt-${receiptId}`, wallet_operation_id: null,
+      wallet_line_no: null, amount: '1.20',
+    }).execute()
+    await db.updateTable('payment_attempts').set({ status: 'succeeded' }).where('id', '=', attemptId).execute()
+    const eventId = randomUUID()
+    await db.insertInto('payment_provider_events').values({
+      id: eventId, payment_attempt_id: attemptId, source: 'callback', event_sha256: digest,
+      verification: 'verified', disposition: 'reconciliation_required', provider_status: 'paid',
+      provider_transaction_id: `fixed-reconciliation-txn-${receiptId}`, reported_amount: '1.20',
+      currency: 'CNY', provider_paid_at: new Date(), provider_time_text: null,
+      payload: { outcome: 'conflicting_callback' }, error_code: 'CALLBACK_QUERY_MISMATCH',
+    }).execute()
+    await db.insertInto('payment_provider_reconciliation_cases').values({
+      id: randomUUID(), payment_attempt_id: attemptId, reason: 'callback_query_mismatch',
+      opening_callback_event_id: eventId, opening_query_event_id: null,
+    }).execute()
+
+    const stopWorker = startCodePoolDeliveryWorker(db, appConfig, app.log)
+    const blocked = await waitForFixedDeliveryOrder(orderId, itemId, 0)
+    await stopWorker()
+    expect(blocked.attempts.at(-1)).toMatchObject({
+      status: 'failed', failure_code: 'FIXED_DELIVERY_PAYMENT_UNRESOLVED',
+    })
+    expect((await db.selectFrom('payment_receipts').select('disposition').where('id', '=', receiptId).executeTakeFirstOrThrow()).disposition)
+      .toBe('on_time')
+    expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status)
+      .toBe('succeeded')
+    expect(await db.selectFrom('order_item_fulfillment_deliveries as delivery')
+      .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'delivery.fulfillment_attempt_id')
+      .select('delivery.id').where('attempt.order_item_id', '=', itemId).execute()).toHaveLength(0)
+  })
+
+  it('rejects dangerous link schemes, delivers HTTPS instructions to an isolated guest, and leaves unlimited stock unreserved', async () => {
+    const admin = await createAdmin()
+    const catalog = await createCatalog({ price: '0.00', mode: 'unlimited' })
+    const configUrl = `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/fixed-delivery`
+    const initial = await inject({ method: 'GET', url: configUrl, headers: { cookie: admin.cookie } })
+    for (const url of ['javascript:alert(1)', 'data:text/html,hello', 'file:///etc/passwd']) {
+      const rejected = await inject({
+        method: 'POST', url: `${configUrl}/versions`, headers: adminHeaders(admin),
+        payload: { expectedRevision: initial.json().data.configurationRevision, method: 'link', url, title: '恶意链接', accessInstructions: 'PRIVATE-URL-SECRET' },
+      })
+      expect(rejected.statusCode).toBe(400)
+      expect(JSON.stringify(rejected.json())).not.toContain('PRIVATE-URL-SECRET')
+    }
+    const url = 'https://downloads.example.test/private-guide?token=FIXED-LINK-SECRET'
+    const saved = await inject({
+      method: 'POST', url: `${configUrl}/versions`, headers: adminHeaders(admin),
+      payload: { expectedRevision: initial.json().data.configurationRevision, method: 'link', url, title: '授权下载页面', accessInstructions: '访问说明 PRIVATE-ACCESS-INSTRUCTIONS' },
+    })
+    expect(saved.statusCode).toBe(200)
+    expect(saved.json().data).toMatchObject({ method: 'link', automaticDeliveryReady: false, currentVersion: { method: 'link', content: url, title: '授权下载页面' } })
+    const enabled = await inject({
+      method: 'PUT', url: `${configUrl}/readiness`, headers: adminHeaders(admin),
+      payload: { expectedRevision: saved.json().data.configurationRevision, enabled: true },
+    })
+    expect(enabled.statusCode).toBe(200)
+    await db.updateTable('storefront_customer_policy').set({ guest_checkout_enabled: true, guest_free_claim_enabled: true })
+      .where('singleton', '=', true).execute()
+    const guest = await newGuestSession()
+    const otherGuest = await newGuestSession()
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const guestQuote = await quote(items, undefined, guest.cookie)
+    expect(guestQuote.json().data.canContinue).toBe(true)
+    const guestOwner = { cookie: guest.cookie, csrfToken: guest.csrfToken, csrfCookie: guest.csrfCookie }
+    const created = await createOrder(items, guestQuote.json().data.quoteToken, guestOwner)
+    expect(created.statusCode).toBe(201)
+    const orderId = created.json().data.order.id as string
+    const itemId = created.json().data.order.items[0].id as string
+    const stopWorker = startCodePoolDeliveryWorker(db, appConfig, app.log)
+    await waitForFixedDeliveryOrder(orderId, itemId, 1)
+    await stopWorker()
+
+    const guestDetail = await inject({ method: 'GET', url: `/api/v1/guest/orders/${orderId}`, headers: { cookie: guest.cookie } })
+    expect(guestDetail.statusCode).toBe(200)
+    expect(guestDetail.json().data.items[0].deliveries).toMatchObject([{
+      content: url, contentFormat: 'link', title: '授权下载页面', accessInstructions: '访问说明 PRIVATE-ACCESS-INSTRUCTIONS',
+    }])
+    expect((await inject({ method: 'GET', url: `/api/v1/guest/orders/${orderId}`, headers: { cookie: otherGuest.cookie } })).statusCode).toBe(404)
+    const customer = await createCustomer()
+    expect((await inject({ method: 'GET', url: `/api/v1/guest/orders/${orderId}`, headers: { cookie: customer.cookie } })).statusCode).toBe(403)
+    expect(await db.selectFrom('order_inventory_reservations').select('id').where('order_item_id', '=', itemId).execute()).toHaveLength(0)
+    expect(await db.selectFrom('order_inventory_events').select('id').where('product_variant_id', '=', catalog.skuId).execute()).toHaveLength(0)
+    const publicProduct = await inject({ method: 'GET', url: `/api/v1/public/products/${catalog.productId}` })
+    expect(JSON.stringify(publicProduct.json())).not.toContain('FIXED-LINK-SECRET')
+    expect(JSON.stringify(publicProduct.json())).not.toContain('PRIVATE-ACCESS-INSTRUCTIONS')
+
+    const switched = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/manual-fulfillment`,
+      headers: adminHeaders(admin), payload: { enabled: false },
+    })
+    expect(switched.statusCode).toBe(200)
+    expect(switched.json().data.method).toBe('manual')
+    const historyAfterSwitch = await inject({ method: 'GET', url: `/api/v1/guest/orders/${orderId}`, headers: { cookie: guest.cookie } })
+    expect(historyAfterSwitch.json().data.items[0].deliveries[0]).toMatchObject({ content: url, title: '授权下载页面' })
+
+    const productRevision = await db.selectFrom('products').select('revision')
+      .where('id', '=', catalog.productId).executeTakeFirstOrThrow()
+    const archived = await inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${catalog.productId}/lifecycle`, headers: adminHeaders(admin),
+      payload: { expectedRevision: productRevision.revision, status: 'archived' },
+    })
+    expect(archived.statusCode).toBe(200)
+    await db.updateTable('product_variants').set({ enabled: false, retired_at: new Date() })
+      .where('id', '=', catalog.skuId).execute()
+    const retiredHistory = await inject({
+      method: 'GET', url: `/api/v1/guest/orders/${orderId}`, headers: { cookie: guest.cookie },
+    })
+    expect(retiredHistory.statusCode).toBe(200)
+    expect(retiredHistory.json().data.items[0].deliveries[0]).toMatchObject({
+      content: url, contentFormat: 'link', title: '授权下载页面',
+    })
+  })
+
+  it('waits for confirmed payment and key recovery, then keeps delivered history after refund without rerunning', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'quantity', stock: 2 })
+    const configUrl = `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/fixed-delivery`
+    const initial = await inject({ method: 'GET', url: configUrl, headers: { cookie: admin.cookie } })
+    const saved = await inject({
+      method: 'POST', url: `${configUrl}/versions`, headers: adminHeaders(admin),
+      payload: { expectedRevision: initial.json().data.configurationRevision, method: 'fixed_content', content: 'PAID-FIXED-DELIVERY-SECRET' },
+    })
+    const enabled = await inject({
+      method: 'PUT', url: `${configUrl}/readiness`, headers: adminHeaders(admin),
+      payload: { expectedRevision: saved.json().data.configurationRevision, enabled: true },
+    })
+    expect(enabled.statusCode).toBe(200)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const currentQuote = await quote(items, customer)
+    const created = await createOrder(items, currentQuote.json().data.quoteToken, customer)
+    expect(created.statusCode).toBe(201)
+    const orderId = created.json().data.order.id as string
+    const itemId = created.json().data.order.items[0].id as string
+    expect(created.json().data.order.status).toBe('pending_payment')
+    const pendingDetail = await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie } })
+    expect(pendingDetail.json().data.items[0].deliveries).toEqual([])
+    expect(JSON.stringify(pendingDetail.json())).not.toContain('PAID-FIXED-DELIVERY-SECRET')
+
+    const attemptId = randomUUID()
+    const receiptId = randomUUID()
+    await db.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+      topup_customer_id: null, source: 'external', amount: '1.20', status: 'created', provider: 'integration',
+      provider_payment_id: `fixed-delivery-payment-${attemptId}`, wallet_operation_id: null, wallet_hold_operation_id: null,
+      requested_wallet_amount: null, expires_at: new Date(Date.now() + 60 * 60_000), completed_at: null,
+    }).execute()
+    await db.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+    await db.insertInto('payment_receipts').values({
+      id: receiptId, payment_attempt_id: attemptId, source_bucket: 'external', provider: 'integration',
+      provider_transaction_id: `fixed-delivery-receipt-${receiptId}`, wallet_operation_id: null, wallet_line_no: null, amount: '1.20',
+    }).execute()
+    const originalRing = appConfig.codePoolEncryptionKeyRing
+    try {
+      appConfig.codePoolEncryptionKeyRing = null
+      await db.updateTable('payment_attempts').set({ status: 'succeeded' }).where('id', '=', attemptId).execute()
+      expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status).toBe('processing')
+      const stopWithoutKey = startCodePoolDeliveryWorker(db, appConfig, app.log)
+      const failed = await waitForFixedDeliveryOrder(orderId, itemId, 0)
+      await stopWithoutKey()
+      expect(failed.attempts.at(-1)).toMatchObject({ status: 'failed', failure_code: 'FIXED_DELIVERY_KEY_UNAVAILABLE' })
+      expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status).toBe('succeeded')
+      expect((await db.selectFrom('payment_receipts').select('disposition').where('id', '=', receiptId).executeTakeFirstOrThrow()).disposition).toBe('on_time')
+      expect(await db.selectFrom('order_item_fulfillment_deliveries').select('order_item_fulfillment_deliveries.id')
+        .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'order_item_fulfillment_deliveries.fulfillment_attempt_id')
+        .where('attempt.order_item_id', '=', itemId).execute()).toHaveLength(0)
+
+      appConfig.codePoolEncryptionKeyRing = originalRing
+      const stopWithKey = startCodePoolDeliveryWorker(db, appConfig, app.log)
+      await waitForFixedDeliveryOrder(orderId, itemId, 1)
+      await stopWithKey()
+      await refundExistingReceipt(orderId, receiptId, '1.20')
+      const afterRefund = await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie } })
+      expect(afterRefund.statusCode).toBe(200)
+      expect(afterRefund.json().data.items[0].deliveries[0].content).toBe('PAID-FIXED-DELIVERY-SECRET')
+      const stopAfterRefund = startCodePoolDeliveryWorker(db, appConfig, app.log)
+      await new Promise(resolve => setTimeout(resolve, 1_100))
+      await stopAfterRefund()
+      expect(await db.selectFrom('order_item_fulfillment_attempts').select('id')
+        .where('order_item_id', '=', itemId).where('delivery_source', '=', 'fixed_content').execute()).toHaveLength(2)
+      expect((await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+        .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow())).toEqual({ stocked: 1, reserved: 0 })
+    } finally {
+      appConfig.codePoolEncryptionKeyRing = originalRing
+    }
   })
 })
 

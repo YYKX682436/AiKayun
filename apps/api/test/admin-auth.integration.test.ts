@@ -938,7 +938,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       'product_category_tree_guard', 'product_management_audit_events',
       'product_media', 'product_media_references', 'product_media_variants',
       'product_option_groups', 'product_option_values',
-      'product_variant_fulfillment', 'product_variant_inventory_adjustments', 'product_variant_option_values',
+      'product_variant_fulfillment', 'product_variant_fulfillment_versions', 'product_variant_inventory_adjustments', 'product_variant_option_values',
       'product_variant_quantity_inventory', 'product_variants', 'products',
       'storefront_customer_policy', 'wallet_accounts', 'wallet_ledger_entries', 'wallet_operations',
       'withdrawal_audit_events', 'withdrawal_payout_attempts', 'withdrawal_payout_results',

@@ -94,13 +94,18 @@ async function setQuantityInventory(page: Page, product: Product): Promise<void>
 
 async function enableManualDeliveryInAdmin(page: Page, product: Product): Promise<void> {
   await page.goto(`/admin/products/${product.id}`)
-  await expect(page.getByRole('heading', { name: '人工数字交付资格' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'SKU 数字履约方式' })).toBeVisible()
+  const method = page.getByRole('combobox', { name: /履约方式/u }).first()
+  await method.click()
+  await page.getByRole('option', { name: '人工交付' }).click()
+  await expect(method).toContainText('人工交付')
+  await expect(page.getByText('人工交付 · 销售已暂停')).toBeVisible()
   const enable = page.getByRole('button', { name: '明确开启' }).first()
   await expect(enable).toBeEnabled()
   page.once('dialog', dialog => dialog.accept())
   await enable.click()
   await expect(page.getByRole('status')).toContainText('已明确开启人工数字交付')
-  await expect(page.getByText('人工交付已就绪')).toBeVisible()
+  await expect(page.getByText('人工交付 · 销售已启用')).toBeVisible()
 }
 
 async function registerCustomer(page: Page, username: string): Promise<void> {
@@ -211,6 +216,74 @@ test('creates a zero-value order, completes actual private delivery, and cancels
   await expect.poll(() => page.locator('html').evaluate(element => element.classList.contains('light'))).toBe(true)
 })
 
+test('configures and safely delivers an encrypted fixed Markdown version through the browser', async ({ page }) => {
+  test.setTimeout(180_000)
+  const productName = `固定文本自动交付 ${randomUUID().slice(0, 8)}`
+  const username = `fixed-${randomUUID().replaceAll('-', '').slice(0, 18)}`
+  const secretText = 'BROWSER-FIXED-CONTENT-2026'
+  const content = `# 授权教程\n\n**${secretText}**\n\n<img src=x onerror=alert(1)>\n\n[不安全链接](javascript:alert(1))`
+
+  await attachAdmin(page)
+  const product = await createProduct(page, productName, '0.00')
+  await setUnlimitedInventory(page, product)
+  await page.goto(`/admin/products/${product.id}`)
+  await expectClientMounted(page, '[data-admin-product-ready="true"]')
+  const editor = page.getByRole('region', { name: '固定文本与固定链接' })
+  await expect(editor).toBeVisible()
+  await editor.getByLabel('固定文本（Markdown）').fill(content)
+  await editor.getByRole('button', { name: '预览展示' }).click()
+  const preview = editor.locator('article.secure-markdown')
+  await expect(preview.getByText(secretText)).toBeVisible()
+  await expect(preview.locator('img, script, a[href^="javascript:"]')).toHaveCount(0)
+  await expect(preview).toContainText('<img src=x onerror=alert(1)>')
+
+  await editor.getByRole('button', { name: '保存为新版本' }).click()
+  await expect(editor.getByRole('status')).toContainText('版本 1 已保存')
+  await expect(editor.getByText('固定文本 · v1')).toBeVisible()
+  page.once('dialog', dialog => dialog.accept())
+  await editor.getByRole('button', { name: '明确启用自动交付' }).click()
+  await expect(editor.getByRole('status')).toContainText('自动交付已启用')
+  await expect(editor.getByText('自动交付已启用', { exact: true })).toBeVisible()
+
+  await registerCustomer(page, username)
+  await addProductToCart(page, product)
+  await page.goto('/cart')
+  await page.getByRole('link', { name: '查看结算报价' }).click()
+  await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
+  await page.getByRole('button', { name: '提交订单' }).click()
+  await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
+  const orderUrl = page.url()
+  const orderId = orderUrl.split('/').at(-1)!
+  await expect(page.getByText(secretText)).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByRole('heading', { name: '已完成的数字交付' })).toBeVisible()
+  const deliveredMarkdown = page.locator('.secure-markdown').filter({ hasText: secretText })
+  await expect(deliveredMarkdown.locator('strong')).toContainText(secretText)
+  await expect(deliveredMarkdown.locator('script, img, a[href^="javascript:"]')).toHaveCount(0)
+
+  const publicHtml = await page.request.get(`/products/${product.id}`)
+  expect(publicHtml.status()).toBe(200)
+  expect(await publicHtml.text()).not.toContain(secretText)
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'])
+  await page.getByRole('button', { name: '复制第 1 件交付内容' }).click()
+  await expect(page.getByRole('status')).toContainText('交付内容已复制')
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toContain(secretText)
+  const detailResponse = await page.reload()
+  expect(detailResponse?.headers()['cache-control']).toContain('private')
+  await expect(page.getByText(secretText)).toBeVisible()
+  expect(orderId).toMatch(/^[0-9a-f-]{36}$/iu)
+
+  for (const width of [320, 390, 768, 1440]) await noHorizontalOverflow(page, width)
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.getByRole('button', { name: '显示模式' }).click()
+  await page.getByRole('option', { name: '深色' }).click()
+  await expect.poll(() => page.locator('html').evaluate(element => element.classList.contains('dark'))).toBe(true)
+  await page.reload()
+  await expect(page.getByText(secretText)).toBeVisible()
+  await page.getByRole('button', { name: '显示模式' }).click()
+  await page.getByRole('option', { name: '浅色' }).click()
+  await expect.poll(() => page.locator('html').evaluate(element => element.classList.contains('light'))).toBe(true)
+})
+
 test('imports a per-SKU code pool in the admin UI and shows only the completed card to its customer', async ({ page }) => {
   test.setTimeout(180_000)
   await page.setViewportSize({ width: 1440, height: 1000 })
@@ -251,10 +324,10 @@ test('imports a per-SKU code pool in the admin UI and shows only the completed c
   const orderResponse = await page.reload()
   expect(orderResponse?.headers()['cache-control']).toContain('private')
   await expect(page.getByText(code, { exact: true })).toBeVisible({ timeout: 20_000 })
-  await expect(page.getByRole('button', { name: '复制第 1 件卡密' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '复制第 1 件交付内容' })).toBeVisible()
   await page.context().grantPermissions(['clipboard-read', 'clipboard-write'])
-  await page.getByRole('button', { name: '复制第 1 件卡密' }).click()
-  await expect(page.getByRole('status')).toContainText('卡密已复制到剪贴板。')
+  await page.getByRole('button', { name: '复制第 1 件交付内容' }).click()
+  await expect(page.getByRole('status')).toContainText('交付内容已复制到剪贴板。')
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(code)
 
   const publicHtml = await page.request.get(`/products/${product.id}`)
