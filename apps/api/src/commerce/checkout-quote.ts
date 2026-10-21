@@ -43,6 +43,8 @@ type QuoteSkuRow = {
   available_quantity: number | null
   fulfillment_method: string | null
   manual_delivery_ready: boolean
+  code_pool_delivery_ready: boolean
+  code_pool_inventory_consistent: boolean
   combination_valid: boolean | null
   options: CheckoutQuoteItem['options']
   product_limit_per_order: number | null
@@ -96,7 +98,14 @@ function reasonForSku(row: QuoteSkuRow): CheckoutQuoteReason | null {
     if (!row.inventory_row_exists || row.available_quantity === null) return 'inventory_not_configured'
     if (row.available_quantity < row.quantity) return 'insufficient_inventory'
   }
-  if (row.product_type !== 'digital' || row.fulfillment_method !== 'manual' || !row.manual_delivery_ready) {
+  if (row.fulfillment_method === 'code_pool' && !row.code_pool_inventory_consistent) {
+    return 'code_pool_inventory_inconsistent'
+  }
+  if (row.product_type !== 'digital'
+    || (row.fulfillment_method === 'manual' && !row.manual_delivery_ready)
+    || (row.fulfillment_method === 'code_pool'
+      && (row.inventory_mode !== 'quantity' || !row.code_pool_delivery_ready))
+    || (row.fulfillment_method !== 'manual' && row.fulfillment_method !== 'code_pool')) {
     return 'fulfillment_not_ready'
   }
   return null
@@ -203,6 +212,11 @@ export async function quoteCheckoutItems(
       END AS available_quantity,
       fulfillment.method AS fulfillment_method,
       COALESCE(fulfillment.manual_delivery_ready, false) AS manual_delivery_ready,
+      COALESCE(fulfillment.code_pool_delivery_ready, false) AS code_pool_delivery_ready,
+      CASE WHEN fulfillment.method = 'code_pool'
+        THEN assert_code_pool_inventory_consistency(variant.id)
+        ELSE true
+      END AS code_pool_inventory_consistent,
       ${combinationValid} AS combination_valid,
       COALESCE((
         SELECT jsonb_agg(jsonb_build_object(
@@ -298,6 +312,7 @@ export async function quoteCheckoutItems(
       quantity: row.quantity,
       lineTotal,
       inventoryMode: row.inventory_mode,
+      fulfillmentMethod: row.fulfillment_method,
       availableQuantity: row.available_quantity,
       identityValid: row.product_id !== null && row.product_status !== null,
       purchaseLimits: {

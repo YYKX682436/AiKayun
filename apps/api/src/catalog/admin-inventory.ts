@@ -301,6 +301,12 @@ export function registerAdminInventoryRoutes(app: FastifyInstance, db: Kysely<Da
           return toVariantInventory(current)
         }
 
+        const fulfillment = await trx.selectFrom('product_variant_fulfillment')
+          .select('method').where('product_variant_id', '=', skuId).forShare().executeTakeFirst()
+        if (fulfillment?.method === 'code_pool' && body.inventoryMode !== 'quantity') {
+          throw new CatalogError(409, 'CODE_POOL_INVENTORY_MODE_PROTECTED', '卡密池 SKU 必须保留 quantity 库存模式；先处理未售卡密并保留既有交付历史。')
+        }
+
         let quantityState: { stocked: number; reserved: number } | undefined
         if (variant.inventory_mode === 'quantity') {
           quantityState = await trx.selectFrom('product_variant_quantity_inventory')
@@ -397,6 +403,12 @@ export function registerAdminInventoryRoutes(app: FastifyInstance, db: Kysely<Da
           .where('product_id', '=', productId).where('product_variant_id', '=', skuId)
           .forUpdate().executeTakeFirst()
         if (!inventory) throw new Error('Quantity-mode SKU is missing its quantity inventory record')
+
+        const fulfillment = await trx.selectFrom('product_variant_fulfillment')
+          .select('method').where('product_variant_id', '=', skuId).forShare().executeTakeFirst()
+        if (fulfillment?.method === 'code_pool') {
+          throw new CatalogError(409, 'CODE_POOL_INVENTORY_EVENT_REQUIRED', '卡密池库存只能通过卡密导入、撤回、下单预留和履约消费事件调整。')
+        }
 
         const duplicateAfterSkuLock = await trx.selectFrom('product_variant_inventory_adjustments').selectAll()
           .where('operation_id', '=', requestData.operationId).executeTakeFirst()

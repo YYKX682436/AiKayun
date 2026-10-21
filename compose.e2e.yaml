@@ -8,6 +8,7 @@ services:
     environment:
       NODE_ENV: test
       PAYMENT_PROVIDER_BASE_URL_FOR_TESTS: http://127.0.0.1:${ZPAY_FIXTURE_PORT:-3099}
+      CODE_POOL_ENCRYPTION_KEY_RING: '{"activeKeyId":"e2e-v1","keys":{"e2e-v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}}'
     ports:
       - "127.0.0.1:${API_PORT:-3001}:3001"
       - "127.0.0.1:${ZPAY_FIXTURE_PORT:-3099}:${ZPAY_FIXTURE_PORT:-3099}"

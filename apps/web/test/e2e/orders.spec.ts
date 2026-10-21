@@ -74,6 +74,24 @@ async function setUnlimitedInventory(page: Page, product: Product): Promise<void
   expect(changed.status()).toBe(200)
 }
 
+async function setQuantityInventory(page: Page, product: Product): Promise<void> {
+  const inventoryResponse = await page.request.get(`/api/v1/admin/products/${product.id}/inventory`)
+  expect(inventoryResponse.status()).toBe(200)
+  const inventory = (await inventoryResponse.json()).data
+  const variant = inventory.variants.find((row: { skuId: string }) => row.skuId === product.variants[0]!.id)
+  expect(variant).toBeTruthy()
+  const changed = await page.request.put(`/api/v1/admin/products/${product.id}/variants/${variant.skuId}/inventory-mode`, {
+    headers: await adminHeaders(page),
+    data: {
+      expectedRevision: inventory.productRevision,
+      expectedSkuRevision: variant.skuRevision,
+      expectedInventoryRevision: variant.inventoryRevision,
+      inventoryMode: 'quantity',
+    },
+  })
+  expect(changed.status()).toBe(200)
+}
+
 async function enableManualDeliveryInAdmin(page: Page, product: Product): Promise<void> {
   await page.goto(`/admin/products/${product.id}`)
   await expect(page.getByRole('heading', { name: '人工数字交付资格' })).toBeVisible()
@@ -143,8 +161,8 @@ test('creates a zero-value order, completes actual private delivery, and cancels
   await page.getByRole('button', { name: '确认实际交付' }).click()
   await expect(page.getByText('已完成', { exact: true })).toBeVisible()
   await expect(page.getByText('E2E-REAL-DIGITAL-DELIVERY-2026')).toBeVisible()
-  await expect(page.getByRole('heading', { name: '人工履约审计' })).toBeVisible()
-  await expect(page.getByText(/1 件 · 1 条内容 · 管理员/u)).toBeVisible()
+  await expect(page.getByRole('heading', { name: '人工与自动履约审计' })).toBeVisible()
+  await expect(page.getByText(/1 件 · 1 条交付 · 管理员/u)).toBeVisible()
   await expect(page.getByText(/SHA-256/u)).toBeVisible()
 
   await page.goto(zeroOrderUrl)
@@ -191,4 +209,56 @@ test('creates a zero-value order, completes actual private delivery, and cancels
   await page.getByRole('button', { name: '显示模式' }).click()
   await page.getByRole('option', { name: '浅色' }).click()
   await expect.poll(() => page.locator('html').evaluate(element => element.classList.contains('light'))).toBe(true)
+})
+
+test('imports a per-SKU code pool in the admin UI and shows only the completed card to its customer', async ({ page }) => {
+  test.setTimeout(180_000)
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const code = 'E2E-CODEPOOL  2026'
+  const productName = `卡密自动发货 ${randomUUID().slice(0, 8)}`
+  const username = `codepool-${randomUUID().replaceAll('-', '').slice(0, 18)}`
+
+  await attachAdmin(page)
+  const product = await createProduct(page, productName, '0.00')
+  await setQuantityInventory(page, product)
+  await page.goto(`/admin/products/${product.id}`)
+  await expectClientMounted(page, '[data-admin-product-ready="true"]')
+  const pool = page.getByRole('region', { name: 'SKU 卡密池与自动发货' })
+  await expect(pool).toBeVisible()
+  page.once('dialog', dialog => dialog.accept())
+  await pool.getByRole('button', { name: '配置并保持暂停' }).click()
+  await expect(pool.getByText('已配置并暂停新销售')).toBeVisible()
+  await pool.getByLabel('卡密内容').fill(`${code}\n${code}`)
+  await pool.getByRole('button', { name: '预检查导入内容' }).click()
+  await expect(pool.getByText('共 2 行 · 可入库 1 · 重复 1 · 无效 0')).toBeVisible()
+  await expect(pool.getByText('第 2 行 · 重复 · 本次内容重复')).toBeVisible()
+  await expect(pool.getByText(code, { exact: true })).toHaveCount(0)
+  page.once('dialog', dialog => dialog.accept())
+  await pool.getByRole('button', { name: '确认加密入库 1 条' }).click()
+  await expect(pool.getByRole('status')).toContainText('已入库 1 条')
+  await expect(pool.getByText('SKU 库存：实存 1 · 预留 0 · 可售 1。')).toBeVisible()
+  page.once('dialog', dialog => dialog.accept())
+  await pool.getByRole('button', { name: '开启自动发货销售' }).click()
+  await expect(pool.getByText('新订单自动发货已启用')).toBeVisible()
+
+  await registerCustomer(page, username)
+  await addProductToCart(page, product)
+  await page.goto('/cart')
+  await page.getByRole('link', { name: '查看结算报价' }).click()
+  await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
+  await page.getByRole('button', { name: '提交订单' }).click()
+  await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
+  const orderResponse = await page.reload()
+  expect(orderResponse?.headers()['cache-control']).toContain('private')
+  await expect(page.getByText(code, { exact: true })).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByRole('button', { name: '复制第 1 件卡密' })).toBeVisible()
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'])
+  await page.getByRole('button', { name: '复制第 1 件卡密' }).click()
+  await expect(page.getByRole('status')).toContainText('卡密已复制到剪贴板。')
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(code)
+
+  const publicHtml = await page.request.get(`/products/${product.id}`)
+  expect(publicHtml.status()).toBe(200)
+  expect(await publicHtml.text()).not.toContain(code)
+  for (const width of [320, 390, 768, 1440]) await noHorizontalOverflow(page, width)
 })

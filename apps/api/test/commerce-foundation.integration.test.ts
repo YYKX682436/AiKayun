@@ -822,6 +822,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
     const freeOrder = await createOrder({ catalog: freeCatalog, customerId, totalAmount: '0.00' })
     await db.insertInto('order_item_fulfillment_attempts').values({
       id: randomUUID(), order_item_id: freeOrder.itemId, operation_id: randomUUID(), quantity: 1,
+      started_by_admin_id: adminId, delivery_source: 'manual',
       status: 'processing', result_sha256: null, completed_at: null,
     }).execute()
     await expect(db.updateTable('orders').set({ status: 'closed' }).where('id', '=', freeOrder.id).execute())
@@ -1255,6 +1256,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
       delete prePaymentMigrations['202610200003_payment_reconciliation']
       delete prePaymentMigrations['202610200004_wallet_payments']
       delete prePaymentMigrations['202610200005_refunds']
+      delete prePaymentMigrations['202610210002_code_pool']
       const prePaymentProvider = { getMigrations: async () => prePaymentMigrations }
       const currentMigrator = new Migrator({ db, provider: prePaymentProvider })
       const upgradeResult = await currentMigrator.migrateToLatest()

@@ -5,6 +5,12 @@ import type {
   AdminProductVariantInventory,
   AdminProductVariantPrices,
   AdminProductVariantPricesPage,
+  CodePoolBatchPage,
+  CodePoolEntryPage,
+  CodePoolFormat,
+  CodePoolImportPreview,
+  CodePoolMutationResult,
+  CodePoolStatus,
   CreateInventoryAdjustmentBody,
   InventoryAdjustmentPage,
   ManualFulfillmentConfig,
@@ -70,6 +76,7 @@ const conflictLoading = ref(false)
 const conflictError = ref('')
 
 const name = ref('')
+const clientReady = ref(false)
 const description = ref('')
 const productType = ref<ProductDetail['productType']>('digital')
 const categorySelection = ref<string[]>([])
@@ -86,6 +93,22 @@ const bulkSalePrice = ref('')
 const inventorySummary = shallowRef<AdminProductInventorySummary | null>(null)
 const manualFulfillment = ref<ManualFulfillmentConfigPage>([])
 const manualFulfillmentLoading = ref(false)
+const codePoolSkuId = ref('')
+const codePoolStatus = shallowRef<CodePoolStatus | null>(null)
+const codePoolBatches = shallowRef<CodePoolBatchPage | null>(null)
+const codePoolEntries = shallowRef<CodePoolEntryPage | null>(null)
+const codePoolEntryFilter = ref<'all' | 'available' | 'reserved' | 'delivered' | 'revoked'>('available')
+const codePoolFormat = ref<CodePoolFormat>('paste')
+const codePoolSourceText = ref('')
+const codePoolPreview = shallowRef<CodePoolImportPreview | null>(null)
+const codePoolOperationId = ref('')
+const codePoolSelectedEntryIds = ref<string[]>([])
+const codePoolWithdrawalReason = ref('')
+const codePoolWithdrawalConfirmation = ref('')
+const codePoolError = ref('')
+const codePoolMessage = ref('')
+const codePoolLoading = ref(false)
+const codePoolEntryPageNumber = ref(1)
 const inventoryPageNumber = ref(1)
 const inventoryPageSize = 20
 const historySkuId = ref('')
@@ -145,6 +168,18 @@ const inventoryModeItems = [
   { label: '资源池（未就绪）', value: 'resource_pool' },
   { label: '不限数量', value: 'unlimited' },
   { label: '外部供应商（未就绪）', value: 'external' },
+]
+const codePoolFormatItems = [
+  { label: '粘贴文本', value: 'paste' },
+  { label: 'TXT 文件', value: 'txt' },
+  { label: 'CSV 文件', value: 'csv' },
+]
+const codePoolStatusItems = [
+  { label: '全部状态', value: 'all' },
+  { label: '未售可用', value: 'available' },
+  { label: '已预留', value: 'reserved' },
+  { label: '已交付', value: 'delivered' },
+  { label: '已撤回', value: 'revoked' },
 ]
 
 const categoryTree = computed(() => {
@@ -219,6 +254,19 @@ const visibleInventoryRows = computed(() => {
   const start = (inventoryPageNumber.value - 1) * inventoryPageSize
   return rows.slice(start, start + inventoryPageSize)
 })
+const codePoolSkuOptions = computed(() => (inventorySummary.value?.variants ?? []).map(row => ({
+  label: `${row.skuCode} · ${row.inventory.mode === 'quantity' ? `数量库存 ${row.inventory.stocked}` : '需要 quantity 库存'}`,
+  value: row.skuId,
+})))
+const codePoolInventoryRow = computed(() => inventoryForSku(codePoolSkuId.value))
+const canConfigureCodePool = computed(() => product.value?.productType === 'digital'
+  && Boolean(codePoolInventoryRow.value?.enabled && !codePoolInventoryRow.value.retiredAt
+    && codePoolInventoryRow.value.inventory.mode === 'quantity'))
+const codePoolReasonLabels: Record<Exclude<CodePoolImportPreview['rows'][number]['reason'], null>, string> = {
+  duplicate_in_request: '本次内容重复', already_imported: '此 SKU 已存在', empty: '空白行',
+  too_long: '单条内容超过 512 个字符', invalid_text: '文本含不支持的字符', invalid_csv_row: 'CSV 需为单列卡密',
+}
+const codePoolReasonLabel = (reason: CodePoolImportPreview['rows'][number]['reason']) => reason ? codePoolReasonLabels[reason] : ''
 const inventoryTotalPages = computed(() => Math.ceil((inventorySummary.value?.variants.length ?? 0) / inventoryPageSize))
 const matrixNeedsConfirmation = computed(() => matrixPreview.value?.changes.some(change => change.change === 'removed' || change.change === 'retired' || change.change === 'modified') ?? false)
 const matrixBlockedChanges = computed(() => matrixPreview.value?.changes.filter(change => change.inventoryMutationBlocked || change.retirementBlocked) ?? [])
@@ -360,6 +408,180 @@ function manualFulfillmentForSku(skuId: string): ManualFulfillmentConfig | undef
   return manualFulfillment.value.find(row => row.skuId === skuId)
 }
 
+async function loadCodePoolEntries() {
+  if (!codePoolSkuId.value) return
+  const page = codePoolEntryPageNumber.value
+  const filter = codePoolEntryFilter.value
+  const suffix = `page=${page}&pageSize=50&status=${filter}`
+  codePoolEntries.value = await request<CodePoolEntryPage>(`/api/v1/admin/products/${productId.value}/variants/${codePoolSkuId.value}/code-pool/entries?${suffix}`)
+  codePoolSelectedEntryIds.value = []
+}
+
+async function loadCodePool() {
+  if (!codePoolSkuId.value || product.value?.productType !== 'digital') return
+  codePoolLoading.value = true
+  codePoolError.value = ''
+  try {
+    const skuId = codePoolSkuId.value
+    const [status, batches] = await Promise.all([
+      request<CodePoolStatus>(`/api/v1/admin/products/${productId.value}/variants/${skuId}/code-pool`),
+      request<CodePoolBatchPage>(`/api/v1/admin/products/${productId.value}/variants/${skuId}/code-pool/batches?page=1&pageSize=20`),
+    ])
+    if (skuId !== codePoolSkuId.value) return
+    codePoolStatus.value = status
+    codePoolBatches.value = batches
+    await loadCodePoolEntries()
+  } catch (error) {
+    codePoolError.value = error instanceof Error ? error.message : '卡密池状态暂时无法读取。'
+  } finally {
+    codePoolLoading.value = false
+  }
+}
+
+watch(inventorySummary, (summary) => {
+  if (product.value?.productType !== 'digital' || !summary?.variants.length) return
+  if (!summary.variants.some(row => row.skuId === codePoolSkuId.value)) {
+    codePoolSkuId.value = summary.variants[0]!.skuId
+  }
+}, { immediate: true })
+watch([codePoolSkuId, codePoolEntryFilter, codePoolEntryPageNumber], () => {
+  codePoolPreview.value = null
+  codePoolOperationId.value = ''
+  codePoolSelectedEntryIds.value = []
+  if (codePoolSkuId.value && !codePoolLoading.value) void loadCodePool()
+})
+watch([codePoolSourceText, codePoolFormat], () => {
+  codePoolPreview.value = null
+  codePoolOperationId.value = ''
+})
+
+function toggleCodePoolEntry(entryId: string, checked: boolean) {
+  if (checked) {
+    if (!codePoolSelectedEntryIds.value.includes(entryId)) codePoolSelectedEntryIds.value.push(entryId)
+  } else {
+    codePoolSelectedEntryIds.value = codePoolSelectedEntryIds.value.filter(id => id !== entryId)
+  }
+}
+
+async function readCodePoolFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  if (file.size > 1_048_576) {
+    codePoolError.value = '导入文件不能超过 1 MiB。'
+    input.value = ''
+    return
+  }
+  codePoolFormat.value = file.name.toLowerCase().endsWith('.csv') ? 'csv' : 'txt'
+  try {
+    codePoolSourceText.value = await file.text()
+    codePoolError.value = ''
+  } catch {
+    codePoolError.value = '文件读取失败，请重新选择 UTF-8 TXT 或 CSV 文件。'
+  } finally {
+    input.value = ''
+  }
+}
+
+async function precheckCodePoolImport() {
+  if (!codePoolSkuId.value || !codePoolSourceText.value || codePoolLoading.value) return
+  codePoolLoading.value = true
+  codePoolError.value = ''
+  codePoolMessage.value = ''
+  codePoolPreview.value = null
+  try {
+    codePoolPreview.value = await request<CodePoolImportPreview>(`/api/v1/admin/products/${productId.value}/variants/${codePoolSkuId.value}/code-pool/precheck`, {
+      method: 'POST', body: { format: codePoolFormat.value, sourceText: codePoolSourceText.value },
+    })
+    codePoolOperationId.value = crypto.randomUUID()
+  } catch (error) {
+    codePoolError.value = error instanceof Error ? error.message : '导入预检查失败。'
+  } finally {
+    codePoolLoading.value = false
+  }
+}
+
+async function importCodePool() {
+  const preview = codePoolPreview.value
+  if (!preview?.acceptedCount || !codePoolOperationId.value || codePoolLoading.value) return
+  if (!window.confirm(`确认将预检通过的 ${preview.acceptedCount} 条卡密加密入库？重复 ${preview.duplicateCount} 条、无效 ${preview.invalidCount} 条不会导入。`)) return
+  codePoolLoading.value = true
+  codePoolError.value = ''
+  try {
+    const result = await request<CodePoolMutationResult>(`/api/v1/admin/products/${productId.value}/variants/${codePoolSkuId.value}/code-pool/batches`, {
+      method: 'POST', body: {
+        operationId: codePoolOperationId.value,
+        format: codePoolFormat.value,
+        sourceText: codePoolSourceText.value,
+      },
+    })
+    codePoolStatus.value = result.status
+    codePoolMessage.value = result.repeated
+      ? '已读取相同导入操作的原结果，库存没有重复增加。'
+      : `批次 ${result.batch.id} 已入库 ${result.batch.acceptedCount} 条，库存由同一库存事件原子增加。`
+    codePoolSourceText.value = ''
+    codePoolPreview.value = null
+    codePoolOperationId.value = ''
+    await Promise.all([loadInventory(), loadCodePool()])
+  } catch (error) {
+    codePoolError.value = error instanceof Error ? error.message : '导入结果尚未确认。保留输入后再次提交可安全恢复相同操作。'
+  } finally {
+    codePoolLoading.value = false
+  }
+}
+
+async function setCodePoolReadiness(enabled: boolean) {
+  const row = codePoolInventoryRow.value
+  if (!row || !codePoolSkuId.value || !canConfigureCodePool.value || codePoolLoading.value) return
+  const action = enabled ? '开启此 SKU 的卡密自动发货销售资格' : '暂停此 SKU 的新订单卡密销售'
+  if (!window.confirm(`确认${action}？已预留订单仍会继续自动交付。`)) return
+  codePoolLoading.value = true
+  codePoolError.value = ''
+  codePoolMessage.value = ''
+  try {
+    codePoolStatus.value = await request<CodePoolStatus>(`/api/v1/admin/products/${productId.value}/variants/${codePoolSkuId.value}/code-pool/readiness`, {
+      method: 'PUT', body: {
+        enabled,
+        expectedSkuRevision: row.skuRevision,
+        expectedInventoryRevision: row.inventoryRevision,
+      },
+    })
+    codePoolMessage.value = enabled ? '新销售资格已开启。' : '新销售资格已暂停，已有订单预留仍可自动交付。'
+    await loadManualFulfillment()
+  } catch (error) {
+    codePoolError.value = error instanceof Error ? error.message : '卡密发货资格更新失败。'
+  } finally {
+    codePoolLoading.value = false
+  }
+}
+
+async function withdrawCodePoolEntries() {
+  const entries = codePoolSelectedEntryIds.value
+  if (!entries.length || !codePoolSkuId.value || !codePoolWithdrawalReason.value.trim()
+    || codePoolWithdrawalConfirmation.value !== 'REVOKE_UNSOLD_CODES' || codePoolLoading.value) return
+  if (!window.confirm(`将撤回 ${entries.length} 条仍未预留的卡密并减少相同数量的 SKU 库存。此操作不可撤销。继续吗？`)) return
+  codePoolLoading.value = true
+  codePoolError.value = ''
+  try {
+    const result = await request<CodePoolMutationResult>(`/api/v1/admin/products/${productId.value}/variants/${codePoolSkuId.value}/code-pool/withdrawals`, {
+      method: 'POST', body: {
+        operationId: crypto.randomUUID(), entryIds: [...entries],
+        reason: codePoolWithdrawalReason.value.trim(), confirmation: 'REVOKE_UNSOLD_CODES',
+      },
+    })
+    codePoolStatus.value = result.status
+    codePoolMessage.value = `已将 ${result.batch.acceptedCount} 条未售卡密安全撤回，数量库存已同步减少。`
+    codePoolSelectedEntryIds.value = []
+    codePoolWithdrawalReason.value = ''
+    codePoolWithdrawalConfirmation.value = ''
+    await Promise.all([loadInventory(), loadCodePool()])
+  } catch (error) {
+    codePoolError.value = error instanceof Error ? error.message : '撤回结果尚未确认，请刷新状态后核对批次记录。'
+  } finally {
+    codePoolLoading.value = false
+  }
+}
+
 function canEnableManualFulfillment(skuId: string): boolean {
   const row = inventorySummary.value?.variants.find(variant => variant.skuId === skuId)
   return product.value?.productType === 'digital'
@@ -448,7 +670,10 @@ async function loadProduct() {
   }
 }
 
-onMounted(() => { void loadProduct() })
+onMounted(() => {
+  clientReady.value = true
+  void loadProduct()
+})
 
 function beforeUnload(event: BeforeUnloadEvent) {
   if (!hasUnsavedChanges.value) return
@@ -1252,7 +1477,11 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
     </template>
 
     <template #body>
-      <main class="mx-auto w-full max-w-[96rem] min-w-0 px-4 py-5 sm:px-6 lg:px-8">
+      <main
+        id="admin-main"
+        class="mx-auto w-full max-w-[96rem] min-w-0 px-4 py-5 sm:px-6 lg:px-8"
+        :data-admin-product-ready="clientReady"
+      >
         <div
           v-if="loading"
           class="grid gap-5"
@@ -2925,6 +3154,445 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                   >
                     请使用上方库存分页逐页配置 SKU。资格切换会立即保存。
                   </p>
+                </section>
+
+                <section
+                  v-if="product?.productType === 'digital' && inventorySummary"
+                  class="mt-6 rounded-xl border border-success/25 bg-success/5 p-4 sm:p-5"
+                  aria-labelledby="code-pool-title"
+                >
+                  <div class="flex flex-wrap items-start justify-between gap-3">
+                    <div class="min-w-0">
+                      <h3
+                        id="code-pool-title"
+                        class="font-semibold text-highlighted"
+                      >
+                        SKU 卡密池与自动发货
+                      </h3>
+                      <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
+                        每个 SKU 独立管理。卡密按原文加密保存；此列表和批次记录不会显示完整卡密。库存、预留、撤回与交付由订单库存事件同步。
+                      </p>
+                    </div>
+                    <UBadge
+                      :color="codePoolStatus?.enabled && codePoolStatus.inventoryConsistent ? 'success' : codePoolStatus?.configured ? 'warning' : 'neutral'"
+                      variant="soft"
+                    >
+                      {{ codePoolStatus?.enabled ? '新订单自动发货已启用' : codePoolStatus?.configured ? '已配置并暂停新销售' : '尚未配置' }}
+                    </UBadge>
+                  </div>
+
+                  <div class="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto_auto] sm:items-end">
+                    <UFormField label="管理 SKU">
+                      <USelect
+                        v-model="codePoolSkuId"
+                        :items="codePoolSkuOptions"
+                        class="w-full"
+                        :disabled="codePoolLoading"
+                        aria-label="选择要管理的卡密池 SKU"
+                      />
+                    </UFormField>
+                    <UButton
+                      v-if="codePoolStatus?.configured"
+                      :color="codePoolStatus.enabled ? 'warning' : 'success'"
+                      :variant="codePoolStatus.enabled ? 'outline' : 'solid'"
+                      :disabled="codePoolLoading || (!codePoolStatus.enabled && !canConfigureCodePool)"
+                      :loading="codePoolLoading"
+                      :aria-pressed="codePoolStatus.enabled"
+                      @click="setCodePoolReadiness(!codePoolStatus.enabled)"
+                    >
+                      {{ codePoolStatus.enabled ? '暂停新销售' : '开启自动发货销售' }}
+                    </UButton>
+                    <UButton
+                      v-else
+                      color="neutral"
+                      variant="outline"
+                      :disabled="codePoolLoading || !canConfigureCodePool"
+                      :loading="codePoolLoading"
+                      @click="setCodePoolReadiness(false)"
+                    >
+                      配置并保持暂停
+                    </UButton>
+                    <UButton
+                      color="neutral"
+                      variant="ghost"
+                      icon="i-lucide-refresh-cw"
+                      :loading="codePoolLoading"
+                      @click="loadCodePool"
+                    >
+                      刷新状态
+                    </UButton>
+                  </div>
+                  <p
+                    v-if="!canConfigureCodePool && !codePoolStatus?.configured"
+                    class="mt-2 text-xs text-muted"
+                  >
+                    仅启用且未退役的数字商品 quantity SKU 可配置卡密池。配置卡密池前，请先将旧数量库存安全调整为 0。
+                  </p>
+                  <UAlert
+                    v-if="codePoolError"
+                    class="mt-3"
+                    color="error"
+                    variant="soft"
+                    :title="codePoolError"
+                    role="alert"
+                  />
+                  <UAlert
+                    v-if="codePoolMessage"
+                    class="mt-3"
+                    color="success"
+                    variant="soft"
+                    :title="codePoolMessage"
+                    role="status"
+                  />
+                  <UAlert
+                    v-if="codePoolStatus && !codePoolStatus.inventoryConsistent"
+                    class="mt-3"
+                    color="error"
+                    variant="soft"
+                    title="SKU 数量库存与卡密状态不一致。系统已阻止新订单，请检查订单库存事件和卡密批次。"
+                    role="alert"
+                  />
+
+                  <div
+                    v-if="codePoolStatus"
+                    class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4"
+                  >
+                    <div class="rounded-lg border border-default bg-elevated p-3">
+                      <p class="text-xs text-muted">
+                        未售可用
+                      </p>
+                      <p class="mt-1 text-xl font-semibold tabular-nums text-highlighted">
+                        {{ codePoolStatus.counts.available }}
+                      </p>
+                    </div>
+                    <div class="rounded-lg border border-default bg-elevated p-3">
+                      <p class="text-xs text-muted">
+                        订单已预留
+                      </p>
+                      <p class="mt-1 text-xl font-semibold tabular-nums text-highlighted">
+                        {{ codePoolStatus.counts.reserved }}
+                      </p>
+                    </div>
+                    <div class="rounded-lg border border-default bg-elevated p-3">
+                      <p class="text-xs text-muted">
+                        已交付
+                      </p>
+                      <p class="mt-1 text-xl font-semibold tabular-nums text-highlighted">
+                        {{ codePoolStatus.counts.delivered }}
+                      </p>
+                    </div>
+                    <div class="rounded-lg border border-default bg-elevated p-3">
+                      <p class="text-xs text-muted">
+                        已撤回
+                      </p>
+                      <p class="mt-1 text-xl font-semibold tabular-nums text-highlighted">
+                        {{ codePoolStatus.counts.revoked }}
+                      </p>
+                    </div>
+                  </div>
+                  <p
+                    v-if="codePoolStatus"
+                    class="mt-2 text-xs text-muted"
+                  >
+                    SKU 库存：实存 {{ codePoolStatus.inventory.stocked }} · 预留 {{ codePoolStatus.inventory.reserved }} · 可售 {{ codePoolStatus.inventory.available }}。启用时可售库存必须与未售卡密一致。
+                  </p>
+
+                  <form
+                    v-if="codePoolStatus?.configured"
+                    class="mt-5 grid gap-3 rounded-lg border border-default bg-elevated p-3 sm:p-4"
+                    @submit.prevent="precheckCodePoolImport"
+                  >
+                    <div class="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h4 class="font-medium text-highlighted">
+                          批量导入
+                        </h4>
+                        <p class="mt-1 text-xs text-muted">
+                          支持粘贴或 UTF-8 TXT/单列 CSV，单次最多 5,000 条。会保留大小写及空格，只忽略空白行。
+                        </p>
+                      </div>
+                      <UFormField label="来源格式">
+                        <USelect
+                          v-model="codePoolFormat"
+                          :items="codePoolFormatItems"
+                          class="w-36"
+                          aria-label="卡密导入格式"
+                        />
+                      </UFormField>
+                    </div>
+                    <label class="grid gap-1 text-sm font-medium text-highlighted">
+                      选择 TXT 或 CSV 文件
+                      <input
+                        class="block min-h-11 w-full rounded-md border border-default bg-default px-3 py-2 text-sm text-muted file:mr-3 file:rounded-md file:border-0 file:bg-primary/10 file:px-3 file:py-1.5 file:font-medium file:text-primary"
+                        type="file"
+                        accept=".txt,.csv,text/plain,text/csv"
+                        aria-label="选择卡密 TXT 或 CSV 文件"
+                        @change="readCodePoolFile"
+                      >
+                    </label>
+                    <UFormField
+                      label="卡密内容"
+                      hint="每行一条。CSV 可用 code 或 卡密 作为表头；预检查只返回行号和原因，不回显内容。"
+                    >
+                      <UTextarea
+                        v-model="codePoolSourceText"
+                        class="w-full"
+                        :rows="6"
+                        maxlength="1048576"
+                        placeholder="在此粘贴卡密，每行一条"
+                        autocomplete="off"
+                        spellcheck="false"
+                      />
+                    </UFormField>
+                    <div class="flex flex-wrap gap-2">
+                      <UButton
+                        type="submit"
+                        :disabled="codePoolLoading || !codePoolSourceText"
+                        :loading="codePoolLoading"
+                        icon="i-lucide-scan-search"
+                      >
+                        预检查导入内容
+                      </UButton>
+                      <UButton
+                        v-if="codePoolSourceText"
+                        type="button"
+                        color="neutral"
+                        variant="outline"
+                        :disabled="codePoolLoading"
+                        @click="codePoolSourceText = ''; codePoolPreview = null; codePoolError = ''"
+                      >
+                        清除输入
+                      </UButton>
+                    </div>
+                    <div
+                      v-if="codePoolPreview"
+                      class="rounded-lg border border-default bg-muted/20 p-3"
+                    >
+                      <p class="text-sm font-medium text-highlighted">
+                        共 {{ codePoolPreview.rowCount }} 行 · 可入库 {{ codePoolPreview.acceptedCount }} · 重复 {{ codePoolPreview.duplicateCount }} · 无效 {{ codePoolPreview.invalidCount }}
+                      </p>
+                      <ul
+                        v-if="codePoolPreview.rows.some(row => row.status !== 'accepted')"
+                        class="mt-2 max-h-36 space-y-1 overflow-auto text-xs text-muted"
+                        aria-label="重复及无效行"
+                      >
+                        <li
+                          v-for="row in codePoolPreview.rows.filter(item => item.status !== 'accepted').slice(0, 100)"
+                          :key="`${row.row}-${row.status}`"
+                        >
+                          第 {{ row.row }} 行 · {{ row.status === 'duplicate' ? '重复' : '无效' }} · {{ codePoolReasonLabel(row.reason) }}
+                        </li>
+                      </ul>
+                      <p
+                        v-if="codePoolPreview.rows.filter(row => row.status !== 'accepted').length > 100"
+                        class="mt-2 text-xs text-muted"
+                      >
+                        仅显示前 100 条重复或无效行；其余行号已包含在预检查结果中。
+                      </p>
+                      <UButton
+                        v-if="codePoolPreview.acceptedCount"
+                        class="mt-3"
+                        color="success"
+                        :disabled="codePoolLoading"
+                        :loading="codePoolLoading"
+                        @click="importCodePool"
+                      >
+                        确认加密入库 {{ codePoolPreview.acceptedCount }} 条
+                      </UButton>
+                    </div>
+                  </form>
+
+                  <section
+                    v-if="codePoolStatus?.configured"
+                    class="mt-5 rounded-lg border border-default bg-elevated p-3 sm:p-4"
+                    aria-labelledby="code-pool-entries-title"
+                  >
+                    <div class="flex flex-wrap items-end justify-between gap-3">
+                      <div>
+                        <h4
+                          id="code-pool-entries-title"
+                          class="font-medium text-highlighted"
+                        >
+                          卡密条目管理
+                        </h4>
+                        <p class="mt-1 text-xs text-muted">
+                          列表只显示状态与追踪编号，不显示卡密内容。只有“未售可用”条目能撤回。
+                        </p>
+                      </div>
+                      <UFormField label="状态筛选">
+                        <USelect
+                          v-model="codePoolEntryFilter"
+                          :items="codePoolStatusItems"
+                          class="w-36"
+                          aria-label="卡密条目状态筛选"
+                        />
+                      </UFormField>
+                    </div>
+                    <div
+                      v-if="codePoolEntries?.items.length"
+                      class="mt-3 divide-y divide-default rounded-lg border border-default"
+                    >
+                      <article
+                        v-for="entry in codePoolEntries.items"
+                        :key="entry.id"
+                        class="flex min-w-0 flex-col gap-2 p-3 sm:flex-row sm:items-center sm:justify-between"
+                      >
+                        <div class="flex min-w-0 items-start gap-3">
+                          <UCheckbox
+                            v-if="entry.state === 'available'"
+                            :model-value="codePoolSelectedEntryIds.includes(entry.id)"
+                            :aria-label="`选择未售卡密条目 ${entry.id} 撤回`"
+                            @update:model-value="value => toggleCodePoolEntry(entry.id, Boolean(value))"
+                          />
+                          <div class="min-w-0">
+                            <p class="break-all font-mono text-xs text-highlighted">
+                              条目 {{ entry.id }}
+                            </p>
+                            <p class="mt-1 break-all font-mono text-[11px] text-dimmed">
+                              导入批次 {{ entry.importBatchId }}
+                            </p>
+                            <p
+                              v-if="entry.orderId"
+                              class="mt-1 text-xs text-muted"
+                            >
+                              所属订单
+                              <NuxtLink
+                                :to="`/admin/orders/${entry.orderId}`"
+                                class="text-primary underline underline-offset-2"
+                              >
+                                {{ entry.orderId }}
+                              </NuxtLink>
+                            </p>
+                          </div>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2 text-xs text-muted sm:justify-end">
+                          <UBadge
+                            :color="entry.state === 'available' ? 'success' : entry.state === 'reserved' ? 'warning' : entry.state === 'delivered' ? 'primary' : 'neutral'"
+                            variant="soft"
+                          >
+                            {{ entry.state === 'available' ? '未售可用' : entry.state === 'reserved' ? '已预留' : entry.state === 'delivered' ? '已交付' : '已撤回' }}
+                          </UBadge>
+                          <time :datetime="entry.createdAt">{{ formatDate(entry.createdAt) }}</time>
+                        </div>
+                      </article>
+                    </div>
+                    <UEmpty
+                      v-else
+                      class="mt-3 rounded-lg border border-dashed border-default p-4"
+                      icon="i-lucide-key-round"
+                      title="没有符合筛选条件的卡密条目"
+                      description="导入批次和状态变化会保留在此追踪。"
+                    />
+                    <div
+                      v-if="codePoolEntries && codePoolEntries.totalPages > 1"
+                      class="mt-3 flex items-center justify-between gap-3"
+                    >
+                      <UButton
+                        color="neutral"
+                        variant="outline"
+                        size="sm"
+                        :disabled="codePoolEntryPageNumber <= 1 || codePoolLoading"
+                        @click="codePoolEntryPageNumber--"
+                      >
+                        上一页
+                      </UButton>
+                      <span class="text-xs text-muted">第 {{ codePoolEntryPageNumber }} / {{ codePoolEntries.totalPages }} 页，共 {{ codePoolEntries.total }} 条</span>
+                      <UButton
+                        color="neutral"
+                        variant="outline"
+                        size="sm"
+                        :disabled="codePoolEntryPageNumber >= codePoolEntries.totalPages || codePoolLoading"
+                        @click="codePoolEntryPageNumber++"
+                      >
+                        下一页
+                      </UButton>
+                    </div>
+                    <form
+                      v-if="codePoolSelectedEntryIds.length"
+                      class="mt-4 grid gap-3 rounded-lg border border-warning/30 bg-warning/5 p-3"
+                      @submit.prevent="withdrawCodePoolEntries"
+                    >
+                      <p class="text-sm font-medium text-highlighted">
+                        已选择 {{ codePoolSelectedEntryIds.length }} 条未售可用卡密。撤回会永久标记这些条目，并通过库存事件同步减少 SKU 数量。
+                      </p>
+                      <UFormField
+                        label="撤回原因"
+                        required
+                      >
+                        <UInput
+                          v-model="codePoolWithdrawalReason"
+                          class="w-full"
+                          maxlength="500"
+                          placeholder="例如：供应商批次取消"
+                        />
+                      </UFormField>
+                      <UFormField
+                        label="输入确认词 REVOKE_UNSOLD_CODES"
+                        hint="此操作不可撤销。已预留或已交付的卡密不能撤回。"
+                      >
+                        <UInput
+                          v-model="codePoolWithdrawalConfirmation"
+                          class="w-full sm:max-w-md"
+                          autocomplete="off"
+                          spellcheck="false"
+                        />
+                      </UFormField>
+                      <UButton
+                        type="submit"
+                        color="warning"
+                        variant="outline"
+                        icon="i-lucide-archive-restore"
+                        :disabled="codePoolLoading || !codePoolWithdrawalReason.trim() || codePoolWithdrawalConfirmation !== 'REVOKE_UNSOLD_CODES'"
+                        :loading="codePoolLoading"
+                      >
+                        安全撤回未售卡密
+                      </UButton>
+                    </form>
+                  </section>
+
+                  <section
+                    v-if="codePoolBatches?.items.length"
+                    class="mt-5 rounded-lg border border-default bg-elevated p-3 sm:p-4"
+                    aria-labelledby="code-pool-batches-title"
+                  >
+                    <h4
+                      id="code-pool-batches-title"
+                      class="font-medium text-highlighted"
+                    >
+                      最近导入与撤回批次
+                    </h4>
+                    <ul class="mt-3 divide-y divide-default rounded-lg border border-default">
+                      <li
+                        v-for="batch in codePoolBatches.items"
+                        :key="batch.id"
+                        class="grid gap-1 p-3 text-xs sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center sm:gap-3"
+                      >
+                        <UBadge
+                          :color="batch.kind === 'import' ? 'primary' : 'warning'"
+                          variant="soft"
+                        >
+                          {{ batch.kind === 'import' ? '导入批次' : '撤回批次' }} · {{ batch.acceptedCount }} 条
+                        </UBadge>
+                        <span class="break-all font-mono text-dimmed">{{ batch.id }} · 管理员 {{ batch.administratorId }}</span>
+                        <time
+                          class="text-muted"
+                          :datetime="batch.createdAt"
+                        >{{ formatDate(batch.createdAt) }}</time>
+                        <p
+                          v-if="batch.reason"
+                          class="text-muted sm:col-span-3"
+                        >
+                          撤回原因：{{ batch.reason }}
+                        </p>
+                        <p
+                          v-if="batch.kind === 'import'"
+                          class="text-muted sm:col-span-3"
+                        >
+                          请求 {{ batch.requestedCount }} · 重复 {{ batch.duplicateCount }} · 无效 {{ batch.invalidCount }}
+                        </p>
+                      </li>
+                    </ul>
+                  </section>
                 </section>
 
                 <section

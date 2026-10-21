@@ -51,6 +51,7 @@ import {
 } from '../auth/security.js'
 import type { Database, OrderStatus as DbOrderStatus } from '../db/types.js'
 import { CheckoutQuoteError, checkoutRequestHash, normalizeCheckoutItems, quoteCheckoutItems } from './checkout-quote.js'
+import { CodePoolDecryptionError, CodePoolKeyUnavailableError, decryptCodePoolContent } from './code-pool-crypto.js'
 
 export const guestSessionCookie = 'aikayun_guest_order_session'
 const guestSessionTtlSeconds = 60 * 60 * 24 * 180
@@ -84,9 +85,34 @@ function postgresCode(error: unknown): string | undefined {
   return undefined
 }
 
+function postgresConstraint(error: unknown): string | undefined {
+  let current: unknown = error
+  for (let depth = 0; depth < 5 && current && typeof current === 'object'; depth += 1) {
+    const candidate = current as { constraint?: unknown; cause?: unknown }
+    if (typeof candidate.constraint === 'string') return candidate.constraint
+    current = candidate.cause
+  }
+  return undefined
+}
+
 function handleOrderError(error: unknown, reply: FastifyReply, requestId: string) {
+  if (error instanceof CodePoolKeyUnavailableError) {
+    return reply.code(503).send(failure('CODE_POOL_KEY_UNAVAILABLE', '服务暂时无法解密此订单的交付凭证，请稍后重试。', requestId))
+  }
+  if (error instanceof CodePoolDecryptionError) {
+    return reply.code(503).send(failure('CODE_POOL_DECRYPTION_FAILED', '此订单的交付凭证完整性校验失败，已记录请求编号供管理员排查。', requestId))
+  }
   if (error instanceof OrderError || error instanceof CheckoutQuoteError) {
     return reply.code(error.status).send(failure(error.code, error.message, requestId))
+  }
+  const constraint = postgresConstraint(error)
+  if (constraint === 'order_inventory_insufficient_code_pool') {
+    return reply.code(409).send(failure('INSUFFICIENT_CODE_POOL', '卡密池可售数量已变化，请刷新报价后重试。', requestId))
+  }
+  if (constraint === 'code_pool_stock_requires_inventory_event'
+    || constraint === 'code_pool_inventory_mode_immutable'
+    || constraint === 'code_pool_fulfillment_history_immutable') {
+    return reply.code(409).send(failure('CODE_POOL_HISTORY_PROTECTED', '此 SKU 的卡密池历史受保护，请通过卡密池管理操作调整。', requestId))
   }
   if (error instanceof RangeError || error instanceof TypeError) {
     return reply.code(422).send(failure('ORDER_AMOUNT_OUT_OF_RANGE', '订单金额超出当前结算金额范围。', requestId))
@@ -144,7 +170,7 @@ function parseOptions(value: unknown): OrderDetail['items'][number]['options'] {
   return []
 }
 
-export async function loadOrderDetail(db: Db, id: string): Promise<OrderDetail | undefined> {
+export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): Promise<OrderDetail | undefined> {
   const order = await orderRow(db, id)
   if (!order) return undefined
   const itemRows = await db.selectFrom('order_items')
@@ -163,7 +189,8 @@ export async function loadOrderDetail(db: Db, id: string): Promise<OrderDetail |
       .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'delivery.fulfillment_attempt_id')
       .select([
         'attempt.order_item_id as order_item_id', 'delivery.id', 'delivery.unit_index',
-        'delivery.content', 'delivery.created_at',
+        'delivery.content', 'delivery.delivery_source', 'delivery.encrypted_content', 'delivery.content_nonce',
+        'delivery.content_auth_tag', 'delivery.encryption_key_id', 'delivery.code_pool_entry_id', 'delivery.created_at',
       ])
       .where('attempt.order_item_id', 'in', itemIds)
       .where('attempt.status', '=', 'succeeded')
@@ -172,11 +199,27 @@ export async function loadOrderDetail(db: Db, id: string): Promise<OrderDetail |
     : []
   const deliveriesByItem = new Map<string, OrderDetail['items'][number]['deliveries']>()
   for (const delivery of deliveries) {
+    let content = delivery.content
+    if (delivery.delivery_source === 'code_pool') {
+      const item = itemRows.find(row => row.id === delivery.order_item_id)
+      if (!config || !item || !delivery.encrypted_content || !delivery.content_nonce || !delivery.content_auth_tag
+        || !delivery.encryption_key_id || !delivery.code_pool_entry_id) {
+        throw new Error('Authorized code-pool delivery could not be decrypted')
+      }
+      content = decryptCodePoolContent(config,
+        `code-pool-delivery:${delivery.order_item_id}:${delivery.id}:${delivery.code_pool_entry_id}`, {
+          keyId: delivery.encryption_key_id,
+          nonce: delivery.content_nonce,
+          ciphertext: delivery.encrypted_content,
+          authTag: delivery.content_auth_tag,
+        })
+    }
+    if (content === null) throw new Error('Fulfillment delivery content is missing')
     const rows = deliveriesByItem.get(delivery.order_item_id) ?? []
     rows.push({
       id: delivery.id,
       unitIndex: delivery.unit_index,
-      content: delivery.content,
+      content,
       createdAt: delivery.created_at.toISOString(),
     })
     deliveriesByItem.set(delivery.order_item_id, rows)
@@ -302,6 +345,7 @@ async function existingIdempotentOrder(
   ownerId: string,
   idempotencyKey: string,
   requestHash: string,
+  config: AppConfig,
 ): Promise<OrderDetail | null> {
   let query = trx.selectFrom('orders').select(['id', 'request_sha256'])
     .where('idempotency_key', '=', idempotencyKey)
@@ -313,7 +357,7 @@ async function existingIdempotentOrder(
   if (existing.request_sha256 !== requestHash) {
     throw new OrderError(409, 'ORDER_IDEMPOTENCY_CONFLICT', '此幂等标识已用于不同的 SKU 或购买数量。请为新的下单内容生成新标识。')
   }
-  const detail = await loadOrderDetail(trx, existing.id)
+  const detail = await loadOrderDetail(trx, existing.id, config)
   if (!detail) throw new Error('Idempotent order disappeared inside its transaction')
   return detail
 }
@@ -323,6 +367,7 @@ async function createOrderTransaction(
   body: CreateOrderBody,
   customer: AuthenticatedCustomer | null,
   guestToken: string | undefined,
+  config: AppConfig,
 ): Promise<{ created: boolean; order: OrderDetail }> {
   const items = normalizeCheckoutItems(body.items)
   const requestHash = checkoutRequestHash(items)
@@ -340,7 +385,7 @@ async function createOrderTransaction(
   }
 
   await lockIdempotencyKey(trx, ownerType, ownerId, body.idempotencyKey)
-  const existing = await existingIdempotentOrder(trx, ownerType, ownerId, body.idempotencyKey, requestHash)
+  const existing = await existingIdempotentOrder(trx, ownerType, ownerId, body.idempotencyKey, requestHash, config)
   if (existing) return { created: false, order: existing }
 
   await trx.selectFrom('storefront_customer_policy').select('singleton')
@@ -378,7 +423,8 @@ async function createOrderTransaction(
   for (const item of orderItems) {
     const inventoryMode = item.inventoryMode
     if (!item.productId || !item.productName || !item.productType || !item.skuCode || !item.unitPrice || !item.lineTotal
-      || (inventoryMode !== 'quantity' && inventoryMode !== 'unlimited')) {
+      || (inventoryMode !== 'quantity' && inventoryMode !== 'unlimited')
+      || (item.fulfillmentMethod !== 'manual' && item.fulfillmentMethod !== 'code_pool')) {
       throw new Error('Eligible checkout item is missing required transaction snapshot fields')
     }
     const orderItemId = randomUUID()
@@ -392,7 +438,7 @@ async function createOrderTransaction(
       sku_code_snapshot: item.skuCode,
       sku_snapshot: JSON.stringify(item.options),
       inventory_mode_snapshot: inventoryMode,
-      fulfillment_method_snapshot: 'manual',
+      fulfillment_method_snapshot: item.fulfillmentMethod,
       unit_price: item.unitPrice,
       quantity: item.quantity,
       line_amount: item.lineTotal,
@@ -408,7 +454,7 @@ async function createOrderTransaction(
     }
   }
   await trx.updateTable('orders').set({ items_sealed: true }).where('id', '=', orderId).execute()
-  const order = await loadOrderDetail(trx, orderId)
+  const order = await loadOrderDetail(trx, orderId, config)
   if (!order) throw new Error('New order could not be loaded before commit')
   return { created: true, order }
 }
@@ -418,11 +464,12 @@ async function createOrderWithRetry(
   body: CreateOrderBody,
   customer: AuthenticatedCustomer | null,
   guestToken: string | undefined,
+  config: AppConfig,
 ): Promise<{ created: boolean; order: OrderDetail }> {
   const maxAttempts = 3
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      return await db.transaction().execute(trx => createOrderTransaction(trx, body, customer, guestToken))
+      return await db.transaction().execute(trx => createOrderTransaction(trx, body, customer, guestToken, config))
     } catch (error) {
       if (!retryableSqlStates.has(postgresCode(error) ?? '') || attempt === maxAttempts) {
         if (retryableSqlStates.has(postgresCode(error) ?? '')) {
@@ -495,13 +542,14 @@ async function getOwnedOrder(
   orderId: string,
   ownerType: 'customer' | 'guest',
   ownerId: string,
+  config: AppConfig,
 ): Promise<OrderDetail | undefined> {
   const order = await db.selectFrom('orders').select('id').where('id', '=', orderId)
   const owned = ownerType === 'customer'
     ? await order.where('customer_id', '=', ownerId).executeTakeFirst()
     : await order.where('guest_order_session_id', '=', ownerId).executeTakeFirst()
   if (!owned) return undefined
-  return loadOrderDetail(db, owned.id)
+  return loadOrderDetail(db, owned.id, config)
 }
 
 async function orderHasCloseProtection(trx: Transaction<Database>, orderId: string): Promise<boolean> {
@@ -673,8 +721,8 @@ async function adminOrderPage(db: Kysely<Database>, query: {
   }
 }
 
-async function adminOrderDetail(db: Kysely<Database>, orderId: string): Promise<AdminOrderDetail | undefined> {
-  const detail = await loadOrderDetail(db, orderId)
+async function adminOrderDetail(db: Kysely<Database>, orderId: string, config: AppConfig): Promise<AdminOrderDetail | undefined> {
+  const detail = await loadOrderDetail(db, orderId, config)
   if (!detail) return undefined
   const row = await db.selectFrom('orders as order')
     .leftJoin('customers as customer', 'customer.id', 'order.customer_id')
@@ -708,6 +756,7 @@ async function adminOrderDetail(db: Kysely<Database>, orderId: string): Promise<
     .select([
       'attempt.id', 'attempt.order_item_id', 'attempt.started_by_admin_id', 'attempt.quantity',
       'attempt.status', 'attempt.result_sha256', 'attempt.created_at', 'attempt.completed_at',
+      'attempt.delivery_source', 'attempt.failure_code', 'attempt.retry_after',
     ])
     .where('item.order_id', '=', orderId)
     .orderBy('attempt.created_at').orderBy('attempt.id')
@@ -841,6 +890,9 @@ async function adminOrderDetail(db: Kysely<Database>, orderId: string): Promise<
       administratorId: attempt.started_by_admin_id,
       quantity: attempt.quantity,
       status: attempt.status,
+      deliverySource: attempt.delivery_source,
+      failureCode: attempt.failure_code as AdminOrderDetail['fulfillmentAttempts'][number]['failureCode'],
+      retryAfter: attempt.retry_after?.toISOString() ?? null,
       resultSha256: attempt.result_sha256,
       createdAt: attempt.created_at.toISOString(),
       completedAt: attempt.completed_at?.toISOString() ?? null,
@@ -915,6 +967,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
         request.body as CreateOrderBody,
         request.customer,
         request.customer ? undefined : request.cookies[guestSessionCookie],
+        config,
       )
       reply.header('cache-control', 'no-store')
       return reply.code(result.created ? 201 : 200).send(success(result, request.id))
@@ -960,7 +1013,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
       const params = request.params as { id: string }
       const detail = await db.transaction().execute(async (trx) => {
         await assertCustomerSession(trx, request.customer!)
-        return getOwnedOrder(trx, params.id, 'customer', request.customer!.id)
+        return getOwnedOrder(trx, params.id, 'customer', request.customer!.id, config)
       })
       if (!detail) return reply.code(404).send(failure('ORDER_NOT_FOUND', '找不到属于当前顾客账户的订单。', request.id))
       reply.header('cache-control', 'no-store')
@@ -983,7 +1036,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
       const params = request.params as { id: string }
       const detail = await db.transaction().execute(async (trx) => {
         await lockCustomerForOrderMutation(trx, customer)
-        return cancelOwnedOrderInTransaction(trx, params.id, 'customer', customer.id)
+        return cancelOwnedOrderInTransaction(trx, params.id, 'customer', customer.id, config)
       })
       reply.header('cache-control', 'no-store')
       return success(detail, request.id)
@@ -1027,7 +1080,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
       const params = request.params as { id: string }
       const detail = await db.transaction().execute(async (trx) => {
         const sessionId = await assertGuestSession(trx, request.cookies[guestSessionCookie])
-        return getOwnedOrder(trx, params.id, 'guest', sessionId)
+        return getOwnedOrder(trx, params.id, 'guest', sessionId, config)
       })
       if (!detail) return reply.code(404).send(failure('ORDER_NOT_FOUND', '找不到属于当前游客会话的订单。', request.id))
       reply.header('cache-control', 'no-store')
@@ -1050,7 +1103,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
       const params = request.params as { id: string }
       const detail = await db.transaction().execute(async (trx) => {
         const sessionId = await assertGuestSession(trx, request.cookies[guestSessionCookie])
-        return cancelOwnedOrderInTransaction(trx, params.id, 'guest', sessionId)
+        return cancelOwnedOrderInTransaction(trx, params.id, 'guest', sessionId, config)
       })
       reply.header('cache-control', 'no-store')
       return success(detail, request.id)
@@ -1082,10 +1135,14 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
     },
   }, async (request, reply) => {
     const params = request.params as { id: string }
-    const detail = await adminOrderDetail(db, params.id)
-    if (!detail) return reply.code(404).send(failure('ORDER_NOT_FOUND', '订单不存在。', request.id))
-    reply.header('cache-control', 'no-store')
-    return success(detail, request.id)
+    try {
+      const detail = await adminOrderDetail(db, params.id, config)
+      if (!detail) return reply.code(404).send(failure('ORDER_NOT_FOUND', '订单不存在。', request.id))
+      reply.header('cache-control', 'no-store')
+      return success(detail, request.id)
+    } catch (error) {
+      return handleOrderError(error, reply, request.id)
+    }
   })
 
   app.post('/api/v1/admin/orders/:id/items/:itemId/fulfillments', {
@@ -1116,7 +1173,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
             || existing.status !== 'succeeded' || existing.result_sha256 !== resultHash) {
             throw new OrderError(409, 'FULFILLMENT_OPERATION_CONFLICT', '此履约操作标识已用于不同的订单、数量或交付内容。')
           }
-          const order = await loadOrderDetail(trx, params.id)
+          const order = await loadOrderDetail(trx, params.id, config)
           if (!order) throw new OrderError(404, 'ORDER_NOT_FOUND', '订单不存在。')
           return { repeated: true, order }
         }
@@ -1174,7 +1231,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
           .set({ status: 'succeeded', result_sha256: resultHash })
           .where('id', '=', attemptId)
           .execute()
-        const detail = await loadOrderDetail(trx, params.id)
+        const detail = await loadOrderDetail(trx, params.id, config)
         if (!detail) throw new Error('Fulfilled order could not be loaded')
         return { repeated: false, order: detail }
       })
@@ -1240,14 +1297,18 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
           throw new OrderError(409, 'MANUAL_FULFILLMENT_SKU_UNSUITABLE', '只有启用且未退役、库存模式为按数量或不限数量的数字商品 SKU 才能开启人工交付。')
         }
         const configured = await trx.selectFrom('product_variant_fulfillment')
-          .select('product_variant_id')
+          .select(['product_variant_id', 'method'])
           .where('product_variant_id', '=', variant.id)
           .forUpdate()
           .executeTakeFirst()
+        if (configured?.method === 'code_pool') {
+          throw new OrderError(409, 'CODE_POOL_METHOD_ACTIVE', '此 SKU 正在使用卡密池履约，不能切换为人工发货。请先暂停新销售并处理卡密池历史。')
+        }
         if (configured) {
           await trx.updateTable('product_variant_fulfillment').set({
             method: 'manual',
             manual_delivery_ready: body.enabled,
+            code_pool_delivery_ready: false,
             updated_at: new Date(),
           }).where('product_variant_id', '=', variant.id).execute()
         } else {
@@ -1255,6 +1316,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
             product_variant_id: variant.id,
             method: 'manual',
             manual_delivery_ready: body.enabled,
+            code_pool_delivery_ready: false,
           }).execute()
         }
         const saved = await trx.selectFrom('product_variant_fulfillment')
@@ -1282,6 +1344,7 @@ async function cancelOwnedOrderInTransaction(
   orderId: string,
   ownerType: 'customer' | 'guest',
   ownerId: string,
+  config: AppConfig,
 ): Promise<OrderDetail> {
   const order = await trx.selectFrom('orders').select(['id', 'status'])
   const owned = ownerType === 'customer'
@@ -1289,7 +1352,7 @@ async function cancelOwnedOrderInTransaction(
     : await order.where('guest_order_session_id', '=', ownerId).where('id', '=', orderId).forUpdate().executeTakeFirst()
   if (!owned) throw new OrderError(404, 'ORDER_NOT_FOUND', '找不到属于当前账户或游客会话的订单。')
   if (owned.status === 'closed') {
-    const detail = await loadOrderDetail(trx, orderId)
+    const detail = await loadOrderDetail(trx, orderId, config)
     if (!detail) throw new Error('Closed order could not be loaded')
     return detail
   }
@@ -1297,7 +1360,7 @@ async function cancelOwnedOrderInTransaction(
     throw new OrderError(409, 'ORDER_NOT_CANCELLABLE', '只有仍在待付款且没有资金或履约义务的订单可以取消。')
   }
   await closeOrderAndReleaseInventory(trx, orderId)
-  const detail = await loadOrderDetail(trx, orderId)
+  const detail = await loadOrderDetail(trx, orderId, config)
   if (!detail) throw new Error('Cancelled order could not be loaded')
   return detail
 }

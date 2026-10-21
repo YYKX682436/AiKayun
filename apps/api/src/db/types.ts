@@ -159,6 +159,7 @@ export interface ProductVariantFulfillmentTable {
   product_variant_id: string
   method: FulfillmentMethod
   manual_delivery_ready: Generated<boolean>
+  code_pool_delivery_ready: Generated<boolean>
   updated_at: Generated<Date>
 }
 
@@ -219,14 +220,62 @@ export interface OrderInventoryReservationsTable {
   created_at: Generated<Date>
 }
 
-export type OrderInventoryAction = 'reserve' | 'release' | 'consume'
+export type OrderInventoryAction = 'reserve' | 'release' | 'consume' | 'restock' | 'withdraw'
 
 export interface OrderInventoryEventsTable {
   id: string
-  reservation_id: string
+  reservation_id: string | null
+  product_variant_id: string | null
+  code_pool_batch_id: string | null
   operation_id: string
   action: OrderInventoryAction
   quantity: number
+  created_at: Generated<Date>
+}
+
+export type CodePoolBatchKind = 'import' | 'withdrawal'
+export interface CodePoolBatchesTable {
+  id: string
+  product_id: string
+  product_variant_id: string
+  operation_id: string
+  kind: CodePoolBatchKind
+  request_sha256: string
+  requested_count: number
+  accepted_count: number
+  duplicate_count: number
+  invalid_count: number
+  reason: string | null
+  created_by_admin_id: string
+  created_at: Generated<Date>
+}
+
+export type CodePoolEntryState = 'staged' | 'available' | 'reserved' | 'delivered' | 'revoked'
+export interface CodePoolEntriesTable {
+  id: string
+  product_id: string
+  product_variant_id: string
+  import_batch_id: string
+  ciphertext: Buffer
+  nonce: Buffer
+  auth_tag: Buffer
+  encryption_key_id: string
+  content_fingerprint: string
+  fingerprint_key_id: string
+  state: CodePoolEntryState
+  order_item_id: string | null
+  withdrawal_batch_id: string | null
+  created_at: Generated<Date>
+  reserved_at: Date | null
+  delivered_at: Date | null
+  revoked_at: Date | null
+}
+
+export interface CodePoolWithdrawalEntriesTable {
+  batch_id: string
+  product_id: string
+  product_variant_id: string
+  entry_id: string
   created_at: Generated<Date>
 }
 
@@ -593,6 +642,9 @@ export interface OrderItemFulfillmentAttemptsTable {
   started_by_admin_id: string | null
   status: Generated<FulfillmentAttemptStatus>
   result_sha256: string | null
+  delivery_source: Generated<'manual' | 'code_pool'>
+  failure_code: string | null
+  retry_after: Date | null
   created_at: Generated<Date>
   completed_at: Date | null
 }
@@ -600,10 +652,16 @@ export interface OrderItemFulfillmentAttemptsTable {
 export interface OrderItemFulfillmentDeliveriesTable {
   id: string
   fulfillment_attempt_id: string
-  started_by_admin_id: string
+  started_by_admin_id: string | null
   unit_index: number
-  content: string
+  content: string | null
   content_sha256: string
+  delivery_source: Generated<'manual' | 'code_pool'>
+  encrypted_content: Buffer | null
+  content_nonce: Buffer | null
+  content_auth_tag: Buffer | null
+  encryption_key_id: string | null
+  code_pool_entry_id: string | null
   created_at: Generated<Date>
 }
 
@@ -768,6 +826,9 @@ export interface Database {
   order_items: OrderItemsTable
   order_inventory_reservations: OrderInventoryReservationsTable
   order_inventory_events: OrderInventoryEventsTable
+  code_pool_batches: CodePoolBatchesTable
+  code_pool_entries: CodePoolEntriesTable
+  code_pool_withdrawal_entries: CodePoolWithdrawalEntriesTable
   wallet_accounts: WalletAccountsTable
   wallet_operations: WalletOperationsTable
   payment_attempts: PaymentAttemptsTable

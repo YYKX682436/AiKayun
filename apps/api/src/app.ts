@@ -32,6 +32,7 @@ import { registerAdminProductDetailRoutes } from './catalog/admin-product-detail
 import { registerAdminVariantMatrixRoutes } from './catalog/admin-variant-matrix.js'
 import { registerAdminProductPriceRoutes } from './catalog/admin-product-prices.js'
 import { registerAdminInventoryRoutes } from './catalog/admin-inventory.js'
+import { registerAdminCodePoolRoutes } from './catalog/admin-code-pool.js'
 import { registerProductMediaRoutes } from './media/admin.js'
 import { registerPublicProductRoutes } from './catalog/public-products.js'
 import { registerCustomerCartRoutes } from './commerce/customer-cart.js'
@@ -180,6 +181,7 @@ export async function createApp(options: {
   registerAdminVariantMatrixRoutes(app, db, config, identityFactory)
   registerAdminProductPriceRoutes(app, db, config)
   registerAdminInventoryRoutes(app, db, config)
+  registerAdminCodePoolRoutes(app, db, config)
   await registerProductMediaRoutes(app, db, config)
   registerPublicProductRoutes(app, db)
   return app

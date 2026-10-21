@@ -933,6 +933,7 @@ export const CheckoutQuoteReasonSchema = Type.Union([
   Type.Literal('insufficient_inventory'),
   Type.Literal('inventory_not_ready'),
   Type.Literal('fulfillment_not_ready'),
+  Type.Literal('code_pool_inventory_inconsistent'),
   Type.Literal('guest_checkout_disabled'),
   Type.Literal('guest_free_claim_disabled'),
   Type.Literal('purchase_limit_exceeded'),
@@ -951,6 +952,7 @@ export const CheckoutQuoteItemSchema = Type.Object({
   quantity: Type.Integer({ minimum: 1, maximum: 99 }),
   lineTotal: Type.Union([SettlementAmountSchema, Type.Null()]),
   inventoryMode: Type.Union([NullableProductInventoryModeSchema, Type.Null()]),
+  fulfillmentMethod: Type.Union([Type.String({ minLength: 1, maxLength: 24 }), Type.Null()]),
   availableQuantity: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
   identityValid: Type.Boolean(),
   purchaseLimits: CheckoutPurchaseLimitsSchema,
@@ -1784,7 +1786,10 @@ export const AdminOrderPageSchema = Type.Object({
   totalPages: Type.Integer({ minimum: 0 }),
 }, { additionalProperties: false })
 export const AdminOrderInventoryEventSchema = Type.Object({
-  action: Type.Union([Type.Literal('reserve'), Type.Literal('release'), Type.Literal('consume')]),
+  action: Type.Union([
+    Type.Literal('reserve'), Type.Literal('release'), Type.Literal('consume'),
+    Type.Literal('restock'), Type.Literal('withdraw'),
+  ]),
   quantity: Type.Integer({ minimum: 1 }),
   createdAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
@@ -1800,6 +1805,14 @@ export const AdminFulfillmentAttemptSchema = Type.Object({
   administratorId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   quantity: Type.Integer({ minimum: 1 }),
   status: Type.Union([Type.Literal('processing'), Type.Literal('unknown'), Type.Literal('succeeded'), Type.Literal('failed')]),
+  deliverySource: Type.Union([Type.Literal('manual'), Type.Literal('code_pool')]),
+  failureCode: Type.Union([Type.Null(),
+    Type.Literal('CODE_POOL_DATA_INCONSISTENT'),
+    Type.Literal('CODE_POOL_KEY_UNAVAILABLE'),
+    Type.Literal('CODE_POOL_DECRYPTION_FAILED'),
+    Type.Literal('CODE_POOL_PAYMENT_UNRESOLVED'),
+  ]),
+  retryAfter: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
   resultSha256: Type.Union([Type.String({ pattern: '^[0-9a-f]{64}$' }), Type.Null()]),
   createdAt: Type.String({ format: 'date-time' }),
   completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
@@ -1841,6 +1854,119 @@ export const ManualFulfillmentDeliveryBodySchema = Type.Object({
 export const ManualFulfillmentResultSchema = Type.Object({
   repeated: Type.Boolean(),
   order: OrderDetailSchema,
+}, { additionalProperties: false })
+
+export const CodePoolFormatSchema = Type.Union([
+  Type.Literal('paste'), Type.Literal('txt'), Type.Literal('csv'),
+])
+export const CodePoolStatusFilterSchema = Type.Union([
+  Type.Literal('all'), Type.Literal('available'), Type.Literal('reserved'),
+  Type.Literal('delivered'), Type.Literal('revoked'),
+])
+export const CodePoolImportPreviewBodySchema = Type.Object({
+  format: CodePoolFormatSchema,
+  sourceText: Type.String({ minLength: 1, maxLength: 1_048_576 }),
+}, { additionalProperties: false })
+export const CodePoolImportBodySchema = Type.Object({
+  operationId: Type.String({ format: 'uuid' }),
+  format: CodePoolFormatSchema,
+  sourceText: Type.String({ minLength: 1, maxLength: 1_048_576 }),
+}, { additionalProperties: false })
+export const CodePoolImportPreviewRowSchema = Type.Object({
+  row: Type.Integer({ minimum: 1 }),
+  status: Type.Union([Type.Literal('accepted'), Type.Literal('duplicate'), Type.Literal('invalid')]),
+  reason: Type.Union([Type.Null(),
+    Type.Literal('duplicate_in_request'), Type.Literal('already_imported'),
+    Type.Literal('empty'), Type.Literal('too_long'), Type.Literal('invalid_text'),
+    Type.Literal('invalid_csv_row'),
+  ]),
+}, { additionalProperties: false })
+export const CodePoolImportPreviewSchema = Type.Object({
+  rowCount: Type.Integer({ minimum: 0 }),
+  acceptedCount: Type.Integer({ minimum: 0 }),
+  duplicateCount: Type.Integer({ minimum: 0 }),
+  invalidCount: Type.Integer({ minimum: 0 }),
+  rows: Type.Array(CodePoolImportPreviewRowSchema, { maxItems: 5000 }),
+}, { additionalProperties: false })
+export const CodePoolBatchSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  operationId: Type.String({ format: 'uuid' }),
+  kind: Type.Union([Type.Literal('import'), Type.Literal('withdrawal')]),
+  requestedCount: Type.Integer({ minimum: 0 }),
+  acceptedCount: Type.Integer({ minimum: 0 }),
+  duplicateCount: Type.Integer({ minimum: 0 }),
+  invalidCount: Type.Integer({ minimum: 0 }),
+  reason: Type.Union([Type.String({ minLength: 1, maxLength: 500 }), Type.Null()]),
+  administratorId: Type.String({ format: 'uuid' }),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const CodePoolCountsSchema = Type.Object({
+  available: Type.Integer({ minimum: 0 }),
+  reserved: Type.Integer({ minimum: 0 }),
+  delivered: Type.Integer({ minimum: 0 }),
+  revoked: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const CodePoolInventorySchema = Type.Object({
+  stocked: Type.Integer({ minimum: 0 }),
+  reserved: Type.Integer({ minimum: 0 }),
+  available: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const CodePoolStatusSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  skuId: Type.String({ format: 'uuid' }),
+  enabled: Type.Boolean(),
+  configured: Type.Boolean(),
+  inventoryConsistent: Type.Boolean(),
+  counts: CodePoolCountsSchema,
+  inventory: CodePoolInventorySchema,
+}, { additionalProperties: false })
+export const CodePoolEntrySchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  importBatchId: Type.String({ format: 'uuid' }),
+  state: Type.Union([
+    Type.Literal('available'), Type.Literal('reserved'), Type.Literal('delivered'), Type.Literal('revoked'),
+  ]),
+  orderId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  createdAt: Type.String({ format: 'date-time' }),
+  reservedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  deliveredAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  revokedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+}, { additionalProperties: false })
+export const CodePoolListQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  status: Type.Optional(CodePoolStatusFilterSchema),
+  batchId: Type.Optional(Type.String({ format: 'uuid' })),
+}, { additionalProperties: false })
+export const CodePoolEntryPageSchema = Type.Object({
+  items: Type.Array(CodePoolEntrySchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const CodePoolBatchPageSchema = Type.Object({
+  items: Type.Array(CodePoolBatchSchema),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 100 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const CodePoolReadinessBodySchema = Type.Object({
+  enabled: Type.Boolean(),
+  expectedSkuRevision: Type.Integer({ minimum: 1 }),
+  expectedInventoryRevision: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const CodePoolWithdrawalBodySchema = Type.Object({
+  operationId: Type.String({ format: 'uuid' }),
+  entryIds: Type.Array(Type.String({ format: 'uuid' }), { minItems: 1, maxItems: 500 }),
+  reason: Type.String({ minLength: 1, maxLength: 500 }),
+  confirmation: Type.Literal('REVOKE_UNSOLD_CODES'),
+}, { additionalProperties: false })
+export const CodePoolMutationResultSchema = Type.Object({
+  repeated: Type.Boolean(),
+  batch: CodePoolBatchSchema,
+  status: CodePoolStatusSchema,
 }, { additionalProperties: false })
 
 export const CustomerCartSchema = Type.Object({
@@ -2343,6 +2469,19 @@ export type ManualFulfillmentConfigPage = Static<typeof ManualFulfillmentConfigP
 export type ManualFulfillmentResult = Static<typeof ManualFulfillmentResultSchema>
 export type GuestOrderSession = Static<typeof GuestOrderSessionSchema>
 export type ManualFulfillmentDeliveryBody = Static<typeof ManualFulfillmentDeliveryBodySchema>
+export type CodePoolFormat = Static<typeof CodePoolFormatSchema>
+export type CodePoolImportPreviewBody = Static<typeof CodePoolImportPreviewBodySchema>
+export type CodePoolImportBody = Static<typeof CodePoolImportBodySchema>
+export type CodePoolImportPreview = Static<typeof CodePoolImportPreviewSchema>
+export type CodePoolBatch = Static<typeof CodePoolBatchSchema>
+export type CodePoolBatchPage = Static<typeof CodePoolBatchPageSchema>
+export type CodePoolStatus = Static<typeof CodePoolStatusSchema>
+export type CodePoolEntry = Static<typeof CodePoolEntrySchema>
+export type CodePoolEntryPage = Static<typeof CodePoolEntryPageSchema>
+export type CodePoolListQuery = Static<typeof CodePoolListQuerySchema>
+export type CodePoolReadinessBody = Static<typeof CodePoolReadinessBodySchema>
+export type CodePoolWithdrawalBody = Static<typeof CodePoolWithdrawalBodySchema>
+export type CodePoolMutationResult = Static<typeof CodePoolMutationResultSchema>
 export type CustomerCart = Static<typeof CustomerCartSchema>
 export type CustomerCartMutation = Static<typeof CustomerCartMutationSchema>
 export type PublicProductCategoryAssignment = Static<typeof PublicProductCategoryAssignmentSchema>

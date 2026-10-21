@@ -11,6 +11,9 @@ import { createDatabase } from '../src/db/pool.js'
 import type { Database, ProductInventoryMode, ProductStatus } from '../src/db/types.js'
 import { expireDueUnpaidOrders } from '../src/commerce/orders.js'
 import { startUnpaidOrderExpiryWorker } from '../src/commerce/unpaid-order-expiry.js'
+import { startCodePoolDeliveryWorker } from '../src/commerce/code-pool-delivery-worker.js'
+import type { AppConfig } from '../src/config.js'
+import { decryptCodePoolContent } from '../src/commerce/code-pool-crypto.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const testOrigin = 'http://localhost:3000'
@@ -19,6 +22,7 @@ const digest = 'a'.repeat(64)
 
 let app: FastifyInstance
 let db: Kysely<Database>
+let appConfig: AppConfig
 let nextIp = 1
 
 type Customer = { id: string; username: string; cookie: string; csrfToken: string; csrfCookie: string }
@@ -269,6 +273,24 @@ async function settleAndRefundExternally(orderId: string, amount: string): Promi
   await db.updateTable('order_refunds').set({ status: 'succeeded' }).where('id', '=', refundId).execute()
 }
 
+async function refundExistingReceipt(orderId: string, receiptId: string, amount: string): Promise<void> {
+  const refundId = randomUUID()
+  const allocationId = randomUUID()
+  const reviewingAdminId = (await db.selectFrom('admin_users').select('id').executeTakeFirstOrThrow()).id
+  await db.insertInto('order_refunds').values({
+    id: refundId, order_id: orderId, idempotency_key: randomUUID(), request_sha256: digest, amount,
+  }).execute()
+  await db.updateTable('order_refunds').set({ status: 'approved', reviewed_by_admin_id: reviewingAdminId })
+    .where('id', '=', refundId).execute()
+  await db.insertInto('order_refund_allocations').values({
+    id: allocationId, refund_id: refundId, source_payment_receipt_id: receiptId,
+    operation_id: randomUUID(), request_sha256: digest, destination: 'cash_balance', amount,
+  }).execute()
+  await db.updateTable('order_refunds').set({ status: 'processing' }).where('id', '=', refundId).execute()
+  await db.updateTable('order_refund_allocations').set({ status: 'succeeded' }).where('id', '=', allocationId).execute()
+  await db.updateTable('order_refunds').set({ status: 'succeeded' }).where('id', '=', refundId).execute()
+}
+
 async function insertDirectPurchaseOrder(
   trx: Transaction<Database>,
   customerId: string,
@@ -366,6 +388,51 @@ async function createOrder(
     },
     payload: { idempotencyKey, quoteToken, items, ...extra },
   })
+}
+
+async function setCodePoolReadiness(catalog: Catalog, admin: Admin, enabled: boolean) {
+  const revisions = await db.selectFrom('product_variants')
+    .select(['revision', 'inventory_revision']).where('id', '=', catalog.skuId).executeTakeFirstOrThrow()
+  return inject({
+    method: 'PUT',
+    url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/readiness`,
+    headers: adminHeaders(admin),
+    payload: {
+      enabled,
+      expectedSkuRevision: revisions.revision,
+      expectedInventoryRevision: revisions.inventory_revision,
+    },
+  })
+}
+
+async function importCodePool(catalog: Catalog, admin: Admin, sourceText: string, operationId = randomUUID()) {
+  return inject({
+    method: 'POST',
+    url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/batches`,
+    headers: adminHeaders(admin),
+    payload: { operationId, format: 'paste', sourceText },
+  })
+}
+
+async function waitForCodePoolOrder(orderId: string, itemId: string, expectedFulfilled: number, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const [order, item, attempts] = await Promise.all([
+      db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirst(),
+      db.selectFrom('order_items').select(['fulfilled_quantity', 'fulfillment_status'])
+        .where('id', '=', itemId).executeTakeFirst(),
+      db.selectFrom('order_item_fulfillment_attempts').select(['status', 'failure_code'])
+        .where('order_item_id', '=', itemId).where('delivery_source', '=', 'code_pool')
+        .orderBy('created_at', 'desc').orderBy('id', 'desc').execute(),
+    ])
+    if (item?.fulfilled_quantity === expectedFulfilled && (expectedFulfilled === 0
+      ? attempts.some(attempt => attempt.status === 'failed')
+      : order?.status === 'completed' && item.fulfillment_status === 'completed')) {
+      return { order, item, attempts }
+    }
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error(`Timed out waiting for code-pool order ${orderId} to fulfill ${expectedFulfilled} units`)
 }
 
 async function attachPendingPaymentWithoutExpiry(orderId: string, amount: string): Promise<string> {
@@ -573,14 +640,18 @@ beforeAll(async () => {
   if (migrated.error) throw migrated.error
   const repeated = await migrator.migrateToLatest()
   if (repeated.error) throw repeated.error
-  const config = readConfig({
+  appConfig = readConfig({
     ...process.env,
     DATABASE_URL: testDatabaseUrl,
     NODE_ENV: 'test',
     PUBLIC_ORIGIN: testOrigin,
     COOKIE_SECURE: 'false',
+    CODE_POOL_ENCRYPTION_KEY_RING: JSON.stringify({
+      activeKeyId: 'test-v1',
+      keys: { 'test-v1': Buffer.alloc(32, 0x51).toString('base64') },
+    }),
   })
-  app = await createApp({ db, config, logger: false })
+  app = await createApp({ db, config: appConfig, logger: false })
   await app.ready()
 })
 
@@ -1800,6 +1871,388 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     } finally {
       await stopWorker()
     }
+  })
+})
+
+describe('per-SKU encrypted code-pool fulfillment on PostgreSQL', () => {
+  it('prechecks without returning card text, filters duplicates, preserves exact content, and copies no stock', async () => {
+    const admin = await createAdmin()
+    const catalog = await createCatalog({ price: '0.00', mode: 'quantity', stock: 0 })
+    const configured = await setCodePoolReadiness(catalog, admin, false)
+    expect(configured.statusCode).toBe(200)
+    expect(configured.json().data).toMatchObject({ configured: true, enabled: false, inventoryConsistent: true })
+
+    const original = '  ab  Cd 123  '
+    const sourceText = `${original}\n${original}\n${'x'.repeat(513)}\n\0bad`
+    const preview = await inject({
+      method: 'POST',
+      url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/precheck`,
+      headers: adminHeaders(admin),
+      payload: { format: 'paste', sourceText },
+    })
+    expect(preview.statusCode).toBe(200)
+    expect(preview.headers['cache-control']).toContain('no-store')
+    expect(preview.json().data).toMatchObject({
+      rowCount: 4, acceptedCount: 1, duplicateCount: 1, invalidCount: 2,
+      rows: [
+        { status: 'accepted' },
+        { status: 'duplicate', reason: 'duplicate_in_request' },
+        { status: 'invalid', reason: 'too_long' },
+        { status: 'invalid', reason: 'invalid_text' },
+      ],
+    })
+    expect(JSON.stringify(preview.json())).not.toContain(original)
+
+    const firstImport = await importCodePool(catalog, admin, sourceText)
+    expect(firstImport.statusCode).toBe(201)
+    expect(firstImport.json().data.batch).toMatchObject({ acceptedCount: 1, duplicateCount: 1, invalidCount: 2 })
+    expect(firstImport.json().data.status).toMatchObject({
+      enabled: false, counts: { available: 1, reserved: 0, delivered: 0 },
+      inventory: { stocked: 1, reserved: 0, available: 1 },
+    })
+    const stored = await db.selectFrom('code_pool_entries')
+      .select(['id', 'ciphertext', 'nonce', 'auth_tag', 'encryption_key_id'])
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()
+    expect(Buffer.from(stored.ciphertext).includes(Buffer.from(original))).toBe(false)
+    expect(decryptCodePoolContent(appConfig, `aikayun:code-pool:entry:v1:${catalog.skuId}:${stored.id}`, {
+      keyId: stored.encryption_key_id,
+      nonce: stored.nonce,
+      ciphertext: stored.ciphertext,
+      authTag: stored.auth_tag,
+    })).toBe(original)
+
+    const secondBatch = await importCodePool(catalog, admin, `${original}\nSECOND-BATCH`)
+    expect(secondBatch.statusCode).toBe(201)
+    expect(secondBatch.json().data.batch).toMatchObject({ acceptedCount: 1, duplicateCount: 1 })
+    const concurrentImports = await Promise.all([
+      importCodePool(catalog, admin, 'RACE-IMPORT-CODE'),
+      importCodePool(catalog, admin, 'RACE-IMPORT-CODE'),
+    ])
+    expect(concurrentImports.map(response => response.statusCode)).toEqual([201, 201])
+    expect(concurrentImports.reduce((sum, response) => sum + response.json().data.batch.acceptedCount, 0)).toBe(1)
+    expect(concurrentImports.reduce((sum, response) => sum + response.json().data.batch.duplicateCount, 0)).toBe(1)
+    expect((await inject({
+      method: 'GET',
+      url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/entries?status=available`,
+      headers: { cookie: admin.cookie },
+    })).json()).not.toHaveProperty('data.items[0].content')
+    const listed = await inject({
+      method: 'GET',
+      url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/entries?status=available`,
+      headers: { cookie: admin.cookie },
+    })
+    expect(JSON.stringify(listed.json())).not.toContain(original)
+    expect(listed.json().data.items[0]).not.toHaveProperty('content')
+    expect((await sql<{ consistent: boolean }>`
+      SELECT assert_code_pool_inventory_consistency(${catalog.skuId}::uuid) AS consistent
+    `.execute(db)).rows[0]?.consistent).toBe(true)
+
+    const otherSku = await createCatalog({ price: '0.00', mode: 'quantity', stock: 0 })
+    expect((await setCodePoolReadiness(otherSku, admin, false)).statusCode).toBe(200)
+    const sameCodeOtherSku = await importCodePool(otherSku, admin, original)
+    expect(sameCodeOtherSku.statusCode).toBe(201)
+    expect(sameCodeOtherSku.json().data.batch.acceptedCount).toBe(1)
+
+    const sourceRevision = await db.selectFrom('products').select('revision')
+      .where('id', '=', catalog.productId).executeTakeFirstOrThrow()
+    const copied = await inject({
+      method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/copy`,
+      headers: adminHeaders(admin), payload: { expectedRevision: sourceRevision.revision },
+    })
+    expect(copied.statusCode).toBe(201)
+    const copiedSkuId = copied.json().data.variants[0].id as string
+    expect(await db.selectFrom('product_variant_quantity_inventory').select('product_variant_id')
+      .where('product_variant_id', '=', copiedSkuId).execute()).toHaveLength(0)
+    expect(await db.selectFrom('code_pool_entries').select('id')
+      .where('product_variant_id', '=', copiedSkuId).execute()).toHaveLength(0)
+    expect(await db.selectFrom('product_variant_fulfillment').select('product_variant_id')
+      .where('product_variant_id', '=', copiedSkuId).execute()).toHaveLength(0)
+
+    const productRevision = await db.selectFrom('products').select('revision')
+      .where('id', '=', catalog.productId).executeTakeFirstOrThrow()
+    const archived = await inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${catalog.productId}/lifecycle`,
+      headers: adminHeaders(admin), payload: { expectedRevision: productRevision.revision, status: 'archived' },
+    })
+    expect(archived.statusCode).toBe(200)
+    expect((await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow())).toEqual({ stocked: 3, reserved: 0 })
+    await expect(db.updateTable('product_variants').set({ inventory_mode: 'unlimited' })
+      .where('id', '=', catalog.skuId).execute()).rejects.toMatchObject({ constraint: 'code_pool_inventory_mode_immutable' })
+    await expect(db.updateTable('product_variant_fulfillment').set({ method: 'manual' })
+      .where('product_variant_id', '=', catalog.skuId).execute()).rejects.toMatchObject({ constraint: 'code_pool_fulfillment_history_immutable' })
+    await expect(db.deleteFrom('code_pool_entries').where('product_variant_id', '=', catalog.skuId).execute())
+      .rejects.toMatchObject({ constraint: 'code_pool_entries_immutable' })
+    await expect(db.deleteFrom('product_variant_quantity_inventory')
+      .where('product_variant_id', '=', catalog.skuId).execute())
+      .rejects.toMatchObject({ constraint: 'code_pool_stock_requires_inventory_event' })
+    const archivedRevision = await db.selectFrom('products').select('revision')
+      .where('id', '=', catalog.productId).executeTakeFirstOrThrow()
+    const deleteArchived = await inject({
+      method: 'DELETE', url: `/api/v1/admin/products/${catalog.productId}`,
+      headers: adminHeaders(admin), payload: { expectedRevision: archivedRevision.revision },
+    })
+    expect(deleteArchived.statusCode).toBe(409)
+    expect(deleteArchived.json().error.code).toBe('PRODUCT_HAS_CODE_POOL_HISTORY')
+  })
+
+  it('serializes last-code checkout against another order and safe withdrawal, and releases unpaid cancellation', async () => {
+    const admin = await createAdmin()
+    const catalog = await createCatalog({ price: '2.00', mode: 'quantity', stock: 0 })
+    expect((await setCodePoolReadiness(catalog, admin, false)).statusCode).toBe(200)
+    expect((await importCodePool(catalog, admin, 'LAST-CODE-001')).statusCode).toBe(201)
+    expect((await setCodePoolReadiness(catalog, admin, true)).statusCode).toBe(200)
+    const firstCustomer = await createCustomer()
+    const secondCustomer = await createCustomer()
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const [firstQuote, secondQuote] = await Promise.all([quote(items, firstCustomer), quote(items, secondCustomer)])
+    expect(firstQuote.json().data.canContinue).toBe(true)
+    expect(secondQuote.json().data.canContinue).toBe(true)
+    const racedOrders = await Promise.all([
+      createOrder(items, firstQuote.json().data.quoteToken, firstCustomer),
+      createOrder(items, secondQuote.json().data.quoteToken, secondCustomer),
+    ])
+    const winners = racedOrders.map((response, index) => ({ response, customer: index === 0 ? firstCustomer : secondCustomer }))
+      .filter(item => item.response.statusCode === 201)
+    expect(winners).toHaveLength(1)
+    expect(racedOrders.filter(response => response.statusCode === 409)).toHaveLength(1)
+    const winner = winners[0]!
+    const orderId = winner.response.json().data.order.id as string
+    const itemId = winner.response.json().data.order.items[0].id as string
+    const pendingDetail = await inject({
+      method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: winner.customer.cookie },
+    })
+    expect(pendingDetail.statusCode).toBe(200)
+    expect(pendingDetail.json().data.items[0].deliveries).toEqual([])
+    expect(JSON.stringify(pendingDetail.json())).not.toContain('LAST-CODE-001')
+    const wrongOwner = winner.customer.id === firstCustomer.id ? secondCustomer : firstCustomer
+    expect((await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: wrongOwner.cookie } })).statusCode)
+      .toBe(404)
+    const cancelled = await inject({
+      method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(winner.customer),
+    })
+    expect(cancelled.statusCode).toBe(200)
+    expect(cancelled.json().data.status).toBe('closed')
+    const afterRelease = await inject({
+      method: 'GET', url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool`,
+      headers: { cookie: admin.cookie },
+    })
+    expect(afterRelease.json().data).toMatchObject({
+      counts: { available: 1, reserved: 0, delivered: 0 },
+      inventory: { stocked: 1, reserved: 0, available: 1 },
+    })
+
+    const raceQuote = await quote(items, firstCustomer)
+    const entryPage = await inject({
+      method: 'GET',
+      url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/entries?status=available`,
+      headers: { cookie: admin.cookie },
+    })
+    const entryId = entryPage.json().data.items[0].id as string
+    const withdrawal = inject({
+      method: 'POST',
+      url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool/withdrawals`,
+      headers: adminHeaders(admin),
+      payload: {
+        operationId: randomUUID(), entryIds: [entryId], reason: '并发撤回验证', confirmation: 'REVOKE_UNSOLD_CODES',
+      },
+    })
+    const checkout = createOrder(items, raceQuote.json().data.quoteToken, firstCustomer)
+    const [withdrawalResult, checkoutResult] = await Promise.all([withdrawal, checkout])
+    expect([withdrawalResult.statusCode, checkoutResult.statusCode].filter(status => status === 201)).toHaveLength(1)
+    const inventory = await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()
+    const state = await db.selectFrom('code_pool_entries').select('state')
+      .where('product_variant_id', '=', catalog.skuId).execute()
+    if (withdrawalResult.statusCode === 201) {
+      expect(checkoutResult.statusCode).toBe(409)
+      expect(inventory).toEqual({ stocked: 0, reserved: 0 })
+      expect(state.map(entry => entry.state)).toEqual(['revoked'])
+    } else {
+      expect(withdrawalResult.statusCode).toBe(409)
+      expect(checkoutResult.statusCode).toBe(201)
+      expect(inventory).toEqual({ stocked: 1, reserved: 1 })
+      expect(state.map(entry => entry.state)).toEqual(['reserved'])
+      const racedOrderId = checkoutResult.json().data.order.id as string
+      expect((await inject({
+        method: 'POST', url: `/api/v1/customer/orders/${racedOrderId}/cancel`, headers: customerHeaders(firstCustomer),
+      })).statusCode).toBe(200)
+    }
+    expect((await sql<{ consistent: boolean }>`
+      SELECT assert_code_pool_inventory_consistency(${catalog.skuId}::uuid) AS consistent
+    `.execute(db)).rows[0]?.consistent).toBe(true)
+    expect(await db.selectFrom('order_items').select('id').where('id', '=', itemId).execute()).toHaveLength(1)
+  })
+
+  it('retries zero-value multi-code delivery after restart, exposes only authorized history, and never restores refunded codes', async () => {
+    const admin = await createAdmin()
+    const catalog = await createCatalog({ price: '0.00', mode: 'quantity', stock: 0 })
+    expect((await setCodePoolReadiness(catalog, admin, false)).statusCode).toBe(200)
+    expect((await importCodePool(catalog, admin, 'UNIT-A 01\nUNIT-B 02\nGUEST-CODE')).statusCode).toBe(201)
+    expect((await setCodePoolReadiness(catalog, admin, true)).statusCode).toBe(200)
+    const customer = await createCustomer()
+    const items = [{ skuId: catalog.skuId, quantity: 2 }]
+    const currentQuote = await quote(items, customer)
+    const created = await createOrder(items, currentQuote.json().data.quoteToken, customer)
+    expect(created.statusCode).toBe(201)
+    expect(created.json().data.order.status).toBe('processing')
+    const orderId = created.json().data.order.id as string
+    const itemId = created.json().data.order.items[0].id as string
+    const noDeliveryYet = await inject({
+      method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie },
+    })
+    expect(noDeliveryYet.json().data.items[0].deliveries).toEqual([])
+
+    const stopWithoutKey = startCodePoolDeliveryWorker(db, { ...appConfig, codePoolEncryptionKeyRing: null }, app.log)
+    const failed = await waitForCodePoolOrder(orderId, itemId, 0)
+    await stopWithoutKey()
+    expect(failed.attempts.at(-1)).toMatchObject({ status: 'failed', failure_code: 'CODE_POOL_KEY_UNAVAILABLE' })
+    expect(await db.selectFrom('order_item_fulfillment_deliveries').select('order_item_fulfillment_deliveries.id')
+      .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'order_item_fulfillment_deliveries.fulfillment_attempt_id')
+      .where('attempt.order_item_id', '=', itemId).execute()).toHaveLength(0)
+    expect((await db.selectFrom('order_items').select('fulfilled_quantity').where('id', '=', itemId).executeTakeFirstOrThrow())
+      .fulfilled_quantity).toBe(0)
+
+    const stopWorkerA = startCodePoolDeliveryWorker(db, appConfig, app.log)
+    const stopWorkerB = startCodePoolDeliveryWorker(db, appConfig, app.log)
+    await waitForCodePoolOrder(orderId, itemId, 2)
+    await Promise.all([stopWorkerA(), stopWorkerB()])
+    const attempts = await db.selectFrom('order_item_fulfillment_attempts').select(['status', 'failure_code'])
+      .where('order_item_id', '=', itemId).where('delivery_source', '=', 'code_pool')
+      .orderBy('created_at').orderBy('id').execute()
+    expect(attempts).toMatchObject([
+      { status: 'failed', failure_code: 'CODE_POOL_KEY_UNAVAILABLE' },
+      { status: 'succeeded', failure_code: null },
+    ])
+    const deliveries = await db.selectFrom('order_item_fulfillment_deliveries')
+      .select(['encrypted_content', 'content', 'unit_index'])
+      .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'order_item_fulfillment_deliveries.fulfillment_attempt_id')
+      .where('attempt.order_item_id', '=', itemId).where('attempt.status', '=', 'succeeded')
+      .orderBy('unit_index').execute()
+    expect(deliveries.map(delivery => delivery.unit_index)).toEqual([1, 2])
+    expect(deliveries.every(delivery => delivery.content === null && delivery.encrypted_content !== null)).toBe(true)
+    expect(deliveries.some(delivery => Buffer.from(delivery.encrypted_content!).includes(Buffer.from('UNIT-A 01')))).toBe(false)
+    const inventory = await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()
+    expect(inventory).toEqual({ stocked: 1, reserved: 0 })
+    expect(await db.selectFrom('code_pool_entries').select('id')
+      .where('product_variant_id', '=', catalog.skuId).where('state', '=', 'delivered').execute()).toHaveLength(2)
+    expect(await db.selectFrom('order_inventory_events as event').select(['event.action', 'event.quantity'])
+      .innerJoin('order_inventory_reservations as reservation', 'reservation.id', 'event.reservation_id')
+      .where('reservation.order_item_id', '=', itemId).orderBy('event.action').execute()).toMatchObject([
+      { action: 'consume', quantity: 2 }, { action: 'reserve', quantity: 2 },
+    ])
+
+    const ownerDetail = await inject({
+      method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie },
+    })
+    expect(ownerDetail.statusCode).toBe(200)
+    expect(ownerDetail.json().data.items[0].deliveries.map((delivery: { content: string }) => delivery.content))
+      .toEqual(['UNIT-A 01', 'UNIT-B 02'])
+    const unauthorizedCustomer = await createCustomer()
+    expect((await inject({
+      method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: unauthorizedCustomer.cookie },
+    })).statusCode).toBe(404)
+    const adminDetail = await inject({ method: 'GET', url: `/api/v1/admin/orders/${orderId}`, headers: { cookie: admin.cookie } })
+    expect(adminDetail.statusCode).toBe(200)
+    expect(adminDetail.json().data.fulfillmentAttempts.at(-1)).toMatchObject({
+      deliverySource: 'code_pool', status: 'succeeded', deliveryCount: 2,
+    })
+
+    const stopAfterCompletion = startCodePoolDeliveryWorker(db, appConfig, app.log)
+    await new Promise(resolve => setTimeout(resolve, 1_100))
+    await stopAfterCompletion()
+    expect(await db.selectFrom('order_item_fulfillment_attempts').select('id')
+      .where('order_item_id', '=', itemId).where('delivery_source', '=', 'code_pool').execute()).toHaveLength(2)
+
+    await db.updateTable('storefront_customer_policy').set({
+      guest_checkout_enabled: true, guest_free_claim_enabled: true,
+    }).execute()
+    const guest = await newGuestSession()
+    const otherGuest = await newGuestSession()
+    const guestItems = [{ skuId: catalog.skuId, quantity: 1 }]
+    const guestQuote = await quote(guestItems, undefined, guest.cookie)
+    const guestOwner = { cookie: guest.cookie, csrfToken: guest.csrfToken, csrfCookie: guest.csrfCookie }
+    const guestCreated = await createOrder(guestItems, guestQuote.json().data.quoteToken, guestOwner)
+    expect(guestCreated.statusCode).toBe(201)
+    const guestOrderId = guestCreated.json().data.order.id as string
+    const guestItemId = guestCreated.json().data.order.items[0].id as string
+    const stopGuestDelivery = startCodePoolDeliveryWorker(db, appConfig, app.log)
+    await waitForCodePoolOrder(guestOrderId, guestItemId, 1)
+    await stopGuestDelivery()
+    const guestDetail = await inject({ method: 'GET', url: `/api/v1/guest/orders/${guestOrderId}`, headers: { cookie: guest.cookie } })
+    expect(guestDetail.statusCode).toBe(200)
+    expect(guestDetail.json().data.items[0].deliveries[0].content).toBe('GUEST-CODE')
+    expect((await inject({
+      method: 'GET', url: `/api/v1/guest/orders/${guestOrderId}`, headers: { cookie: otherGuest.cookie },
+    })).statusCode).toBe(404)
+    expect((await inject({
+      method: 'GET', url: `/api/v1/guest/orders/${guestOrderId}`, headers: { cookie: customer.cookie },
+    })).statusCode).toBe(403)
+    expect((await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow())).toEqual({ stocked: 0, reserved: 0 })
+    expect(await db.selectFrom('code_pool_entries').select('id')
+      .where('product_variant_id', '=', catalog.skuId).where('state', '=', 'delivered').execute()).toHaveLength(3)
+  })
+
+  it('commits a real payment receipt while delivery retries, then retains delivered codes after refund', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '2.50', mode: 'quantity', stock: 0 })
+    expect((await setCodePoolReadiness(catalog, admin, false)).statusCode).toBe(200)
+    expect((await importCodePool(catalog, admin, 'PAID-DELIVERY-CODE')).statusCode).toBe(201)
+    expect((await setCodePoolReadiness(catalog, admin, true)).statusCode).toBe(200)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const currentQuote = await quote(items, customer)
+    const created = await createOrder(items, currentQuote.json().data.quoteToken, customer)
+    expect(created.statusCode).toBe(201)
+    const orderId = created.json().data.order.id as string
+    const itemId = created.json().data.order.items[0].id as string
+    expect(created.json().data.order.status).toBe('pending_payment')
+    const beforePayment = await inject({
+      method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie },
+    })
+    expect(beforePayment.json().data.items[0].deliveries).toEqual([])
+    expect(JSON.stringify(beforePayment.json())).not.toContain('PAID-DELIVERY-CODE')
+
+    const attemptId = randomUUID()
+    const receiptId = randomUUID()
+    await db.insertInto('payment_attempts').values({
+      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
+      topup_customer_id: null, source: 'external', amount: '2.50', status: 'created', provider: 'integration',
+      provider_payment_id: `confirmed-${attemptId}`, wallet_operation_id: null, wallet_hold_operation_id: null,
+      requested_wallet_amount: null, expires_at: new Date(Date.now() + 60 * 60_000), completed_at: null,
+    }).execute()
+    await db.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+    await db.insertInto('payment_receipts').values({
+      id: receiptId, payment_attempt_id: attemptId, source_bucket: 'external', provider: 'integration',
+      provider_transaction_id: `confirmed-receipt-${receiptId}`, wallet_operation_id: null,
+      wallet_line_no: null, amount: '2.50',
+    }).execute()
+    const stopWithoutKey = startCodePoolDeliveryWorker(db, { ...appConfig, codePoolEncryptionKeyRing: null }, app.log)
+    await db.updateTable('payment_attempts').set({ status: 'succeeded' }).where('id', '=', attemptId).execute()
+    await waitForCodePoolOrder(orderId, itemId, 0)
+    await stopWithoutKey()
+    expect((await db.selectFrom('payment_receipts').select(['id', 'disposition'])
+      .where('id', '=', receiptId).executeTakeFirstOrThrow()).disposition).toBe('on_time')
+    expect((await db.selectFrom('payment_attempts').select('status')
+      .where('id', '=', attemptId).executeTakeFirstOrThrow()).status).toBe('succeeded')
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+      .toBe('processing')
+    expect((await db.selectFrom('order_item_fulfillment_attempts').select('failure_code')
+      .where('order_item_id', '=', itemId).where('delivery_source', '=', 'code_pool')
+      .executeTakeFirstOrThrow()).failure_code).toBe('CODE_POOL_KEY_UNAVAILABLE')
+
+    const stopWithKey = startCodePoolDeliveryWorker(db, appConfig, app.log)
+    await waitForCodePoolOrder(orderId, itemId, 1)
+    await stopWithKey()
+    expect((await db.selectFrom('code_pool_entries').select('state')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).state).toBe('delivered')
+    await refundExistingReceipt(orderId, receiptId, '2.50')
+    expect((await db.selectFrom('code_pool_entries').select('state')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).state).toBe('delivered')
+    expect((await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow())).toEqual({ stocked: 0, reserved: 0 })
   })
 })
 

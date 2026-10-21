@@ -24,9 +24,21 @@ let sequence = 0
 
 function statusLabel(status: AdminOrderDetail['order']['status'], paymentStatus: AdminOrderDetail['order']['paymentStatus']): string {
   if (status === 'pending_payment') return '等待付款'
-  if (status === 'processing') return paymentStatus === 'not_required' ? '等待人工交付' : '付款成功 · 等待人工交付'
+  if (status === 'processing') return paymentStatus === 'not_required' ? '等待订单交付' : '付款成功 · 等待订单交付'
   if (status === 'completed') return '已完成'
   return '已关闭'
+}
+
+function fulfillmentFailureLabel(code: AdminOrderDetail['fulfillmentAttempts'][number]['failureCode']): string {
+  if (code === 'CODE_POOL_KEY_UNAVAILABLE') return '服务端缺少历史加密密钥'
+  if (code === 'CODE_POOL_DECRYPTION_FAILED') return '卡密密文完整性校验失败'
+  if (code === 'CODE_POOL_PAYMENT_UNRESOLVED') return '付款或对账状态尚未确认'
+  if (code === 'CODE_POOL_DATA_INCONSISTENT') return '卡密、库存或交付记录不一致'
+  return ''
+}
+
+function fulfillmentAttemptStatusLabel(status: AdminOrderDetail['fulfillmentAttempts'][number]['status']): string {
+  return status === 'processing' ? '处理中' : status === 'unknown' ? '结果未知' : status === 'succeeded' ? '成功' : '失败'
 }
 
 function formatDate(value: string): string {
@@ -333,6 +345,15 @@ onBeforeUnmount(() => { sequence++ })
           >
             {{ statusLabel(data.order.status, data.order.paymentStatus) }}
           </UBadge>
+          <UButton
+            color="neutral"
+            variant="outline"
+            icon="i-lucide-refresh-cw"
+            :loading="loading"
+            @click="loadOrder"
+          >
+            刷新订单与交付
+          </UButton>
         </header>
 
         <UAlert
@@ -1150,7 +1171,7 @@ onBeforeUnmount(() => { sequence++ })
                       {{ item.options.map(option => `${option.groupName}：${option.valueName}`).join(' / ') || '默认规格' }}
                     </p>
                     <p class="mt-1 font-mono text-xs text-dimmed">
-                      SKU {{ item.skuCode }} · {{ item.inventoryMode }} · {{ item.fulfillmentMethod }}
+                      SKU {{ item.skuCode }} · {{ item.inventoryMode }} · {{ item.fulfillmentMethod === 'code_pool' ? '卡密池自动发货' : item.fulfillmentMethod === 'manual' ? '人工数字交付' : item.fulfillmentMethod }}
                     </p>
                   </div>
                   <UBadge
@@ -1190,6 +1211,17 @@ onBeforeUnmount(() => { sequence++ })
                     </dd>
                   </div>
                 </dl>
+
+                <UAlert
+                  v-if="item.fulfillmentMethod === 'code_pool' && data.order.status === 'processing' && item.fulfillmentStatus === 'failed'"
+                  class="mt-3"
+                  color="warning"
+                  variant="soft"
+                  icon="i-lucide-shield-alert"
+                  title="自动交付失败，系统按退避计划重试"
+                  description="查看下方履约审计中的失败原因与下次重试时间。预留卡密不会被其他订单占用。"
+                  role="status"
+                />
 
                 <section
                   v-if="item.deliveries.length"
@@ -1273,7 +1305,7 @@ onBeforeUnmount(() => { sequence++ })
               id="fulfillment-attempts-title"
               class="font-semibold text-highlighted"
             >
-              人工履约审计
+              人工与自动履约审计
             </h2>
             <UAlert
               v-if="!data.fulfillmentAttempts.length"
@@ -1281,7 +1313,7 @@ onBeforeUnmount(() => { sequence++ })
               color="neutral"
               variant="subtle"
               title="尚无履约记录"
-              description="录入实际交付内容后，订单项、操作管理员、数量和内容摘要会保存在审计记录中。"
+              description="系统自动发卡和人工录入共用同一履约尝试、私有交付历史与库存消费流水。"
             />
             <ul
               v-else
@@ -1297,7 +1329,13 @@ onBeforeUnmount(() => { sequence++ })
                     履约 {{ attempt.id }}
                   </p>
                   <p class="mt-1 text-highlighted">
-                    {{ attempt.quantity }} 件 · {{ attempt.deliveryCount }} 条内容 · 管理员 {{ attempt.administratorId ?? '未知' }}
+                    {{ attempt.quantity }} 件 · {{ attempt.deliveryCount }} 条交付 · {{ attempt.deliverySource === 'code_pool' ? '系统自动发卡' : `管理员 ${attempt.administratorId ?? '未知'}` }}
+                  </p>
+                  <p
+                    v-if="attempt.failureCode"
+                    class="mt-1 text-sm text-warning"
+                  >
+                    失败原因：{{ fulfillmentFailureLabel(attempt.failureCode) }}
                   </p>
                   <p
                     v-if="attempt.resultSha256"
@@ -1307,7 +1345,13 @@ onBeforeUnmount(() => { sequence++ })
                   </p>
                 </div>
                 <div class="text-right text-xs text-muted">
-                  <p>{{ attempt.status }}</p><time :datetime="attempt.createdAt">{{ formatDate(attempt.createdAt) }}</time>
+                  <p>{{ fulfillmentAttemptStatusLabel(attempt.status) }}</p><time :datetime="attempt.createdAt">{{ formatDate(attempt.createdAt) }}</time>
+                  <p
+                    v-if="attempt.retryAfter"
+                    class="mt-1"
+                  >
+                    下次自动重试 {{ formatDate(attempt.retryAfter) }}
+                  </p>
                 </div>
               </li>
             </ul>

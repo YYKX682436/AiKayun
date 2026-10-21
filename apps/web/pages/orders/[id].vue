@@ -26,9 +26,12 @@ const selectedPaymentMode = ref<'external' | 'wallet' | 'hybrid'>('external')
 const hybridWalletAmountInput = ref('')
 const qrDataUrl = ref('')
 const qrError = ref('')
+const copiedDeliveryId = ref('')
+const deliveryCopyMessage = ref('')
 let sequence = 0
 let qrSequence = 0
 let renderedQrValue = ''
+let deliveryPollTimer: number | undefined
 
 useSeoMeta({ title: '订单详情', description: '查看订单状态、成交快照和已完成的数字交付。', robots: 'noindex, nofollow' })
 useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
@@ -37,6 +40,8 @@ const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id
 const hasActiveAttempt = computed(() => Boolean(payment.value?.attempt
   && ['created', 'pending', 'reconciliation_required'].includes(payment.value.attempt.status)))
 const canCancel = computed(() => order.value?.status === 'pending_payment' && !hasActiveAttempt.value)
+const codePoolDeliveryPending = computed(() => order.value?.items.some(item =>
+  item.fulfillmentMethod === 'code_pool' && item.fulfilledQuantity < item.quantity) ?? false)
 const selectedChannel = computed(() => payment.value?.channels.find(channel => channel.id === selectedChannelId.value) ?? null)
 const qrAction = computed(() => payment.value?.attempt?.action?.type === 'qr_code'
   ? payment.value.attempt.action.value
@@ -150,6 +155,10 @@ function selectPaymentMode(mode: 'external' | 'wallet' | 'hybrid') {
 
 function statusLabel(value: OrderDetail): string {
   if (value.status === 'pending_payment') return '等待付款'
+  if (value.status === 'processing' && value.items.some(item =>
+    item.fulfillmentMethod === 'code_pool' && item.fulfilledQuantity < item.quantity)) {
+    return value.paymentStatus === 'not_required' ? '卡密自动发放中' : '付款成功 · 卡密自动发放中'
+  }
   if (value.status === 'processing') return value.paymentStatus === 'not_required' ? '等待发货' : '付款成功 · 等待发货'
   if (value.status === 'completed') return '已完成'
   return '已关闭'
@@ -177,6 +186,25 @@ const statusNames: Record<OrderDetail['status'], string> = {
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
+}
+
+async function copyDelivery(deliveryId: string, content: string) {
+  deliveryCopyMessage.value = ''
+  try {
+    await navigator.clipboard.writeText(content)
+    copiedDeliveryId.value = deliveryId
+    deliveryCopyMessage.value = '卡密已复制到剪贴板。'
+    window.setTimeout(() => {
+      if (copiedDeliveryId.value === deliveryId) copiedDeliveryId.value = ''
+    }, 1800)
+  } catch {
+    deliveryCopyMessage.value = '浏览器未允许复制，请手动选择卡密内容。'
+  }
+}
+
+function hasPendingCodePoolDelivery(): boolean {
+  return order.value?.status === 'processing' && order.value.items.some(item =>
+    item.fulfillmentMethod === 'code_pool' && item.fulfilledQuantity < item.quantity)
 }
 
 async function loadOrder() {
@@ -388,6 +416,13 @@ watch(qrAction, async (value) => {
 onMounted(() => {
   mounted.value = true
   void loadOrder()
+  deliveryPollTimer = window.setInterval(() => {
+    if (mounted.value && !loading.value && hasPendingCodePoolDelivery()) void loadOrder()
+  }, 3000)
+})
+
+onBeforeUnmount(() => {
+  if (deliveryPollTimer) window.clearInterval(deliveryPollTimer)
 })
 
 watch(() => customerApi.identityVersion.value, () => {
@@ -542,8 +577,8 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
             color="info"
             variant="subtle"
             icon="i-lucide-package-check"
-            :title="order.paymentStatus === 'not_required' ? '零元订单，等待商家交付' : '付款已确认，等待商家交付'"
-            description="订单正在履约。商家完成人工数字交付后，交付内容会安全显示在此订单详情中。"
+            :title="codePoolDeliveryPending ? (order.paymentStatus === 'not_required' ? '零元订单，卡密正在自动发放' : '付款已确认，卡密正在自动发放') : (order.paymentStatus === 'not_required' ? '零元订单，等待商家交付' : '付款已确认，等待商家交付')"
+            :description="codePoolDeliveryPending ? '卡密已预留给此订单，系统正在安全发放，完成后会显示在下方。付款确认前不会展示卡密。' : '订单正在履约。商家完成人工数字交付后，交付内容会安全显示在此订单详情中。'"
           />
           <UAlert
             v-else-if="order.status === 'completed'"
@@ -551,7 +586,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
             variant="subtle"
             icon="i-lucide-circle-check"
             title="订单已完成"
-            description="订单中的人工数字交付内容已记录在下方订单项。"
+            :description="order.items.some(item => item.fulfillmentMethod === 'code_pool') ? '卡密及其他数字交付内容已安全记录在下方订单项。退款不会清除已交付内容。' : '订单中的人工数字交付内容已记录在下方订单项。'"
           />
 
           <div
@@ -1190,10 +1225,21 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                   <dt class="text-muted">
                     交付方式
                   </dt><dd class="mt-1 text-highlighted">
-                    {{ item.fulfillmentMethod === 'manual' ? '人工数字交付' : '尚未开放' }}
+                    {{ item.fulfillmentMethod === 'manual' ? '人工数字交付' : item.fulfillmentMethod === 'code_pool' ? 'SKU 卡密池自动发货' : '尚未开放' }}
                   </dd>
                 </div>
               </dl>
+
+              <UAlert
+                v-if="item.fulfillmentMethod === 'code_pool' && order.status === 'processing' && item.fulfilledQuantity < item.quantity"
+                class="mt-4"
+                color="info"
+                variant="soft"
+                icon="i-lucide-loader-circle"
+                :title="item.fulfillmentStatus === 'failed' ? '自动交付正在安全重试' : '卡密正在自动交付'"
+                description="卡密预留给此订单，页面会自动刷新交付状态。付款确认前不会展示卡密。"
+                role="status"
+              />
 
               <section
                 v-if="item.deliveries.length"
@@ -1214,11 +1260,31 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                   >
                     <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
                       <span>第 {{ delivery.unitIndex }} 件</span>
-                      <time :datetime="delivery.createdAt">{{ formatDate(delivery.createdAt) }}</time>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <time :datetime="delivery.createdAt">{{ formatDate(delivery.createdAt) }}</time>
+                        <UButton
+                          color="neutral"
+                          variant="outline"
+                          size="xs"
+                          icon="i-lucide-copy"
+                          :aria-label="`复制第 ${delivery.unitIndex} 件卡密`"
+                          @click="copyDelivery(delivery.id, delivery.content)"
+                        >
+                          {{ copiedDeliveryId === delivery.id ? '已复制' : '复制卡密' }}
+                        </UButton>
+                      </div>
                     </div>
                     <pre class="mt-2 overflow-x-auto whitespace-pre-wrap break-all font-mono text-sm text-highlighted">{{ delivery.content }}</pre>
                   </li>
                 </ol>
+                <p
+                  v-if="deliveryCopyMessage"
+                  class="mt-2 text-xs text-muted"
+                  role="status"
+                  aria-live="polite"
+                >
+                  {{ deliveryCopyMessage }}
+                </p>
               </section>
             </li>
           </ul>

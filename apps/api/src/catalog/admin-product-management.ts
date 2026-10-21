@@ -732,6 +732,11 @@ async function deleteProduct(
     const variants = await trx.selectFrom('product_variants').selectAll()
       .where('product_id', '=', productId).orderBy('id').forUpdate().execute()
     if (variants.length === 0) throw new CatalogError(409, 'PRODUCT_SKU_REQUIRED', 'The product has no SKU rows to delete safely')
+    const codePoolHistory = await trx.selectFrom('code_pool_batches').select('id')
+      .where('product_id', '=', productId).limit(1).executeTakeFirst()
+    if (codePoolHistory) {
+      throw new CatalogError(409, 'PRODUCT_HAS_CODE_POOL_HISTORY', 'A product with code-pool batch history cannot be deleted; archive it instead')
+    }
     if (variants.some((variant) => variant.retired_at !== null)) {
       throw new CatalogError(409, 'PRODUCT_HAS_RETIRED_SKU', 'A product with permanently retired SKU identities cannot be deleted; archive it instead')
     }

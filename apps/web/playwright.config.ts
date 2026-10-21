@@ -62,6 +62,10 @@ export default defineConfig({
           activeKeyId: 'playwright-v1',
           keys: { 'playwright-v1': 'Kys1KGV3aLVP4dWZV0nZ3QXxSbg7g4lWIMHFAsrK6fI=' },
         }),
+        CODE_POOL_ENCRYPTION_KEY_RING: JSON.stringify({
+          activeKeyId: 'playwright-code-pool-v1',
+          keys: { 'playwright-code-pool-v1': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' },
+        }),
         PAYMENT_PROVIDER_BASE_URL_FOR_TESTS: 'http://127.0.0.1:3099',
       },
     },
