@@ -179,3 +179,7 @@ Fastify 的 `/api/v1/public/*` 接口与管理员接口分离，使用独立 Typ
 ## 部署边界
 
 Compose 启动时先等 PostgreSQL 健康，再运行一次性迁移容器，之后启动 API、Nuxt SSR 和 Caddy。PG18 官方镜像卷挂在 `/var/lib/postgresql`，以覆盖 PG18 的版本化数据目录。所有镜像按当前稳定标签和 manifest digest 固定。站点域名、外部 HTTPS、PostgreSQL 密码均通过本地未跟踪的 `.env` 注入；本阶段没有授权中心、安装器或更新器。
+
+## 供应商只读连接（⑥-1）
+
+原供应商管理在⑥-1增加 `kayixin_customer_v3`，与 `http_json_v1` 并存。连接、凭据和配置继续版本化；新协议只开放账户、分页商品及包含规格/购买模板的详情读取，不进入旧自动履约 worker。只读测试按配置版本保存 `catalog_read_v3` 范围，与旧履约测试资格分离；API 和 PostgreSQL 同时禁止其成为可售 API 履约配置。上游报价和供货观察不写本地 SKU、库存或资金历史。具体字段、安全边界、真实站点未验证项及⑥-2接续事实见[卡易信客户 V3 只读接入](../supplier-kayixin-v3-readonly.md)。

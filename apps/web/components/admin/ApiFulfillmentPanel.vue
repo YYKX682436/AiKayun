@@ -26,13 +26,13 @@ const errorMessage = ref('')
 const successMessage = ref('')
 
 const root = computed(() => `/api/v1/admin/products/${props.productId}/variants/${skuId.value}/api-fulfillment`)
-const enabledOptions = computed(() => suppliers.value.filter(row => row.enabled).map(row => ({
+const enabledOptions = computed(() => suppliers.value.filter(row => row.enabled && row.providerType === 'http_json_v1' && row.fulfillmentEligible).map(row => ({
   label: `${row.name} · v${row.currentVersion.versionNumber}`,
   value: row.currentVersion.id,
 })))
 const canEnable = computed(() => Boolean(config.value?.currentVersionId
   && config.value.supplierEnabled && config.value.supplierConnectionVersionId
-  && suppliers.value.some(row => row.enabled && row.currentVersion.id === config.value?.supplierConnectionVersionId)))
+  && suppliers.value.some(row => row.enabled && row.providerType === 'http_json_v1' && row.fulfillmentEligible && row.currentVersion.id === config.value?.supplierConnectionVersionId)))
 
 async function load() {
   if (!skuId.value || !props.productId) return
@@ -165,7 +165,7 @@ watch([() => props.productId, skuId], () => {
         </UFormField>
         <UFormField
           label="供应商连接版本"
-          hint="仅显示通过测试并明确启用的连接；请先到供应商连接管理中完成配置。"
+          hint="仅显示通过履约测试并明确启用的 http_json_v1 连接；卡易信只读连接不可选。请先到供应商连接管理中完成配置。"
         >
           <USelect
             v-model="selectedConnectionVersionId"

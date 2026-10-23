@@ -79,6 +79,7 @@ function handleError(reply: FastifyReply, error: unknown, requestId: string) {
       || candidate.constraint === 'code_pool_inventory_mode_immutable') {
       return reply.code(409).send(failure('FULFILLMENT_METHOD_PROTECTED', '卡密池历史仍在使用，不能切换此 SKU 的履约方式。', requestId))
     }
+    if (candidate.constraint === 'supplier_protocol_readonly') return reply.code(409).send(failure('SUPPLIER_READ_ONLY', '卡易信只读连接不能用于自动履约。', requestId))
     if (candidate.constraint === 'api_delivery_supplier_disabled' || candidate.constraint === 'supplier_connection_test_required') {
       return reply.code(409).send(failure('SUPPLIER_NOT_READY', '供应商当前版本必须通过测试并启用后才能启用自动销售。', requestId))
     }
@@ -187,9 +188,10 @@ async function lockProductSkuAndConfig(trx: Transaction<Database>, productId: st
 async function assertSupplierVersionMaySell(db: Db, connectionVersionId: string): Promise<void> {
   const supplier = await db.selectFrom('supplier_connection_versions as version')
     .innerJoin('supplier_connections as connection', 'connection.id', 'version.supplier_connection_id')
-    .select(['connection.id', 'connection.enabled', 'connection.current_version_id', 'connection.tested_version_id'])
+    .select(['connection.id', 'connection.enabled', 'connection.current_version_id', 'connection.tested_version_id', 'version.provider_type'])
     .where('version.id', '=', connectionVersionId).executeTakeFirst()
   if (!supplier) throw new ApiFulfillmentAdminError(404, 'SUPPLIER_VERSION_NOT_FOUND', '供应商配置版本不存在。')
+  if (supplier.provider_type !== 'http_json_v1') throw new ApiFulfillmentAdminError(409, 'SUPPLIER_READ_ONLY', '卡易信只读连接尚未开放自动采购和履约。')
   if (!supplier.enabled || supplier.current_version_id !== connectionVersionId
     || supplier.tested_version_id !== connectionVersionId) {
     throw new ApiFulfillmentAdminError(409, 'SUPPLIER_NOT_READY', '只有通过当前连接和查单测试并已启用的供应商版本可用于自动销售。')

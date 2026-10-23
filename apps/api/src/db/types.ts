@@ -186,6 +186,7 @@ export interface ProductVariantFulfillmentVersionsTable {
 }
 
 export interface SupplierConnectionsTable {
+  provider_type: Generated<'http_json_v1' | 'kayixin_customer_v3'>
   id: string
   display_name: string
   enabled: boolean
@@ -197,6 +198,8 @@ export interface SupplierConnectionsTable {
 }
 
 export interface SupplierConnectionCredentialsTable {
+  provider_type: Generated<'http_json_v1' | 'kayixin_customer_v3'>
+  auth_scheme: Generated<'bearer' | 'app_signature_v3'>
   supplier_connection_id: string
   credential_version: number
   key_id: string
@@ -211,12 +214,24 @@ export interface SupplierConnectionVersionsTable {
   supplier_connection_id: string
   version_number: number
   display_name: string
-  provider_type: 'http_json_v1'
+  provider_type: 'http_json_v1' | 'kayixin_customer_v3'
   base_url: string
-  auth_scheme: 'bearer'
+  auth_scheme: 'bearer' | 'app_signature_v3'
   credential_version: number
   created_by_admin_id: string
   created_at: Generated<Date>
+}
+
+export interface SupplierConnectionTestsTable {
+  id: string
+  supplier_connection_id: string
+  configuration_version_id: string
+  provider_type: 'http_json_v1' | 'kayixin_customer_v3'
+  scope: 'fulfillment_v1' | 'catalog_read_v3'
+  passed: boolean
+  error_code: string | null
+  checked_at: Date
+  administrator_id: string
 }
 
 export interface SupplierConnectionAuditEventsTable {
@@ -985,6 +1000,7 @@ export interface Database {
   guest_order_sessions: GuestOrderSessionsTable
   product_variant_fulfillment: ProductVariantFulfillmentTable
   product_variant_fulfillment_versions: ProductVariantFulfillmentVersionsTable
+  supplier_connection_tests: SupplierConnectionTestsTable
   supplier_connections: SupplierConnectionsTable
   supplier_connection_credentials: SupplierConnectionCredentialsTable
   supplier_connection_versions: SupplierConnectionVersionsTable

@@ -27,6 +27,8 @@ import { privateFileDeliveryMigration } from './migrations/202610210005_private_
 import { externalApiDeliveryMigration } from './migrations/202610230001_external_api_delivery.js'
 import { digitalFulfillmentAcceptanceMigration } from './migrations/202610230002_digital_fulfillment_acceptance.js'
 
+import { kayixinReadonlyMigration } from './migrations/202610240001_kayixin_readonly.js'
+
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
     return {
@@ -57,6 +59,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610210005_private_file_delivery': privateFileDeliveryMigration,
       '202610230001_external_api_delivery': externalApiDeliveryMigration,
       '202610230002_digital_fulfillment_acceptance': digitalFulfillmentAcceptanceMigration,
+      '202610240001_kayixin_readonly': kayixinReadonlyMigration,
     }
   }
 }

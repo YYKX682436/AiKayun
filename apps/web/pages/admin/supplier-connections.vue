@@ -6,6 +6,7 @@ import type {
   SupplierConnectionTestResult,
   SupplierConnectionVersion,
   SupplierConnectionVersionsPage,
+  SupplierProviderType, UpdateSupplierConnectionBody,
 } from '@aikayun/contracts'
 import { useAdminApi } from '~/composables/useAdminApi'
 
@@ -23,7 +24,13 @@ const saving = ref(false)
 const errorMessage = ref('')
 const successMessage = ref('')
 const testResult = shallowRef<SupplierConnectionTestResult | null>(null)
-const form = reactive({ name: '', baseUrl: '', bearerToken: '' })
+const form = reactive({ name: '', baseUrl: '', bearerToken: '', appId: '', appSecret: '', providerType: 'http_json_v1' as SupplierProviderType })
+const creating = ref(false)
+const protocolOptions = [{ label: 'HTTP JSON v1 · 自动履约', value: 'http_json_v1' }, { label: '卡易信客户 V3 · 只读', value: 'kayixin_customer_v3' }]
+const isKayixin = computed(() => form.providerType === 'kayixin_customer_v3')
+const credentialsComplete = computed(() => isKayixin.value ? /^[0-9]{1,32}$/u.test(form.appId) && /^[!-~]{1,512}$/u.test(form.appSecret) : Boolean(form.bearerToken))
+function clearCredentials() { form.bearerToken = ''; form.appId = ''; form.appSecret = '' }
+function newConnection() { creating.value = true; selectedId.value = ''; form.name = ''; form.baseUrl = ''; clearCredentials(); testResult.value = null; clearMessages() }
 const selected = computed(() => connections.value.find(row => row.id === selectedId.value) ?? null)
 const actionPath = computed(() => `/api/v1/admin/supplier-connections/${selectedId.value}`)
 
@@ -46,7 +53,7 @@ async function load() {
   loading.value = true
   try {
     connections.value = await request<SupplierConnection[]>('/api/v1/admin/supplier-connections')
-    if (!connections.value.some(row => row.id === selectedId.value)) selectedId.value = connections.value[0]?.id ?? ''
+    if (!creating.value && !connections.value.some(row => row.id === selectedId.value)) selectedId.value = connections.value[0]?.id ?? ''
     await loadSelected()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '供应商连接暂时无法读取。'
@@ -62,13 +69,16 @@ async function loadSelected() {
     audit.value = null
     form.name = ''
     form.baseUrl = ''
-    form.bearerToken = ''
+    clearCredentials()
     return
   }
+  versions.value = null
+  audit.value = null
   form.name = current.name
   form.baseUrl = current.currentVersion.baseUrl
-  form.bearerToken = ''
-  testResult.value = null
+  clearCredentials()
+  form.providerType = current.providerType
+  testResult.value = current.lastTest
   const [versionPage, auditPage] = await Promise.all([
     request<SupplierConnectionVersionsPage>(`${actionPath.value}/versions?page=1&pageSize=50`),
     request<SupplierConnectionAuditPage>(`${actionPath.value}/audit`),
@@ -79,6 +89,7 @@ async function loadSelected() {
 }
 
 watch(selectedId, () => {
+  if (selectedId.value) creating.value = false
   clearMessages()
   if (!loading.value) void loadSelected().catch(error => {
     errorMessage.value = error instanceof Error ? error.message : '供应商版本和审计暂时无法读取。'
@@ -86,21 +97,23 @@ watch(selectedId, () => {
 })
 
 async function createConnection() {
-  if (saving.value || !form.name.trim() || !form.baseUrl.trim() || !form.bearerToken) return
+  if (saving.value || !form.name.trim() || !form.baseUrl.trim() || !credentialsComplete.value) return
   saving.value = true
   clearMessages()
   const body: CreateSupplierConnectionBody = {
-    name: form.name.trim(), providerType: 'http_json_v1',
-    baseUrl: form.baseUrl.trim(), bearerToken: form.bearerToken,
+    name: form.name.trim(), baseUrl: form.baseUrl.trim(),
+    ...(isKayixin.value ? { providerType: 'kayixin_customer_v3' as const, credentials: { appId: form.appId, appSecret: form.appSecret } }
+      : { providerType: 'http_json_v1' as const, bearerToken: form.bearerToken }),
   }
   try {
     const created = await request<SupplierConnection[]>('/api/v1/admin/supplier-connections', { method: 'POST', body })
-    form.bearerToken = ''
+    clearCredentials()
+    creating.value = false
     selectedId.value = created[0]?.id ?? ''
-    successMessage.value = '供应商连接已加密保存并保持停用。请先测试，再明确启用。'
     await load()
+    successMessage.value = isKayixin.value ? '卡易信连接已加密保存。可测试只读连接并浏览商品；自动采购尚未开放。' : '供应商连接已加密保存并保持停用。请先测试，再明确启用。'
   } catch (error) {
-    form.bearerToken = ''
+    clearCredentials()
     errorMessage.value = error instanceof Error ? error.message : '供应商连接保存失败。'
   } finally {
     saving.value = false
@@ -111,14 +124,18 @@ async function saveConfiguration() {
   if (!selected.value || saving.value || !form.name.trim() || !form.baseUrl.trim()) return
   saving.value = true
   clearMessages()
-  const bearerToken = form.bearerToken
-  form.bearerToken = ''
+  const body: UpdateSupplierConnectionBody = { name: form.name.trim(), baseUrl: form.baseUrl.trim(),
+    ...(isKayixin.value ? { providerType: 'kayixin_customer_v3' as const,
+      ...(form.appId || form.appSecret ? { credentials: { appId: form.appId, appSecret: form.appSecret } } : {}) }
+      : { ...(form.bearerToken ? { bearerToken: form.bearerToken } : {}) }) }
+  const rotated = credentialsComplete.value
+  clearCredentials()
   try {
     await request<SupplierConnection[]>(actionPath.value, {
       method: 'PUT',
-      body: { name: form.name.trim(), baseUrl: form.baseUrl.trim(), ...(bearerToken ? { bearerToken } : {}) },
+      body,
     })
-    successMessage.value = bearerToken
+    successMessage.value = rotated
       ? '新供应商版本与凭据已加密保存，连接已停用。请测试新版本后再启用。'
       : '新供应商地址版本已保存，连接已停用。请测试新版本后再启用。'
     await load()
@@ -136,8 +153,11 @@ async function testConnection() {
   testResult.value = null
   try {
     testResult.value = await request<SupplierConnectionTestResult>(`${actionPath.value}/test`, { method: 'POST' })
-    successMessage.value = testResult.value.message
+    const result = testResult.value
     await load()
+    testResult.value = result
+    if (result.connectionOk) successMessage.value = result.message
+    else errorMessage.value = result.message
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '供应商测试请求失败。'
   } finally {
@@ -191,6 +211,14 @@ void load()
       <UDashboardNavbar title="供应商连接">
         <template #right>
           <UButton
+            color="primary"
+            icon="i-lucide-plus"
+            :disabled="saving || loading"
+            @click="newConnection"
+          >
+            新增连接
+          </UButton>
+          <UButton
             color="neutral"
             variant="outline"
             icon="i-lucide-refresh-cw"
@@ -209,7 +237,7 @@ void load()
             外部供应商 API
           </h1>
           <p class="mt-2 text-sm leading-6 text-muted">
-            首版仅支持遵守 http_json_v1 的供应商。认证仅以加密形式存储，不会从服务端返回或写入操作日志。更新地址或凭据会创建新版本并停用连接，历史订单仍绑定原版本。
+            支持 HTTP JSON v1 自动履约与卡易信客户 V3 只读连接。卡易信可读取账户、商品、规格及填写要求，自动采购尚未开放。认证仅以加密形式存储，不会从服务端返回或写入操作日志。更新地址或凭据会创建新版本并停用连接，历史订单仍绑定原版本。
           </p>
         </div>
         <UAlert
@@ -231,7 +259,7 @@ void load()
           role="status"
         />
 
-        <div class="grid min-w-0 gap-5 lg:grid-cols-[minmax(15rem,0.8fr)_minmax(0,1.6fr)]">
+        <div class="grid min-w-0 items-start gap-5 lg:grid-cols-[minmax(15rem,0.8fr)_minmax(0,1.6fr)]">
           <section
             class="min-w-0 rounded-xl border border-default bg-elevated p-4 sm:p-5"
             aria-labelledby="supplier-list-title"
@@ -270,7 +298,7 @@ void load()
                     <UBadge
                       :color="connection.enabled ? 'success' : 'neutral'"
                       variant="soft"
-                    >{{ connection.enabled ? '已启用' : '已停用' }}</UBadge>
+                    >{{ connection.providerType === 'kayixin_customer_v3' ? '只读' : connection.enabled ? '已启用' : '已停用' }}</UBadge>
                   </span>
                   <span class="mt-1 block truncate text-xs text-muted">v{{ connection.currentVersion.versionNumber }} · {{ connection.currentVersion.baseUrl }}</span>
                 </button>
@@ -298,7 +326,7 @@ void load()
                     {{ selected ? '连接配置' : '新增连接' }}
                   </h2>
                   <p class="mt-1 text-xs leading-5 text-muted">
-                    协议：http_json_v1 · Bearer 身份认证
+                    {{ isKayixin ? '卡易信客户 API V3 · AppID / AppSecret 签名认证' : 'HTTP JSON v1 · Bearer 身份认证' }}
                   </p>
                 </div>
                 <UBadge
@@ -306,10 +334,23 @@ void load()
                   :color="selected.enabled ? 'success' : 'neutral'"
                   variant="soft"
                 >
-                  {{ selected.enabled ? '新订单可使用' : '新订单已暂停' }}
+                  {{ isKayixin ? '自动采购尚未开放' : selected.enabled ? '新订单可使用' : '新订单已暂停' }}
                 </UBadge>
               </div>
               <div class="mt-4 grid min-w-0 gap-3 sm:grid-cols-2">
+                <UFormField
+                  label="连接协议"
+                  class="sm:col-span-2"
+                  description="保存后协议不可更换；使用不同协议请新增连接。"
+                >
+                  <USelect
+                    v-model="form.providerType"
+                    :items="protocolOptions"
+                    class="w-full"
+                    :disabled="Boolean(selected) || loading || saving"
+                    @update:model-value="clearCredentials"
+                  />
+                </UFormField>
                 <UFormField label="供应商名称">
                   <UInput
                     v-model="form.name"
@@ -328,12 +369,13 @@ void load()
                     class="w-full"
                     maxlength="2048"
                     type="url"
-                    placeholder="https://supplier.example/api"
+                    :placeholder="isKayixin ? 'https://supplier.example' : 'https://supplier.example/api'"
                     :disabled="loading || saving"
                     autocomplete="url"
                   />
                 </UFormField>
                 <UFormField
+                  v-if="!isKayixin"
                   class="sm:col-span-2"
                   :label="selected ? 'Bearer Token（可选轮换）' : 'Bearer Token'"
                   hint="保存后立即清空输入框；服务端不会回显凭据。留空表示保留当前凭据。"
@@ -347,6 +389,36 @@ void load()
                     :disabled="loading || saving"
                   />
                 </UFormField>
+                <template v-else>
+                  <UFormField
+                    label="AppID"
+                    :error="form.appId && !/^[0-9]{1,32}$/u.test(form.appId) ? 'AppID 必须是 1 至 32 位数字。' : undefined"
+                    description="轮换时与 AppSecret 一起填写；服务端不回显。"
+                  >
+                    <UInput
+                      v-model="form.appId"
+                      class="w-full"
+                      inputmode="numeric"
+                      maxlength="32"
+                      autocomplete="off"
+                      :disabled="loading || saving"
+                    />
+                  </UFormField>
+                  <UFormField
+                    label="AppSecret"
+                    :error="form.appSecret && !/^[!-~]{1,512}$/u.test(form.appSecret) ? 'AppSecret 不能包含空格、控制字符或非 ASCII 字符。' : undefined"
+                    description="仅填写商户 API 凭据；文档密码不适用。保存后清空。"
+                  >
+                    <UInput
+                      v-model="form.appSecret"
+                      class="w-full"
+                      type="password"
+                      maxlength="512"
+                      autocomplete="new-password"
+                      :disabled="loading || saving"
+                    />
+                  </UFormField>
+                </template>
               </div>
               <div class="mt-4 flex flex-wrap gap-2">
                 <UButton
@@ -354,7 +426,7 @@ void load()
                   color="primary"
                   icon="i-lucide-plus"
                   :loading="saving"
-                  :disabled="loading || !form.name.trim() || !form.baseUrl.trim() || !form.bearerToken"
+                  :disabled="loading || !form.name.trim() || !form.baseUrl.trim() || !credentialsComplete"
                   @click="createConnection"
                 >
                   加密保存连接
@@ -364,7 +436,7 @@ void load()
                     color="primary"
                     icon="i-lucide-save"
                     :loading="saving"
-                    :disabled="loading || !form.name.trim() || !form.baseUrl.trim()"
+                    :disabled="loading || !form.name.trim() || !form.baseUrl.trim() || (isKayixin && Boolean(form.appId || form.appSecret) && !credentialsComplete)"
                     @click="saveConfiguration"
                   >
                     保存新版本
@@ -377,7 +449,7 @@ void load()
                     :disabled="loading"
                     @click="testConnection"
                   >
-                    测试连接与查单
+                    {{ isKayixin ? '测试只读连接' : '测试连接与查单' }}
                   </UButton>
                   <UButton
                     color="neutral"
@@ -390,6 +462,7 @@ void load()
                     轮换加密密钥
                   </UButton>
                   <UButton
+                    v-if="!isKayixin"
                     :color="selected.enabled ? 'warning' : 'success'"
                     variant="outline"
                     :icon="selected.enabled ? 'i-lucide-pause' : 'i-lucide-play'"
@@ -406,7 +479,7 @@ void load()
                 class="mt-4 grid gap-2 rounded-lg border border-default bg-default p-3 text-sm sm:grid-cols-2"
               >
                 <p><span class="text-muted">当前版本：</span><span class="text-highlighted">{{ selected.currentVersion.name }} · v{{ selected.currentVersion.versionNumber }}</span></p>
-                <p><span class="text-muted">认证：</span><span class="text-highlighted">Bearer 已加密保存</span></p>
+                <p><span class="text-muted">认证：</span><span class="text-highlighted">{{ isKayixin ? 'AppID / AppSecret 已加密保存' : 'Bearer 已加密保存' }}</span></p>
                 <p class="sm:col-span-2 break-all">
                   <span class="text-muted">地址：</span><span class="text-highlighted">{{ selected.currentVersion.baseUrl }}</span>
                 </p>
@@ -414,17 +487,24 @@ void load()
               <p
                 v-if="testResult"
                 class="mt-3 text-sm"
-                :class="testResult.connectionOk && testResult.queryCapable ? 'text-success' : 'text-warning'"
+                :class="testResult.connectionOk ? 'text-success' : 'text-warning'"
               >
-                连接 {{ testResult.connectionOk ? '通过' : '失败' }} · 查单 {{ testResult.queryCapable ? '通过' : '失败' }} · {{ formatDate(testResult.checkedAt) }}
+                {{ testResult.scope === 'catalog_read_v3' ? '只读连接' : '连接与查单' }} {{ testResult.connectionOk ? '通过' : '失败' }} · {{ formatDate(testResult.checkedAt) }}
+                <span class="block">{{ testResult.message }}</span>
               </p>
               <p
                 v-if="selected"
                 class="mt-3 text-xs leading-5 text-muted"
               >
-                停用连接只阻止新订单销售；历史订单仍保留对应版本与加密凭据，以便恢复查单。更换 Token 会保留旧凭据版本。
+                {{ isKayixin ? '更换 AppID / AppSecret 会保留旧凭据版本。只读测试只对当前配置有效，自动采购和履约尚未开放。' : '停用连接只阻止新订单销售；历史订单仍保留对应版本与加密凭据，以便恢复查单。更换 Token 会保留旧凭据版本。' }}
               </p>
             </section>
+
+            <AdminSupplierCatalogBrowser
+              v-if="selected?.providerType === 'kayixin_customer_v3'"
+              :connection="selected"
+              :request="request"
+            />
 
             <section
               v-if="selected"
@@ -453,7 +533,7 @@ void load()
                       {{ versionLabel(version) }}
                     </p>
                     <p class="mt-1 break-all text-xs text-muted">
-                      {{ version.baseUrl }} · http_json_v1
+                      {{ version.baseUrl }} · {{ version.providerType }} · {{ version.authScheme }}
                     </p>
                   </li>
                 </ol>
@@ -484,7 +564,7 @@ void load()
                     class="rounded-lg border border-default p-3 text-sm"
                   >
                     <p class="font-medium text-highlighted">
-                      {{ actionLabels[event.action] }}
+                      {{ event.details.scope === 'catalog_read_v3' && event.action === 'connection_test_succeeded' ? '只读连接测试通过' : event.details.scope === 'catalog_read_v3' && event.action === 'connection_test_failed' ? '只读连接测试失败' : actionLabels[event.action] }}
                     </p>
                     <p class="mt-1 text-xs text-muted">
                       管理员 {{ event.administratorId }} · {{ formatDate(event.createdAt) }}

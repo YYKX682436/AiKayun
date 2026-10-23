@@ -79,6 +79,35 @@ export function decryptSupplierBearerToken(
   }
 }
 
+export type SupplierCredentials =
+  | { providerType: 'http_json_v1'; bearerToken: string }
+  | { providerType: 'kayixin_customer_v3'; appId: string; appSecret: string }
+
+function kayixinCredentialContext(connectionId: string, credentialVersion: number): string {
+  return `aikayun:supplier-connection:credential:kayixin_customer_v3:v1:${connectionId}:${credentialVersion}`
+}
+
+export function encryptSupplierCredentials(config: AppConfig, connectionId: string, credentialVersion: number, credentials: SupplierCredentials) {
+  if (credentials.providerType === 'http_json_v1') return encryptSupplierBearerToken(config, connectionId, credentialVersion, credentials.bearerToken)
+  if (!config.paymentCredentialKeyRing || !/^[0-9]{1,32}$/u.test(credentials.appId)
+    || !/^[!-~]{1,512}$/u.test(credentials.appSecret)) throw new SupplierCredentialKeyUnavailableError()
+  return encryptPaymentConfig(config, kayixinCredentialContext(connectionId, credentialVersion),
+    serializePaymentConfig({ appId: credentials.appId, appSecret: credentials.appSecret }))
+}
+
+export function decryptSupplierCredentials(config: AppConfig, connectionId: string, credentialVersion: number,
+  providerType: SupplierCredentials['providerType'],
+  envelope: { keyId: string; nonce: Buffer; ciphertext: Buffer; authTag: Buffer },
+): SupplierCredentials {
+  if (providerType === 'http_json_v1') return { providerType, bearerToken: decryptSupplierBearerToken(config, connectionId, credentialVersion, envelope) }
+  try {
+    const parsed = parsePaymentConfig(decryptPaymentConfig(config, kayixinCredentialContext(connectionId, credentialVersion), envelope))
+    if (Object.keys(parsed).sort().join(',') !== 'appId,appSecret' || !/^[0-9]{1,32}$/u.test(parsed.appId ?? '')
+      || !/^[!-~]{1,512}$/u.test(parsed.appSecret ?? '')) throw new SupplierCredentialKeyUnavailableError()
+    return { providerType, appId: parsed.appId!, appSecret: parsed.appSecret! }
+  } catch { throw new SupplierCredentialKeyUnavailableError() }
+}
+
 function apiResultRing(config: AppConfig): PaymentCredentialKeyRing {
   if (!config.codePoolEncryptionKeyRing) throw new ApiDeliveryKeyUnavailableError()
   return config.codePoolEncryptionKeyRing

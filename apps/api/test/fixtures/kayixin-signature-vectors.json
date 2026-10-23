@@ -1,0 +1,30 @@
+[
+  {
+    "appId": "602401",
+    "appSecret": "fixture-vector-secret",
+    "timestamp": "1760767397",
+    "bodyJson": "",
+    "expected": "650875d5c8cf8cb86fdf8867cce31b7a"
+  },
+  {
+    "appId": "602401",
+    "appSecret": "fixture-vector-secret",
+    "timestamp": "1760767397",
+    "bodyJson": "{\"keyWord\":\"中文 & + \\\"会员\\\" / 😃\\n\",\"page\":2}",
+    "expected": "808b367634e0eb6977238414c4b845aa"
+  },
+  {
+    "appId": "602401",
+    "appSecret": "fixture-vector-secret",
+    "timestamp": "1760767397",
+    "bodyJson": "{ \"page\": 2, \"keyWord\": \"中文\" }",
+    "expected": "8ff222ef816526cab10f9e1c9583088f"
+  },
+  {
+    "appId": "602401",
+    "appSecret": "fixture-vector-secret",
+    "timestamp": "1760767397",
+    "bodyJson": "{\"page\":2,\"keyWord\":\"中文\"}",
+    "expected": "917c9b5da5ac1f9f9c1748c747cce0e2"
+  }
+]

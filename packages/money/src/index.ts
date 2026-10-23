@@ -153,3 +153,14 @@ export function allocateWalletOrderPayment(
     externalAmount: externalAmount.toFixed(2),
   }
 }
+
+/** An upstream observation, never a settlement or a SKU sale price. Preserve all
+ * supported digits and trailing zeros; reject unsupported precision, never round. */
+export function preserveSupplierReferenceAmount(value: string): string {
+  if (!/^(?:0|[1-9]\d{0,23})(?:\.\d{1,18})?$/.test(value)) {
+    throw new TypeError('Supplier reference amount has an unsupported format or precision')
+  }
+  const amount = new ExactDecimal(value)
+  if (!amount.isFinite() || amount.isNegative()) throw new TypeError('Invalid supplier reference amount')
+  return value
+}

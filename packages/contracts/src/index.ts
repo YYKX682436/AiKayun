@@ -1966,13 +1966,27 @@ export const FixedDeliveryVersionsQuerySchema = Type.Object({
   pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
 }, { additionalProperties: false })
 
+export const SupplierProviderTypeSchema = Type.Union([Type.Literal('http_json_v1'), Type.Literal('kayixin_customer_v3')])
+export const SupplierAuthSchemeSchema = Type.Union([Type.Literal('bearer'), Type.Literal('app_signature_v3')])
+export const KayixinCredentialsSchema = Type.Object({
+  appId: Type.String({ pattern: '^[0-9]{1,32}$' }),
+  appSecret: Type.String({ minLength: 1, maxLength: 512, pattern: '^[!-~]+$' }),
+}, { additionalProperties: false })
+export const SupplierConnectionTestResultSchema = Type.Object({
+  connectionOk: Type.Boolean(), queryCapable: Type.Boolean(),
+  scope: Type.Union([Type.Literal('fulfillment_v1'), Type.Literal('catalog_read_v3')]),
+  configurationVersionId: Type.String({ format: 'uuid' }),
+  checkedAt: Type.String({ format: 'date-time' }),
+  errorCode: Type.Union([Type.String({ maxLength: 64 }), Type.Null()]),
+  message: Type.String({ maxLength: 200 }),
+}, { additionalProperties: false })
 export const SupplierConnectionVersionSchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
   versionNumber: Type.Integer({ minimum: 1 }),
   name: Type.String({ minLength: 1, maxLength: 120 }),
-  providerType: Type.Literal('http_json_v1'),
+  providerType: SupplierProviderTypeSchema,
   baseUrl: Type.String({ minLength: 1, maxLength: 2048 }),
-  authScheme: Type.Literal('bearer'),
+  authScheme: SupplierAuthSchemeSchema,
   credentialVersion: Type.Integer({ minimum: 1 }),
   createdAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
@@ -1980,30 +1994,31 @@ export const SupplierConnectionSchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
   name: Type.String({ minLength: 1, maxLength: 120 }),
   enabled: Type.Boolean(),
-  providerType: Type.Literal('http_json_v1'),
+  providerType: SupplierProviderTypeSchema,
+  fulfillmentEligible: Type.Boolean(),
+  lastTest: Type.Union([SupplierConnectionTestResultSchema, Type.Null()]),
   credentialsConfigured: Type.Literal(true),
   currentVersion: SupplierConnectionVersionSchema,
   updatedAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
 export const SupplierConnectionPageSchema = Type.Array(SupplierConnectionSchema)
-export const CreateSupplierConnectionBodySchema = Type.Object({
-  name: Type.String({ minLength: 1, maxLength: 120, pattern: '.*\\S.*' }),
-  providerType: Type.Literal('http_json_v1'),
-  baseUrl: Type.String({ minLength: 1, maxLength: 2048 }),
-  bearerToken: Type.String({ minLength: 1, maxLength: 2048 }),
-}, { additionalProperties: false })
-export const UpdateSupplierConnectionBodySchema = Type.Object({
+const SupplierConnectionConfigProperties = {
   name: Type.String({ minLength: 1, maxLength: 120, pattern: '.*\\S.*' }),
   baseUrl: Type.String({ minLength: 1, maxLength: 2048 }),
-  bearerToken: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })),
-}, { additionalProperties: false })
+}
+export const CreateSupplierConnectionBodySchema = Type.Union([
+  Type.Object({ ...SupplierConnectionConfigProperties, providerType: Type.Literal('http_json_v1'),
+    bearerToken: Type.String({ minLength: 1, maxLength: 2048 }) }, { additionalProperties: false }),
+  Type.Object({ ...SupplierConnectionConfigProperties, providerType: Type.Literal('kayixin_customer_v3'),
+    credentials: KayixinCredentialsSchema }, { additionalProperties: false }),
+])
+export const UpdateSupplierConnectionBodySchema = Type.Union([
+  Type.Object({ ...SupplierConnectionConfigProperties, providerType: Type.Optional(Type.Literal('http_json_v1')),
+    bearerToken: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })) }, { additionalProperties: false }),
+  Type.Object({ ...SupplierConnectionConfigProperties, providerType: Type.Literal('kayixin_customer_v3'),
+    credentials: Type.Optional(KayixinCredentialsSchema) }, { additionalProperties: false }),
+])
 export const UpdateSupplierConnectionEnabledBodySchema = Type.Object({ enabled: Type.Boolean() }, { additionalProperties: false })
-export const SupplierConnectionTestResultSchema = Type.Object({
-  connectionOk: Type.Boolean(),
-  queryCapable: Type.Boolean(),
-  checkedAt: Type.String({ format: 'date-time' }),
-  message: Type.String({ maxLength: 200 }),
-}, { additionalProperties: false })
 export const SupplierConnectionVersionsPageSchema = Type.Object({
   items: Type.Array(SupplierConnectionVersionSchema, { maxItems: 50 }),
   total: Type.Integer({ minimum: 0 }),
@@ -2892,3 +2907,7 @@ export function success<T>(data: T, requestId: string): ApiSuccess<T> {
 export function failure(code: string, message: string, requestId: string): ApiError {
   return { error: { code, message }, meta: { requestId } }
 }
+
+export * from './supplier-catalog.js'
+export type SupplierProviderType = Static<typeof SupplierProviderTypeSchema>
+export type SupplierAuthScheme = Static<typeof SupplierAuthSchemeSchema>

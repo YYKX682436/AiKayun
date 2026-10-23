@@ -69,7 +69,7 @@ export async function createApp(options: {
     logger: options.logger === false ? false : {
       level: config.nodeEnv === 'production' ? 'info' : 'debug',
       redact: {
-        paths: ['req.headers.cookie', 'req.headers.authorization', 'req.headers.x-csrf-token', 'res.headers.set-cookie'],
+        paths: ['req.headers.cookie', 'req.headers.authorization', 'req.headers.x-csrf-token', 'res.headers.set-cookie', 'req.body.bearerToken', 'req.body.credentials', 'req.headers.x-signature'],
         censor: '[REDACTED]',
       },
     },
