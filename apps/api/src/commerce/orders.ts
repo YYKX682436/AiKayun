@@ -23,6 +23,7 @@ import {
   OrderListQuerySchema,
   OrderPageSchema,
   UpdateManualFulfillmentBodySchema,
+  SupplierOperationAdminActionResultSchema,
   failure,
   success,
 } from '@aikayun/contracts'
@@ -59,6 +60,7 @@ import {
   fixedDeliveryDeliveryContext,
   type FixedDeliveryMethod,
 } from './fixed-delivery-crypto.js'
+import { decryptApiDeliveryResult } from './supplier-api-crypto.js'
 
 export const guestSessionCookie = 'aikayun_guest_order_session'
 const guestSessionTtlSeconds = 60 * 60 * 24 * 180
@@ -208,6 +210,7 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
         'delivery.content', 'delivery.delivery_source', 'delivery.encrypted_content', 'delivery.content_nonce',
         'delivery.content_auth_tag', 'delivery.encryption_key_id', 'delivery.code_pool_entry_id',
         'delivery.fulfillment_content_version_id', 'delivery.created_at',
+        'delivery.supplier_api_operation_id', 'delivery.supplier_content_type',
         'version.method as version_method', 'version.display_filename',
         'object.size_bytes as file_size_bytes', 'object.media_type as file_media_type',
       ])
@@ -276,8 +279,38 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
       fileMediaType = delivery.file_media_type
       const ownerPath = order.customer_id ? 'customer' : 'guest'
       downloadUrl = `/api/v1/${ownerPath}/orders/${order.id}/items/${item.id}/deliveries/${delivery.id}/file`
+    } else if (delivery.delivery_source === 'api') {
+      const item = itemRows.find(row => row.id === delivery.order_item_id)
+      if (!config || !item || item.fulfillment_method_snapshot !== 'api'
+        || !item.fulfillment_content_version_id
+        || delivery.fulfillment_content_version_id !== item.fulfillment_content_version_id
+        || !delivery.supplier_api_operation_id || !delivery.supplier_content_type) {
+        throw new Error('Authorized API delivery does not match its immutable order snapshot')
+      }
+      if (delivery.supplier_content_type === 'completed') {
+        if (delivery.encrypted_content || delivery.content_nonce || delivery.content_auth_tag || delivery.encryption_key_id) {
+          throw new Error('Completed API confirmation unexpectedly includes a content envelope')
+        }
+        content = null
+        contentFormat = 'confirmation'
+      } else {
+        if (!delivery.encrypted_content || !delivery.content_nonce || !delivery.content_auth_tag || !delivery.encryption_key_id) {
+          throw new Error('Authorized API delivery could not be decrypted')
+        }
+        const result = decryptApiDeliveryResult(config, delivery.supplier_api_operation_id, {
+          keyId: delivery.encryption_key_id,
+          nonce: delivery.content_nonce,
+          ciphertext: delivery.encrypted_content,
+          authTag: delivery.content_auth_tag,
+        })
+        if (result.type !== delivery.supplier_content_type) throw new Error('API delivery type does not match its stored result')
+        content = result.content
+        contentFormat = result.type === 'link' ? 'link' : 'plain_text'
+        title = result.title
+        accessInstructions = result.instructions
+      }
     }
-    if (content === null && contentFormat !== 'file') throw new Error('Fulfillment delivery content is missing')
+    if (content === null && contentFormat !== 'file' && contentFormat !== 'confirmation') throw new Error('Fulfillment delivery content is missing')
     const rows = deliveriesByItem.get(delivery.order_item_id) ?? []
     rows.push({
       id: delivery.id,
@@ -297,11 +330,11 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
   const attemptRows = itemIds.length
     ? await sql<{
       order_item_id: string; status: OrderDetail['items'][number]['fulfillmentAttempts'][number]['status'];
-      quantity: number; failure_code: string | null; retry_after: Date | null; created_at: Date; completed_at: Date | null;
+      quantity: number; delivery_source: string; failure_code: string | null; retry_after: Date | null; created_at: Date; completed_at: Date | null;
     }>`
       SELECT order_item_id, status, quantity, failure_code, retry_after, created_at, completed_at
       FROM (
-        SELECT attempt.order_item_id, attempt.status, attempt.quantity, attempt.failure_code,
+        SELECT attempt.order_item_id, attempt.status, attempt.quantity, attempt.delivery_source, attempt.failure_code,
           attempt.retry_after, attempt.created_at, attempt.completed_at,
           row_number() OVER (PARTITION BY attempt.order_item_id ORDER BY attempt.created_at DESC, attempt.id DESC) AS rank
         FROM order_item_fulfillment_attempts AS attempt
@@ -317,7 +350,7 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
     rows.push({
       status: attempt.status,
       quantity: attempt.quantity,
-      failureCode: attempt.failure_code,
+      failureCode: attempt.delivery_source === 'api' ? null : attempt.failure_code,
       retryAfter: attempt.retry_after?.toISOString() ?? null,
       createdAt: attempt.created_at.toISOString(),
       completedAt: attempt.completed_at?.toISOString() ?? null,
@@ -525,7 +558,7 @@ async function createOrderTransaction(
     const inventoryMode = item.inventoryMode
     if (!item.productId || !item.productName || !item.productType || !item.skuCode || !item.unitPrice || !item.lineTotal
       || (inventoryMode !== 'quantity' && inventoryMode !== 'unlimited')
-      || !['manual', 'code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod ?? '')) {
+      || !['manual', 'code_pool', 'fixed_content', 'link', 'file', 'api'].includes(item.fulfillmentMethod ?? '')) {
       throw new Error('Eligible checkout item is missing required transaction snapshot fields')
     }
     const orderItemId = randomUUID()
@@ -871,6 +904,38 @@ async function adminOrderDetail(db: Kysely<Database>, orderId: string, config: A
     .groupBy('attempt.id')
     .execute()
   const deliveryCounts = new Map(attemptCounts.map(item => [item.attempt_id, item.delivery_count]))
+  const supplierOperationRows = await sql<{
+    id: string; fulfillment_attempt_id: string; operation_id: string; unit_index: number;
+    supplier_connection_id: string; supplier_name: string; supplier_product_id: string;
+    idempotency_key: string; provider_operation_id: string | null; state: AdminOrderDetail['supplierOperations'][number]['state'];
+    create_attempt_count: number; query_attempt_count: number; last_http_status: number | null;
+    last_error_code: string | null; last_failure_class: string | null; last_provider_status: string | null;
+    next_action_at: Date | null; create_requested_at: Date | null; last_query_at: Date | null;
+    created_at: Date; completed_at: Date | null; events: AdminOrderDetail['supplierOperations'][number]['events'];
+  }>`
+    SELECT operation.id, operation.fulfillment_attempt_id, operation.operation_id, operation.unit_index,
+      operation.supplier_connection_id, supplier_version.display_name AS supplier_name,
+      operation.supplier_product_id, operation.idempotency_key, operation.provider_operation_id,
+      operation.state, operation.create_attempt_count, operation.query_attempt_count,
+      operation.last_http_status, operation.last_error_code, operation.last_failure_class,
+      operation.last_provider_status, operation.next_action_at, operation.create_requested_at,
+      operation.last_query_at, operation.created_at, operation.completed_at,
+      COALESCE(jsonb_agg(jsonb_build_object(
+        'eventType', event.event_type, 'httpStatus', event.http_status,
+        'classification', event.classification, 'providerStatus', event.provider_status,
+        'errorCode', event.error_code, 'responseSha256', nullif(btrim(event.response_sha256), ''),
+        'createdAt', event.created_at
+      ) ORDER BY event.created_at, event.id) FILTER (WHERE event.id IS NOT NULL), '[]'::jsonb) AS events
+    FROM supplier_api_delivery_operations AS operation
+    JOIN supplier_connection_versions AS supplier_version
+      ON supplier_version.id = operation.supplier_connection_version_id
+    JOIN order_item_fulfillment_attempts AS attempt ON attempt.id = operation.fulfillment_attempt_id
+    JOIN order_items AS item ON item.id = attempt.order_item_id
+    LEFT JOIN supplier_api_delivery_events AS event ON event.operation_id = operation.id
+    WHERE item.order_id = ${orderId}::uuid
+    GROUP BY operation.id, supplier_version.display_name
+    ORDER BY operation.created_at, operation.id
+  `.execute(db)
   const paymentAttempts = await db.selectFrom('payment_attempts as attempt')
     .leftJoin('payment_attempt_provider_state as provider_state', 'provider_state.payment_attempt_id', 'attempt.id')
     .select([
@@ -999,6 +1064,34 @@ async function adminOrderDetail(db: Kysely<Database>, orderId: string, config: A
       createdAt: attempt.created_at.toISOString(),
       completedAt: attempt.completed_at?.toISOString() ?? null,
       deliveryCount: deliveryCounts.get(attempt.id) ?? 0,
+    })),
+    supplierOperations: supplierOperationRows.rows.map(operation => ({
+      id: operation.id,
+      fulfillmentAttemptId: operation.fulfillment_attempt_id,
+      operationId: operation.operation_id,
+      unitIndex: operation.unit_index,
+      supplierConnectionId: operation.supplier_connection_id,
+      supplierName: operation.supplier_name,
+      supplierProductId: operation.supplier_product_id,
+      idempotencyKey: operation.idempotency_key,
+      providerOperationId: operation.provider_operation_id,
+      state: operation.state,
+      createAttemptCount: operation.create_attempt_count,
+      queryAttemptCount: operation.query_attempt_count,
+      lastHttpStatus: operation.last_http_status,
+      lastErrorCode: operation.last_error_code,
+      lastFailureClass: operation.last_failure_class,
+      lastProviderStatus: operation.last_provider_status,
+      nextActionAt: operation.next_action_at?.toISOString() ?? null,
+      createRequestedAt: operation.create_requested_at?.toISOString() ?? null,
+      lastQueryAt: operation.last_query_at?.toISOString() ?? null,
+      createdAt: operation.created_at.toISOString(),
+      completedAt: operation.completed_at?.toISOString() ?? null,
+      events: operation.events.map(event => ({
+        ...event,
+        createdAt: new Date(event.createdAt).toISOString(),
+        responseSha256: event.responseSha256?.trim() ?? null,
+      })),
     })),
     payments,
   }
@@ -1247,6 +1340,138 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
     }
   })
 
+  app.post('/api/v1/admin/orders/:id/supplier-operations/:operationId/query', {
+    preHandler: [requireAdministrator, adminCsrf],
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    schema: {
+      tags: ['admin'], summary: 'Queue a safe supplier status query or finalize a previously stored success result',
+      params: { type: 'object', required: ['id', 'operationId'], additionalProperties: false, properties: {
+        id: { type: 'string', format: 'uuid' }, operationId: { type: 'string', format: 'uuid' },
+      } },
+      response: { 200: ApiSuccessSchemaOf(SupplierOperationAdminActionResultSchema), 401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema, 429: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const params = request.params as { id: string; operationId: string }
+      await db.transaction().execute(async (trx) => {
+        const order = await trx.selectFrom('orders').select(['id', 'status'])
+          .where('id', '=', params.id).forUpdate().executeTakeFirst()
+        if (!order) throw new OrderError(404, 'ORDER_NOT_FOUND', '订单不存在。')
+        const identity = await trx.selectFrom('supplier_api_delivery_operations as operation')
+          .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'operation.fulfillment_attempt_id')
+          .innerJoin('order_items as item', 'item.id', 'attempt.order_item_id')
+          .select(['item.id as item_id', 'item.product_id', 'item.product_variant_id', 'item.inventory_mode_snapshot',
+            'operation.fulfillment_attempt_id'])
+          .where('operation.id', '=', params.operationId).where('item.order_id', '=', params.id).executeTakeFirst()
+        if (!identity) throw new OrderError(404, 'SUPPLIER_OPERATION_NOT_FOUND', '此订单没有该供应商操作。')
+        await trx.selectFrom('order_items').select('id').where('id', '=', identity.item_id).forUpdate().executeTakeFirst()
+        await trx.selectFrom('products').select('id').where('id', '=', identity.product_id).forShare().executeTakeFirst()
+        await trx.selectFrom('product_variants').select('id').where('id', '=', identity.product_variant_id).forUpdate().executeTakeFirst()
+        if (identity.inventory_mode_snapshot === 'quantity') {
+          await trx.selectFrom('product_variant_quantity_inventory').select('product_variant_id')
+            .where('product_variant_id', '=', identity.product_variant_id).forUpdate().executeTakeFirst()
+        }
+        await trx.selectFrom('product_variant_fulfillment').select('product_variant_id')
+          .where('product_variant_id', '=', identity.product_variant_id).forShare().executeTakeFirst()
+        const operation = await trx.selectFrom('supplier_api_delivery_operations').selectAll()
+          .where('id', '=', params.operationId).forUpdate().executeTakeFirstOrThrow()
+        if (operation.state === 'succeeded' || operation.state === 'failed'
+          || operation.state === 'create_in_flight' || operation.state === 'query_in_flight') {
+          throw new OrderError(409, 'SUPPLIER_OPERATION_NOT_QUERYABLE', '该操作已结束或正在执行，当前不能手动查单。')
+        }
+        if (operation.result_ciphertext && operation.state !== 'succeeded_pending_finalize') {
+          throw new OrderError(409, 'SUPPLIER_RESULT_REQUIRES_REVIEW', '此操作已有供应商成功结果，需要人工核对；系统不会覆盖或伪造交付。')
+        }
+        const nextState = operation.state === 'succeeded_pending_finalize' ? 'succeeded_pending_finalize' : 'query_pending'
+        await trx.updateTable('supplier_api_delivery_operations').set({
+          state: nextState, next_action_at: new Date(), lease_token: null, lease_expires_at: null,
+        }).where('id', '=', operation.id).execute()
+        await trx.insertInto('supplier_api_delivery_events').values({
+          id: randomUUID(), operation_id: operation.id,
+          event_type: 'manual_query_requested', http_status: null,
+          classification: nextState === 'query_pending' ? 'admin_requested' : 'finalize_saved_result',
+          provider_status: operation.last_provider_status,
+          provider_operation_id: operation.provider_operation_id, error_code: null,
+          response_sha256: null, details: { administratorId: request.admin!.id },
+        }).execute()
+        await trx.insertInto('supplier_api_operations_admin_audit').values({
+          id: randomUUID(), operation_id: operation.id, administrator_id: request.admin!.id,
+          action: 'query_requested', details: { queuedState: nextState },
+        }).execute()
+      })
+      const detail = await adminOrderDetail(db, params.id, config)
+      const operation = detail?.supplierOperations.find(row => row.id === params.operationId)
+      if (!operation) throw new OrderError(404, 'SUPPLIER_OPERATION_NOT_FOUND', '此订单没有该供应商操作。')
+      reply.header('cache-control', 'private, no-store')
+      return success({ operation }, request.id)
+    } catch (error) {
+      return handleOrderError(error, reply, request.id)
+    }
+  })
+
+  app.post('/api/v1/admin/orders/:id/supplier-operations/:operationId/retry', {
+    preHandler: [requireAdministrator, adminCsrf],
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    schema: {
+      tags: ['admin'], summary: 'Retry only a supplier operation explicitly rejected without delivery',
+      params: { type: 'object', required: ['id', 'operationId'], additionalProperties: false, properties: {
+        id: { type: 'string', format: 'uuid' }, operationId: { type: 'string', format: 'uuid' },
+      } },
+      response: { 200: ApiSuccessSchemaOf(SupplierOperationAdminActionResultSchema), 401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema, 429: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const params = request.params as { id: string; operationId: string }
+      await db.transaction().execute(async (trx) => {
+        const order = await trx.selectFrom('orders').select(['id', 'status'])
+          .where('id', '=', params.id).forUpdate().executeTakeFirst()
+        if (!order) throw new OrderError(404, 'ORDER_NOT_FOUND', '订单不存在。')
+        if (order.status !== 'processing') throw new OrderError(409, 'ORDER_FULFILLMENT_REQUIRES_PROCESSING', '只有仍在 processing 的订单可以恢复供应商拒绝操作。')
+        const identity = await trx.selectFrom('supplier_api_delivery_operations as operation')
+          .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'operation.fulfillment_attempt_id')
+          .innerJoin('order_items as item', 'item.id', 'attempt.order_item_id')
+          .select(['item.id as item_id', 'item.product_id', 'item.product_variant_id', 'item.inventory_mode_snapshot', 'attempt.id as attempt_id'])
+          .where('operation.id', '=', params.operationId).where('item.order_id', '=', params.id).executeTakeFirst()
+        if (!identity) throw new OrderError(404, 'SUPPLIER_OPERATION_NOT_FOUND', '此订单没有该供应商操作。')
+        await trx.selectFrom('order_items').select('id').where('id', '=', identity.item_id).forUpdate().executeTakeFirst()
+        await trx.selectFrom('products').select('id').where('id', '=', identity.product_id).forShare().executeTakeFirst()
+        await trx.selectFrom('product_variants').select('id').where('id', '=', identity.product_variant_id).forUpdate().executeTakeFirst()
+        if (identity.inventory_mode_snapshot === 'quantity') {
+          await trx.selectFrom('product_variant_quantity_inventory').select('product_variant_id')
+            .where('product_variant_id', '=', identity.product_variant_id).forUpdate().executeTakeFirst()
+        }
+        await trx.selectFrom('product_variant_fulfillment').select('product_variant_id')
+          .where('product_variant_id', '=', identity.product_variant_id).forShare().executeTakeFirst()
+        const operation = await trx.selectFrom('supplier_api_delivery_operations').selectAll()
+          .where('id', '=', params.operationId).forUpdate().executeTakeFirstOrThrow()
+        const attempt = await trx.selectFrom('order_item_fulfillment_attempts').select(['id', 'status'])
+          .where('id', '=', identity.attempt_id).forUpdate().executeTakeFirstOrThrow()
+        if (operation.state !== 'failed' || operation.last_failure_class !== 'supplier_rejected' || attempt.status !== 'failed') {
+          throw new OrderError(409, 'SUPPLIER_RETRY_REQUIRES_CONFIRMED_REJECTION', '只有供应商明确拒绝且确认未发货的操作可重试。')
+        }
+        await trx.updateTable('order_item_fulfillment_attempts').set({ retry_after: new Date() })
+          .where('id', '=', attempt.id).execute()
+        await trx.insertInto('supplier_api_delivery_events').values({
+          id: randomUUID(), operation_id: operation.id, event_type: 'manual_retry_requested',
+          http_status: null, classification: 'admin_requested', provider_status: 'rejected',
+          provider_operation_id: operation.provider_operation_id, error_code: 'confirmed_no_delivery',
+          response_sha256: null, details: { administratorId: request.admin!.id },
+        }).execute()
+        await trx.insertInto('supplier_api_operations_admin_audit').values({
+          id: randomUUID(), operation_id: operation.id, administrator_id: request.admin!.id,
+          action: 'retry_requested', details: { retryAfter: new Date().toISOString(), reason: 'confirmed_supplier_rejection' },
+        }).execute()
+      })
+      const detail = await adminOrderDetail(db, params.id, config)
+      const operation = detail?.supplierOperations.find(row => row.id === params.operationId)
+      if (!operation) throw new OrderError(404, 'SUPPLIER_OPERATION_NOT_FOUND', '此订单没有该供应商操作。')
+      reply.header('cache-control', 'private, no-store')
+      return success({ operation }, request.id)
+    } catch (error) {
+      return handleOrderError(error, reply, request.id)
+    }
+  })
+
   app.post('/api/v1/admin/orders/:id/items/:itemId/fulfillments', {
     preHandler: [requireAdministrator, adminCsrf],
     config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
@@ -1359,10 +1584,15 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
     const variants = await db.selectFrom('product_variants as variant')
       .leftJoin('product_variant_fulfillment as fulfillment', 'fulfillment.product_variant_id', 'variant.id')
       .leftJoin('product_variant_fulfillment_versions as version', 'version.id', 'fulfillment.current_content_version_id')
+      .leftJoin('supplier_connection_versions as supplier_version', 'supplier_version.id', 'version.supplier_connection_version_id')
+      .leftJoin('supplier_connections as supplier_connection', 'supplier_connection.id', 'supplier_version.supplier_connection_id')
       .select([
         'variant.id as sku_id', 'fulfillment.method', 'fulfillment.manual_delivery_ready',
         'fulfillment.code_pool_delivery_ready', 'fulfillment.automatic_delivery_ready',
         'fulfillment.configuration_revision', 'version.version_number', 'fulfillment.updated_at',
+        sql<boolean>`COALESCE(supplier_connection.enabled
+          AND supplier_connection.current_version_id = supplier_version.id
+          AND supplier_connection.tested_version_id = supplier_version.id, false)`.as('supplier_connection_available'),
       ])
       .where('variant.product_id', '=', product.id)
       .orderBy('variant.id')
@@ -1377,6 +1607,8 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
       codePoolDeliveryReady: variant.method === 'code_pool' && variant.code_pool_delivery_ready === true,
       automaticDeliveryReady: variant.method === 'fixed_content' || variant.method === 'link' || variant.method === 'file'
         ? variant.automatic_delivery_ready === true
+        : variant.method === 'api'
+          ? variant.automatic_delivery_ready === true && variant.supplier_connection_available
         : false,
       configurationRevision: variant.configuration_revision ?? 0,
       currentVersionNumber: variant.version_number ?? null,
@@ -1449,7 +1681,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
           method: saved.method,
           enabled: saved.method === 'manual' && saved.manual_delivery_ready && product.product_type === 'digital',
           codePoolDeliveryReady: saved.method === 'code_pool' && saved.code_pool_delivery_ready,
-          automaticDeliveryReady: (saved.method === 'fixed_content' || saved.method === 'link' || saved.method === 'file') && saved.automatic_delivery_ready,
+          automaticDeliveryReady: (saved.method === 'fixed_content' || saved.method === 'link' || saved.method === 'file' || saved.method === 'api') && saved.automatic_delivery_ready,
           configurationRevision: saved.configuration_revision,
           currentVersionNumber: saved.version_number ?? null,
           updatedAt: saved.updated_at.toISOString(),

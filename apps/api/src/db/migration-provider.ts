@@ -24,6 +24,7 @@ import { codePoolMigration } from './migrations/202610210002_code_pool.js'
 import { codePoolOperationKeyMigration } from './migrations/202610210003_code_pool_operation_key.js'
 import { fixedDeliveryMigration } from './migrations/202610210004_fixed_delivery.js'
 import { privateFileDeliveryMigration } from './migrations/202610210005_private_file_delivery.js'
+import { externalApiDeliveryMigration } from './migrations/202610230001_external_api_delivery.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -53,6 +54,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610210003_code_pool_operation_key': codePoolOperationKeyMigration,
       '202610210004_fixed_delivery': fixedDeliveryMigration,
       '202610210005_private_file_delivery': privateFileDeliveryMigration,
+      '202610230001_external_api_delivery': externalApiDeliveryMigration,
     }
   }
 }

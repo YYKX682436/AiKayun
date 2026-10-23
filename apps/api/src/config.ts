@@ -37,6 +37,7 @@ export interface AppConfig {
   sessionTtlSeconds: number
   mediaRoot: string
   privateFileRoot: string
+  supplierHttpTestAllowlist: string[]
   database: PoolConfig
   paymentCredentialKeyRing: PaymentCredentialKeyRing | null
   codePoolEncryptionKeyRing: PaymentCredentialKeyRing | null
@@ -176,6 +177,22 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         password: env.PGPASSWORD ?? env.POSTGRES_PASSWORD,
       }
 
+  const supplierHttpTestAllowlist = env.SUPPLIER_HTTP_TEST_ALLOWLIST
+    ? env.SUPPLIER_HTTP_TEST_ALLOWLIST.split(',').map(value => value.trim()).filter(Boolean)
+    : []
+  if (supplierHttpTestAllowlist.length && nodeEnv !== 'test') {
+    throw new Error('SUPPLIER_HTTP_TEST_ALLOWLIST is only available in NODE_ENV=test')
+  }
+  for (const value of supplierHttpTestAllowlist) {
+    let parsed: URL
+    try { parsed = new URL(value) } catch { throw new Error('Supplier test allowlist entries must be HTTP loopback origins') }
+    const host = parsed.hostname.replace(/^\[|\]$/gu, '').toLowerCase()
+    if (parsed.protocol !== 'http:' || parsed.origin !== value
+      || !['localhost', '127.0.0.1', '::1'].includes(host)) {
+      throw new Error('Supplier test allowlist entries must be exact HTTP loopback origins')
+    }
+  }
+
   return {
     nodeEnv,
     host: env.API_HOST ?? '127.0.0.1',
@@ -186,6 +203,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     sessionTtlSeconds: 60 * 60 * 12,
     mediaRoot,
     privateFileRoot,
+    supplierHttpTestAllowlist,
     database,
     paymentCredentialKeyRing: parsePaymentCredentialKeyRing(env.PAYMENT_CREDENTIAL_KEY_RING),
     codePoolEncryptionKeyRing: parseCodePoolEncryptionKeyRing(env.CODE_POOL_ENCRYPTION_KEY_RING),

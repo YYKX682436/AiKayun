@@ -101,6 +101,7 @@ const manualFulfillment = ref<ManualFulfillmentConfigPage>([])
 const manualFulfillmentLoading = ref(false)
 const fixedDeliverySkuId = ref('')
 const fileDeliverySkuId = ref('')
+const apiFulfillmentSkuId = ref('')
 const fixedDeliveryConfig = shallowRef<FixedDeliveryConfig | null>(null)
 const fixedDeliveryVersions = shallowRef<FixedDeliveryVersionsPage | null>(null)
 const fixedDeliveryHistoryDetail = shallowRef<FixedDeliveryVersion | null>(null)
@@ -291,6 +292,7 @@ const fulfillmentMethodOptions = [
   { label: '固定文本', value: 'fixed_content' },
   { label: '固定链接', value: 'link' },
   { label: '私有文件', value: 'file' },
+  { label: '外部 API', value: 'api' },
 ]
 const fixedDeliverySkuOptions = computed(() => (inventorySummary.value?.variants ?? []).map(row => ({
   label: `${row.skuCode}${row.retiredAt ? ' · 已退役' : ''}`,
@@ -528,6 +530,12 @@ async function selectFulfillmentMethod(skuId: string, method: string) {
     scrollToSection('private-file-title')
     return
   }
+  if (method === 'api') {
+    apiFulfillmentSkuId.value = skuId
+    await nextTick()
+    scrollToSection('api-fulfillment-title')
+    return
+  }
   const inventory = inventoryForSku(skuId)
   if (!variant || !inventory || inventory.inventory.mode !== 'quantity') {
     sectionErrors.inventory = '卡密池只支持 quantity 数量库存，请先检查 SKU 的库存模式。'
@@ -623,6 +631,7 @@ function fulfillmentMethodLabel(method: ManualFulfillmentConfig['method']): stri
   if (method === 'fixed_content') return '固定文本'
   if (method === 'link') return '固定链接'
   if (method === 'file') return '私有文件'
+  if (method === 'api') return '外部 API'
   return '未配置'
 }
 
@@ -3422,6 +3431,15 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 <AdminPrivateFileDeliveryPanel
                   v-if="product?.productType === 'digital' && inventorySummary"
                   v-model:sku-id="fileDeliverySkuId"
+                  :product-id="productId"
+                  :sku-options="fixedDeliverySkuOptions"
+                  :archived="isArchived"
+                  @updated="loadManualFulfillment"
+                />
+
+                <AdminApiFulfillmentPanel
+                  v-if="product?.productType === 'digital' && inventorySummary"
+                  v-model:sku-id="apiFulfillmentSkuId"
                   :product-id="productId"
                   :sku-options="fixedDeliverySkuOptions"
                   :archived="isArchived"

@@ -1530,7 +1530,10 @@ export const OrderDeliverySchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
   unitIndex: Type.Integer({ minimum: 1 }),
   content: Type.Union([Type.String({ minLength: 1, maxLength: 20_000 }), Type.Null()]),
-  contentFormat: Type.Union([Type.Literal('plain_text'), Type.Literal('markdown'), Type.Literal('link'), Type.Literal('file')]),
+  contentFormat: Type.Union([
+    Type.Literal('plain_text'), Type.Literal('markdown'), Type.Literal('link'),
+    Type.Literal('file'), Type.Literal('confirmation'),
+  ]),
   title: Type.Union([Type.String({ minLength: 1, maxLength: 160 }), Type.Null()]),
   accessInstructions: Type.Union([Type.String({ maxLength: 4_000 }), Type.Null()]),
   fileName: Type.Union([Type.String({ minLength: 1, maxLength: 255 }), Type.Null()]),
@@ -1829,7 +1832,7 @@ export const AdminFulfillmentAttemptSchema = Type.Object({
   quantity: Type.Integer({ minimum: 1 }),
   status: Type.Union([Type.Literal('processing'), Type.Literal('unknown'), Type.Literal('succeeded'), Type.Literal('failed')]),
   deliverySource: Type.Union([
-    Type.Literal('manual'), Type.Literal('code_pool'), Type.Literal('fixed_content'), Type.Literal('link'), Type.Literal('file'),
+    Type.Literal('manual'), Type.Literal('code_pool'), Type.Literal('fixed_content'), Type.Literal('link'), Type.Literal('file'), Type.Literal('api'),
   ]),
   failureCode: Type.Union([Type.Null(),
     Type.Literal('CODE_POOL_DATA_INCONSISTENT'),
@@ -1845,12 +1848,56 @@ export const AdminFulfillmentAttemptSchema = Type.Object({
     Type.Literal('FILE_DELIVERY_OBJECT_UNAVAILABLE'),
     Type.Literal('FILE_DELIVERY_INTEGRITY_FAILED'),
     Type.Literal('FILE_DELIVERY_PAYMENT_UNRESOLVED'),
+    Type.Literal('API_DELIVERY_DATA_INCONSISTENT'),
+    Type.Literal('API_DELIVERY_KEY_UNAVAILABLE'),
+    Type.Literal('API_DELIVERY_ENCRYPTION_FAILED'),
+    Type.Literal('API_DELIVERY_PAYMENT_UNRESOLVED'),
+    Type.Literal('API_DELIVERY_SUPPLIER_REJECTED'),
+    Type.Literal('API_DELIVERY_DUPLICATE_RESULT'),
   ]),
   retryAfter: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
   resultSha256: Type.Union([Type.String({ pattern: '^[0-9a-f]{64}$' }), Type.Null()]),
   createdAt: Type.String({ format: 'date-time' }),
   completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
   deliveryCount: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const SupplierApiOperationEventSchema = Type.Object({
+  eventType: Type.String({ minLength: 1, maxLength: 32 }),
+  httpStatus: Type.Union([Type.Integer({ minimum: 100, maximum: 599 }), Type.Null()]),
+  classification: Type.Union([Type.String({ minLength: 1, maxLength: 32 }), Type.Null()]),
+  providerStatus: Type.Union([Type.String({ minLength: 1, maxLength: 24 }), Type.Null()]),
+  errorCode: Type.Union([Type.String({ minLength: 1, maxLength: 64 }), Type.Null()]),
+  responseSha256: Type.Union([Type.String({ pattern: '^[0-9a-f]{64}$' }), Type.Null()]),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const SupplierApiOperationSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  fulfillmentAttemptId: Type.String({ format: 'uuid' }),
+  operationId: Type.String({ format: 'uuid' }),
+  unitIndex: Type.Integer({ minimum: 1 }),
+  supplierConnectionId: Type.String({ format: 'uuid' }),
+  supplierName: Type.String({ minLength: 1, maxLength: 120 }),
+  supplierProductId: Type.String({ minLength: 1, maxLength: 200 }),
+  idempotencyKey: Type.String({ minLength: 1, maxLength: 80 }),
+  providerOperationId: Type.Union([Type.String({ minLength: 1, maxLength: 200 }), Type.Null()]),
+  state: Type.Union([
+    Type.Literal('create_pending'), Type.Literal('create_in_flight'), Type.Literal('query_pending'),
+    Type.Literal('query_in_flight'), Type.Literal('processing'), Type.Literal('unknown'),
+    Type.Literal('succeeded_pending_finalize'), Type.Literal('manual_review'),
+    Type.Literal('succeeded'), Type.Literal('failed'),
+  ]),
+  createAttemptCount: Type.Integer({ minimum: 0 }),
+  queryAttemptCount: Type.Integer({ minimum: 0 }),
+  lastHttpStatus: Type.Union([Type.Integer({ minimum: 100, maximum: 599 }), Type.Null()]),
+  lastErrorCode: Type.Union([Type.String({ minLength: 1, maxLength: 64 }), Type.Null()]),
+  lastFailureClass: Type.Union([Type.String({ minLength: 1, maxLength: 32 }), Type.Null()]),
+  lastProviderStatus: Type.Union([Type.String({ minLength: 1, maxLength: 24 }), Type.Null()]),
+  nextActionAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  createRequestedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  lastQueryAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  createdAt: Type.String({ format: 'date-time' }),
+  completedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  events: Type.Array(SupplierApiOperationEventSchema),
 }, { additionalProperties: false })
 export const AdminOrderDetailSchema = Type.Object({
   order: OrderDetailSchema,
@@ -1862,6 +1909,7 @@ export const AdminOrderDetailSchema = Type.Object({
   }, { additionalProperties: false }),
   inventory: Type.Array(AdminOrderItemInventorySchema),
   fulfillmentAttempts: Type.Array(AdminFulfillmentAttemptSchema),
+  supplierOperations: Type.Array(SupplierApiOperationSchema),
   payments: AdminOrderPaymentsSchema,
 }, { additionalProperties: false })
 export const UpdateManualFulfillmentBodySchema = Type.Object({
@@ -1916,6 +1964,133 @@ export const FixedDeliveryVersionsPageSchema = Type.Object({
 export const FixedDeliveryVersionsQuerySchema = Type.Object({
   page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
   pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+}, { additionalProperties: false })
+
+export const SupplierConnectionVersionSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  versionNumber: Type.Integer({ minimum: 1 }),
+  name: Type.String({ minLength: 1, maxLength: 120 }),
+  providerType: Type.Literal('http_json_v1'),
+  baseUrl: Type.String({ minLength: 1, maxLength: 2048 }),
+  authScheme: Type.Literal('bearer'),
+  credentialVersion: Type.Integer({ minimum: 1 }),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const SupplierConnectionSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 120 }),
+  enabled: Type.Boolean(),
+  providerType: Type.Literal('http_json_v1'),
+  credentialsConfigured: Type.Literal(true),
+  currentVersion: SupplierConnectionVersionSchema,
+  updatedAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const SupplierConnectionPageSchema = Type.Array(SupplierConnectionSchema)
+export const CreateSupplierConnectionBodySchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 120, pattern: '.*\\S.*' }),
+  providerType: Type.Literal('http_json_v1'),
+  baseUrl: Type.String({ minLength: 1, maxLength: 2048 }),
+  bearerToken: Type.String({ minLength: 1, maxLength: 2048 }),
+}, { additionalProperties: false })
+export const UpdateSupplierConnectionBodySchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 120, pattern: '.*\\S.*' }),
+  baseUrl: Type.String({ minLength: 1, maxLength: 2048 }),
+  bearerToken: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })),
+}, { additionalProperties: false })
+export const UpdateSupplierConnectionEnabledBodySchema = Type.Object({ enabled: Type.Boolean() }, { additionalProperties: false })
+export const SupplierConnectionTestResultSchema = Type.Object({
+  connectionOk: Type.Boolean(),
+  queryCapable: Type.Boolean(),
+  checkedAt: Type.String({ format: 'date-time' }),
+  message: Type.String({ maxLength: 200 }),
+}, { additionalProperties: false })
+export const SupplierConnectionVersionsPageSchema = Type.Object({
+  items: Type.Array(SupplierConnectionVersionSchema, { maxItems: 50 }),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 50 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const SupplierConnectionVersionsQuerySchema = Type.Object({
+  page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
+  pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+}, { additionalProperties: false })
+export const SupplierConnectionAuditEventSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  administratorId: Type.String({ format: 'uuid' }),
+  action: Type.Union([
+    Type.Literal('created'), Type.Literal('configuration_updated'), Type.Literal('credential_rotated'),
+    Type.Literal('credential_key_rewrapped'), Type.Literal('enabled'), Type.Literal('disabled'),
+    Type.Literal('connection_test_succeeded'), Type.Literal('connection_test_failed'),
+  ]),
+  details: Type.Record(Type.String(), Type.Any()),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const SupplierConnectionAuditPageSchema = Type.Object({
+  events: Type.Array(SupplierConnectionAuditEventSchema, { maxItems: 100 }),
+}, { additionalProperties: false })
+export const SupplierCredentialRewrapResultSchema = Type.Object({
+  rewrappedCredentialVersions: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false })
+export const ApiFulfillmentConfigSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  skuId: Type.String({ format: 'uuid' }),
+  productType: ProductTypeSchema,
+  method: Type.Union([FulfillmentMethodSchema, Type.Null()]),
+  automaticDeliveryReady: Type.Boolean(),
+  configurationRevision: Type.Integer({ minimum: 0 }),
+  updatedAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  supplierConnectionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  supplierConnectionName: Type.Union([Type.String({ minLength: 1, maxLength: 120 }), Type.Null()]),
+  supplierEnabled: Type.Boolean(),
+  supplierConnectionVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  supplierConnectionVersionNumber: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+  supplierProductId: Type.Union([Type.String({ minLength: 1, maxLength: 200 }), Type.Null()]),
+  parameters: Type.Record(Type.String({ maxLength: 500 }), Type.String({ maxLength: 500 }), { maxProperties: 20 }),
+  currentVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+}, { additionalProperties: false })
+export const ApiFulfillmentHistoryItemSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  versionNumber: Type.Integer({ minimum: 1 }),
+  supplierConnectionId: Type.String({ format: 'uuid' }),
+  supplierConnectionName: Type.String({ minLength: 1, maxLength: 120 }),
+  supplierConnectionVersionId: Type.String({ format: 'uuid' }),
+  supplierConnectionVersionNumber: Type.Integer({ minimum: 1 }),
+  supplierProductId: Type.String({ minLength: 1, maxLength: 200 }),
+  parameters: Type.Record(Type.String({ maxLength: 500 }), Type.String({ maxLength: 500 }), { maxProperties: 20 }),
+  createdAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+export const ApiFulfillmentHistoryPageSchema = Type.Object({
+  items: Type.Array(ApiFulfillmentHistoryItemSchema, { maxItems: 50 }),
+  total: Type.Integer({ minimum: 0 }),
+  page: Type.Integer({ minimum: 1 }),
+  pageSize: Type.Integer({ minimum: 1, maximum: 50 }),
+  totalPages: Type.Integer({ minimum: 0 }),
+  events: Type.Array(Type.Object({
+    id: Type.String({ format: 'uuid' }),
+    administratorId: Type.String({ format: 'uuid' }),
+    action: Type.Union([Type.Literal('version_saved'), Type.Literal('automatic_delivery_enabled'), Type.Literal('automatic_delivery_paused')]),
+    details: Type.Record(Type.String(), Type.Any()),
+    createdAt: Type.String({ format: 'date-time' }),
+  }, { additionalProperties: false }), { maxItems: 100 }),
+}, { additionalProperties: false })
+export const SaveApiFulfillmentVersionBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 0 }),
+  supplierConnectionVersionId: Type.String({ format: 'uuid' }),
+  supplierProductId: Type.String({ minLength: 1, maxLength: 200, pattern: '.*\\S.*' }),
+  parameters: Type.Record(Type.String({ minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9_.-]+$' }),
+    Type.String({ maxLength: 500 }), { maxProperties: 20 }),
+}, { additionalProperties: false })
+export const UpdateApiFulfillmentReadinessBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 0 }),
+  enabled: Type.Boolean(),
+}, { additionalProperties: false })
+export const ApiFulfillmentMutationResultSchema = Type.Object({
+  configuration: ApiFulfillmentConfigSchema,
+  currentVersion: Type.Union([ApiFulfillmentHistoryItemSchema, Type.Null()]),
+}, { additionalProperties: false })
+export const SupplierOperationAdminActionResultSchema = Type.Object({
+  operation: SupplierApiOperationSchema,
 }, { additionalProperties: false })
 export const SaveFixedDeliveryContentBodySchema = Type.Object({
   expectedRevision: Type.Integer({ minimum: 0 }),
@@ -2637,6 +2812,23 @@ export type FixedDeliveryVersionsPage = Static<typeof FixedDeliveryVersionsPageS
 export type FixedDeliveryVersionsQuery = Static<typeof FixedDeliveryVersionsQuerySchema>
 export type SaveFixedDeliveryVersionBody = Static<typeof SaveFixedDeliveryVersionBodySchema>
 export type UpdateFixedDeliveryReadinessBody = Static<typeof UpdateFixedDeliveryReadinessBodySchema>
+export type SupplierConnection = Static<typeof SupplierConnectionSchema>
+export type SupplierConnectionVersion = Static<typeof SupplierConnectionVersionSchema>
+export type SupplierConnectionTestResult = Static<typeof SupplierConnectionTestResultSchema>
+export type SupplierConnectionVersionsPage = Static<typeof SupplierConnectionVersionsPageSchema>
+export type SupplierConnectionVersionsQuery = Static<typeof SupplierConnectionVersionsQuerySchema>
+export type SupplierConnectionAuditPage = Static<typeof SupplierConnectionAuditPageSchema>
+export type CreateSupplierConnectionBody = Static<typeof CreateSupplierConnectionBodySchema>
+export type UpdateSupplierConnectionBody = Static<typeof UpdateSupplierConnectionBodySchema>
+export type UpdateSupplierConnectionEnabledBody = Static<typeof UpdateSupplierConnectionEnabledBodySchema>
+export type ApiFulfillmentConfig = Static<typeof ApiFulfillmentConfigSchema>
+export type ApiFulfillmentHistoryItem = Static<typeof ApiFulfillmentHistoryItemSchema>
+export type ApiFulfillmentHistoryPage = Static<typeof ApiFulfillmentHistoryPageSchema>
+export type SaveApiFulfillmentVersionBody = Static<typeof SaveApiFulfillmentVersionBodySchema>
+export type UpdateApiFulfillmentReadinessBody = Static<typeof UpdateApiFulfillmentReadinessBodySchema>
+export type ApiFulfillmentMutationResult = Static<typeof ApiFulfillmentMutationResultSchema>
+export type SupplierApiOperation = Static<typeof SupplierApiOperationSchema>
+export type SupplierOperationAdminActionResult = Static<typeof SupplierOperationAdminActionResultSchema>
 export type PrivateFileIntegrityStatus = Static<typeof PrivateFileIntegrityStatusSchema>
 export type PrivateFileVersionSummary = Static<typeof PrivateFileVersionSummarySchema>
 export type PrivateFileVersion = Static<typeof PrivateFileVersionSchema>

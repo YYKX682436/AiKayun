@@ -50,6 +50,7 @@ type QuoteSkuRow = {
   fulfillment_revision: number | null
   fulfillment_version_id: string | null
   fulfillment_version_method: string | null
+  supplier_connection_available: boolean
   private_file_object_id: string | null
   private_file_status: string | null
   private_file_size_bytes: number | null
@@ -119,7 +120,10 @@ function reasonForSku(row: QuoteSkuRow): CheckoutQuoteReason | null {
     || (row.fulfillment_method === 'file' && (!row.automatic_delivery_ready
       || !row.fulfillment_version_id || row.fulfillment_version_method !== 'file'
       || row.private_file_status !== 'available'))
-    || !['manual', 'code_pool', 'fixed_content', 'link', 'file'].includes(row.fulfillment_method ?? '')) {
+    || (row.fulfillment_method === 'api' && (!row.automatic_delivery_ready
+      || !row.fulfillment_version_id || row.fulfillment_version_method !== 'api'
+      || !row.supplier_connection_available))
+    || !['manual', 'code_pool', 'fixed_content', 'link', 'file', 'api'].includes(row.fulfillment_method ?? '')) {
     return 'fulfillment_not_ready'
   }
   return null
@@ -232,6 +236,8 @@ export async function quoteCheckoutItems(
       fulfillment.configuration_revision AS fulfillment_revision,
       fulfillment.current_content_version_id AS fulfillment_version_id,
       version.method AS fulfillment_version_method,
+      COALESCE(supplier.enabled AND supplier.current_version_id = supplier_version.id
+        AND supplier.tested_version_id = supplier_version.id, false) AS supplier_connection_available,
       private_file.id AS private_file_object_id,
       private_file.status AS private_file_status,
       private_file.size_bytes AS private_file_size_bytes,
@@ -277,6 +283,9 @@ export async function quoteCheckoutItems(
     LEFT JOIN product_variant_fulfillment AS fulfillment ON fulfillment.product_variant_id = variant.id
     LEFT JOIN product_variant_fulfillment_versions AS version
       ON version.id = fulfillment.current_content_version_id
+    LEFT JOIN supplier_connection_versions AS supplier_version
+      ON supplier_version.id = version.supplier_connection_version_id AND version.method = 'api'
+    LEFT JOIN supplier_connections AS supplier ON supplier.id = supplier_version.supplier_connection_id
     LEFT JOIN private_file_objects AS private_file
       ON private_file.id = version.private_file_object_id AND version.method = 'file'
     LEFT JOIN product_purchase_counts ON product_purchase_counts.product_id = product.id

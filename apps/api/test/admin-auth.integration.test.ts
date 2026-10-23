@@ -923,7 +923,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       order by tablename
     `.execute(db)
     expect(result.rows.map((row) => row.table_name)).toEqual([
-      'admin_product_creation_requests', 'admin_sessions', 'admin_users', 'code_pool_batches',
+      'admin_product_creation_requests', 'admin_sessions', 'admin_users', 'api_fulfillment_audit_events', 'code_pool_batches',
       'code_pool_entries', 'code_pool_withdrawal_entries', 'customer_cart_items',
       'customer_cart_merge_requests', 'customer_management_audit',
       'customer_sessions', 'customers', 'guest_order_sessions',
@@ -940,7 +940,10 @@ describe('Fastify API with PostgreSQL 18', () => {
       'product_option_groups', 'product_option_values',
       'product_variant_fulfillment', 'product_variant_fulfillment_versions', 'product_variant_inventory_adjustments', 'product_variant_option_values',
       'product_variant_quantity_inventory', 'product_variants', 'products',
-      'storefront_customer_policy', 'wallet_accounts', 'wallet_ledger_entries', 'wallet_operations',
+      'storefront_customer_policy', 'supplier_api_delivery_events', 'supplier_api_delivery_operations',
+      'supplier_api_operations_admin_audit', 'supplier_connection_audit_events', 'supplier_connection_credentials',
+      'supplier_connection_versions', 'supplier_connections',
+      'wallet_accounts', 'wallet_ledger_entries', 'wallet_operations',
       'withdrawal_audit_events', 'withdrawal_payout_attempts', 'withdrawal_payout_results',
       'withdrawal_private_files', 'withdrawal_settings_audit_events', 'withdrawals',
     ])

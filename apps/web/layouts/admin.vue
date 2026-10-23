@@ -28,6 +28,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     to: '/admin/payment-channels',
   },
   {
+    label: '供应商连接',
+    icon: 'i-lucide-plug-zap',
+    to: '/admin/supplier-connections',
+  },
+  {
     label: '钱包与充值',
     icon: 'i-lucide-wallet',
     to: '/admin/wallets',

@@ -42,7 +42,7 @@ const hasActiveAttempt = computed(() => Boolean(payment.value?.attempt
   && ['created', 'pending', 'reconciliation_required'].includes(payment.value.attempt.status)))
 const canCancel = computed(() => order.value?.status === 'pending_payment' && !hasActiveAttempt.value)
 const automaticDeliveryPending = computed(() => order.value?.items.some(item =>
-  ['code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity) ?? false)
+  ['code_pool', 'fixed_content', 'link', 'file', 'api'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity) ?? false)
 const selectedChannel = computed(() => payment.value?.channels.find(channel => channel.id === selectedChannelId.value) ?? null)
 const qrAction = computed(() => payment.value?.attempt?.action?.type === 'qr_code'
   ? payment.value.attempt.action.value
@@ -157,7 +157,7 @@ function selectPaymentMode(mode: 'external' | 'wallet' | 'hybrid') {
 function statusLabel(value: OrderDetail): string {
   if (value.status === 'pending_payment') return '等待付款'
   if (value.status === 'processing' && value.items.some(item =>
-    ['code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity)) {
+    ['code_pool', 'fixed_content', 'link', 'file', 'api'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity)) {
     return value.paymentStatus === 'not_required' ? '自动交付处理中' : '付款成功 · 自动交付处理中'
   }
   if (value.status === 'processing') return value.paymentStatus === 'not_required' ? '等待发货' : '付款成功 · 等待发货'
@@ -220,7 +220,7 @@ function safeDeliveryHref(value: string): string {
 
 function hasPendingAutomaticDelivery(): boolean {
   return order.value?.status === 'processing' && order.value.items.some(item =>
-    ['code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity)
+    ['code_pool', 'fixed_content', 'link', 'file', 'api'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity)
 }
 
 function fulfillmentFailureHint(code: string | null): string {
@@ -611,7 +611,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
             variant="subtle"
             icon="i-lucide-circle-check"
             title="订单已完成"
-            :description="order.items.some(item => ['code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod)) ? '数字交付已按订单绑定版本安全记录在下方。文件下载由服务端逐次授权；退款不会删除历史交付记录。' : '订单中的人工数字交付内容已记录在下方订单项。'"
+            :description="order.items.some(item => ['code_pool', 'fixed_content', 'link', 'file', 'api'].includes(item.fulfillmentMethod)) ? '数字交付已按订单绑定版本安全记录在下方。文件下载由服务端逐次授权；退款不会删除历史交付记录。' : '订单中的人工数字交付内容已记录在下方订单项。'"
           />
 
           <div
@@ -1250,13 +1250,13 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                   <dt class="text-muted">
                     交付方式
                   </dt><dd class="mt-1 text-highlighted">
-                    {{ item.fulfillmentMethod === 'manual' ? '人工数字交付' : item.fulfillmentMethod === 'code_pool' ? 'SKU 卡密池自动发货' : item.fulfillmentMethod === 'fixed_content' ? '固定文本自动交付' : item.fulfillmentMethod === 'link' ? '固定链接自动交付' : item.fulfillmentMethod === 'file' ? '私有文件自动交付' : '尚未开放' }}
+                    {{ item.fulfillmentMethod === 'manual' ? '人工数字交付' : item.fulfillmentMethod === 'code_pool' ? 'SKU 卡密池自动发货' : item.fulfillmentMethod === 'fixed_content' ? '固定文本自动交付' : item.fulfillmentMethod === 'link' ? '固定链接自动交付' : item.fulfillmentMethod === 'file' ? '私有文件自动交付' : item.fulfillmentMethod === 'api' ? '外部供应商自动交付' : '尚未开放' }}
                   </dd>
                 </div>
               </dl>
 
               <UAlert
-                v-if="['code_pool', 'fixed_content', 'link', 'file'].includes(item.fulfillmentMethod) && order.status === 'processing' && item.fulfilledQuantity < item.quantity"
+                v-if="['code_pool', 'fixed_content', 'link', 'file', 'api'].includes(item.fulfillmentMethod) && order.status === 'processing' && item.fulfilledQuantity < item.quantity"
                 class="mt-4"
                 color="info"
                 variant="soft"
@@ -1306,6 +1306,15 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                     >
                       {{ delivery.title }}
                     </p>
+                    <UAlert
+                      v-if="delivery.contentFormat === 'confirmation'"
+                      class="mt-3"
+                      color="success"
+                      variant="soft"
+                      icon="i-lucide-circle-check"
+                      title="供应商已确认此件交付完成"
+                      description="该业务确认不包含需要展示的兑换内容。"
+                    />
                     <div
                       v-if="delivery.contentFormat === 'file'"
                       class="mt-3 flex min-w-0 flex-col gap-3 rounded-md border border-default bg-default p-3 sm:flex-row sm:items-center sm:justify-between"
@@ -1361,7 +1370,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                       :content="delivery.content ?? ''"
                     />
                     <pre
-                      v-else-if="delivery.contentFormat !== 'file'"
+                      v-else-if="delivery.contentFormat !== 'file' && delivery.contentFormat !== 'confirmation'"
                       class="mt-2 overflow-x-auto whitespace-pre-wrap break-all font-mono text-sm text-highlighted"
                     >{{ delivery.content ?? '' }}</pre>
                     <p

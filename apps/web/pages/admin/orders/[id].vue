@@ -14,6 +14,7 @@ const refunds = shallowRef<AdminOrderRefunds | null>(null)
 const loading = ref(false)
 const savingItemId = ref('')
 const reconcilingAttemptId = ref('')
+const supplierActionId = ref('')
 const errorMessage = ref('')
 const successMessage = ref('')
 const deliveryDrafts = reactive<Record<string, string>>({})
@@ -39,6 +40,16 @@ function fulfillmentFailureLabel(code: AdminOrderDetail['fulfillmentAttempts'][n
 
 function fulfillmentAttemptStatusLabel(status: AdminOrderDetail['fulfillmentAttempts'][number]['status']): string {
   return status === 'processing' ? '处理中' : status === 'unknown' ? '结果未知' : status === 'succeeded' ? '成功' : '失败'
+}
+
+function supplierOperationStatusLabel(state: AdminOrderDetail['supplierOperations'][number]['state']): string {
+  const labels: Record<typeof state, string> = {
+    create_pending: '等待创建', create_in_flight: '正在创建', query_pending: '等待查询',
+    query_in_flight: '正在查询', processing: '供应商处理中', unknown: '结果未知',
+    succeeded_pending_finalize: '已确认成功，商城待落账', manual_review: '需要人工核对',
+    succeeded: '已交付', failed: '明确失败',
+  }
+  return labels[state]
 }
 
 function formatDate(value: string): string {
@@ -103,6 +114,28 @@ async function loadOrder() {
     errorMessage.value = error instanceof Error ? error.message : '订单详情暂时无法加载。'
   } finally {
     if (currentSequence === sequence) loading.value = false
+  }
+}
+
+async function runSupplierAction(operationId: string, action: 'query' | 'retry') {
+  if (supplierActionId.value) return
+  supplierActionId.value = operationId
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    await request<{ operation: AdminOrderDetail['supplierOperations'][number] }>(
+      `/api/v1/admin/orders/${orderId.value}/supplier-operations/${operationId}/${action}`,
+      { method: 'POST' },
+    )
+    await loadOrder()
+    successMessage.value = action === 'query'
+      ? '已排入原供应商操作的状态查询；系统不会因此创建新的交付。'
+      : '已记录人工恢复请求；仅会重试供应商明确拒绝且确认未交付的单位。'
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '供应商操作未能排队，请刷新状态后重试。'
+    await loadOrder()
+  } finally {
+    supplierActionId.value = ''
   }
 }
 
@@ -1295,6 +1328,69 @@ onBeforeUnmount(() => { sequence++ })
                 </section>
               </li>
             </ul>
+          </section>
+
+          <section
+            v-if="data.supplierOperations.length"
+            class="mt-6 rounded-xl border border-primary/25 bg-primary/5 p-4 sm:p-5"
+            aria-labelledby="supplier-operations-title"
+          >
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h2 id="supplier-operations-title" class="font-semibold text-highlighted">外部供应商交付操作</h2>
+                <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
+                  每件商品使用独立持久化操作与稳定幂等键。未知结果只能查询原操作；系统不会因此再次创建交付。
+                </p>
+              </div>
+              <UBadge color="neutral" variant="soft">{{ data.supplierOperations.length }} 个单位</UBadge>
+            </div>
+            <ol class="mt-4 grid gap-3">
+              <li v-for="operation in data.supplierOperations" :key="operation.id" class="min-w-0 rounded-lg border border-default bg-default p-3 sm:p-4">
+                <div class="flex min-w-0 flex-wrap items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <p class="font-medium text-highlighted">第 {{ operation.unitIndex }} 件 · {{ operation.supplierName }} · {{ supplierOperationStatusLabel(operation.state) }}</p>
+                    <p class="mt-1 break-all font-mono text-xs text-muted">操作 {{ operation.operationId }} · 商品 {{ operation.supplierProductId }}</p>
+                    <p class="mt-1 break-all font-mono text-xs text-dimmed">幂等键 {{ operation.idempotencyKey }}</p>
+                  </div>
+                  <UBadge :color="operation.state === 'succeeded' ? 'success' : operation.state === 'failed' ? 'error' : operation.state === 'unknown' || operation.state === 'manual_review' ? 'warning' : 'info'" variant="soft">
+                    {{ supplierOperationStatusLabel(operation.state) }}
+                  </UBadge>
+                </div>
+                <dl class="mt-3 grid gap-2 border-t border-default pt-3 text-xs sm:grid-cols-2 xl:grid-cols-4">
+                  <div><dt class="text-muted">供应商操作 ID</dt><dd class="mt-1 break-all font-mono text-highlighted">{{ operation.providerOperationId ?? '尚未返回' }}</dd></div>
+                  <div><dt class="text-muted">创建请求</dt><dd class="mt-1 text-highlighted">{{ operation.createRequestedAt ? formatDate(operation.createRequestedAt) : '尚未发出' }} · {{ operation.createAttemptCount }} 次</dd></div>
+                  <div><dt class="text-muted">最近查单</dt><dd class="mt-1 text-highlighted">{{ operation.lastQueryAt ? formatDate(operation.lastQueryAt) : '尚未查询' }} · {{ operation.queryAttemptCount }} 次</dd></div>
+                  <div><dt class="text-muted">HTTP / 分类 / 错误</dt><dd class="mt-1 break-words text-highlighted">{{ operation.lastHttpStatus ?? '—' }} · {{ operation.lastFailureClass ?? '—' }} · {{ operation.lastErrorCode ?? '—' }}</dd></div>
+                </dl>
+                <p v-if="operation.nextActionAt" class="mt-2 text-xs text-muted">下次恢复检查：{{ formatDate(operation.nextActionAt) }}</p>
+                <div v-if="operation.events.length" class="mt-3 border-t border-default pt-3">
+                  <p class="text-xs font-medium text-highlighted">最近状态事件</p>
+                  <ul class="mt-2 grid gap-1 text-xs text-muted sm:grid-cols-2">
+                    <li v-for="event in operation.events.slice(-6).reverse()" :key="`${event.eventType}-${event.createdAt}`" class="flex min-w-0 flex-wrap gap-x-2">
+                      <time :datetime="event.createdAt">{{ formatDate(event.createdAt) }}</time>
+                      <span>{{ event.eventType }}</span>
+                      <span>{{ event.classification ?? '' }}</span>
+                      <span>{{ event.httpStatus ?? '' }}</span>
+                      <span v-if="event.errorCode" class="text-warning">{{ event.errorCode }}</span>
+                    </li>
+                  </ul>
+                </div>
+                <div class="mt-3 flex flex-wrap gap-2">
+                  <UButton
+                    v-if="!['succeeded', 'failed', 'create_in_flight', 'query_in_flight'].includes(operation.state)"
+                    size="sm" color="neutral" variant="outline" icon="i-lucide-search"
+                    :loading="supplierActionId === operation.id" :disabled="Boolean(supplierActionId)"
+                    @click="runSupplierAction(operation.id, 'query')"
+                  >查询同一供应商操作</UButton>
+                  <UButton
+                    v-if="operation.state === 'failed' && operation.lastFailureClass === 'supplier_rejected' && data.order.status === 'processing'"
+                    size="sm" color="warning" variant="outline" icon="i-lucide-rotate-cw"
+                    :loading="supplierActionId === operation.id" :disabled="Boolean(supplierActionId)"
+                    @click="runSupplierAction(operation.id, 'retry')"
+                  >恢复明确拒绝的单位</UButton>
+                </div>
+              </li>
+            </ol>
           </section>
 
           <section

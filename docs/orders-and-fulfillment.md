@@ -4,13 +4,13 @@
 
 ## 成交资格与统一报价
 
-购物车报价、商品详情立即购买与结算预览都调用 `apps/api/src/commerce/checkout-quote.ts`。报价读取商品/SKU 状态、规格组合、当前售价、库存模式和可售库存、人工交付就绪状态、游客购买策略及当前顾客自己的购买限制占用。购买限制配置公开可读；顾客历史数量只在已验证顾客报价中返回，不接受 `customerId` 查询。
+购物车报价、商品详情立即购买与结算预览都调用 `apps/api/src/commerce/checkout-quote.ts`。报价读取商品/SKU 状态、规格组合、当前售价、库存模式和可售库存、人工/自动交付就绪状态、游客购买策略及当前顾客自己的购买限制占用。购买限制配置公开可读；顾客历史数量只在已验证顾客报价中返回，不接受 `customerId` 查询。
 
 可下单 SKU 必须满足：
 
 1. 商品存在且为 `active`；SKU 启用、未退役，规格组合仍有效。
 2. 库存模式为 `quantity` 或 `unlimited`。数量模式须有库存记录且可售数量足够；`code_pool` 必须使用 `quantity`，且数量库存与 SKU 卡密池状态一致。
-3. 商品为数字商品，履约方式为 `manual`、`code_pool`、已明确开启的 `fixed_content` 或 `link`。人工交付要求 `manual_delivery_ready=true`；卡密池要求 `code_pool_delivery_ready=true` 且逐件预留不同卡密；固定内容/链接要求 `automatic_delivery_ready=true`，报价和订单快照绑定当前不可变内容版本。
+3. 商品为数字商品，履约方式为 `manual`、`code_pool`、已明确开启的 `fixed_content`、`link` 或 `api`。人工交付要求 `manual_delivery_ready=true`；卡密池要求 `code_pool_delivery_ready=true` 且逐件预留不同卡密；固定内容/链接与外部 API 要求 `automatic_delivery_ready=true`，报价和订单快照绑定当前不可变履约版本。
 4. 登录顾客会话有效；游客正价订单要求商家开启游客结算，零元订单另外要求开启免费领取。若商品或 SKU 配有账号累计或滚动 24 小时限制，游客必须登录；游客订单仍受每单限制。
 
 ## 商品与 SKU 购买限制
@@ -77,9 +77,9 @@ API 启动时立即执行一次未付款订单清理，然后每 60 秒执行一
 
 顾客订单始终从已验证登录会话取得 `customer_id`。游客订单始终从安全 Cookie 对应的 `guest_order_session_id` 取得。登录顾客不能切换到游客订单 API；游客也不能读取顾客订单或其他游客会话的订单。详情越权统一返回 404，订单 API 设置 `Cache-Control: no-store`。页面请求在顾客身份版本变化后丢弃旧响应，不将旧身份订单写入当前视图。
 
-## 人工数字交付、卡密池与固定内容自动交付
+## 人工数字交付、卡密池、固定内容和外部 API 自动交付
 
-迁移 `202610190004_orders` 增加 `product_variant_fulfillment.manual_delivery_ready`，默认 `false`；⑤-1迁移 `202610210002_code_pool` 为同一配置增加 `code_pool_delivery_ready`，默认 `false`。商家必须在商品 SKU 管理页明确开启所需资格。人工数字交付可用于数量或不限数量库存；卡密池只能用于启用且未退役的数字商品 `quantity` SKU。未实现的履约方式持续返回未就绪。
+迁移 `202610190004_orders` 增加 `product_variant_fulfillment.manual_delivery_ready`，默认 `false`；⑤-1迁移 `202610210002_code_pool` 为同一配置增加 `code_pool_delivery_ready`，默认 `false`。商家必须在商品 SKU 管理页明确开启所需资格。人工数字交付可用于数量或不限数量库存；卡密池只能用于启用且未退役的数字商品 `quantity` SKU。未配置或未就绪的履约方式持续拒绝新报价。
 
 管理员在 `/admin/orders/:id` 为订单项逐件录入真实内容。`POST /api/v1/admin/orders/:id/items/:itemId/fulfillments` 需要管理员权限、同源 Origin 和双提交 CSRF。服务和数据库都要求订单为 `processing`：零元订单由④-1订单创建触发器直接置为此状态；正价订单只有④-1确认真实、足额、按时收款后才能进入此状态。本阶段没有任何管理员标记付款成功的接口。
 
@@ -87,7 +87,7 @@ API 启动时立即执行一次未付款订单清理，然后每 60 秒执行一
 
 人工交付内容行数必须等于此次交付数量，每件最多 512 个字符。卡密池在下单时通过库存预留事件逐件绑定不同卡密；确认交付时写入相同 `order_item_fulfillment_attempts` 与 `order_item_fulfillment_deliveries`，成功触发原订单库存消费及订单完成。人工内容只允许管理员录入；卡密内容在服务端解密后只返回给订单所属顾客、有效游客订单会话或管理员，响应禁止缓存。数据库拒绝修改、删除或截断历史交付内容；退款不重置交付、库存或卡密状态。应用日志不记录请求正文、Cookie、会话令牌或卡密明文。
 
-人工录入、卡密池自动发货、固定文本/固定链接自动交付和私有文件自动交付都保存在原订单履约历史。卡密池逐件消耗 quantity 库存；固定内容或文件可重复售卖，但 quantity SKU 成功交付时仍消费该订单已有数量预留；unlimited SKU 不创建数量预留或库存事件。自动交付订单项在下单事务中绑定报价版本；同一数字交付调度器处理自动履约，失败重试不会影响已确认的支付回执。文件交付每个单位只记录不可变版本引用；顾客下载时对真实订单、已付款事实、成功履约及顾客/游客会话逐次授权，并在支持单一 Range 响应前校验完整文件 SHA-256。卡密池预检查、批次、状态、撤回和密钥运维见[数字商品卡密池与自动发卡](digital-code-pool.md)；固定内容/链接版本、安全 Markdown、AES-GCM 密钥轮换、对账拦截与恢复见[固定内容与固定链接自动交付](digital-fixed-delivery.md)；文件存储、下载和备份见[私有文件自动交付与安全下载](digital-private-file-delivery.md)。
+人工录入、卡密池自动发货、固定文本/固定链接、私有文件和外部 API 自动交付都保存在原订单履约历史。卡密池逐件消耗 quantity 库存；固定内容、文件和 API 可重复售卖，但 quantity SKU 成功交付时仍消费该订单已有数量预留；unlimited SKU 不创建数量预留或库存事件。自动交付订单项在下单事务中绑定报价版本；同一数字交付调度器处理自动履约，失败重试不会影响已确认的支付回执。文件交付每个单位只记录不可变版本引用；顾客下载时对真实订单、已付款事实、成功履约及顾客/游客会话逐次授权，并在支持单一 Range 响应前校验完整文件 SHA-256。卡密池预检查、批次、状态、撤回和密钥运维见[数字商品卡密池与自动发卡](digital-code-pool.md)；固定内容/链接版本、安全 Markdown、AES-GCM 密钥轮换、对账拦截与恢复见[固定内容与固定链接自动交付](digital-fixed-delivery.md)；文件存储、下载和备份见[私有文件自动交付与安全下载](digital-private-file-delivery.md)；供应商配置、`http_json_v1` 协议、凭据保护、外部操作状态及未知恢复见[外部 API 自动发货](external-api-delivery.md)。
 
 ## 退款及订单售后
 

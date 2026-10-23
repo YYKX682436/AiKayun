@@ -34,6 +34,17 @@ export default defineConfig({
   globalSetup: './test/e2e/global-setup.ts',
   webServer: useExternalServer ? undefined : [
     {
+      command: 'pnpm --filter @aikayun/api exec tsx test/fixtures/http-json-v1-server.ts --serve',
+      url: 'http://127.0.0.1:3101/__fixture/health',
+      reuseExistingServer: false,
+      timeout: 30_000,
+      env: {
+        NODE_ENV: 'test',
+        HTTP_JSON_V1_FIXTURE_PORT: '3101',
+        HTTP_JSON_V1_FIXTURE_BEARER_TOKEN: 'playwright-only-supplier-token',
+      },
+    },
+    {
       command: 'pnpm --filter @aikayun/api exec tsx test/fixtures/zpay-http-server.ts --serve',
       url: 'http://127.0.0.1:3099/__fixture/health',
       reuseExistingServer: false,
@@ -69,6 +80,7 @@ export default defineConfig({
           keys: { 'playwright-code-pool-v1': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' },
         }),
         PAYMENT_PROVIDER_BASE_URL_FOR_TESTS: 'http://127.0.0.1:3099',
+        SUPPLIER_HTTP_TEST_ALLOWLIST: 'http://127.0.0.1:3101',
       },
     },
     {

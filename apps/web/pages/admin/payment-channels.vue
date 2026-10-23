@@ -21,6 +21,7 @@ const paymentMethodOptions: ExternalPaymentMethod[] = ['alipay', 'wechat']
 const drafts = reactive<Record<string, ChannelDraft>>({})
 const creating = ref(false)
 const loading = ref(false)
+const channelsReady = ref(false)
 const savingId = ref('')
 const testingId = ref('')
 const reencrypting = ref(false)
@@ -72,6 +73,7 @@ async function loadChannels() {
     const result = await request<{ items: AdminPaymentChannel[] }>('/api/v1/admin/payment-channels')
     channels.value = result.items
     resetDrafts(result.items)
+    channelsReady.value = true
   } catch (error) {
     errorMessage.value = error instanceof AdminApiError || error instanceof Error
       ? error.message
@@ -193,6 +195,7 @@ onMounted(() => { void loadChannels() })
       <main
         id="admin-main-content"
         class="mx-auto w-full max-w-[76rem] min-w-0 px-4 py-5 sm:px-6 lg:px-8"
+        :data-payment-channels-ready="channelsReady ? 'true' : undefined"
       >
         <header class="mb-6 flex flex-wrap items-start justify-between gap-3">
           <div class="min-w-0">

@@ -170,7 +170,7 @@ export interface ProductVariantFulfillmentVersionsTable {
   id: string
   product_variant_id: string
   version_number: number
-  method: 'fixed_content' | 'link' | 'file'
+  method: 'fixed_content' | 'link' | 'file' | 'api'
   encrypted_content: Buffer | null
   content_nonce: Buffer | null
   content_auth_tag: Buffer | null
@@ -178,7 +178,65 @@ export interface ProductVariantFulfillmentVersionsTable {
   content_sha256: string
   private_file_object_id: string | null
   display_filename: string | null
+  supplier_connection_version_id: string | null
+  supplier_product_id: string | null
+  supplier_parameters: ColumnType<Record<string, string> | null, Record<string, string> | null, Record<string, string> | null>
   created_by_admin_id: string
+  created_at: Generated<Date>
+}
+
+export interface SupplierConnectionsTable {
+  id: string
+  display_name: string
+  enabled: boolean
+  current_version_id: string | null
+  tested_version_id: string | null
+  created_by_admin_id: string
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
+
+export interface SupplierConnectionCredentialsTable {
+  supplier_connection_id: string
+  credential_version: number
+  key_id: string
+  nonce: Buffer
+  ciphertext: Buffer
+  auth_tag: Buffer
+  created_at: Generated<Date>
+}
+
+export interface SupplierConnectionVersionsTable {
+  id: string
+  supplier_connection_id: string
+  version_number: number
+  display_name: string
+  provider_type: 'http_json_v1'
+  base_url: string
+  auth_scheme: 'bearer'
+  credential_version: number
+  created_by_admin_id: string
+  created_at: Generated<Date>
+}
+
+export interface SupplierConnectionAuditEventsTable {
+  id: string
+  supplier_connection_id: string
+  administrator_id: string
+  action: 'created' | 'configuration_updated' | 'credential_rotated' | 'credential_key_rewrapped'
+    | 'enabled' | 'disabled' | 'connection_test_succeeded' | 'connection_test_failed'
+  details: ColumnType<Record<string, unknown>, Record<string, unknown> | undefined, Record<string, unknown>>
+  created_at: Generated<Date>
+}
+
+export interface ApiFulfillmentAuditEventsTable {
+  id: string
+  product_variant_id: string | null
+  fulfillment_version_id: string | null
+  supplier_connection_id: string | null
+  administrator_id: string
+  action: 'version_saved' | 'automatic_delivery_enabled' | 'automatic_delivery_paused'
+  details: ColumnType<Record<string, unknown>, Record<string, unknown> | undefined, Record<string, unknown>>
   created_at: Generated<Date>
 }
 
@@ -678,7 +736,7 @@ export interface OrderItemFulfillmentAttemptsTable {
   started_by_admin_id: string | null
   status: Generated<FulfillmentAttemptStatus>
   result_sha256: string | null
-  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link' | 'file'>
+  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link' | 'file' | 'api'>
   failure_code: string | null
   retry_after: Date | null
   created_at: Generated<Date>
@@ -692,13 +750,80 @@ export interface OrderItemFulfillmentDeliveriesTable {
   unit_index: number
   content: string | null
   content_sha256: string
-  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link' | 'file'>
+  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link' | 'file' | 'api'>
   encrypted_content: Buffer | null
   content_nonce: Buffer | null
   content_auth_tag: Buffer | null
   encryption_key_id: string | null
   code_pool_entry_id: string | null
   fulfillment_content_version_id: string | null
+  supplier_api_operation_id: string | null
+  supplier_connection_id: string | null
+  supplier_product_id: string | null
+  supplier_content_type: 'code' | 'text' | 'redemption' | 'link' | 'completed' | null
+  supplier_fingerprint_key_id: string | null
+  created_at: Generated<Date>
+}
+
+export type SupplierApiOperationState = 'create_pending' | 'create_in_flight' | 'query_pending' | 'query_in_flight'
+  | 'processing' | 'unknown' | 'succeeded_pending_finalize' | 'manual_review' | 'succeeded' | 'failed'
+
+export interface SupplierApiDeliveryOperationsTable {
+  id: string
+  fulfillment_attempt_id: string
+  operation_id: string
+  unit_index: number
+  supplier_connection_id: string
+  supplier_connection_version_id: string
+  supplier_product_id: string
+  idempotency_key: string
+  request_sha256: string
+  provider_operation_id: string | null
+  state: SupplierApiOperationState
+  next_action_at: Date | null
+  lease_token: string | null
+  lease_expires_at: Date | null
+  create_requested_at: Date | null
+  last_query_at: Date | null
+  create_attempt_count: Generated<number>
+  query_attempt_count: Generated<number>
+  last_http_status: number | null
+  last_error_code: string | null
+  last_failure_class: string | null
+  last_provider_status: string | null
+  result_type: 'code' | 'text' | 'redemption' | 'link' | 'completed' | null
+  result_sha256: string | null
+  result_key_id: string | null
+  result_nonce: Buffer | null
+  result_ciphertext: Buffer | null
+  result_auth_tag: Buffer | null
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+  completed_at: Date | null
+}
+
+export interface SupplierApiDeliveryEventsTable {
+  id: string
+  operation_id: string
+  event_type: 'create_started' | 'create_response' | 'query_started' | 'query_response' | 'result_stored'
+    | 'delivery_finalized' | 'payment_protection_pending' | 'manual_query_requested'
+    | 'manual_retry_requested' | 'credential_unavailable' | 'integrity_conflict'
+  http_status: number | null
+  classification: string | null
+  provider_status: string | null
+  provider_operation_id: string | null
+  error_code: string | null
+  response_sha256: string | null
+  details: ColumnType<Record<string, unknown>, Record<string, unknown> | undefined, Record<string, unknown>>
+  created_at: Generated<Date>
+}
+
+export interface SupplierApiOperationsAdminAuditTable {
+  id: string
+  operation_id: string
+  administrator_id: string
+  action: 'query_requested' | 'retry_requested'
+  details: ColumnType<Record<string, unknown>, Record<string, unknown> | undefined, Record<string, unknown>>
   created_at: Generated<Date>
 }
 
@@ -860,6 +985,11 @@ export interface Database {
   guest_order_sessions: GuestOrderSessionsTable
   product_variant_fulfillment: ProductVariantFulfillmentTable
   product_variant_fulfillment_versions: ProductVariantFulfillmentVersionsTable
+  supplier_connections: SupplierConnectionsTable
+  supplier_connection_credentials: SupplierConnectionCredentialsTable
+  supplier_connection_versions: SupplierConnectionVersionsTable
+  supplier_connection_audit_events: SupplierConnectionAuditEventsTable
+  api_fulfillment_audit_events: ApiFulfillmentAuditEventsTable
   private_file_objects: PrivateFileObjectsTable
   orders: OrdersTable
   order_items: OrderItemsTable
@@ -891,5 +1021,8 @@ export interface Database {
   withdrawal_payout_results: WithdrawalPayoutResultsTable
   order_item_fulfillment_attempts: OrderItemFulfillmentAttemptsTable
   order_item_fulfillment_deliveries: OrderItemFulfillmentDeliveriesTable
+  supplier_api_delivery_operations: SupplierApiDeliveryOperationsTable
+  supplier_api_delivery_events: SupplierApiDeliveryEventsTable
+  supplier_api_operations_admin_audit: SupplierApiOperationsAdminAuditTable
   order_status_events: OrderStatusEventsTable
 }
