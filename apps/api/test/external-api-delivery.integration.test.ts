@@ -11,7 +11,7 @@ import type { AppConfig } from '../src/config.js'
 import { createDatabase } from '../src/db/pool.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
 import type { Database } from '../src/db/types.js'
-import { runDigitalDeliveryRecoveryPass } from '../src/commerce/code-pool-delivery-worker.js'
+import { runDigitalDeliveryRecoveryPass, startDigitalDeliveryWorker } from '../src/commerce/code-pool-delivery-worker.js'
 import { createHttpJsonV1Delivery, HttpJsonV1Error, resolvePinnedAddress, testHttpJsonV1Connection, validateSupplierBaseUrl, isPublicAddress } from '../src/commerce/http-json-v1.js'
 import { startHttpJsonV1Fixture } from './fixtures/http-json-v1-server.js'
 import { startZpayHttpFixture } from './fixtures/zpay-http-server.js'
@@ -109,6 +109,11 @@ async function createGuest() {
 
 function customerHeaders(customer: Customer) {
   return { origin, cookie: `${customer.cookie}; ${customer.csrfCookie}`, 'x-csrf-token': customer.csrfToken }
+}
+
+async function runStartupDeliveryWorkerPass() {
+  const stop = startDigitalDeliveryWorker(db, config, app.log)
+  await stop()
 }
 
 async function createSupplier(admin: Admin, name = `测试供应商 ${randomUUID().slice(0, 6)}`): Promise<Supplier> {
@@ -519,14 +524,14 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
     expect(supplierFixture.stats()).toMatchObject({ createRequests: 1, executions: 1, queries: queryBaseline.queries })
 
     await db.updateTable('supplier_api_delivery_operations').set({ next_action_at: new Date() }).where('id', '=', operations[0]!.id).execute()
-    await runDigitalDeliveryRecoveryPass(db, config)
+    await runStartupDeliveryWorkerPass()
     operations = await pendingOperations(itemId)
     expect(operations[0]!.state).toBe('succeeded_pending_finalize')
     expect(supplierFixture.stats()).toMatchObject({
       createRequests: 1, executions: 1, queries: queryBaseline.queries + 1,
       idempotencyQueries: queryBaseline.idempotencyQueries + 1,
     })
-    await runDigitalDeliveryRecoveryPass(db, config)
+    await runStartupDeliveryWorkerPass()
     await assertItemDelivered(orderId, itemId, 1)
 
     const op = await db.selectFrom('supplier_api_delivery_operations').select(['result_ciphertext', 'state'])
