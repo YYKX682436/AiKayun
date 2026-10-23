@@ -25,6 +25,7 @@ import { codePoolOperationKeyMigration } from './migrations/202610210003_code_po
 import { fixedDeliveryMigration } from './migrations/202610210004_fixed_delivery.js'
 import { privateFileDeliveryMigration } from './migrations/202610210005_private_file_delivery.js'
 import { externalApiDeliveryMigration } from './migrations/202610230001_external_api_delivery.js'
+import { digitalFulfillmentAcceptanceMigration } from './migrations/202610230002_digital_fulfillment_acceptance.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -55,6 +56,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610210004_fixed_delivery': fixedDeliveryMigration,
       '202610210005_private_file_delivery': privateFileDeliveryMigration,
       '202610230001_external_api_delivery': externalApiDeliveryMigration,
+      '202610230002_digital_fulfillment_acceptance': digitalFulfillmentAcceptanceMigration,
     }
   }
 }

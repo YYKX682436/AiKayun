@@ -1,4 +1,7 @@
 import { randomUUID, randomBytes } from 'node:crypto'
+import { appendFile, mkdtemp, rm, readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Migrator } from 'kysely/migration'
 import { sql } from 'kysely'
@@ -15,6 +18,7 @@ import { runDigitalDeliveryRecoveryPass, startDigitalDeliveryWorker } from '../s
 import { createHttpJsonV1Delivery, HttpJsonV1Error, resolvePinnedAddress, testHttpJsonV1Connection, validateSupplierBaseUrl, isPublicAddress } from '../src/commerce/http-json-v1.js'
 import { startHttpJsonV1Fixture } from './fixtures/http-json-v1-server.js'
 import { startZpayHttpFixture } from './fixtures/zpay-http-server.js'
+import { startCrashProcess } from './fixtures/crash-process.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
   ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
@@ -34,6 +38,7 @@ let supplierFixture: Awaited<ReturnType<typeof startHttpJsonV1Fixture>>
 let paymentFixture: Awaited<ReturnType<typeof startZpayHttpFixture>>
 let paymentChannelId: string
 let nextIp = 1
+let storageRoot: string
 
 type Admin = { id: string; cookie: string; csrfToken: string; csrfCookie: string }
 type Customer = { id: string; cookie: string; csrfToken: string; csrfCookie: string }
@@ -161,7 +166,7 @@ async function rotateSupplier(admin: Admin, supplier: Supplier): Promise<Supplie
 }
 
 async function createCatalog(
-  price = '0.00', mode: 'quantity' | 'unlimited' = 'quantity',
+  price = '0.00', mode: 'quantity' | 'unlimited' = 'quantity', stock = 20,
 ): Promise<Catalog> {
   const productId = randomUUID()
   const skuId = randomUUID()
@@ -173,7 +178,7 @@ async function createCatalog(
       sale_price: price, enabled: true, retired_at: null, inventory_mode: mode,
     }).execute()
     if (mode === 'quantity') await trx.insertInto('product_variant_quantity_inventory').values({
-      product_id: productId, product_variant_id: skuId, stocked: 20, reserved: 0,
+      product_id: productId, product_variant_id: skuId, stocked: stock, reserved: 0,
     }).execute()
     await trx.insertInto('product_variant_fulfillment').values({
       product_variant_id: skuId, method: 'manual', manual_delivery_ready: false,
@@ -306,6 +311,8 @@ beforeAll(async () => {
     ...process.env,
     DATABASE_URL: testDatabaseUrl,
     NODE_ENV: 'test', PUBLIC_ORIGIN: origin, COOKIE_SECURE: 'false',
+    MEDIA_ROOT: join(storageRoot = await mkdtemp(join(tmpdir(), 'aikayun-api-acceptance-')), 'public'),
+    PRIVATE_FILE_ROOT: join(storageRoot, 'private'),
     SUPPLIER_HTTP_TEST_ALLOWLIST: supplierFixture.baseUrl,
     PAYMENT_CREDENTIAL_KEY_RING: JSON.stringify({
       activeKeyId: 'supplier-test-a', keys: {
@@ -336,6 +343,7 @@ afterAll(async () => {
   if (paymentFixture) await paymentFixture.close()
   if (supplierFixture) await supplierFixture.close()
   if (db) await db.destroy()
+  if (storageRoot) await rm(storageRoot, { recursive: true, force: true })
 })
 
 describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
@@ -639,6 +647,9 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
     const itemId = created.json().data.order.items[0].id as string
     const gate = supplierFixture.pauseNextCreateResponse()
     const firstWorker = runDigitalDeliveryRecoveryPass(db, config)
+    let persisted: unknown
+    let eventCount: number
+    let leasedOperationId: string
     try {
       await gate.entered
       let operation = (await pendingOperations(itemId))[0]!
@@ -651,6 +662,9 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
       await runDigitalDeliveryRecoveryPass(db, config)
       operation = (await pendingOperations(itemId))[0]!
       expect(operation.state).toBe('succeeded_pending_finalize')
+      leasedOperationId = operation.id
+      persisted = await db.selectFrom('supplier_api_delivery_operations').selectAll().where('id', '=', operation.id).executeTakeFirstOrThrow()
+      eventCount = (await db.selectFrom('supplier_api_delivery_events').select('id').where('operation_id', '=', operation.id).execute()).length
       expect(supplierFixture.stats()).toMatchObject({
         createRequests: 1, executions: 1, queries: queryBaseline.queries + 1,
         providerIdQueries: queryBaseline.providerIdQueries,
@@ -660,6 +674,8 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
       gate.release()
       await firstWorker
     }
+    expect(await db.selectFrom('supplier_api_delivery_operations').selectAll().where('id', '=', leasedOperationId).executeTakeFirstOrThrow()).toEqual(persisted)
+    expect((await db.selectFrom('supplier_api_delivery_events').select('id').where('operation_id', '=', leasedOperationId).execute()).length).toBe(eventCount)
     await runDigitalDeliveryRecoveryPass(db, config)
     await assertItemDelivered(orderId, itemId, 1)
     expect(supplierFixture.stats().executions).toBe(1)
@@ -745,7 +761,7 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
     const admin = await createAdmin()
     const customer = await createCustomer()
     const supplier = await createSupplier(admin)
-    for (const mode of ['identity_mismatch', 'wrong_amount', 'wrong_quantity'] as const) {
+    for (const mode of ['identity_mismatch', 'wrong_amount', 'wrong_quantity', 'wrong_operation', 'wrong_idempotency', 'wrong_currency'] as const) {
       const catalog = await createCatalog('0.00', 'quantity')
       await saveApiVersion(catalog, admin, supplier, { productId: `mismatch-${mode}`, mode })
       expect((await setApiReadiness(catalog, admin, true)).statusCode).toBe(200)
@@ -815,5 +831,756 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
       baseUrl: `${supplierFixture.baseUrl}/redirect`, bearerToken: supplierTokenV1,
     })).rejects.toMatchObject({ classification: 'redirect_rejected' })
     expect(supplierFixture.stats().redirects).toBe(1)
+  }, 30_000)
+})
+
+
+async function configureFixed(catalog: Catalog, admin: Admin, method: 'fixed_content' | 'link') {
+  const { encryptFixedDeliveryPayload, fixedDeliveryPayloadDigest, fixedDeliveryVersionContext } = await import('../src/commerce/fixed-delivery-crypto.js')
+  const id = randomUUID()
+  const payload = method === 'fixed_content' ? { method, content: 'private mixed-order text' }
+    : { method, url: 'https://delivery.example/never-fetched', title: 'private mixed-order link', accessInstructions: null }
+  const envelope = encryptFixedDeliveryPayload(config, fixedDeliveryVersionContext(catalog.skuId, id, method), payload)
+  await db.transaction().execute(async trx => {
+    await trx.insertInto('product_variant_fulfillment_versions').values({ id, product_variant_id: catalog.skuId, version_number: 1, method,
+      encrypted_content: envelope.ciphertext, content_nonce: envelope.nonce, content_auth_tag: envelope.authTag,
+      encryption_key_id: envelope.keyId, content_sha256: fixedDeliveryPayloadDigest(config, payload), created_by_admin_id: admin.id }).execute()
+    await trx.updateTable('product_variant_fulfillment').set({ method, current_content_version_id: id, automatic_delivery_ready: true,
+      manual_delivery_ready: false }).where('product_variant_id', '=', catalog.skuId).execute()
+  })
+}
+
+async function configurePool(catalog: Catalog, admin: Admin, count = 5) {
+  const base = `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/code-pool`
+  const before = await db.selectFrom('product_variants').select(['revision', 'inventory_revision']).where('id', '=', catalog.skuId).executeTakeFirstOrThrow()
+  expect((await inject({ method: 'PUT', url: `${base}/readiness`, headers: adminHeaders(admin), payload: {
+    enabled: false, expectedSkuRevision: before.revision, expectedInventoryRevision: before.inventory_revision,
+  } })).statusCode).toBe(200)
+  const imported = await inject({ method: 'POST', url: `${base}/batches`, headers: adminHeaders(admin),
+    payload: { operationId: randomUUID(), format: 'paste', sourceText: Array.from({ length: count }, (_, i) => `phase55-${catalog.skuId}-${i}`).join('\n') } })
+  expect(imported.statusCode, imported.body).toBe(201)
+  const sku = await db.selectFrom('product_variants').select(['revision', 'inventory_revision']).where('id', '=', catalog.skuId).executeTakeFirstOrThrow()
+  const ready = await inject({ method: 'PUT', url: `${base}/readiness`, headers: adminHeaders(admin),
+    payload: { enabled: true, expectedSkuRevision: sku.revision, expectedInventoryRevision: sku.inventory_revision } })
+  expect(ready.statusCode, ready.body).toBe(200)
+}
+
+async function reconcileSkus(ids: string[]) {
+  const query = await readFile(new URL('../../../scripts/reconcile-digital-fulfillment.sql', import.meta.url), 'utf8')
+  return db.transaction().setIsolationLevel('repeatable read').execute(async trx => {
+    await sql`SELECT set_config('aikayun.reconcile_skus', ${ids.join(',')}, true)`.execute(trx)
+    return (await sql.raw(query).execute(trx)).rows
+  })
+}
+
+async function paidApiOrder(mode = 'success') {
+  supplierFixture.reset()
+  const admin = await createAdmin()
+  const customer = await createCustomer()
+  const supplier = await createSupplier(admin)
+  const catalog = await createCatalog('5.00')
+  if (mode === 'manual') await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true }).where('product_variant_id', '=', catalog.skuId).execute()
+  else {
+    await saveApiVersion(catalog, admin, supplier, { mode, productId: `phase55-${randomUUID()}` })
+    expect((await setApiReadiness(catalog, admin, true)).statusCode).toBe(200)
+  }
+  const created = await createOrder(customer, catalog, 1)
+  expect(created.statusCode, created.body).toBe(201)
+  const orderId = created.json().data.order.id as string
+  const itemId = created.json().data.order.items[0].id as string
+  const payment = await createPayment(orderId, customer)
+  expect(payment.statusCode, payment.body).toBe(201)
+  const paymentAttemptId = payment.json().data.attempt.id as string
+  const paymentAttempt = await db.selectFrom('payment_attempts').select('merchant_order_no')
+    .where('id', '=', paymentAttemptId).executeTakeFirstOrThrow()
+  expect((await inject({ method: 'GET', url: callbackUrl(paymentFixture.setPaid(paymentAttempt.merchant_order_no!)) })).body).toBe('success')
+  const receipt = await db.selectFrom('payment_receipts').selectAll().where('payment_attempt_id', '=', paymentAttemptId).executeTakeFirstOrThrow()
+  return { admin, customer, supplier, catalog, orderId, itemId, paymentAttemptId, receipt }
+}
+
+async function recoverInRebuiltProcess() {
+  const rebuilt = await startCrashProcess(config, 'none')
+  try { await rebuilt.pass(); await rebuilt.pass(); await rebuilt.pass() } finally { await rebuilt.kill() }
+}
+
+async function assertPaidApiFacts(order: Awaited<ReturnType<typeof paidApiOrder>>, operationId: string) {
+  await assertItemDelivered(order.orderId, order.itemId, 1)
+  expect(await db.selectFrom('payment_receipts').selectAll().where('id', '=', order.receipt.id).executeTakeFirstOrThrow()).toEqual(order.receipt)
+  expect((await pendingOperations(order.itemId)).map(row => row.id)).toEqual([operationId])
+  expect(await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
+    .where('product_variant_id', '=', order.catalog.skuId).executeTakeFirstOrThrow()).toEqual({ stocked: 19, reserved: 0 })
+  expect(await db.selectFrom('order_inventory_events as event').innerJoin('order_inventory_reservations as reservation', 'reservation.id', 'event.reservation_id')
+    .select(['event.action', 'event.quantity']).where('reservation.order_item_id', '=', order.itemId).orderBy('event.action').execute())
+    .toEqual([{ action: 'consume', quantity: 1 }, { action: 'reserve', quantity: 1 }])
+}
+
+describe('⑤-5 real SIGKILL and cross-module database acceptance', () => {
+  for (const checkpoint of ['operation_committed', 'lease_committed', 'response_received', 'result_committed']) {
+    it(`SIGKILL at ${checkpoint} preserves payment and the original operation across service rebuild`, async () => {
+      const order = await paidApiOrder()
+      const process = await startCrashProcess(config, checkpoint)
+      let operationId: string
+      try {
+        process.run()
+        expect(await process.waitFor('checkpoint')).toBe(checkpoint)
+        const operation = (await pendingOperations(order.itemId))[0]!
+        operationId = operation.id
+        expect(operation.state).toBe(checkpoint === 'operation_committed' ? 'create_pending'
+          : checkpoint === 'result_committed' ? 'succeeded_pending_finalize' : 'create_in_flight')
+        expect(supplierFixture.stats().executions).toBe(['operation_committed', 'lease_committed'].includes(checkpoint) ? 0 : 1)
+        await process.kill()
+        if (operation.state === 'create_in_flight') await db.updateTable('supplier_api_delivery_operations')
+          .set({ lease_expires_at: new Date(0) }).where('id', '=', operationId).execute()
+      } finally { await process.kill() }
+      await recoverInRebuiltProcess()
+      await assertPaidApiFacts(order, operationId!)
+      expect(supplierFixture.stats()).toMatchObject({ createRequests: 1, executions: 1 })
+    }, 30_000)
+  }
+
+  it('SIGKILL after API final delivery and inventory commit cannot finalize that unit twice', async () => {
+    const order = await paidApiOrder()
+    await runDigitalDeliveryRecoveryPass(db, config)
+    const operationId = (await pendingOperations(order.itemId))[0]!.id
+    const process = await startCrashProcess(config, 'delivery_committed')
+    try { process.run(); await process.waitFor('checkpoint'); await process.kill() }
+    finally { await process.kill() }
+    await recoverInRebuiltProcess()
+    await assertPaidApiFacts(order, operationId)
+    expect(supplierFixture.stats()).toMatchObject({ createRequests: 1, executions: 1 })
+  }, 30_000)
+
+  it('SIGKILL after supplier execution before HTTP response queries the original key without another execution', async () => {
+    const order = await paidApiOrder()
+    const process = await startCrashProcess(config, 'none')
+    const gate = supplierFixture.pauseNextCreateResponse()
+    let operationId: string
+    try {
+      process.run()
+      await gate.entered
+      const operation = (await pendingOperations(order.itemId))[0]!
+      operationId = operation.id
+      expect(operation.state).toBe('create_in_flight')
+      expect(supplierFixture.stats().executions).toBe(1)
+      await process.kill()
+      await db.updateTable('supplier_api_delivery_operations').set({ lease_expires_at: new Date(0) }).where('id', '=', operationId).execute()
+    } finally { gate.release(); await process.kill() }
+    await recoverInRebuiltProcess()
+    await assertPaidApiFacts(order, operationId!)
+    expect(supplierFixture.stats()).toMatchObject({ createRequests: 1, executions: 1 })
+    expect(supplierFixture.stats().idempotencyQueries).toBeGreaterThan(1)
+  }, 30_000)
+
+  it('serializes duplicate supplier codes across different SKUs and different active encryption keys', async () => {
+    supplierFixture.reset()
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const supplier = await createSupplier(admin)
+    const productId = `rotation-duplicate-${randomUUID()}`
+    const orders = []
+    for (let index = 0; index < 2; index++) {
+      const catalog = await createCatalog('0.00', 'unlimited')
+      await saveApiVersion(catalog, admin, supplier, { productId, mode: 'duplicate' })
+      expect((await setApiReadiness(catalog, admin, true)).statusCode).toBe(200)
+      const created = await createOrder(customer, catalog, 1)
+      orders.push({ orderId: created.json().data.order.id as string, itemId: created.json().data.order.items[0].id as string })
+    }
+    await runDigitalDeliveryRecoveryPass(db, config)
+    const ids = await Promise.all(orders.map(async order => (await pendingOperations(order.itemId))[0]!.id))
+    const ring = config.codePoolEncryptionKeyRing!
+    const keys = { ...ring.keys, 'rotation-v2': randomBytes(32) }
+    const first = await startCrashProcess({ ...config, codePoolEncryptionKeyRing: { activeKeyId: ring.activeKeyId, keys } }, 'duplicate_checked', ids[0])
+    const second = await startCrashProcess({ ...config, codePoolEncryptionKeyRing: { activeKeyId: 'rotation-v2', keys } }, 'none', ids[1])
+    try {
+      first.run()
+      await first.waitFor('checkpoint')
+      second.run()
+      // Wait for either the second contender's advisory wait or its committed
+      // delivery. This is a database-observed interleaving, not a guessed delay.
+      await expect.poll(async () => {
+        const waiting = await sql<{ count: number }>`SELECT count(*)::integer AS count FROM pg_stat_activity
+          WHERE application_name = 'aikayun-phase55-crash-test' AND wait_event = 'advisory'`.execute(db)
+        const delivered = await db.selectFrom('order_item_fulfillment_deliveries').select('id').where('supplier_api_operation_id', '=', ids[1]!).execute()
+        return waiting.rows[0]!.count > 0 || delivered.length > 0
+      }, { timeout: 5000, intervals: [10, 25, 50] }).toBe(true)
+      first.child.send('resume')
+      await first.waitFor('done')
+      await second.waitFor('done')
+      const deliveries = await db.selectFrom('order_item_fulfillment_deliveries').select('id').where('supplier_api_operation_id', 'in', ids).execute()
+      expect(deliveries).toHaveLength(1)
+      expect((await db.selectFrom('supplier_api_delivery_operations').select('state').where('id', 'in', ids).execute()).map(row => row.state).sort())
+        .toEqual(['manual_review', 'succeeded'])
+    } finally { first.child.send('resume'); await Promise.all([first.kill(), second.kill()]) }
+  }, 30_000)
+
+  it('fails closed before another supplier create if a historical fingerprint key is missing', async () => {
+    supplierFixture.reset()
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const supplier = await createSupplier(admin)
+    const productId = `missing-history-key-${randomUUID()}`
+    const firstCatalog = await createCatalog('0.00', 'unlimited')
+    await saveApiVersion(firstCatalog, admin, supplier, { productId, mode: 'duplicate' })
+    expect((await setApiReadiness(firstCatalog, admin, true)).statusCode).toBe(200)
+    const firstOrder = await createOrder(customer, firstCatalog, 1)
+    await runDigitalDeliveryRecoveryPass(db, config)
+    await runDigitalDeliveryRecoveryPass(db, config)
+    expect(firstOrder.statusCode).toBe(201)
+    const secondCatalog = await createCatalog('0.00', 'unlimited')
+    await saveApiVersion(secondCatalog, admin, supplier, { productId, mode: 'duplicate' })
+    expect((await setApiReadiness(secondCatalog, admin, true)).statusCode).toBe(200)
+    const created = await createOrder(customer, secondCatalog, 1)
+    const itemId = created.json().data.order.items[0].id as string
+    const retained = config.codePoolEncryptionKeyRing!
+    retained.keys['history-key-v2'] = randomBytes(32)
+    try {
+      config.codePoolEncryptionKeyRing = { activeKeyId: 'history-key-v2', keys: { 'history-key-v2': retained.keys['history-key-v2']! } }
+      await runDigitalDeliveryRecoveryPass(db, config)
+      expect(supplierFixture.stats().createRequests).toBe(1)
+      expect(await pendingOperations(itemId)).toEqual([])
+      const failure = await db.selectFrom('order_item_fulfillment_attempts').select(['failure_code', 'retry_after']).where('order_item_id', '=', itemId).executeTakeFirstOrThrow()
+      expect(failure.failure_code).toBe('API_DELIVERY_KEY_UNAVAILABLE')
+      expect(failure.retry_after!.getTime()).toBeGreaterThan(Date.now())
+      config.codePoolEncryptionKeyRing = retained
+      await db.updateTable('order_item_fulfillment_attempts').set({ retry_after: new Date() }).where('order_item_id', '=', itemId).execute()
+      await recoverInRebuiltProcess()
+      expect((await pendingOperations(itemId))[0]!.state).toBe('manual_review')
+      expect(supplierFixture.stats().createRequests).toBe(2)
+    } finally { config.codePoolEncryptionKeyRing = retained }
+  }, 30_000)
+
+  it('does not starve a newer order behind twenty payment-protected API items', async () => {
+    const blocked = []
+    for (let index = 0; index < 20; index++) {
+      const order = await paidApiOrder()
+      const event = await db.selectFrom('payment_provider_events').select('id').where('payment_attempt_id', '=', order.paymentAttemptId).executeTakeFirstOrThrow()
+      await db.insertInto('payment_provider_reconciliation_cases').values({
+        id: randomUUID(), payment_attempt_id: order.paymentAttemptId, reason: 'provider_identity_conflict', opening_callback_event_id: event.id,
+      }).execute()
+      blocked.push(order)
+    }
+    const healthy = await paidApiOrder()
+    await runDigitalDeliveryRecoveryPass(db, config)
+    await runDigitalDeliveryRecoveryPass(db, config)
+    await assertItemDelivered(healthy.orderId, healthy.itemId, 1)
+    for (const order of blocked) expect(await pendingOperations(order.itemId)).toEqual([])
+    expect(supplierFixture.stats().executions).toBe(1)
+  }, 30_000)
+
+  it('keeps database delivery progressing while a supplier HTTP response is held', async () => {
+    const apiOrder = await paidApiOrder()
+    const gate = supplierFixture.pauseNextCreateResponse()
+    const stop = startDigitalDeliveryWorker(db, config, app.log)
+    try {
+      await gate.entered
+      const catalog = await createCatalog()
+      await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true }).where('product_variant_id', '=', catalog.skuId).execute()
+      const fixedVersionId = randomUUID()
+      const { encryptFixedDeliveryPayload, fixedDeliveryPayloadDigest, fixedDeliveryVersionContext } = await import('../src/commerce/fixed-delivery-crypto.js')
+      const payload = { method: 'fixed_content' as const, content: 'independent local delivery' }
+      const envelope = encryptFixedDeliveryPayload(config, fixedDeliveryVersionContext(catalog.skuId, fixedVersionId, 'fixed_content'), payload)
+      await db.transaction().execute(async trx => {
+        await trx.insertInto('product_variant_fulfillment_versions').values({
+          id: fixedVersionId, product_variant_id: catalog.skuId, version_number: 1, method: 'fixed_content',
+          encrypted_content: envelope.ciphertext, content_nonce: envelope.nonce, content_auth_tag: envelope.authTag,
+          encryption_key_id: envelope.keyId, content_sha256: fixedDeliveryPayloadDigest(config, payload), created_by_admin_id: apiOrder.admin.id,
+        }).execute()
+        await trx.updateTable('product_variant_fulfillment').set({ method: 'fixed_content', manual_delivery_ready: false,
+          current_content_version_id: fixedVersionId, automatic_delivery_ready: true }).where('product_variant_id', '=', catalog.skuId).execute()
+      })
+      const created = await createOrder(apiOrder.customer, catalog, 1)
+      const id = created.json().data.order.id as string
+      await expect.poll(async () => (await db.selectFrom('orders').select('status').where('id', '=', id).executeTakeFirstOrThrow()).status,
+        { timeout: 3000, intervals: [10, 25, 50] }).toBe('completed')
+      expect((await pendingOperations(apiOrder.itemId))[0]!.state).toBe('create_in_flight')
+    } finally { gate.release(); await stop() }
+    await recoverInRebuiltProcess()
+  }, 30_000)
+
+  it('keeps a successful supplier operation unknown while the result key is unavailable and queries it without re-execution', async () => {
+    const order = await paidApiOrder()
+    const gate = supplierFixture.pauseNextCreateResponse()
+    const savedRing = config.codePoolEncryptionKeyRing
+    const pass = runDigitalDeliveryRecoveryPass(db, config)
+    try {
+      await gate.entered
+      config.codePoolEncryptionKeyRing = undefined
+      gate.release()
+      await pass
+      const operation = (await pendingOperations(order.itemId))[0]!
+      expect(operation).toMatchObject({ state: 'unknown', attempt_status: 'unknown' })
+      expect(await db.selectFrom('payment_receipts').selectAll().where('id', '=', order.receipt.id).executeTakeFirstOrThrow()).toEqual(order.receipt)
+      config.codePoolEncryptionKeyRing = savedRing
+      await db.updateTable('supplier_api_delivery_operations').set({ next_action_at: new Date() }).where('id', '=', operation.id).execute()
+      await recoverInRebuiltProcess()
+      await assertPaidApiFacts(order, operation.id)
+      expect(supplierFixture.stats()).toMatchObject({ createRequests: 1, executions: 1 })
+    } finally { config.codePoolEncryptionKeyRing = savedRing; gate.release(); await pass }
+  }, 30_000)
+
+  it('preserves a previously confirmed provider identity when its status endpoint later reports not_found', async () => {
+    const order = await paidApiOrder('accepted')
+    await runDigitalDeliveryRecoveryPass(db, config)
+    const operation = (await pendingOperations(order.itemId))[0]!
+    const before = await db.selectFrom('supplier_api_delivery_operations').selectAll().where('id', '=', operation.id).executeTakeFirstOrThrow()
+    expect(before.provider_operation_id).toBeTruthy()
+    supplierFixture.reset()
+    await db.updateTable('supplier_api_delivery_operations').set({ next_action_at: new Date() }).where('id', '=', operation.id).execute()
+    await runDigitalDeliveryRecoveryPass(db, config)
+    const after = await db.selectFrom('supplier_api_delivery_operations').selectAll().where('id', '=', operation.id).executeTakeFirstOrThrow()
+    expect(after).toMatchObject({ state: 'manual_review', provider_operation_id: before.provider_operation_id, last_error_code: 'supplier_known_operation_not_found' })
+    expect(supplierFixture.stats().createRequests).toBe(0)
+    for (const action of ['query', 'retry']) {
+      const url = `/api/v1/admin/orders/${order.orderId}/supplier-operations/${operation.id}/${action}`
+      expect((await inject({ method: 'POST', url })).statusCode).toBe(401)
+      expect((await inject({ method: 'POST', url, headers: { origin, cookie: order.admin.cookie } })).statusCode).toBe(403)
+      expect((await inject({ method: 'POST', url, headers: { ...adminHeaders(order.admin), origin: 'https://attacker.example' } })).statusCode).toBe(403)
+      expect((await inject({ method: 'POST', url, headers: { cookie: order.customer.cookie } })).statusCode).toBe(401)
+    }
+    const retry = await inject({ method: 'POST', url: `/api/v1/admin/orders/${order.orderId}/supplier-operations/${operation.id}/retry`, headers: adminHeaders(order.admin) })
+    expect(retry.statusCode).toBe(409)
+    expect(await db.selectFrom('supplier_api_operations_admin_audit').select('id').where('operation_id', '=', operation.id).execute()).toEqual([])
+    const authorized = await inject({ method: 'POST', url: `/api/v1/admin/orders/${order.orderId}/supplier-operations/${operation.id}/query`, headers: adminHeaders(order.admin) })
+    expect(authorized.statusCode, authorized.body).toBe(200)
+    expect(await db.selectFrom('supplier_api_operations_admin_audit').select(['administrator_id', 'action']).where('operation_id', '=', operation.id).execute())
+      .toEqual([{ administrator_id: order.admin.id, action: 'query_requested' }])
+    await runDigitalDeliveryRecoveryPass(db, config)
+    expect((await pendingOperations(order.itemId))[0]!.state).toBe('manual_review')
+  }, 30_000)
+
+  for (const mode of ['http_429', 'http_500', 'interrupted']) {
+    it(`preserves payment and backs off ${mode} without creating a new supplier operation`, async () => {
+      const order = await paidApiOrder(mode)
+      await runDigitalDeliveryRecoveryPass(db, config)
+      const operation = (await pendingOperations(order.itemId))[0]!
+      expect(operation).toMatchObject({ state: 'unknown', attempt_status: 'unknown' })
+      const saved = await db.selectFrom('supplier_api_delivery_operations').selectAll().where('id', '=', operation.id).executeTakeFirstOrThrow()
+      expect(saved.next_action_at!.getTime()).toBeGreaterThan(Date.now())
+      await runDigitalDeliveryRecoveryPass(db, config)
+      expect(supplierFixture.stats()).toMatchObject({ createRequests: 1, executions: 1 })
+      await db.updateTable('supplier_api_delivery_operations').set({ next_action_at: new Date() }).where('id', '=', operation.id).execute()
+      await recoverInRebuiltProcess()
+      await assertPaidApiFacts(order, operation.id)
+      expect(supplierFixture.stats()).toMatchObject({ createRequests: 1, executions: 1 })
+    }, 30_000)
+  }
+
+  it('rejects direct SQL mutation of a persisted supplier unit identity', async () => {
+    const order = await paidApiOrder()
+    await runDigitalDeliveryRecoveryPass(db, config)
+    const operation = (await pendingOperations(order.itemId))[0]!
+    await expect(db.updateTable('supplier_api_delivery_operations').set({ unit_index: 2 }).where('id', '=', operation.id).execute())
+      .rejects.toMatchObject({ code: '23514' })
+    await runDigitalDeliveryRecoveryPass(db, config)
+    await assertPaidApiFacts(order, operation.id)
+  })
+
+  it('rejects direct SQL duplicate units across manual attempts and terminal history appends', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog()
+    await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true }).where('product_variant_id', '=', catalog.skuId).execute()
+    const created = await createOrder(customer, catalog, 2)
+    const orderId = created.json().data.order.id as string
+    const itemId = created.json().data.order.items[0].id as string
+    const first = await inject({ method: 'POST', url: `/api/v1/admin/orders/${orderId}/items/${itemId}/fulfillments`,
+      headers: adminHeaders(admin), payload: { operationId: randomUUID(), deliveries: [{ content: 'manual-unit-one' }] } })
+    expect(first.statusCode, first.body).toBe(200)
+    const delivery = await db.selectFrom('order_item_fulfillment_deliveries as delivery')
+      .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'delivery.fulfillment_attempt_id')
+      .selectAll('delivery').where('attempt.order_item_id', '=', itemId).executeTakeFirstOrThrow()
+    const rejectsWrite = async (terminal: boolean) => db.transaction().execute(async trx => {
+      const attemptId = terminal ? delivery.fulfillment_attempt_id : randomUUID()
+      if (!terminal) await trx.insertInto('order_item_fulfillment_attempts').values({
+        id: attemptId, order_item_id: itemId, operation_id: randomUUID(), quantity: 1, started_by_admin_id: admin.id,
+      }).execute()
+      await trx.insertInto('order_item_fulfillment_deliveries').values({ ...delivery, id: randomUUID(),
+        fulfillment_attempt_id: attemptId, unit_index: terminal ? 2 : 1 }).execute()
+    })
+    await expect(rejectsWrite(false)).rejects.toMatchObject({ code: '23514' })
+    await expect(rejectsWrite(true)).rejects.toMatchObject({ code: '23514' })
+  })
+  it('rejects direct SQL appending delivery content to a terminal attempt', async () => {
+    const order = await paidApiOrder()
+    await runDigitalDeliveryRecoveryPass(db, config)
+    await runDigitalDeliveryRecoveryPass(db, config)
+    const operation = (await pendingOperations(order.itemId))[0]!
+    const delivery = await db.selectFrom('order_item_fulfillment_deliveries').selectAll()
+      .where('supplier_api_operation_id', '=', operation.id).executeTakeFirstOrThrow()
+    await expect(db.insertInto('order_item_fulfillment_deliveries').values({ ...delivery, id: randomUUID(), unit_index: 2 }).execute())
+      .rejects.toMatchObject({ code: '23514' })
+  })
+
+  it('rechecks the attempt after a direct SQL delivery insert waits for the order lock', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog()
+    await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true }).where('product_variant_id', '=', catalog.skuId).execute()
+    const created = await createOrder(customer, catalog, 2)
+    const orderId = created.json().data.order.id as string
+    const itemId = created.json().data.order.items[0].id as string
+    const attemptId = randomUUID()
+    await db.insertInto('order_item_fulfillment_attempts').values({ id: attemptId, order_item_id: itemId,
+      operation_id: randomUUID(), quantity: 1, started_by_admin_id: admin.id }).execute()
+    let lockReady!: () => void
+    let releaseLock!: () => void
+    const ready = new Promise<void>(resolve => { lockReady = resolve })
+    const release = new Promise<void>(resolve => { releaseLock = resolve })
+    const finishing = db.transaction().execute(async trx => {
+      await trx.selectFrom('orders').select('id').where('id', '=', orderId).forUpdate().execute()
+      lockReady()
+      await release
+      await trx.updateTable('order_item_fulfillment_attempts').set({ status: 'failed' }).where('id', '=', attemptId).execute()
+    })
+    await ready
+    let insertReady!: (pid: number) => void
+    const insertingPid = new Promise<number>(resolve => { insertReady = resolve })
+    const inserting = db.connection().execute(async connection => {
+      const pid = await sql<{ pid: number }>`SELECT pg_backend_pid() AS pid`.execute(connection)
+      insertReady(pid.rows[0]!.pid)
+      return await connection.insertInto('order_item_fulfillment_deliveries').values({ id: randomUUID(),
+        fulfillment_attempt_id: attemptId, started_by_admin_id: admin.id, unit_index: 1,
+        content: 'must not append after attempt ends during lock wait', content_sha256: 'a'.repeat(64) }).execute()
+    }).then(() => ({ code: 'accepted', constraint: '' }), (error: { code: string; constraint: string }) => error)
+    try {
+      const pid = await insertingPid
+      const deadline = Date.now() + 5_000
+      let waiting = false
+      while (Date.now() < deadline) {
+        const activity = await sql<{ waiting: boolean }>`SELECT wait_event_type = 'Lock' AS waiting FROM pg_stat_activity WHERE pid = ${pid}`.execute(db)
+        if (activity.rows[0]?.waiting) { waiting = true; break }
+        await new Promise<void>(resolve => { setImmediate(resolve) })
+      }
+      expect(waiting, 'insert must reach the real PostgreSQL order-lock barrier').toBe(true)
+    } finally { releaseLock(); await finishing }
+    expect(await inserting).toMatchObject({ code: '23514', constraint: 'digital_delivery_unit_invalid' })
+    expect(await db.selectFrom('order_item_fulfillment_deliveries').select('id').where('fulfillment_attempt_id', '=', attemptId).execute()).toEqual([])
+  })
+})
+
+
+describe('⑤-5 mixed digital orders and transactional rollback', () => {
+  for (const inventoryMode of ['quantity', 'unlimited'] as const) {
+    it(`completes all six methods in one ${inventoryMode} order, retains refund history and reconciles every unit`, async () => {
+      supplierFixture.reset()
+      const admin = await createAdmin()
+      const customer = await createCustomer()
+      const supplier = await createSupplier(admin)
+      const catalogs = new Map<string, Catalog>()
+      for (const method of ['manual', 'code_pool', 'fixed_content', 'link', 'file', 'api']) {
+        const catalog = await createCatalog('1.00', method === 'code_pool' ? 'quantity' : inventoryMode, 0)
+        catalogs.set(method, catalog)
+        if (catalog.mode === 'quantity' && method !== 'code_pool') {
+          const sku = await db.selectFrom('product_variants').select('inventory_revision').where('id', '=', catalog.skuId).executeTakeFirstOrThrow()
+          const replenished = await inject({ method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/inventory/adjustments`,
+            headers: adminHeaders(admin), payload: { operationId: randomUUID(), expectedInventoryRevision: sku.inventory_revision,
+              action: 'increase', quantity: 5, reason: 'isolated phase55 opening stock' } })
+          expect(replenished.statusCode, replenished.body).toBe(201)
+        }
+        if (method === 'manual') await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true }).where('product_variant_id', '=', catalog.skuId).execute()
+        else if (method === 'code_pool') await configurePool(catalog, admin)
+        else if (method === 'fixed_content' || method === 'link') await configureFixed(catalog, admin, method)
+        else if (method === 'api') {
+          await saveApiVersion(catalog, admin, supplier, { productId: `mixed-${randomUUID()}` })
+          expect((await setApiReadiness(catalog, admin, true)).statusCode).toBe(200)
+        } else {
+          const root = `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/private-files`
+          const boundary = `phase55-${randomUUID()}`
+          const upload = await inject({ method: 'POST', url: `${root}/uploads`, headers: { ...adminHeaders(admin), 'content-type': `multipart/form-data; boundary=${boundary}` },
+            payload: Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="mixed.txt"\r\nContent-Type: text/plain\r\n\r\nprivate mixed file\r\n--${boundary}--\r\n`) })
+          expect(upload.statusCode, upload.body).toBe(201)
+          const current = await inject({ method: 'GET', url: root, headers: { cookie: admin.cookie } })
+          const saved = await inject({ method: 'POST', url: `${root}/versions`, headers: adminHeaders(admin), payload: {
+            expectedRevision: current.json().data.configurationRevision, uploadId: upload.json().data.uploadId, displayFilename: 'mixed.txt' } })
+          expect(saved.statusCode, saved.body).toBe(200)
+          const ready = await inject({ method: 'PUT', url: `${root}/readiness`, headers: adminHeaders(admin),
+            payload: { expectedRevision: saved.json().data.configurationRevision, enabled: true } })
+          expect(ready.statusCode, ready.body).toBe(200)
+        }
+      }
+      const items = [...catalogs.values()].map(catalog => ({ skuId: catalog.skuId, quantity: 2 }))
+      const quoted = await inject({ method: 'POST', url: '/api/v1/checkout/quote', headers: customerHeaders(customer), payload: { items } })
+      expect(quoted.json().data.canContinue, quoted.body).toBe(true)
+      const created = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders(customer),
+        payload: { idempotencyKey: randomUUID(), quoteToken: quoted.json().data.quoteToken, items } })
+      expect(created.statusCode, created.body).toBe(201)
+      const orderId = created.json().data.order.id as string
+      const skuIds = items.map(item => item.skuId)
+      expect(await reconcileSkus(skuIds)).toEqual([])
+      await runDigitalDeliveryRecoveryPass(db, config)
+      expect(supplierFixture.stats().executions).toBe(0)
+      const payment = await createPayment(orderId, customer)
+      const attemptId = payment.json().data.attempt.id as string
+      const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no').where('id', '=', attemptId).executeTakeFirstOrThrow()).merchant_order_no!
+      expect((await inject({ method: 'GET', url: callbackUrl(paymentFixture.setPaid(merchantNo)) })).body).toBe('success')
+      // Two independent API instances and two workers share the same database.
+      const otherDb = createDatabase()
+      const otherApp = await createApp({ db: otherDb, config, logger: false })
+      try {
+        for (let round = 0; round < 10; round++) {
+          await Promise.all([runDigitalDeliveryRecoveryPass(db, config), runDigitalDeliveryRecoveryPass(otherDb, config)])
+          const remaining = await db.selectFrom('order_items').select('id').where('order_id', '=', orderId)
+            .where('fulfillment_method_snapshot', '<>', 'manual').where('fulfilled_quantity', '<', 2).execute()
+          if (!remaining.length) break
+        }
+        const partial = await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie } })
+        expect(partial.json().data.status).toBe('processing')
+        expect(partial.json().data.items.filter((item: { fulfillmentMethod: string }) => item.fulfillmentMethod !== 'manual')
+          .every((item: { fulfilledQuantity: number }) => item.fulfilledQuantity === 2), partial.body).toBe(true)
+        const manualItem = partial.json().data.items.find((item: { fulfillmentMethod: string }) => item.fulfillmentMethod === 'manual')
+        const path = `/api/v1/admin/orders/${orderId}/items/${manualItem.id}/fulfillments`
+        const firstBody = { operationId: randomUUID(), deliveries: [{ content: 'mixed manual first unit' }] }
+        expect((await inject({ method: 'POST', url: path, headers: adminHeaders(admin), payload: firstBody })).json().data.order.status).toBe('processing')
+        expect((await otherApp.inject({ method: 'POST', url: path, headers: adminHeaders(admin), payload: firstBody })).json().data.repeated).toBe(true)
+        expect(await reconcileSkus(skuIds)).toEqual([])
+        const complete = await inject({ method: 'POST', url: path, headers: adminHeaders(admin),
+          payload: { operationId: randomUUID(), deliveries: [{ content: 'mixed manual second unit' }] } })
+        expect(complete.json().data.order.status).toBe('completed')
+        const histories = await db.selectFrom('order_item_fulfillment_deliveries as delivery')
+          .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'delivery.fulfillment_attempt_id')
+          .innerJoin('order_items as item', 'item.id', 'attempt.order_item_id').selectAll('delivery').where('item.order_id', '=', orderId).orderBy('delivery.id').execute()
+        expect(histories).toHaveLength(12)
+        const refund = await inject({ method: 'POST', url: `/api/v1/customer/orders/${orderId}/refunds`, headers: customerHeaders(customer),
+          payload: { idempotencyKey: randomUUID(), amount: '12.00', reason: 'phase55 historical delivery regression' } })
+        expect(refund.statusCode, refund.body).toBe(201)
+        const refundId = refund.json().data.refunds.items[0].id
+        const approved = await inject({ method: 'POST', url: `/api/v1/admin/orders/${orderId}/refunds/${refundId}/approve`, headers: adminHeaders(admin),
+          payload: { idempotencyKey: randomUUID() } })
+        expect(approved.statusCode, approved.body).toBe(200)
+        const fileItem = complete.json().data.order.items.find((item: { fulfillmentMethod: string }) => item.fulfillmentMethod === 'file')
+        const historicalDownload = await inject({ method: 'GET', url: fileItem.deliveries[0].downloadUrl, headers: { cookie: customer.cookie } })
+        expect(historicalDownload.statusCode, historicalDownload.body).toBe(200)
+        expect(historicalDownload.rawPayload).toEqual(Buffer.from('private mixed file'))
+        await runDigitalDeliveryRecoveryPass(db, config)
+        expect(await db.selectFrom('order_item_fulfillment_deliveries').selectAll().where('id', 'in', histories.map(row => row.id)).orderBy('id').execute()).toEqual(histories)
+        expect(await reconcileSkus(skuIds)).toEqual([])
+        if (inventoryMode === 'quantity') {
+          const switched = catalogs.get('fixed_content')!
+          const sku = await db.selectFrom('product_variants').select('inventory_revision').where('id', '=', switched.skuId).executeTakeFirstOrThrow()
+          const removed = await inject({ method: 'POST', url: `/api/v1/admin/products/${switched.productId}/variants/${switched.skuId}/inventory/adjustments`,
+            headers: adminHeaders(admin), payload: { operationId: randomUUID(), expectedInventoryRevision: sku.inventory_revision,
+              action: 'decrease', quantity: 3, reason: 'close remaining stock before switching to a code pool' } })
+          expect(removed.statusCode, removed.body).toBe(201)
+          await configurePool(switched, admin, 3)
+          expect(await reconcileSkus(skuIds)).toEqual([])
+          const historical = await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie } })
+          expect(historical.json().data.items.find((item: { skuId: string }) => item.skuId === switched.skuId))
+            .toMatchObject({ fulfillmentMethod: 'fixed_content', fulfilledQuantity: 2 })
+          expect(await db.selectFrom('order_item_fulfillment_deliveries').selectAll().where('id', 'in', histories.map(row => row.id)).orderBy('id').execute()).toEqual(histories)
+        }
+        expect(supplierFixture.stats()).toMatchObject({ executions: 2, createRequests: 2 })
+      } finally { await otherApp.close(); await otherDb.destroy() }
+    }, 30_000)
+  }
+
+  it('redacts private delivery plaintext from unexpected PostgreSQL errors while retaining diagnostic codes', async () => {
+    const order = await paidApiOrder('manual')
+    const secret = 'phase55-private-delivery-never-log-this'
+    await sql`ALTER TABLE order_item_fulfillment_deliveries ADD CONSTRAINT phase55_logging_failure CHECK (content IS DISTINCT FROM ${sql.lit(secret)})`.execute(db)
+    const process = await startCrashProcess(config, 'capture_logs')
+    try {
+      const response = await fetch(`${process.origin}/api/v1/admin/orders/${order.orderId}/items/${order.itemId}/fulfillments`, {
+        method: 'POST', headers: { ...adminHeaders(order.admin), 'content-type': 'application/json' },
+        body: JSON.stringify({ operationId: randomUUID(), deliveries: [{ content: secret }] }),
+      })
+      expect(response.status).toBe(500)
+      expect(await response.text()).not.toContain(secret)
+      await expect.poll(() => process.logs(), { timeout: 1000, intervals: [10, 20] }).toContain('request failed')
+      expect(process.logs()).not.toContain(secret)
+      expect(process.logs()).toContain('23514')
+      expect(process.logs()).toContain('phase55_logging_failure')
+    } finally {
+      await process.kill()
+      await sql`ALTER TABLE order_item_fulfillment_deliveries DROP CONSTRAINT phase55_logging_failure`.execute(db)
+    }
+  }, 30_000)
+
+  it('blocks direct SQL manual success when reconciliation opens after delivery rows were prepared', async () => {
+    const order = await paidApiOrder('manual')
+    const id = randomUUID()
+    await db.transaction().execute(async trx => {
+      await trx.insertInto('order_item_fulfillment_attempts').values({ id, order_item_id: order.itemId, operation_id: randomUUID(), quantity: 1, started_by_admin_id: order.admin.id }).execute()
+      await trx.insertInto('order_item_fulfillment_deliveries').values({ id: randomUUID(), fulfillment_attempt_id: id,
+        started_by_admin_id: order.admin.id, unit_index: 1, content: 'prepared privately', content_sha256: 'a'.repeat(64) }).execute()
+    })
+    const event = await db.selectFrom('payment_provider_events').select('id').where('payment_attempt_id', '=', order.paymentAttemptId).executeTakeFirstOrThrow()
+    await db.insertInto('payment_provider_reconciliation_cases').values({ id: randomUUID(), payment_attempt_id: order.paymentAttemptId,
+      reason: 'provider_identity_conflict', opening_callback_event_id: event.id }).execute()
+    await expect(db.updateTable('order_item_fulfillment_attempts').set({ status: 'succeeded', result_sha256: 'b'.repeat(64) }).where('id', '=', id).execute())
+      .rejects.toMatchObject({ code: '23514', constraint: 'digital_delivery_payment_required' })
+    expect(await db.selectFrom('payment_receipts').selectAll().where('id', '=', order.receipt.id).executeTakeFirstOrThrow()).toEqual(order.receipt)
+  })
+
+  it('SIGKILL after final manual delivery commit before HTTP response keeps receipt, inventory and idempotent replay', async () => {
+    const order = await paidApiOrder('manual')
+    const process = await startCrashProcess(config, 'delivery_committed')
+    const payload = { operationId: randomUUID(), deliveries: [{ content: 'committed before lost HTTP response' }] }
+    const path = `/api/v1/admin/orders/${order.orderId}/items/${order.itemId}/fulfillments`
+    const request = fetch(`${process.origin}${path}`, { method: 'POST', headers: { ...adminHeaders(order.admin), 'content-type': 'application/json' }, body: JSON.stringify(payload) })
+      .then(() => 'unexpected response', () => 'connection lost')
+    try { expect(await process.waitFor('checkpoint')).toBe('delivery_committed'); await process.kill(); expect(await request).toBe('connection lost') }
+    finally { await process.kill() }
+    const rebuilt = await startCrashProcess(config, 'none')
+    try {
+      const replay = await fetch(`${rebuilt.origin}${path}`, { method: 'POST', headers: { ...adminHeaders(order.admin), 'content-type': 'application/json' }, body: JSON.stringify(payload) })
+      expect(replay.status).toBe(200)
+      expect((await replay.json()).data).toMatchObject({ repeated: true, order: { status: 'completed' } })
+      expect(await db.selectFrom('payment_receipts').selectAll().where('id', '=', order.receipt.id).executeTakeFirstOrThrow()).toEqual(order.receipt)
+      expect(await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved']).where('product_variant_id', '=', order.catalog.skuId).executeTakeFirstOrThrow())
+        .toEqual({ stocked: 19, reserved: 0 })
+    } finally { await rebuilt.kill() }
+  }, 30_000)
+
+  it('SIGKILL rolls back real code reservation and delivery transactions without freeing delivered stock twice', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog('0.00', 'quantity', 0)
+    await configurePool(catalog, admin, 3)
+    const quoted = await quote(customer, catalog, 2)
+    const payload = { idempotencyKey: randomUUID(), quoteToken: quoted.json().data.quoteToken, items: [{ skuId: catalog.skuId, quantity: 2 }] }
+    const reservationProcess = await startCrashProcess(config, 'code_reserved_uncommitted')
+    const lost = fetch(`${reservationProcess.origin}/api/v1/checkout/orders`, { method: 'POST', headers: { ...customerHeaders(customer), 'content-type': 'application/json' }, body: JSON.stringify(payload) })
+      .then(() => false, () => true)
+    try { await reservationProcess.waitFor('checkpoint'); await reservationProcess.kill(); expect(await lost).toBe(true) }
+    finally { await reservationProcess.kill() }
+    expect(await db.selectFrom('orders').select('id').where('idempotency_key', '=', payload.idempotencyKey).execute()).toEqual([])
+    expect(await reconcileSkus([catalog.skuId])).toEqual([])
+    const created = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders(customer), payload })
+    expect(created.statusCode, created.body).toBe(201)
+    const id = created.json().data.order.id as string
+    const itemId = created.json().data.order.items[0].id as string
+    const deliveryProcess = await startCrashProcess(config, 'delivery_uncommitted')
+    try { deliveryProcess.run(); await deliveryProcess.waitFor('checkpoint'); await deliveryProcess.kill() }
+    finally { await deliveryProcess.kill() }
+    expect(await db.selectFrom('order_item_fulfillment_attempts').select('id').where('order_item_id', '=', itemId).execute()).toEqual([])
+    expect(await reconcileSkus([catalog.skuId])).toEqual([])
+    await recoverInRebuiltProcess()
+    await assertItemDelivered(id, itemId, 2)
+    expect(await reconcileSkus([catalog.skuId])).toEqual([])
+    expect((await db.selectFrom('code_pool_entries').select('state').where('product_variant_id', '=', catalog.skuId).execute()).map(row => row.state).sort())
+      .toEqual(['available', 'delivered', 'delivered'])
+  }, 30_000)
+})
+
+
+describe('⑤-5 bounded worker backlog', () => {
+  it('drains one hundred pending fixed deliveries through two workers without deadlocks or leaked transactions', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog('0.00', 'unlimited')
+    await configureFixed(catalog, admin, 'fixed_content')
+    const ids: string[] = []
+    for (let index = 0; index < 100; index++) {
+      const created = await createOrder(customer, catalog, 1)
+      expect(created.statusCode, created.body).toBe(201)
+      ids.push(created.json().data.order.id as string)
+    }
+    const otherDb = createDatabase()
+    const before = await sql<{ deadlocks: string }>`SELECT deadlocks::text FROM pg_stat_database WHERE datname = current_database()`.execute(db)
+    const startedAt = performance.now()
+    let rounds = 0
+    try {
+      while (rounds < 10) {
+        rounds++
+        await Promise.all([runDigitalDeliveryRecoveryPass(db, config), runDigitalDeliveryRecoveryPass(otherDb, config)])
+        const remaining = await db.selectFrom('orders').select('id').where('id', 'in', ids).where('status', '<>', 'completed').execute()
+        if (!remaining.length) break
+      }
+      expect(await db.selectFrom('orders').select('id').where('id', 'in', ids).where('status', '=', 'completed').execute()).toHaveLength(100)
+      expect(await reconcileSkus([catalog.skuId])).toEqual([])
+      const after = await sql<{ deadlocks: string }>`SELECT deadlocks::text FROM pg_stat_database WHERE datname = current_database()`.execute(db)
+      expect(after.rows[0]!.deadlocks).toBe(before.rows[0]!.deadlocks)
+      const idle = await sql<{ count: number }>`SELECT count(*)::integer AS count FROM pg_stat_activity
+        WHERE application_name = 'aikayun-api' AND state = 'idle in transaction'`.execute(db)
+      expect(idle.rows[0]!.count).toBe(0)
+      const measurement = { benchmark: 'two-worker-backlog', orders: ids.length, rounds,
+        elapsedMs: Math.round(performance.now() - startedAt), deadlocks: 0, idleTransactions: 0 }
+      if (process.env.AIKAYUN_ACCEPTANCE_OUTPUT) await appendFile(process.env.AIKAYUN_ACCEPTANCE_OUTPUT, `${JSON.stringify(measurement)}\n`)
+    } finally { await otherDb.destroy() }
+  }, 30_000)
+})
+
+
+describe('⑤-5 refund and in-flight supplier crossing', () => {
+  it('blocks refund requests while supplier execution is in-flight or unknown', async () => {
+    const order = await paidApiOrder()
+    const gate = supplierFixture.pauseNextCreateResponse()
+    const pass = runDigitalDeliveryRecoveryPass(db, config)
+    try {
+      await gate.entered
+      const refund = await inject({ method: 'POST', url: `/api/v1/customer/orders/${order.orderId}/refunds`, headers: customerHeaders(order.customer),
+        payload: { idempotencyKey: randomUUID(), amount: '5.00', reason: 'supplier execution is not yet confirmed locally' } })
+      expect(refund.statusCode, refund.body).toBe(409)
+      const operation = (await pendingOperations(order.itemId))[0]!
+      await expect(db.insertInto('order_refunds').values({ id: randomUUID(), order_id: order.orderId, idempotency_key: randomUUID(),
+        request_sha256: 'a'.repeat(64), amount: '5.00', reason: 'direct SQL must respect supplier uncertainty' }).execute())
+        .rejects.toMatchObject({ code: '23514', constraint: 'order_refund_fulfillment_unresolved' })
+      expect(operation.state).toBe('create_in_flight')
+    } finally { gate.release(); await pass }
+    await recoverInRebuiltProcess()
+  }, 30_000)
+
+  it('does not begin new fulfillment after a full refund and releases only unused stock on safe closure', async () => {
+    const order = await paidApiOrder()
+    const refund = await inject({ method: 'POST', url: `/api/v1/customer/orders/${order.orderId}/refunds`, headers: customerHeaders(order.customer),
+      payload: { idempotencyKey: randomUUID(), amount: '5.00', reason: 'refund before any external operation is submitted' } })
+    expect(refund.statusCode, refund.body).toBe(201)
+    const approved = await inject({ method: 'POST', url: `/api/v1/admin/orders/${order.orderId}/refunds/${refund.json().data.refunds.items[0].id}/approve`,
+      headers: adminHeaders(order.admin), payload: { idempotencyKey: randomUUID() } })
+    expect(approved.statusCode, approved.body).toBe(200)
+    await runDigitalDeliveryRecoveryPass(db, config)
+    await runDigitalDeliveryRecoveryPass(db, config)
+    expect(supplierFixture.stats().createRequests).toBe(0)
+    expect(await pendingOperations(order.itemId)).toEqual([])
+    await db.updateTable('orders').set({ status: 'closed' }).where('id', '=', order.orderId).execute()
+    await db.updateTable('orders').set({ status: 'closed' }).where('id', '=', order.orderId).execute()
+    const receipt = await db.selectFrom('payment_receipts').selectAll().where('id', '=', order.receipt.id).executeTakeFirstOrThrow()
+    expect(receipt).toMatchObject({ amount: '5.00', refunded_amount: '5.00', refund_reserved_amount: '0.00' })
+    expect(await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved']).where('product_variant_id', '=', order.catalog.skuId).executeTakeFirstOrThrow())
+      .toEqual({ stocked: 20, reserved: 0 })
+  }, 30_000)
+})
+
+
+describe('⑤-5 multiple rejected supplier units', () => {
+  it('retries any explicitly rejected unit once, queues replay idempotently and rejects replay after replacement', async () => {
+    supplierFixture.reset()
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const supplier = await createSupplier(admin)
+    const catalog = await createCatalog('0.00', 'quantity', 5)
+    await saveApiVersion(catalog, admin, supplier, { productId: `multi-reject-${randomUUID()}`, mode: 'two_rejected_once' })
+    expect((await setApiReadiness(catalog, admin, true)).statusCode).toBe(200)
+    const created = await createOrder(customer, catalog, 2)
+    const orderId = created.json().data.order.id as string
+    const itemId = created.json().data.order.items[0].id as string
+    await runDigitalDeliveryRecoveryPass(db, config)
+    const rejected = await db.selectFrom('supplier_api_delivery_operations as operation')
+      .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'operation.fulfillment_attempt_id')
+      .select(['operation.id', 'operation.unit_index', 'operation.state']).where('attempt.order_item_id', '=', itemId)
+      .orderBy('attempt.created_at').orderBy('attempt.id').execute()
+    expect(rejected.map(row => row.state)).toEqual(['failed', 'failed'])
+    const retry = (id: string) => inject({ method: 'POST', url: `/api/v1/admin/orders/${orderId}/supplier-operations/${id}/retry`, headers: adminHeaders(admin) })
+    expect((await retry(rejected[0]!.id)).statusCode).toBe(200)
+    expect((await retry(rejected[0]!.id)).statusCode).toBe(200)
+    const staleWorker = await startCrashProcess(config, 'candidate_selected')
+    try {
+      staleWorker.run()
+      await staleWorker.waitFor('checkpoint')
+      await runDigitalDeliveryRecoveryPass(db, config)
+      await runDigitalDeliveryRecoveryPass(db, config)
+      staleWorker.child.send('resume')
+      await staleWorker.waitFor('done')
+    } finally { staleWorker.child.send('resume'); await staleWorker.kill() }
+    expect(supplierFixture.stats().createRequests).toBe(3)
+    const consumedReplay = await retry(rejected[0]!.id)
+    expect(consumedReplay.statusCode, consumedReplay.body).toBe(409)
+    expect(await db.selectFrom('supplier_api_operations_admin_audit').select('id').where('operation_id', '=', rejected[0]!.id).where('action', '=', 'retry_requested').execute()).toHaveLength(1)
+    expect((await retry(rejected[1]!.id)).statusCode).toBe(200)
+    await recoverInRebuiltProcess()
+    await assertItemDelivered(orderId, itemId, 2)
+    expect(supplierFixture.stats()).toMatchObject({ createRequests: 4, executions: 2 })
+    expect(await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved']).where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow())
+      .toEqual({ stocked: 3, reserved: 0 })
   }, 30_000)
 })

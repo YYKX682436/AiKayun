@@ -1444,11 +1444,15 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
           .where('product_variant_id', '=', identity.product_variant_id).forShare().executeTakeFirst()
         const operation = await trx.selectFrom('supplier_api_delivery_operations').selectAll()
           .where('id', '=', params.operationId).forUpdate().executeTakeFirstOrThrow()
-        const attempt = await trx.selectFrom('order_item_fulfillment_attempts').select(['id', 'status'])
+        const attempt = await trx.selectFrom('order_item_fulfillment_attempts').select(['id', 'status', 'retry_after'])
           .where('id', '=', identity.attempt_id).forUpdate().executeTakeFirstOrThrow()
         if (operation.state !== 'failed' || operation.last_failure_class !== 'supplier_rejected' || attempt.status !== 'failed') {
           throw new OrderError(409, 'SUPPLIER_RETRY_REQUIRES_CONFIRMED_REJECTION', '只有供应商明确拒绝且确认未发货的操作可重试。')
         }
+        if (attempt.retry_after !== null) return
+        const consumed = await trx.selectFrom('supplier_api_delivery_events').select('id')
+          .where('operation_id', '=', operation.id).where('event_type', '=', 'manual_retry_requested').executeTakeFirst()
+        if (consumed) throw new OrderError(409, 'SUPPLIER_OPERATION_REPLACED', '此操作的重试已生成后续操作，请核对最新单位操作。')
         await trx.updateTable('order_item_fulfillment_attempts').set({ retry_after: new Date() })
           .where('id', '=', attempt.id).execute()
         await trx.insertInto('supplier_api_delivery_events').values({

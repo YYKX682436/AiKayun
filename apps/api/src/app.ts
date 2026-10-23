@@ -117,11 +117,21 @@ export async function createApp(options: {
   })
 
   app.setErrorHandler((untypedError, request, reply) => {
-    const error = untypedError as FastifyError & { validation?: unknown }
+    const error = untypedError as FastifyError & { validation?: unknown; constraint?: unknown }
     const status = error.statusCode && error.statusCode >= 400 && error.statusCode < 500
       ? error.statusCode
       : 500
-    if (status >= 500) request.log.error({ err: error }, 'request failed')
+    if (status >= 500) {
+      // PostgreSQL's error.detail can contain the complete rejected row,
+      // including private delivery plaintext. Keep diagnostic identifiers,
+      // with the logger's request ID/route, rather than serializing that row.
+      request.log.error({
+        errorName: error.name,
+        errorCode: typeof error.code === 'string' && /^[A-Z0-9_]{1,64}$/u.test(error.code) ? error.code : undefined,
+        databaseConstraint: typeof error.constraint === 'string' && /^[A-Za-z0-9_]{1,128}$/u.test(error.constraint)
+          ? error.constraint : undefined,
+      }, 'request failed')
+    }
     const code = error.validation
       ? 'VALIDATION_ERROR'
       : status === 429

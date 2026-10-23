@@ -45,6 +45,7 @@ const batchSize = 20
 const maxRetryDelayMs = 5 * 60_000
 const supplierOperationLeaseMs = 30_000
 const supplierOperationPollMs = 5_000
+const supplierConcurrency = 4
 
 type Db = Kysely<Database> | Transaction<Database>
 type FailureCode = 'CODE_POOL_DATA_INCONSISTENT' | 'CODE_POOL_KEY_UNAVAILABLE'
@@ -83,6 +84,22 @@ async function candidates(db: Db, now: Date): Promise<Candidate[]> {
     FROM orders AS order_row
     JOIN order_items AS item ON item.order_id = order_row.id
     WHERE order_row.status = 'processing'
+      AND NOT order_has_unresolved_payment_attempts(order_row.id)
+      AND NOT EXISTS (SELECT 1 FROM order_refunds WHERE order_id = order_row.id
+        AND status IN ('requested', 'approved', 'processing', 'partially_succeeded'))
+      AND NOT EXISTS (SELECT 1 FROM payment_attempts AS payment
+        JOIN payment_receipts AS receipt ON receipt.payment_attempt_id = payment.id
+        WHERE payment.order_id = order_row.id AND (receipt.refunded_amount > 0 OR receipt.refund_reserved_amount > 0))
+      AND NOT EXISTS (
+        SELECT 1 FROM payment_attempts AS payment
+        JOIN payment_provider_reconciliation_cases AS reconciliation ON reconciliation.payment_attempt_id = payment.id
+        WHERE payment.order_id = order_row.id AND reconciliation.state = 'open'
+      )
+      AND (order_row.total_amount = 0 OR COALESCE((
+        SELECT sum(receipt.amount) FROM payment_attempts AS payment
+        JOIN payment_receipts AS receipt ON receipt.payment_attempt_id = payment.id
+        WHERE payment.order_id = order_row.id AND payment.status = 'succeeded' AND receipt.disposition = 'on_time'
+      ), 0) = order_row.total_amount)
       AND item.fulfillment_method_snapshot IN ('code_pool', 'fixed_content', 'link', 'file', 'api')
       AND item.fulfilled_quantity + item.fulfillment_reserved_quantity < item.quantity
       AND NOT EXISTS (
@@ -97,12 +114,25 @@ async function candidates(db: Db, now: Date): Promise<Candidate[]> {
         ORDER BY attempt.created_at DESC, attempt.id DESC LIMIT 1
       ), '-infinity'::timestamptz) <= ${now})
       AND (item.fulfillment_method_snapshot <> 'api' OR NOT EXISTS (
-        SELECT 1 FROM (
-          SELECT attempt.retry_after FROM order_item_fulfillment_attempts AS attempt
-          WHERE attempt.order_item_id = item.id AND attempt.delivery_source = 'api' AND attempt.status = 'failed'
-          ORDER BY attempt.created_at DESC, attempt.id DESC LIMIT 1
-        ) AS last_api_failure
-        WHERE last_api_failure.retry_after IS NULL OR last_api_failure.retry_after > ${now}
+        SELECT 1 FROM order_item_fulfillment_attempts WHERE order_item_id = item.id AND delivery_source = 'api' AND status = 'failed'
+      ) OR EXISTS (
+        SELECT 1 FROM order_item_fulfillment_attempts AS failed
+        LEFT JOIN supplier_api_delivery_operations AS retry_operation ON retry_operation.fulfillment_attempt_id = failed.id
+        WHERE failed.order_item_id = item.id AND failed.delivery_source = 'api' AND failed.status = 'failed'
+          AND failed.retry_after <= ${now}
+          AND ((retry_operation.id IS NULL AND failed.id = (
+            SELECT latest.id FROM order_item_fulfillment_attempts AS latest
+            WHERE latest.order_item_id = item.id AND latest.delivery_source = 'api' AND latest.status = 'failed'
+            ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+          ) AND NOT EXISTS (
+            SELECT 1 FROM supplier_api_delivery_operations AS submitted
+            JOIN order_item_fulfillment_attempts AS submitted_attempt ON submitted_attempt.id = submitted.fulfillment_attempt_id
+            WHERE submitted_attempt.order_item_id = item.id
+          )) OR (retry_operation.id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM supplier_api_delivery_operations AS replacement
+            JOIN order_item_fulfillment_attempts AS replacement_attempt ON replacement_attempt.id = replacement.fulfillment_attempt_id
+            WHERE replacement_attempt.order_item_id = item.id AND replacement.unit_index = retry_operation.unit_index AND replacement.state <> 'failed'
+          )))
       ))
     ORDER BY order_row.created_at, order_row.id, item.created_at, item.id
     LIMIT ${batchSize}
@@ -113,6 +143,11 @@ async function candidates(db: Db, now: Date): Promise<Candidate[]> {
 async function paymentAllowsDelivery(trx: Transaction<Database>, orderId: string, totalAmount: string): Promise<boolean> {
   const evidence = await sql<{ valid: boolean }>`
     SELECT NOT order_has_unresolved_payment_attempts(${orderId}::uuid)
+      AND NOT EXISTS (SELECT 1 FROM order_refunds WHERE order_id = ${orderId}::uuid
+        AND status IN ('requested', 'approved', 'processing', 'partially_succeeded'))
+      AND NOT EXISTS (SELECT 1 FROM payment_attempts AS payment
+        JOIN payment_receipts AS receipt ON receipt.payment_attempt_id = payment.id
+        WHERE payment.order_id = ${orderId}::uuid AND (receipt.refunded_amount > 0 OR receipt.refund_reserved_amount > 0))
       AND NOT EXISTS (
         SELECT 1 FROM payment_attempts AS attempt
         JOIN payment_provider_reconciliation_cases AS reconciliation
@@ -711,6 +746,17 @@ async function attemptFileDelivery(
 
 type ApiPreflightFailure = 'API_DELIVERY_DATA_INCONSISTENT' | 'API_DELIVERY_KEY_UNAVAILABLE'
 
+async function apiFingerprintKeysAvailable(
+  db: Db, config: AppConfig, connectionId: string, productId: string,
+): Promise<boolean> {
+  const keys = config.codePoolEncryptionKeyRing?.keys
+  if (!keys) return false
+  const history = await db.selectFrom('order_item_fulfillment_deliveries').select('supplier_fingerprint_key_id').distinct()
+    .where('delivery_source', '=', 'api').where('supplier_connection_id', '=', connectionId)
+    .where('supplier_product_id', '=', productId).where('supplier_content_type', '=', 'code').execute()
+  return history.every(row => row.supplier_fingerprint_key_id !== null && keys[row.supplier_fingerprint_key_id] !== undefined)
+}
+
 async function recordApiPreflightFailure(
   trx: Transaction<Database>, orderItemId: string, remaining: number, failureCode: ApiPreflightFailure,
 ): Promise<void> {
@@ -800,19 +846,35 @@ async function attemptApiDelivery(
       await recordApiPreflightFailure(trx, item.id, remaining, 'API_DELIVERY_DATA_INCONSISTENT')
       return 'failed'
     }
-    if (!config.paymentCredentialKeyRing || !config.codePoolEncryptionKeyRing) {
+    if (!config.paymentCredentialKeyRing || !config.codePoolEncryptionKeyRing
+      || !await apiFingerprintKeysAvailable(trx, config, version.supplier_connection_id, version.supplier_product_id)) {
       await recordApiPreflightFailure(trx, item.id, remaining, 'API_DELIVERY_KEY_UNAVAILABLE')
       return 'failed'
     }
 
-    const retryUnit = await sql<{ unit_index: number }>`
-      SELECT operation.unit_index
+    const retryUnit = await sql<{ unit_index: number; attempt_id: string }>`
+      SELECT operation.unit_index, attempt.id AS attempt_id
       FROM order_item_fulfillment_attempts AS attempt
       JOIN supplier_api_delivery_operations AS operation ON operation.fulfillment_attempt_id = attempt.id
       WHERE attempt.order_item_id = ${item.id}::uuid AND attempt.delivery_source = 'api'
         AND attempt.status = 'failed' AND attempt.retry_after IS NOT NULL AND attempt.retry_after <= ${now}
-      ORDER BY attempt.created_at DESC, attempt.id DESC LIMIT 1
+        AND NOT EXISTS (
+          SELECT 1 FROM supplier_api_delivery_operations AS replacement
+          JOIN order_item_fulfillment_attempts AS replacement_attempt ON replacement_attempt.id = replacement.fulfillment_attempt_id
+          WHERE replacement_attempt.order_item_id = ${item.id}::uuid AND replacement.unit_index = operation.unit_index AND replacement.state <> 'failed'
+        )
+      ORDER BY attempt.retry_after, attempt.created_at, attempt.id LIMIT 1
     `.execute(trx)
+    if (!retryUnit.rows.length) {
+      const submitted = await trx.selectFrom('supplier_api_delivery_operations as operation')
+        .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'operation.fulfillment_attempt_id')
+        .select('operation.id').where('attempt.order_item_id', '=', item.id).limit(1).executeTakeFirst()
+      if (submitted) return 'skipped'
+      const lastFailure = await trx.selectFrom('order_item_fulfillment_attempts').select('retry_after')
+        .where('order_item_id', '=', item.id).where('delivery_source', '=', 'api').where('status', '=', 'failed')
+        .orderBy('created_at', 'desc').orderBy('id', 'desc').executeTakeFirst()
+      if (lastFailure && (!lastFailure.retry_after || lastFailure.retry_after > now)) return 'skipped'
+    }
     const unitIndexes = retryUnit.rows.length
       ? [retryUnit.rows[0]!.unit_index]
       : Array.from({ length: remaining }, (_, index) => item.fulfilled_quantity + item.fulfillment_reserved_quantity + index + 1)
@@ -842,6 +904,13 @@ async function attemptApiDelivery(
         state: 'create_pending', next_action_at: now,
       }).execute()
     }
+    // Consume only the selected unit's explicit retry authorization, plus any
+    // preflight backoff rows. A lost admin HTTP response cannot authorize a
+    // second operation after this committed replacement.
+    await sql`UPDATE order_item_fulfillment_attempts AS failed SET retry_after = NULL
+      WHERE failed.order_item_id = ${item.id}::uuid AND failed.delivery_source = 'api' AND failed.status = 'failed'
+        AND failed.retry_after <= ${now} AND (failed.id = ${retryUnit.rows[0]?.attempt_id ?? null}::uuid
+          OR NOT EXISTS (SELECT 1 FROM supplier_api_delivery_operations WHERE fulfillment_attempt_id = failed.id))`.execute(trx)
     return 'delivered'
   })
 }
@@ -873,7 +942,7 @@ interface ApiOperationExecutionRow {
 
 interface ApiOperationClaim { id: string; token: string; action: 'create' | 'query' }
 
-async function claimSupplierOperations(db: Kysely<Database>, limit = 20): Promise<ApiOperationClaim[]> {
+async function claimSupplierOperations(db: Kysely<Database>, limit = supplierConcurrency): Promise<ApiOperationClaim[]> {
   const now = new Date()
   return await db.transaction().execute(async (trx) => {
     const rows = await trx.selectFrom('supplier_api_delivery_operations').selectAll()
@@ -1053,10 +1122,11 @@ async function handleSupplierOutcome(
     }
     const eventType = claim.action === 'create' ? 'create_response' : 'query_response'
     if (outcome.kind === 'not_found') {
-      if (claim.action !== 'query') {
+      if (claim.action !== 'query' || operation.provider_operation_id !== null) {
         await trx.updateTable('supplier_api_delivery_operations').set({
           state: 'manual_review', next_action_at: null, lease_token: null, lease_expires_at: null,
-          last_http_status: outcome.httpStatus, last_error_code: 'supplier_not_found_after_create',
+          last_http_status: outcome.httpStatus, last_error_code: operation.provider_operation_id
+            ? 'supplier_known_operation_not_found' : 'supplier_not_found_after_create',
           last_failure_class: 'identity_mismatch', last_provider_status: 'not_found',
         }).where('id', '=', claim.id).execute()
         await markApiAttemptUnknown(trx, attempt.id)
@@ -1070,7 +1140,9 @@ async function handleSupplierOutcome(
       await trx.insertInto('supplier_api_delivery_events').values({
         id: randomUUID(), operation_id: claim.id, event_type: eventType,
         http_status: outcome.httpStatus, classification: claim.action, provider_status: 'not_found',
-        provider_operation_id: null, error_code: claim.action === 'query' ? null : 'supplier_not_found_after_create',
+        provider_operation_id: operation.provider_operation_id,
+        error_code: operation.provider_operation_id ? 'supplier_known_operation_not_found'
+          : claim.action === 'query' ? null : 'supplier_not_found_after_create',
         response_sha256: outcome.responseSha256, details: {},
       }).execute()
       return
@@ -1358,12 +1430,23 @@ async function finalizeApiOperation(db: Kysely<Database>, config: AppConfig, ope
     let fingerprintKeyId: string | null = null
     let contentDigest = operation.result_sha256!.trim()
     if (result.type === 'code') {
-      if (!result.content || !config.codePoolEncryptionKeyRing) {
+      // The lock also covers the history-key check: an older instance may
+      // commit a fingerprint with another retained key while this one waits.
+      await sql`SELECT pg_advisory_xact_lock(hashtextextended(
+        ${JSON.stringify([operation.supplier_connection_id, operation.supplier_product_id])}, 55))`.execute(trx)
+      if (!result.content || !config.codePoolEncryptionKeyRing
+        || !await apiFingerprintKeysAvailable(trx, config, operation.supplier_connection_id, operation.supplier_product_id)) {
         await markApiAttemptUnknown(trx, attempt.id)
         await trx.updateTable('supplier_api_delivery_operations').set({
           next_action_at: new Date(Date.now() + supplierOperationPollMs),
           last_error_code: 'api_delivery_key_unavailable', last_failure_class: 'key_unavailable',
         }).where('id', '=', operationId).execute()
+        await trx.insertInto('supplier_api_delivery_events').values({
+          id: randomUUID(), operation_id: operationId, event_type: 'credential_unavailable',
+          http_status: null, classification: 'key_unavailable', provider_status: 'succeeded',
+          provider_operation_id: operation.provider_operation_id, error_code: 'api_delivery_key_unavailable',
+          response_sha256: null, details: {},
+        }).execute()
         return
       }
       fingerprintKeyId = config.codePoolEncryptionKeyRing.activeKeyId
@@ -1436,7 +1519,7 @@ async function processSupplierOperations(db: Kysely<Database>, config: AppConfig
     .orderBy('next_action_at').orderBy('id').limit(20).execute()
   for (const row of dueFinalizations) await finalizeApiOperation(db, config, row.id)
   const claims = await claimSupplierOperations(db)
-  for (const claim of claims) await processSupplierClaim(db, config, claim)
+  await Promise.all(claims.map(claim => processSupplierClaim(db, config, claim)))
 }
 
 async function attemptDelivery(
@@ -1456,11 +1539,15 @@ async function attemptDelivery(
 }
 
 /** Run one deterministic recovery pass; operations and network requests remain split by committed transactions. */
-export async function runDigitalDeliveryRecoveryPass(db: Kysely<Database>, config: AppConfig): Promise<void> {
+async function runLocalDeliveryPass(db: Kysely<Database>, config: AppConfig): Promise<void> {
   const batch = await candidates(db, new Date())
   for (const candidate of batch) {
     await attemptDelivery(db, config, candidate.order_id, candidate.order_item_id)
   }
+}
+
+export async function runDigitalDeliveryRecoveryPass(db: Kysely<Database>, config: AppConfig): Promise<void> {
+  await runLocalDeliveryPass(db, config)
   await processSupplierOperations(db, config)
 }
 
@@ -1475,42 +1562,50 @@ export function startDigitalDeliveryWorker(
   config: AppConfig,
   logger: FastifyBaseLogger,
 ): () => Promise<void> {
-  let stopped = false
-  let timer: ReturnType<typeof setTimeout> | undefined
-  let activeRun: Promise<void> | undefined
+  // Slow supplier I/O cannot delay local delivery. Both loops share the same
+  // database, worker lifecycle and persisted order/operation state machine.
+  const stopLocal = startPoll(() => runLocalDeliveryPass(db, config))
+  const stopSupplier = startPoll(() => processSupplierOperations(db, config))
+  return async () => { await Promise.all([stopLocal(), stopSupplier()]) }
 
-  const schedule = () => {
-    if (stopped) return
-    timer = setTimeout(() => { void run() }, pollIntervalMs)
-    timer.unref()
-  }
+  function startPoll(pass: () => Promise<void>): () => Promise<void> {
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let activeRun: Promise<void> | undefined
 
-  const run = async () => {
-    if (stopped) return
-    activeRun = (async () => {
-      try {
-        await runDigitalDeliveryRecoveryPass(db, config)
-      } catch (error) {
-        const candidateError = error && typeof error === 'object'
-          ? error as { code?: unknown; name?: unknown }
-          : {}
-        logger.warn({
-          errorName: typeof candidateError.name === 'string' ? candidateError.name : 'unknown',
-          databaseCode: typeof candidateError.code === 'string' ? candidateError.code : undefined,
-        }, 'digital delivery recovery scan failed')
-      } finally {
-        activeRun = undefined
-        schedule()
-      }
-    })()
-    await activeRun
-  }
+    const schedule = () => {
+      if (stopped) return
+      timer = setTimeout(() => { void run() }, pollIntervalMs)
+      timer.unref()
+    }
 
-  void run()
-  return async () => {
-    stopped = true
-    if (timer) clearTimeout(timer)
-    await activeRun
+    const run = async () => {
+      if (stopped) return
+      activeRun = (async () => {
+        try {
+          await pass()
+        } catch (error) {
+          const candidateError = error && typeof error === 'object'
+            ? error as { code?: unknown; name?: unknown }
+            : {}
+          logger.warn({
+            errorName: typeof candidateError.name === 'string' ? candidateError.name : 'unknown',
+            databaseCode: typeof candidateError.code === 'string' ? candidateError.code : undefined,
+          }, 'digital delivery recovery scan failed')
+        } finally {
+          activeRun = undefined
+          schedule()
+        }
+      })()
+      await activeRun
+    }
+
+    void run()
+    return async () => {
+      stopped = true
+      if (timer) clearTimeout(timer)
+      await activeRun
+    }
   }
 }
 

@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { chmod, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
+import { appendFile, chmod, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { sql } from 'kysely'
 import type { Kysely } from 'kysely'
 import type { FastifyInstance, InjectOptions } from 'fastify'
@@ -18,6 +18,7 @@ import { startDigitalDeliveryWorker } from '../src/commerce/code-pool-delivery-w
 import type { AppConfig } from '../src/config.js'
 import { PrivateFileStorage, newPrivateFileId } from '../src/media/private-file-storage.js'
 import { reconcilePrivateFiles } from '../src/media/private-file-reconcile.js'
+import { startCrashProcess } from './fixtures/crash-process.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const origin = 'http://localhost:3000'
@@ -27,6 +28,7 @@ let app: FastifyInstance
 let db: Kysely<Database>
 let config: AppConfig
 let privateRoot: string
+let publicRoot: string
 let nextIp = 1
 
 type Admin = { id: string; cookie: string; csrfToken: string; csrfCookie: string }
@@ -226,6 +228,7 @@ beforeAll(async () => {
     throw new Error('Refusing to reset a PostgreSQL database that does not end in _test')
   }
   privateRoot = await mkdtemp(join(tmpdir(), 'aikayun-private-file-integration-'))
+  publicRoot = await mkdtemp(join(tmpdir(), 'aikayun-private-file-public-test-'))
   process.env.DATABASE_URL = testDatabaseUrl
   db = createDatabase()
   await sql`DROP SCHEMA public CASCADE`.execute(db)
@@ -239,6 +242,7 @@ beforeAll(async () => {
     ...process.env,
     DATABASE_URL: testDatabaseUrl,
     PRIVATE_FILE_ROOT: privateRoot,
+    MEDIA_ROOT: publicRoot,
     NODE_ENV: 'test',
     PUBLIC_ORIGIN: origin,
     COOKIE_SECURE: 'false',
@@ -255,6 +259,7 @@ afterAll(async () => {
   if (app) await app.close()
   if (db) await db.destroy()
   if (privateRoot) await rm(privateRoot, { recursive: true, force: true })
+  if (publicRoot) await rm(publicRoot, { recursive: true, force: true })
 })
 
 describe('private-file delivery on real PostgreSQL and filesystem', () => {
@@ -606,17 +611,8 @@ describe('private-file delivery on real PostgreSQL and filesystem', () => {
     const orderId = pendingOrder.json().data.order.id as string
     const itemId = pendingOrder.json().data.order.items[0].id as string
     const stop = startDigitalDeliveryWorker(db, config, app.log)
-    try {
-      const deadline = Date.now() + 5_000
-      let failure: string | undefined
-      while (Date.now() < deadline && !failure) {
-        failure = (await db.selectFrom('order_item_fulfillment_attempts').select('failure_code')
-          .where('order_item_id', '=', itemId).where('delivery_source', '=', 'file')
-          .orderBy('created_at', 'desc').executeTakeFirst())?.failure_code ?? undefined
-        if (!failure) await new Promise(resolve => setTimeout(resolve, 20))
-      }
-      expect(failure).toBe('FILE_DELIVERY_PAYMENT_UNRESOLVED')
-    } finally { await stop() }
+    await stop()
+    expect(await db.selectFrom('order_item_fulfillment_attempts').select('id').where('order_item_id', '=', itemId).execute()).toEqual([])
     expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', paidReceipt.attemptId).executeTakeFirstOrThrow()).status).toBe('succeeded')
     expect((await db.selectFrom('payment_receipts').select('disposition').where('id', '=', paidReceipt.receiptId).executeTakeFirstOrThrow()).disposition).toBe('on_time')
     expect(await db.selectFrom('order_item_fulfillment_deliveries as delivery')
@@ -735,4 +731,109 @@ describe('private-file delivery on real PostgreSQL and filesystem', () => {
     const finalCheck = await reconcilePrivateFiles(db, storage, 'check')
     expect(finalCheck, JSON.stringify(finalCheck)).toMatchObject({ needsAttention: true })
   }, 30_000)
+})
+
+
+describe('⑤-5 file SIGKILL and bounded download benchmark', () => {
+  it('SIGKILL after file publication before database update leaves an unsellable object and safely reclaims it after TTL', async () => {
+    const admin = await createAdmin()
+    const catalog = await createCatalog()
+    const process = await startCrashProcess(config, 'upload_published')
+    const form = new FormData()
+    form.set('file', new Blob(['published before database update']), 'crashed-upload.txt')
+    const request = fetch(`${process.origin}/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/private-files/uploads`,
+      { method: 'POST', headers: adminHeaders(admin), body: form }).then(() => false, () => true)
+    let objectId: string
+    try {
+      expect(await process.waitFor('checkpoint')).toBe('upload_published')
+      const row = await db.selectFrom('private_file_objects').selectAll().where('upload_filename', '=', 'crashed-upload.txt').executeTakeFirstOrThrow()
+      objectId = row.id
+      expect(row).toMatchObject({ status: 'uploading', sha256: null, size_bytes: null })
+      expect((await new PrivateFileStorage(privateRoot).scanGeneratedFiles()).some(file => file.id === row.id && !file.staged)).toBe(true)
+      await process.kill()
+      expect(await request).toBe(true)
+    } finally { await process.kill() }
+    const rebuilt = await startCrashProcess(config, 'none')
+    try {
+      const root = `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/private-files`
+      const current = await inject({ method: 'GET', url: root, headers: { cookie: admin.cookie } })
+      const rejected = await fetch(`${rebuilt.origin}${root}/versions`, { method: 'POST', headers: { ...adminHeaders(admin), 'content-type': 'application/json' },
+        body: JSON.stringify({ expectedRevision: current.json().data.configurationRevision, uploadId: objectId!, displayFilename: 'crashed-upload.txt' }) })
+      expect(rejected.status).toBe(409)
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(Date.now() + 25 * 60 * 60_000)
+      await reconcilePrivateFiles(db, new PrivateFileStorage(privateRoot), 'repair')
+      expect(await db.selectFrom('private_file_objects').select('id').where('id', '=', objectId!).execute()).toEqual([])
+      expect((await new PrivateFileStorage(privateRoot).scanGeneratedFiles()).some(file => file.id === objectId!)).toBe(false)
+    } finally { vi.useRealTimers(); await rebuilt.kill() }
+  }, 30_000)
+
+  it('streams a real 100 MiB file and concurrent full/Range downloads with complete SHA-256 authorization', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog()
+    const process = await startCrashProcess(config, 'none')
+    try {
+      const bytes = Buffer.alloc(100 * 1024 * 1024, 0x61)
+      const expectedSha256 = createHash('sha256').update(bytes).digest('hex')
+      const rangeSha256 = createHash('sha256').update(bytes.subarray(0, 1024 * 1024)).digest('hex')
+      const form = new FormData()
+      form.set('file', new Blob([bytes]), 'benchmark-100MiB.txt')
+      const root = `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/private-files`
+      const uploadedResponse = await fetch(`${process.origin}${root}/uploads`, { method: 'POST', headers: adminHeaders(admin), body: form })
+      expect(uploadedResponse.status).toBe(201)
+      const uploaded = (await uploadedResponse.json()).data
+      expect(uploaded).toMatchObject({ fileSizeBytes: bytes.length, sha256: expectedSha256 })
+      const current = await inject({ method: 'GET', url: root, headers: { cookie: admin.cookie } })
+      const saved = await inject({ method: 'POST', url: `${root}/versions`, headers: adminHeaders(admin),
+        payload: { expectedRevision: current.json().data.configurationRevision, uploadId: uploaded.uploadId, displayFilename: 'benchmark-100MiB.txt' } })
+      expect(saved.statusCode, saved.body).toBe(200)
+      expect((await setReadiness(catalog, admin, saved.json().data.configurationRevision, true)).statusCode).toBe(200)
+      const created = await order(catalog, customer, 1)
+      expect(created.statusCode, created.body).toBe(201)
+      const orderId = created.json().data.order.id as string
+      await process.pass()
+      const detail = await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie } })
+      expect(detail.json().data.status).toBe('completed')
+      const path = detail.json().data.items[0].deliveries[0].downloadUrl as string
+      const resources = async () => await (await fetch(`${process.origin}/__test/resources`)).json()
+      for (const [fullCount, rangeCount] of [[1, 0], [4, 0], [0, 4], [4, 4]]) {
+        const before = await resources()
+        const start = performance.now()
+        const downloads = await Promise.all(Array.from({ length: fullCount + rangeCount }, async (_, index) => {
+          const range = index >= fullCount
+          const begin = performance.now()
+          const response = await fetch(`${process.origin}${path}`, { headers: { cookie: customer.cookie, ...(range ? { range: 'bytes=0-1048575' } : {}) } })
+          const ttfb = performance.now() - begin
+          expect(response.status).toBe(range ? 206 : 200)
+          expect(response.headers.get('cache-control')).toContain('no-store')
+          expect(response.headers.get('content-length')).toBe(String(range ? 1024 * 1024 : bytes.length))
+          if (range) expect(response.headers.get('content-range')).toBe(`bytes 0-1048575/${bytes.length}`)
+          let length = 0
+          const hash = createHash('sha256')
+          for await (const chunk of response.body!) { hash.update(chunk); length += chunk.length }
+          expect(length).toBe(range ? 1024 * 1024 : bytes.length)
+          expect(hash.digest('hex')).toBe(range ? rangeSha256 : expectedSha256)
+          return { ttfb, duration: performance.now() - begin, bytes: length }
+        }))
+        const elapsedMs = performance.now() - start
+        const after = await resources()
+        const measurement = { benchmark: 'private-file-100MiB', fullCount, rangeCount,
+          elapsedMs: Math.round(elapsedMs), ttfbMs: downloads.map(row => Math.round(row.ttfb)),
+          downloadMs: downloads.map(row => Math.round(row.duration)),
+          throughputMiBps: Number((downloads.reduce((sum, row) => sum + row.bytes, 0) / 1024 / 1024 / (elapsedMs / 1000)).toFixed(1)),
+          cpuMs: Math.round((after.cpu.user + after.cpu.system - before.cpu.user - before.cpu.system) / 1000),
+          peakRssMiB: Number((after.resource.maxRSS / 1024).toFixed(1)), rssMiB: Number((after.memory.rss / 1024 / 1024).toFixed(1)),
+        }
+        console.log(JSON.stringify(measurement))
+        if (globalThis.process.env.AIKAYUN_ACCEPTANCE_OUTPUT) await appendFile(globalThis.process.env.AIKAYUN_ACCEPTANCE_OUTPUT, `${JSON.stringify(measurement)}\n`)
+      }
+      const head = await fetch(`${process.origin}${path}`, { method: 'HEAD', headers: { cookie: customer.cookie } })
+      expect(head.status).toBe(200)
+      expect(head.headers.get('content-length')).toBe(String(bytes.length))
+      expect((await head.arrayBuffer()).byteLength).toBe(0)
+      expect((await fetch(`${process.origin}${path}`, { headers: { range: 'bytes=0-1048575' } })).status).toBe(401)
+      // Rebuilding the API retains the very same committed filesystem object.
+    } finally { await process.kill() }
+  }, 120_000)
 })

@@ -144,6 +144,9 @@ function handleRefundError(error: unknown, reply: FastifyReply, requestId: strin
   if (constraint === 'order_refund_payment_unresolved' || constraint === 'order_refund_manual_attempt_payment_unresolved') {
     return reply.code(409).send(failure('REFUND_PAYMENT_UNRESOLVED', '订单有未决支付或对账证据，当前不能继续退款。', requestId))
   }
+  if (constraint === 'order_refund_fulfillment_unresolved') {
+    return reply.code(409).send(failure('REFUND_FULFILLMENT_UNRESOLVED', '订单仍有进行中或结果未知的交付，请先核实原交付操作。', requestId))
+  }
   if (constraint?.startsWith('order_refund_') || constraint?.startsWith('order_refunds_')) {
     return reply.code(409).send(failure('REFUND_CONFLICT', '退款记录或资金来源已变化，请刷新订单退款进度后重试。', requestId))
   }
@@ -252,7 +255,8 @@ async function refundBlocker(db: Db, orderId: string): Promise<RefundBlocker> {
         JOIN payment_attempts AS attempt ON attempt.id = reconciliation.payment_attempt_id
         WHERE attempt.order_id = ${orderId}::uuid AND reconciliation.state = 'open'
       ) AS open_case,
-      order_has_unresolved_payment_attempts(${orderId}::uuid) AS unresolved_payment,
+      (order_has_unresolved_payment_attempts(${orderId}::uuid)
+        OR order_has_unresolved_fulfillment(${orderId}::uuid)) AS unresolved_payment,
       EXISTS (SELECT 1 FROM payment_attempts AS attempt
         WHERE attempt.order_id = ${orderId}::uuid AND attempt.status = 'reconciliation_required')
         AS reconciliation_required
@@ -300,7 +304,7 @@ async function assertRefundNotBlocked(db: Db, orderId: string): Promise<void> {
     throw new RefundError(409, 'REFUND_PAYMENT_UNRESOLVED', '订单有待处理的服务商对账异常，暂不能退款。')
   }
   if (blocker.unresolved_payment) {
-    throw new RefundError(409, 'REFUND_PAYMENT_UNRESOLVED', '订单存在未决支付或资金预留，暂不能退款。')
+    throw new RefundError(409, 'REFUND_PAYMENT_UNRESOLVED', '订单的支付或交付结果仍未确认，暂不能退款。')
   }
 }
 

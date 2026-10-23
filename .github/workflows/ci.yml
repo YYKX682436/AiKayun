@@ -108,6 +108,8 @@ jobs:
             sleep 2
           done
           curl --fail --silent http://localhost:8080/ | grep -q '全部商品'
+      - name: Digital delivery SIGKILL, backup restore and untrusted TLS acceptance
+        run: node scripts/verify-digital-recovery.mjs
       - name: Remove CI containers and volumes
         if: always()
         run: docker compose down -v --remove-orphans

@@ -108,6 +108,8 @@ function isPublicIpv6(address: string): boolean {
   if ((first & 0xe000) !== 0x2000) return false
   if (first === 0x2002 || (first === 0x2001 && second <= 0x01ff)) return false
   if (first === 0x2001 && second === 0x0db8) return false
+  // RFC 9637 documentation prefix, also inside 2000::/3.
+  if (first === 0x3fff && (second & 0xf000) === 0) return false
   return true
 }
 
@@ -157,10 +159,20 @@ export async function resolvePinnedAddress(
   if (family) {
     addresses = [{ address: host, family: family as 4 | 6 }]
   } else {
+    let timer: ReturnType<typeof setTimeout> | undefined
     try {
-      addresses = await resolveHostname(host)
-    } catch {
+      addresses = await Promise.race([
+        resolveHostname(host),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new HttpJsonV1Error('transport_unknown', 'supplier_dns_timeout')), timeoutMs)
+          timer.unref()
+        }),
+      ])
+    } catch (error) {
+      if (error instanceof HttpJsonV1Error) throw error
       throw new HttpJsonV1Error('transport_unknown', 'supplier_dns_failed')
+    } finally {
+      if (timer) clearTimeout(timer)
     }
   }
   if (!addresses.length) throw new HttpJsonV1Error('transport_unknown', 'supplier_dns_empty')
@@ -185,6 +197,7 @@ async function requestWire(
   method: 'GET' | 'POST',
   body?: unknown,
 ): Promise<WireResponse> {
+  const startedAt = performance.now()
   const pinned = await resolvePinnedAddress(target, config)
   const encodedBody = body === undefined ? undefined : Buffer.from(JSON.stringify(body), 'utf8')
   if (encodedBody && encodedBody.length > maxRequestBytes) throw new HttpJsonV1Error('response_invalid', 'supplier_request_too_large')
@@ -245,7 +258,7 @@ async function requestWire(
       })
       response.on('error', () => finishReject(new HttpJsonV1Error('transport_unknown', 'supplier_response_interrupted', status || null)))
     })
-    const timer = setTimeout(() => request.destroy(new Error('supplier_timeout')), timeoutMs)
+    const timer = setTimeout(() => request.destroy(new Error('supplier_timeout')), Math.max(1, timeoutMs - (performance.now() - startedAt)))
     timer.unref()
     request.on('error', (error: NodeJS.ErrnoException) => {
       clearTimeout(timer)
@@ -336,7 +349,24 @@ function normalizeOutcome(
   row: Record<string, unknown>,
   response: WireResponse,
   request: HttpJsonV1DeliveryRequest,
+  query?: { providerOperationId: string | null },
 ): HttpJsonV1Outcome {
+  // A never-submitted operation has no product/price record at the supplier.
+  // Its negative lookup must bind to the queried key, not invent that record.
+  // Bare 404s and contradictory identities remain unknown/integrity failures.
+  if (query && row.status === 'not_found') {
+    const keyMatches = row.operationId === request.operationId && row.idempotencyKey === request.idempotencyKey
+    const providerMatches = query.providerOperationId !== null
+      && row.queriedSupplierOperationId === query.providerOperationId
+    const expected = { operationId: request.operationId, idempotencyKey: request.idempotencyKey,
+      productId: request.productId, quantity: 1, unitAmount: request.unitAmount, currency: 'CNY' }
+    if (row.protocol !== 'http_json_v1' || (!keyMatches && !providerMatches)
+      || row.supplierOperationId !== null || row.result !== null
+      || Object.entries(expected).some(([name, value]) => row[name] !== undefined && row[name] !== value)) {
+      throw new HttpJsonV1Error('identity_mismatch', 'supplier_not_found_shape_invalid', response.status)
+    }
+    return { kind: 'not_found', responseSha256: response.sha256, httpStatus: response.status }
+  }
   validateIdentity(row, request)
   const status = row.status
   const rawProviderId = row.supplierOperationId
@@ -413,7 +443,7 @@ export async function queryHttpJsonV1Delivery(
     ? `/deliveries/${encodeURIComponent(providerOperationId)}`
     : `/deliveries/by-idempotency/${encodeURIComponent(request.idempotencyKey)}`
   const wire = await requestWire(config, supplier, appendPath(base, suffix), 'GET')
-  return normalizeOutcome(parseJson(wire), wire, request)
+  return normalizeOutcome(parseJson(wire), wire, request, { providerOperationId })
 }
 
 export async function testHttpJsonV1Connection(

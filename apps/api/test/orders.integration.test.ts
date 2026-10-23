@@ -2723,11 +2723,8 @@ describe('versioned fixed-content and link delivery on PostgreSQL', () => {
     }).execute()
 
     const stopWorker = startCodePoolDeliveryWorker(db, appConfig, app.log)
-    const blocked = await waitForFixedDeliveryOrder(orderId, itemId, 0)
     await stopWorker()
-    expect(blocked.attempts.at(-1)).toMatchObject({
-      status: 'failed', failure_code: 'FIXED_DELIVERY_PAYMENT_UNRESOLVED',
-    })
+    expect(await db.selectFrom('order_item_fulfillment_attempts').select('id').where('order_item_id', '=', itemId).execute()).toEqual([])
     expect((await db.selectFrom('payment_receipts').select('disposition').where('id', '=', receiptId).executeTakeFirstOrThrow()).disposition)
       .toBe('on_time')
     expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status)

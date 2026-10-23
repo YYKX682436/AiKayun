@@ -61,9 +61,11 @@ function responseIdentity(request: DeliveryRequest, mode?: string) {
   return {
     protocol: 'http_json_v1', operationId: request.operationId, idempotencyKey: request.idempotencyKey,
     productId: mode === 'identity_mismatch' ? 'mismatched-product' : request.productId,
+    ...(mode === 'wrong_operation' ? { operationId: '00000000-0000-4000-8000-000000000002' } : {}),
+    ...(mode === 'wrong_idempotency' ? { idempotencyKey: 'aikayun:00000000-0000-4000-8000-000000000002' } : {}),
     quantity: mode === 'wrong_quantity' ? 2 : 1,
     unitAmount: mode === 'wrong_amount' ? '999.99' : request.unitAmount,
-    currency: 'CNY',
+    currency: mode === 'wrong_currency' ? 'USD' : 'CNY',
   }
 }
 
@@ -124,7 +126,7 @@ export async function startHttpJsonV1Fixture(options: {
         const mode = fixtureRequest.parameters?.mode ?? 'success'
         const count = (productCounts.get(fixtureRequest.productId) ?? 0) + 1
         productCounts.set(fixtureRequest.productId, count)
-        if (mode === 'rejected') {
+        if (mode === 'rejected' || (mode === 'two_rejected_once' && count <= 2)) {
           if (createGate) {
             const gate = createGate
             createGate = undefined
@@ -179,6 +181,13 @@ export async function startHttpJsonV1Fixture(options: {
           response.destroy()
           return
         }
+        if (mode === 'http_429' || mode === 'http_500') return json(response, mode === 'http_429' ? 429 : 500, { error: 'temporarily unavailable' })
+        if (mode === 'interrupted') {
+          response.writeHead(200, { 'content-type': 'application/json', 'content-length': '999' })
+          response.write('{"protocol":')
+          setImmediate(() => response.destroy())
+          return
+        }
         return json(response, 200, {
           ...responseIdentity(fixtureRequest, mode), supplierOperationId,
           status: operation.status === 'succeeded' ? 'succeeded' : 'accepted',
@@ -221,7 +230,11 @@ export async function startHttpJsonV1Fixture(options: {
         productId: 'capability-probe', quantity: 1, unitAmount: '0.00', currency: 'CNY',
         supplierOperationId: null, status: 'not_found', result: null,
       })
-      return json(response, 404, { error: { code: 'not_found' } })
+      return json(response, 200, {
+        protocol: 'http_json_v1', supplierOperationId: null, status: 'not_found', result: null,
+        ...(key ? { operationId: key.slice('aikayun:'.length), idempotencyKey: key }
+          : { queriedSupplierOperationId: providerId }),
+      })
     }
     operation.queryCount += 1
     if ((operation.mode === 'accepted' || (operation.mode === 'partial' && operation.queryCount > 0))) {
