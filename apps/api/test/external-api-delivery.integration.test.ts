@@ -546,6 +546,48 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
       .select('event.id').where('reservation.order_item_id', '=', itemId).execute()).toEqual([])
   }, 30_000)
 
+  it('keeps a timed-out create unknown after provider execution and recovers it by the same idempotency key', async () => {
+    supplierFixture.reset()
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const supplier = await createSupplier(admin)
+    const queryBaseline = supplierFixture.stats()
+    const catalog = await createCatalog('0.00', 'unlimited')
+    await saveApiVersion(catalog, admin, supplier)
+    expect((await setApiReadiness(catalog, admin, true)).statusCode).toBe(200)
+    const created = await createOrder(customer, catalog, 1)
+    const orderId = created.json().data.order.id as string
+    const itemId = created.json().data.order.items[0].id as string
+
+    const gate = supplierFixture.pauseNextCreateResponse()
+    let firstPassSettled = false
+    const firstPass = runDigitalDeliveryRecoveryPass(db, config).finally(() => { firstPassSettled = true })
+    try {
+      await gate.entered
+      expect(supplierFixture.stats()).toMatchObject({ createRequests: 1, executions: 1 })
+      // The fixture has durably recorded success, but withholds the response
+      // until the adapter's real eight-second request timeout fires.
+      await firstPass
+      const operation = (await pendingOperations(itemId))[0]!
+      expect(operation).toMatchObject({ state: 'unknown', attempt_status: 'unknown' })
+      expect(supplierFixture.stats()).toMatchObject({ createRequests: 1, executions: 1, queries: queryBaseline.queries })
+      await db.updateTable('supplier_api_delivery_operations').set({ next_action_at: new Date() })
+        .where('id', '=', operation.id).execute()
+    } finally {
+      gate.release()
+      if (!firstPassSettled) await firstPass
+    }
+
+    await runDigitalDeliveryRecoveryPass(db, config)
+    expect((await pendingOperations(itemId))[0]!.state).toBe('succeeded_pending_finalize')
+    await runDigitalDeliveryRecoveryPass(db, config)
+    await assertItemDelivered(orderId, itemId, 1)
+    expect(supplierFixture.stats()).toMatchObject({
+      createRequests: 1, executions: 1, queries: queryBaseline.queries + 1,
+      idempotencyQueries: queryBaseline.idempotencyQueries + 1,
+    })
+  }, 30_000)
+
   it('delivers to a guest order session and isolates its private API delivery from customers and other guests', async () => {
     supplierFixture.reset()
     await db.updateTable('storefront_customer_policy').set({
@@ -751,6 +793,18 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
       operationId: randomUUID(), idempotencyKey: `aikayun:${randomUUID()}`,
       productId: 'ssrf-probe', unitAmount: '0.00', parameters: {},
     })).rejects.toMatchObject({ code: 'supplier_address_not_public' })
+
+    const unavailableFixture = await startHttpJsonV1Fixture()
+    const unavailableUrl = unavailableFixture.baseUrl
+    await unavailableFixture.close()
+    await expect(createHttpJsonV1Delivery({
+      ...config, supplierHttpTestAllowlist: [unavailableUrl],
+    }, {
+      baseUrl: unavailableUrl, bearerToken: supplierTokenV1,
+    }, {
+      operationId: randomUUID(), idempotencyKey: `aikayun:${randomUUID()}`,
+      productId: 'unavailable-probe', unitAmount: '0.00', parameters: {},
+    })).rejects.toMatchObject({ classification: 'transport_unknown', code: 'supplier_connection_refused' })
 
     await expect(testHttpJsonV1Connection(config, {
       baseUrl: `${supplierFixture.baseUrl}/redirect`, bearerToken: supplierTokenV1,
