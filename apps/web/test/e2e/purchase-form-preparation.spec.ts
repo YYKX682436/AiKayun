@@ -355,6 +355,12 @@ test('isolates delayed SKU reads and saves by product/SKU request generation', a
   let failedBRead: ReturnType<typeof responseGate> | null = null
   let delayedBRead: ReturnType<typeof responseGate> | null = null
   let delayedASave: ReturnType<typeof responseGate> | null = null
+  let delayedASaveBeforeServer: ReturnType<typeof responseGate> | null = null
+  let delayedBSaveResponse: ReturnType<typeof responseGate> | null = null
+  let delayedProductSaveResponse: ReturnType<typeof responseGate> | null = null
+  let delayedASaveExpectedRevision: number | null = null
+  let delayedBSaveResult: { productRevision: number; mode: string } | null = null
+  let delayedProductSaveResult: { productRevision: number; mode: string } | null = null
   await page.route('**/api/v1/admin/products/*/variants/*/purchase-form', async (route) => {
     const pathname = new URL(route.request().url()).pathname
     const match = pathname.match(/\/variants\/([^/]+)\/purchase-form$/u)
@@ -380,10 +386,42 @@ test('isolates delayed SKU reads and saves by product/SKU request generation', a
       await route.fulfill({ response })
       return
     }
+    if (route.request().method() === 'PUT' && variantId === variantA.id && delayedASaveBeforeServer) {
+      const gate = delayedASaveBeforeServer
+      delayedASaveBeforeServer = null
+      delayedASaveExpectedRevision = route.request().postDataJSON().expectedRevision as number
+      gate.signal()
+      await gate.waiting
+      await route.continue()
+      return
+    }
+    if (route.request().method() === 'PUT' && variantId === variantB.id && delayedBSaveResponse) {
+      const gate = delayedBSaveResponse
+      delayedBSaveResponse = null
+      const response = await route.fetch()
+      delayedBSaveResult = (await response.json()).data as { productRevision: number; mode: string }
+      gate.signal()
+      await gate.waiting
+      await route.fulfill({ response })
+      return
+    }
     if (route.request().method() === 'PUT' && variantId === variantA.id && delayedASave) {
       const gate = delayedASave
       delayedASave = null
       const response = await route.fetch()
+      gate.signal()
+      await gate.waiting
+      await route.fulfill({ response })
+      return
+    }
+    await route.continue()
+  })
+  await page.route(url => new URL(url).pathname === `/api/v1/admin/products/${product.id}/purchase-form`, async (route) => {
+    if (route.request().method() === 'PUT' && delayedProductSaveResponse) {
+      const gate = delayedProductSaveResponse
+      delayedProductSaveResponse = null
+      const response = await route.fetch()
+      delayedProductSaveResult = (await response.json()).data as { productRevision: number; mode: string }
       gate.signal()
       await gate.waiting
       await route.fulfill({ response })
@@ -526,4 +564,133 @@ test('isolates delayed SKU reads and saves by product/SKU request generation', a
   expect(unchangedBResponse.request().postDataJSON().expectedRevision).toBe(revisionBeforeLateNoop + 1)
   expect((await unchangedBResponse.json()).data.productRevision).toBe(revisionBeforeLateNoop + 1)
   await expect(page.getByText(new RegExp(`商品修订 ${revisionBeforeLateNoop + 1} ·`))).toBeVisible()
+
+  // A request can reach the API only after a newer, already-executed no-op
+  // response has been held at the browser boundary. The stale full response
+  // must not replace B's assignment revision after A advances the product.
+  const beforeOldSkuResponse = await page.request.get(`/api/v1/admin/products/${product.id}`)
+  expect(beforeOldSkuResponse.status()).toBe(200)
+  const revisionBeforeOldSkuResponse = ((await beforeOldSkuResponse.json()).data as Product).revision
+  await skuPicker.click()
+  await page.getByRole('option', { name: new RegExp(variantA.skuCode) }).click()
+  await expect(assignmentMode).toContainText('使用 SKU 覆盖版本（准备）')
+  await assignmentMode.click()
+  await page.getByRole('option', { name: '跟随商品默认' }).click()
+
+  const aRequestGate = responseGate()
+  delayedASaveBeforeServer = aRequestGate
+  const aChangedResponse = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/variants/${variantA.id}/purchase-form`
+    && response.request().method() === 'PUT')
+  await saveSku.click()
+  await aRequestGate.reached
+  expect(delayedASaveExpectedRevision).toBe(revisionBeforeOldSkuResponse)
+
+  await skuPicker.click()
+  await page.getByRole('option', { name: new RegExp(variantB.skuCode) }).click()
+  await expect(assignmentMode).toContainText('明确不使用模板')
+  const bNoopResponseGate = responseGate()
+  delayedBSaveResponse = bNoopResponseGate
+  const bNoopResponse = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/variants/${variantB.id}/purchase-form`
+    && response.request().method() === 'PUT')
+  await saveSku.click()
+  await bNoopResponseGate.reached
+  expect(delayedBSaveResult).toMatchObject({ productRevision: revisionBeforeOldSkuResponse, mode: 'none' })
+
+  const changedA = await releaseAndSettle(page, aRequestGate, aChangedResponse)
+  expect(changedA.status()).toBe(200)
+  expect(changedA.request().postDataJSON().expectedRevision).toBe(revisionBeforeOldSkuResponse)
+  expect((await changedA.json()).data.productRevision).toBe(revisionBeforeOldSkuResponse + 1)
+  await expect(page.getByText(new RegExp(`商品修订 ${revisionBeforeOldSkuResponse + 1} ·`))).toBeVisible()
+  await expect(assignmentMode).toContainText('明确不使用模板')
+  await expect(assignment.getByRole('alert')).toHaveCount(0)
+
+  const oldBNoop = await releaseAndSettle(page, bNoopResponseGate, bNoopResponse)
+  expect(oldBNoop.status()).toBe(200)
+  expect((await oldBNoop.json()).data.productRevision).toBe(revisionBeforeOldSkuResponse)
+  await expect(page.getByText(new RegExp(`商品修订 ${revisionBeforeOldSkuResponse + 1} ·`))).toBeVisible()
+  await expect(assignmentMode).toContainText('明确不使用模板')
+  await expect(assignment.getByRole('alert')).toHaveCount(0)
+  const staleBStatus = assignment.getByRole('status')
+  const staleBStatusCount = await staleBStatus.count()
+  const staleBSuccessMessage = staleBStatusCount ? await staleBStatus.textContent() : null
+
+  await assignmentMode.click()
+  await page.getByRole('option', { name: '跟随商品默认' }).click()
+  const bAfterOldResponse = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/variants/${variantB.id}/purchase-form`
+    && response.request().method() === 'PUT')
+  await saveSku.click()
+  const bAfterOld = await bAfterOldResponse
+  expect(bAfterOld.request().postDataJSON().expectedRevision).toBe(revisionBeforeOldSkuResponse + 1)
+  expect(bAfterOld.status()).toBe(200)
+  expect((await bAfterOld.json()).data.productRevision).toBe(revisionBeforeOldSkuResponse + 2)
+  expect(staleBSuccessMessage).toBeNull()
+  const savedBAfterOld = await page.request.get(`/api/v1/admin/products/${product.id}/variants/${variantB.id}/purchase-form`)
+  expect((await savedBAfterOld.json()).data).toMatchObject({ mode: 'product_default', productRevision: revisionBeforeOldSkuResponse + 2 })
+  await expect(assignment.getByRole('status')).toContainText(`SKU ${variantB.skuCode} 准备覆盖已保存`)
+  await expect(page.getByText(new RegExp(`商品修订 ${revisionBeforeOldSkuResponse + 2} ·`))).toBeVisible()
+
+  // Exercise the product-default response writeback with the same stale-revision
+  // ordering: an A mutation advances the shared revision while a B no-op reply
+  // is still waiting in the browser.
+  await skuPicker.click()
+  await page.getByRole('option', { name: new RegExp(variantA.skuCode) }).click()
+  await expect(assignmentMode).toContainText('跟随商品默认')
+  await assignmentMode.click()
+  await page.getByRole('option', { name: '明确不使用模板' }).click()
+  const beforeProductDefaultResponse = await page.request.get(`/api/v1/admin/products/${product.id}`)
+  expect(beforeProductDefaultResponse.status()).toBe(200)
+  const revisionBeforeProductDefaultResponse = ((await beforeProductDefaultResponse.json()).data as Product).revision
+
+  const aProductRequestGate = responseGate()
+  delayedASaveBeforeServer = aProductRequestGate
+  const aProductChangedResponse = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/variants/${variantA.id}/purchase-form`
+    && response.request().method() === 'PUT')
+  await saveSku.click()
+  await aProductRequestGate.reached
+  expect(delayedASaveExpectedRevision).toBe(revisionBeforeProductDefaultResponse)
+  await skuPicker.click()
+  await page.getByRole('option', { name: new RegExp(variantB.skuCode) }).click()
+  await expect(assignmentMode).toContainText('跟随商品默认')
+
+  const productSaveGate = responseGate()
+  delayedProductSaveResponse = productSaveGate
+  const productNoopResponse = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/purchase-form`
+    && response.request().method() === 'PUT')
+  await assignment.getByRole('button', { name: '保存商品准备关联' }).click()
+  await productSaveGate.reached
+  expect(delayedProductSaveResult).toMatchObject({ productRevision: revisionBeforeProductDefaultResponse, mode: 'not_configured' })
+
+  const changedAForProduct = await releaseAndSettle(page, aProductRequestGate, aProductChangedResponse)
+  expect(changedAForProduct.status()).toBe(200)
+  expect(changedAForProduct.request().postDataJSON().expectedRevision).toBe(revisionBeforeProductDefaultResponse)
+  expect((await changedAForProduct.json()).data.productRevision).toBe(revisionBeforeProductDefaultResponse + 1)
+  await expect(page.getByText(new RegExp(`商品修订 ${revisionBeforeProductDefaultResponse + 1} ·`))).toBeVisible()
+
+  const oldProductNoop = await releaseAndSettle(page, productSaveGate, productNoopResponse)
+  expect(oldProductNoop.status()).toBe(200)
+  expect((await oldProductNoop.json()).data.productRevision).toBe(revisionBeforeProductDefaultResponse)
+  await expect(page.getByText(new RegExp(`商品修订 ${revisionBeforeProductDefaultResponse + 1} ·`))).toBeVisible()
+  await expect(assignment.getByRole('alert')).toHaveCount(0)
+  await expect(assignment.getByRole('status')).toHaveCount(0)
+
+  const productMode = assignment.getByRole('combobox', { name: '关联方式' })
+  await productMode.click()
+  await page.getByRole('option', { name: '明确不使用模板' }).click()
+  const productAfterOldResponse = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/purchase-form`
+    && response.request().method() === 'PUT')
+  await assignment.getByRole('button', { name: '保存商品准备关联' }).click()
+  const productAfterOld = await productAfterOldResponse
+  expect(productAfterOld.status()).toBe(200)
+  expect(productAfterOld.request().postDataJSON().expectedRevision).toBe(revisionBeforeProductDefaultResponse + 1)
+  expect((await productAfterOld.json()).data.productRevision).toBe(revisionBeforeProductDefaultResponse + 2)
+  const savedProductAfterOld = await page.request.get(`/api/v1/admin/products/${product.id}/purchase-form`)
+  expect((await savedProductAfterOld.json()).data).toMatchObject({ mode: 'none', productRevision: revisionBeforeProductDefaultResponse + 2 })
+  await expect(assignment.getByRole('status')).toContainText('商品默认模板准备关联已保存')
+  await expect(page.getByText(new RegExp(`商品修订 ${revisionBeforeProductDefaultResponse + 2} ·`))).toBeVisible()
 })

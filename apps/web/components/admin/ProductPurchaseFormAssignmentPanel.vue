@@ -71,13 +71,23 @@ let highestObservedProductRevision = props.productRevision
 let productVersionRequest = 0
 let skuVersionRequest = 0
 
-function notifyNewProductRevision(revision: number, productId: string, currentGeneration: number): void {
-  if (generation !== currentGeneration || props.productId !== productId) return
-  highestObservedProductRevision = Math.max(highestObservedProductRevision, props.productRevision)
-  if (!Number.isSafeInteger(revision) || revision <= highestObservedProductRevision) return
-  highestObservedProductRevision = revision
-  locallyEmittedRevision = revision
-  emit('revision', revision)
+function acceptResponseRevision(revision: number, productId: string, currentGeneration: number): boolean {
+  if (generation !== currentGeneration || props.productId !== productId || !Number.isSafeInteger(revision)) return false
+  const announcedRevision = Math.max(highestObservedProductRevision, props.productRevision)
+  // A loaded assignment may know a newer shared revision before the parent does.
+  // Reject older bodies, while still announcing a successful write at that revision.
+  const knownRevision = Math.max(
+    announcedRevision,
+    productAssignment.value?.productRevision ?? 0,
+    skuAssignment.value?.productRevision ?? 0,
+  )
+  if (revision < knownRevision) return false
+  if (revision > announcedRevision) {
+    highestObservedProductRevision = revision
+    locallyEmittedRevision = revision
+    emit('revision', revision)
+  } else highestObservedProductRevision = announcedRevision
+  return true
 }
 
 function applyObservedRevision(revision: number) {
@@ -237,13 +247,13 @@ async function saveProductAssignment() {
         ...(productMode.value === 'template' ? { templateVersionId: productVersionId.value } : {}),
       },
     })
-    if (generation !== current || props.productId !== productId) return
+    if (generation !== current || props.productId !== productId || result.productId !== productId) return
+    if (!acceptResponseRevision(result.productRevision, productId, current)) return
     productAssignment.value = result
     productMode.value = result.mode
     productTemplateId.value = result.templateVersion?.templateId ?? ''
     productVersionId.value = result.templateVersion?.id ?? ''
     staleRevision.value = false
-    notifyNewProductRevision(result.productRevision, productId, current)
     successMessage.value = '商品默认模板准备关联已保存；尚未应用到顾客购买。'
   } catch (error) {
     if (generation !== current) return
@@ -279,9 +289,7 @@ async function saveSkuAssignment() {
     // A committed save for an older SKU still advances the shared product
     // revision while this product remains selected, but it must not update a
     // different product after navigation or a newer component load.
-    if (generation === current && props.productId === productId) {
-      notifyNewProductRevision(result.productRevision, productId, current)
-    }
+    if (!acceptResponseRevision(result.productRevision, productId, current)) return
     if (!isCurrent()) return
     skuAssignment.value = result
     skuMode.value = result.mode
