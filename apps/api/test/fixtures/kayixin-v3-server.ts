@@ -3,6 +3,11 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 import type { AddressInfo } from 'node:net'
 
 export const fixtureKayixinCredentials = { appId: '602401', appSecret: 'fixture-V3-secret-only-never-real-2026!' }
+export const fixtureKayixinSpecialCredentials = [
+  { appId: '602411', appSecret: 'R1-fixture-"quotes"-secret!' },
+  { appId: '602412', appSecret: 'R1-fixture-\\slashes\\-secret!' },
+  { appId: '602413', appSecret: 'R1-fixture-"quotes\\and\\slashes"-secret!' },
+]
 export type FixtureMode = 'ok' | 'auth' | 'invalid_json' | 'missing' | 'redirect' | 'large' | 'timeout' | 'echo_secret'
 export function fixtureProduct(goodsId = 201001) {
   return {
@@ -26,7 +31,11 @@ export function fixtureProduct(goodsId = 201001) {
       { type: 15, title: '备注', placeholder: '', required: 0, regex: '', options: [] },
       { type: 16, title: '地区与验证', placeholder: '省市', required: 1, regex: '', options: [
         { name: '广西', value: 'guangxi', children: [{ name: '南宁市', value: 'nanning' }],
-          expand: [{ type: 14, options: [{ name: '身份证后六位', value: '1' }] }, { type: 0, options: [] }] },
+          expand: [{ type: 14, title: '扩展验证编号', required: 1,
+            placeholder: '请输入扩展号码 <b>提示</b>', regex: '^[A-Z]{6}$ <script>window.KAYIXIN_EXPAND_XSS=true</script>',
+            options: [{ name: '身份证后六位', value: '1', expand: [{ type: 15, title: '更深扩展字段',
+              placeholder: '更深提示 <img src=x onerror=alert(1)>', regex: '^深层.*$', options: [] }] }] },
+          { type: 0, title: '扩展备注', required: 0, placeholder: '可选备注', regex: '', options: [] }] },
       ] },
     ],
   }
@@ -104,6 +113,7 @@ export async function startKayixinV3Fixture(options: { port?: number; credential
 }
 if (process.argv.includes('--serve')) {
   if (process.env.NODE_ENV !== 'test') throw new Error('Kayixin fixture may only run in NODE_ENV=test')
-  const fixture = await startKayixinV3Fixture({ port: Number(process.env.KAYIXIN_FIXTURE_PORT ?? 3102) })
+  const fixture = await startKayixinV3Fixture({ port: Number(process.env.KAYIXIN_FIXTURE_PORT ?? 3102),
+    credentials: [fixtureKayixinCredentials, ...fixtureKayixinSpecialCredentials] })
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => { void fixture.close().then(() => process.exit(0)) })
 }

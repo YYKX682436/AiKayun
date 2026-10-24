@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { useAdminApi } from '~/composables/useAdminApi'
-import type { SupplierAccountObservation, SupplierCatalogPage, SupplierCatalogProduct, SupplierConnection, SupplierPurchaseField } from '@aikayun/contracts'
+import type { SupplierAccountObservation, SupplierCatalogPage, SupplierCatalogProduct, SupplierConnection } from '@aikayun/contracts'
 const props = defineProps<{ connection: SupplierConnection; request: ReturnType<typeof useAdminApi>['request'] }>()
 const request = props.request
 const account = shallowRef<SupplierAccountObservation | null>(null)
@@ -13,10 +13,9 @@ const page = ref(1)
 let generation = 0
 const root = computed(() => `/api/v1/admin/supplier-connections/${props.connection.id}/catalog`)
 const productStatus = (value: number) => ({ 1: '上游在售', 2: '上游暂停', 3: '上游禁售' }[value] ?? `未知状态 ${value}`)
-const fieldType = (value: number | null) => value === null ? '未知类型' : ({ 0: '单行文本', 1: '图片', 13: '数字', 14: '单项选择', 15: '多行文本', 16: '级联选择' }[value] ?? `未知类型 ${value}`)
-const fieldRequired = (field: SupplierPurchaseField) => field.required === null ? '必填性未知' : field.required ? '必填' : '选填'
 const time = (value: string) => new Date(value).toLocaleString('zh-CN')
-watch(() => props.connection.currentVersion.id, () => { generation++; account.value = null; catalog.value = null; detail.value = null; errorMessage.value = ''; page.value = 1; keyWord.value = ''; loading.value = false })
+onBeforeUnmount(() => { generation++ })
+watch([() => props.connection.id, () => props.connection.currentVersion.id], () => { generation++; account.value = null; catalog.value = null; detail.value = null; errorMessage.value = ''; page.value = 1; keyWord.value = ''; loading.value = false }, { flush: 'sync' })
 async function read(kind: 'account' | 'goods' | 'detail', goodsId?: string) {
   if (loading.value) return
   const current = ++generation
@@ -291,25 +290,9 @@ function turn(delta: number) { page.value = Math.min(100000, Math.max(1, page.va
             :key="index"
             class="min-w-0 rounded-lg border border-default p-3 text-sm"
           >
-            <p class="font-medium">
-              {{ index + 1 }}. {{ field.title ?? '标题未提供' }} · {{ fieldType(field.type) }} · {{ fieldRequired(field) }}
-            </p>
-            <p
-              v-if="field.placeholder"
-              class="mt-1 break-words text-muted"
-            >
-              提示：{{ field.placeholder }}
-            </p>
-            <p
-              v-if="field.regex"
-              class="mt-1 break-words text-muted"
-            >
-              校验说明（不执行）：{{ field.regex }}
-            </p>
-            <AdminSupplierPurchaseOptions
-              v-if="field.options.length"
-              :options="field.options"
-              class="mt-2"
+            <AdminSupplierPurchaseField
+              :field="field"
+              :label="`${index + 1}. `"
             />
           </li>
         </ol>

@@ -49,52 +49,92 @@ function clearMessages() {
   successMessage.value = ''
 }
 
-async function load() {
-  loading.value = true
-  try {
-    connections.value = await request<SupplierConnection[]>('/api/v1/admin/supplier-connections')
-    if (!creating.value && !connections.value.some(row => row.id === selectedId.value)) selectedId.value = connections.value[0]?.id ?? ''
-    await loadSelected()
-  } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '供应商连接暂时无法读取。'
-  } finally {
-    loading.value = false
-  }
+type LoadResult = { ok: boolean; stale?: boolean; message?: string }
+let selectionGeneration = 0
+let viewGeneration = 0
+let listGeneration = 0
+let metadataGeneration = 0
+let testGeneration = 0
+let selectedLoad: Promise<LoadResult> = Promise.resolve({ ok: true })
+function currentScope() {
+  return { id: selectedId.value, versionId: selected.value?.currentVersion.id,
+    selection: selectionGeneration, view: viewGeneration }
 }
-
-async function loadSelected() {
+function sameSelection(scope: ReturnType<typeof currentScope>) {
+  return scope.id === selectedId.value && scope.selection === selectionGeneration
+}
+function sameView(scope: ReturnType<typeof currentScope>) {
+  return sameSelection(scope) && scope.versionId === selected.value?.currentVersion.id && scope.view === viewGeneration
+}
+function syncEditor() {
   const current = selected.value
-  if (!current) {
-    versions.value = null
-    audit.value = null
-    form.name = ''
-    form.baseUrl = ''
-    clearCredentials()
-    return
-  }
   versions.value = null
   audit.value = null
-  form.name = current.name
-  form.baseUrl = current.currentVersion.baseUrl
+  form.name = current?.name ?? ''
+  form.baseUrl = current?.currentVersion.baseUrl ?? ''
   clearCredentials()
-  form.providerType = current.providerType
-  testResult.value = current.lastTest
-  const [versionPage, auditPage] = await Promise.all([
-    request<SupplierConnectionVersionsPage>(`${actionPath.value}/versions?page=1&pageSize=50`),
-    request<SupplierConnectionAuditPage>(`${actionPath.value}/audit`),
-  ])
-  if (selectedId.value !== current.id) return
-  versions.value = versionPage
-  audit.value = auditPage
+  if (current) form.providerType = current.providerType
+  testResult.value = current?.lastTest?.configurationVersionId === current?.currentVersion.id ? current?.lastTest ?? null : null
 }
-
-watch(selectedId, () => {
-  if (selectedId.value) creating.value = false
+function mergeConnection(row: SupplierConnection): SupplierConnection {
+  const known = connections.value.find(existing => existing.id === row.id)
+  // A confirmed PUT is authoritative even if an older GET snapshot arrives later.
+  return known && known.currentVersion.versionNumber > row.currentVersion.versionNumber ? known : row
+}
+async function load(options: { silent?: boolean } = {}): Promise<LoadResult> {
+  const generation = ++listGeneration
+  const scope = currentScope()
+  loading.value = true
+  try {
+    const rows = await request<SupplierConnection[]>('/api/v1/admin/supplier-connections')
+    if (generation !== listGeneration) return { ok: false, stale: true }
+    const updateEditor = sameSelection(scope)
+    connections.value = rows.map(mergeConnection)
+    if (!creating.value && !connections.value.some(row => row.id === selectedId.value)) selectedId.value = connections.value[0]?.id ?? ''
+    if (updateEditor && selectedId.value === scope.id) return await loadSelected(options)
+    if (!scope.id && selectedId.value) return await selectedLoad
+    return { ok: true }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '供应商连接暂时无法读取。'
+    const stale = generation !== listGeneration || !sameView(scope)
+    if (!stale && !options.silent) errorMessage.value = message
+    return { ok: false, stale, message }
+  } finally {
+    if (generation === listGeneration) loading.value = false
+  }
+}
+async function loadSelected(options: { silent?: boolean } = {}): Promise<LoadResult> {
+  const generation = ++metadataGeneration
+  const scope = currentScope()
+  syncEditor()
+  if (!selected.value) return { ok: true }
+  const path = `/api/v1/admin/supplier-connections/${scope.id}`
+  try {
+    const [versionPage, auditPage] = await Promise.all([
+      request<SupplierConnectionVersionsPage>(`${path}/versions?page=1&pageSize=50`),
+      request<SupplierConnectionAuditPage>(`${path}/audit`),
+    ])
+    if (generation !== metadataGeneration || !sameView(scope)) return { ok: false, stale: true }
+    versions.value = versionPage
+    audit.value = auditPage
+    return { ok: true }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '供应商版本和审计暂时无法读取。'
+    const stale = generation !== metadataGeneration || !sameView(scope)
+    if (!stale && !options.silent) errorMessage.value = message
+    return { ok: false, stale, message }
+  }
+}
+watch([selectedId, () => selected.value?.currentVersion.id], ([id], [previousId]) => {
+  if (id !== previousId) selectionGeneration++
+  viewGeneration++
+  testGeneration++
+  metadataGeneration++
+  if (id) creating.value = false
   clearMessages()
-  if (!loading.value) void loadSelected().catch(error => {
-    errorMessage.value = error instanceof Error ? error.message : '供应商版本和审计暂时无法读取。'
-  })
-})
+  syncEditor()
+  if (id !== previousId) selectedLoad = loadSelected()
+}, { flush: 'sync' })
 
 async function createConnection() {
   if (saving.value || !form.name.trim() || !form.baseUrl.trim() || !credentialsComplete.value) return
@@ -122,6 +162,8 @@ async function createConnection() {
 
 async function saveConfiguration() {
   if (!selected.value || saving.value || !form.name.trim() || !form.baseUrl.trim()) return
+  const scope = currentScope()
+  const path = `/api/v1/admin/supplier-connections/${scope.id}`
   saving.value = true
   clearMessages()
   const body: UpdateSupplierConnectionBody = { name: form.name.trim(), baseUrl: form.baseUrl.trim(),
@@ -131,35 +173,52 @@ async function saveConfiguration() {
   const rotated = credentialsComplete.value
   clearCredentials()
   try {
-    await request<SupplierConnection[]>(actionPath.value, {
-      method: 'PUT',
-      body,
-    })
-    successMessage.value = rotated
-      ? '新供应商版本与凭据已加密保存，连接已停用。请测试新版本后再启用。'
-      : '新供应商地址版本已保存，连接已停用。请测试新版本后再启用。'
-    await load()
+    const result = await request<SupplierConnection[]>(path, { method: 'PUT', body })
+    const saved = result.find(row => row.id === scope.id)
+    if (!saved) throw new Error('保存响应缺少对应连接，请刷新核对。')
+    listGeneration++
+    loading.value = false
+    const confirmed = mergeConnection(saved)
+    connections.value = connections.value.map(row => row.id === saved.id ? confirmed : row)
+    if (!sameSelection(scope) || selected.value?.currentVersion.id !== saved.currentVersion.id) return
+    const message = rotated
+      ? '新供应商版本与凭据已加密保存，连接已停用。请重新测试当前版本。'
+      : '新供应商地址版本已保存，连接已停用。请重新测试当前版本。'
+    successMessage.value = message
+    const refreshed = await load({ silent: true })
+    if (!sameSelection(scope) || selected.value?.currentVersion.id !== saved.currentVersion.id) return
+    successMessage.value = message
+    if (!refreshed.ok && !refreshed.stale) errorMessage.value = `配置已保存，但刷新失败。${refreshed.message ?? '请重试刷新。'}`
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '供应商配置保存失败。'
+    if (sameView(scope)) errorMessage.value = error instanceof Error ? error.message : '供应商配置保存失败。'
   } finally {
     saving.value = false
   }
 }
-
 async function testConnection() {
   if (!selected.value || saving.value) return
+  const scope = currentScope()
+  const generation = ++testGeneration
   saving.value = true
   clearMessages()
   testResult.value = null
   try {
-    testResult.value = await request<SupplierConnectionTestResult>(`${actionPath.value}/test`, { method: 'POST' })
-    const result = testResult.value
-    await load()
+    const result = await request<SupplierConnectionTestResult>(`/api/v1/admin/supplier-connections/${scope.id}/test`, { method: 'POST' })
+    if (generation !== testGeneration || !sameView(scope) || result.configurationVersionId !== scope.versionId) return
     testResult.value = result
-    if (result.connectionOk) successMessage.value = result.message
-    else errorMessage.value = result.message
+    const refreshed = await load({ silent: true })
+    if (generation !== testGeneration || !sameView(scope)) return
+    if (!refreshed.ok) {
+      if (!refreshed.stale) errorMessage.value = `测试已完成，但刷新失败。${refreshed.message ?? '请重试刷新。'}`
+      return
+    }
+    // The refreshed current version owns its test state; never restore a POST snapshot.
+    const current = selected.value?.lastTest
+    if (!current || current.configurationVersionId !== scope.versionId) return
+    if (current.connectionOk) successMessage.value = current.message
+    else errorMessage.value = current.message
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '供应商测试请求失败。'
+    if (generation === testGeneration && sameView(scope)) errorMessage.value = error instanceof Error ? error.message : '供应商测试请求失败。'
   } finally {
     saving.value = false
   }
@@ -223,7 +282,7 @@ void load()
             variant="outline"
             icon="i-lucide-refresh-cw"
             :loading="loading"
-            @click="load"
+            @click="load()"
           >
             刷新
           </UButton>
@@ -502,6 +561,7 @@ void load()
 
             <AdminSupplierCatalogBrowser
               v-if="selected?.providerType === 'kayixin_customer_v3'"
+              :key="selected.currentVersion.id"
               :connection="selected"
               :request="request"
             />

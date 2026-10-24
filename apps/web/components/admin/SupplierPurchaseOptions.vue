@@ -21,11 +21,9 @@ defineProps<{ options: SupplierPurchaseOption[] }>()
         :key="fieldIndex"
         class="mt-2 rounded-md bg-muted/40 p-2"
       >
-        <p>扩展填写项 {{ fieldIndex + 1 }} · 类型 {{ field.type ?? '未知' }} · {{ field.title ?? '未提供标题' }}</p>
-        <AdminSupplierPurchaseOptions
-          v-if="field.options.length"
-          :options="field.options"
-          class="mt-2"
+        <AdminSupplierPurchaseField
+          :field="field"
+          :label="`扩展填写项 ${fieldIndex + 1} · `"
         />
       </div>
     </li>

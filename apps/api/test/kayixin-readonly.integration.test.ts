@@ -10,7 +10,7 @@ import { createDatabase } from '../src/db/pool.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
 import type { Database } from '../src/db/types.js'
 import { decryptSupplierBearerToken, decryptSupplierCredentials, encryptSupplierBearerToken } from '../src/commerce/supplier-api-crypto.js'
-import { fixtureKayixinCredentials, startKayixinV3Fixture } from './fixtures/kayixin-v3-server.js'
+import { fixtureKayixinCredentials, fixtureProduct, fixtureKayixinSpecialCredentials, startKayixinV3Fixture } from './fixtures/kayixin-v3-server.js'
 
 const databaseUrl = process.env.TEST_DATABASE_URL ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
 const origin = 'http://localhost:3000'
@@ -29,7 +29,7 @@ function cookie(response: { headers: Record<string, string | string[] | undefine
 }
 beforeAll(async () => {
   if (!new URL(databaseUrl).pathname.endsWith('_test')) throw new Error('Requires isolated _test database')
-  fixture = await startKayixinV3Fixture({ credentials: [fixtureKayixinCredentials, rotated] })
+  fixture = await startKayixinV3Fixture({ credentials: [fixtureKayixinCredentials, rotated, ...fixtureKayixinSpecialCredentials] })
   config = readConfig({ ...process.env, DATABASE_URL: databaseUrl, NODE_ENV: 'test', PUBLIC_ORIGIN: origin,
     COOKIE_SECURE: 'false', SUPPLIER_HTTP_TEST_ALLOWLIST: fixture.baseUrl,
     PAYMENT_CREDENTIAL_KEY_RING: JSON.stringify({ activeKeyId: 'a', keys: { a: keyA.toString('base64'), b: keyB.toString('base64') } }),
@@ -112,6 +112,31 @@ describe('⑥-1 PostgreSQL protocol, credential and fulfillment boundaries', () 
     expect(versions.body).not.toContain(rotated.appSecret)
     const tested = await inject({ method: 'POST', url: `${root}/test`, headers })
     expect(tested.json().data.connectionOk, tested.body).toBe(true)
+  })
+  it.each(fixtureKayixinSpecialCredentials)('R1 protects API responses, persisted test results and audits for AppID $appId', async credentials => {
+    const created = await inject({ method: 'POST', url: '/api/v1/admin/supplier-connections', headers,
+      payload: { name: `特殊凭据 ${credentials.appId}`, providerType: 'kayixin_customer_v3', baseUrl: fixture.baseUrl, credentials } })
+    expect(created.statusCode).toBe(201)
+    const root = `/api/v1/admin/supplier-connections/${created.json().data[0].id}`
+    const clean = await inject({ method: 'POST', url: `${root}/test`, headers })
+    expect(clean.json().data).toMatchObject({ connectionOk: true, queryCapable: false })
+    fixture.setData(path => path.endsWith('/getAccount') ? { balance: '1.00' }
+      : path.endsWith('/getList') ? { allCount: 1, allPage: 1, items: [fixtureProduct()] }
+        : { ...fixtureProduct(), goodsDescribe: `禁止展示 ${credentials.appSecret}` })
+    try {
+      const detail = await inject({ method: 'POST', url: `${root}/catalog/goods/201001`, headers })
+      expect(detail.statusCode).toBe(502)
+      expect(detail.json().error.code).toBe('KAYIXIN_SENSITIVE_RESPONSE')
+      const tested = await inject({ method: 'POST', url: `${root}/test`, headers })
+      expect(tested.json().data).toMatchObject({ connectionOk: false, errorCode: 'kayixin_sensitive_response', queryCapable: false })
+      const audit = await inject({ method: 'GET', url: `${root}/audit`, headers })
+      expect(audit.json().data.events[0].details).toMatchObject({ errorCode: 'kayixin_sensitive_response', scope: 'catalog_read_v3' })
+      for (const response of [created, clean, detail, tested, audit]) {
+        expect(response.body).not.toContain('R1-fixture-')
+        expect(response.body).not.toContain(credentials.appSecret)
+        expect(response.body).not.toContain(JSON.stringify(credentials.appSecret).slice(1, -1))
+      }
+    } finally { fixture.setData() }
   })
   it('rejects mixed auth structures and protocol mutation at both API and SQL layers', async () => {
     const connection = await createConnection()

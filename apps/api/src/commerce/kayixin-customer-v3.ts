@@ -58,8 +58,26 @@ async function readOperation(config: AppConfig, supplier: KayixinV3Supplier,
   }
   if (row.data === null || row.data === undefined) invalid()
   // A hostile upstream must not echo a signing secret into admin pages/audits.
-  if (JSON.stringify(row.data).includes(supplier.appSecret)) throw new KayixinV3Error('kayixin_sensitive_response')
+  assertNoSensitiveValue(row.data, supplier.appSecret)
   return row.data
+}
+
+/** Inspect decoded strings, not their escaped JSON representation. The wire is
+ * already size-bounded; also bound traversal work and depth before mapping. */
+function assertNoSensitiveValue(value: unknown, secret: string): void {
+  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }]
+  let visited = 0
+  while (pending.length) {
+    const item = pending.pop()!
+    if (++visited > 50000 || item.depth > 32) invalid()
+    if (typeof item.value === 'string') {
+      if (item.value.includes(secret)) throw new KayixinV3Error('kayixin_sensitive_response')
+    } else if (item.value && typeof item.value === 'object') {
+      const children = Array.isArray(item.value) ? item.value : Object.entries(item.value).flat()
+      if (visited + pending.length + children.length > 50000) invalid()
+      for (const child of children) pending.push({ value: child, depth: item.depth + 1 })
+    }
+  }
 }
 
 function invalid(): never { throw new KayixinV3Error('kayixin_response_invalid') }
