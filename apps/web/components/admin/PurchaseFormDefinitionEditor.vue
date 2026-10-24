@@ -19,14 +19,17 @@ const addFieldItems = [
 const persisted = computed(() => props.persistedIds ?? new Set<string>())
 
 function updateField(index: number, field: PurchaseFormField) {
+  if (props.disabled) return
   const fields = [...props.modelValue.fields]
   fields[index] = field
   emit('update:modelValue', { fields })
 }
 function removeField(index: number) {
+  if (props.disabled) return
   emit('update:modelValue', { fields: props.modelValue.fields.filter((_, fieldIndex) => fieldIndex !== index) })
 }
 function moveField(index: number, delta: -1 | 1) {
+  if (props.disabled) return
   const nextIndex = index + delta
   if (nextIndex < 0 || nextIndex >= props.modelValue.fields.length) return
   const fields = [...props.modelValue.fields]
@@ -34,7 +37,7 @@ function moveField(index: number, delta: -1 | 1) {
   emit('update:modelValue', { fields })
 }
 function addField() {
-  if (props.modelValue.fields.length >= 30) return
+  if (props.disabled || props.modelValue.fields.length >= 30) return
   const id = crypto.randomUUID()
   const common = { id, meaningKey: `field_${id.slice(0, 8)}`, label: '新字段', required: false }
   let field: PurchaseFormField

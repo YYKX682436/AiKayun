@@ -86,6 +86,53 @@ describe('⑥-2A purchase form definition and normalization', () => {
     expect(validatePurchaseFormDefinition(deep)).toMatchObject({ ok: false, issues: expect.arrayContaining([expect.objectContaining({ code: 'OPTION_TREE_LIMIT_EXCEEDED' })]) })
   })
 
+  it('reports malformed deep expanded fields and accepts the deepest legal cascade with a select expansion', () => {
+    const malformedValues: unknown[] = [null, 7, []]
+    for (const malformed of malformedValues) {
+      const { value } = definitionFixture()
+      const cascade = value.fields.find(row => row.type === 'cascade')
+      if (cascade?.type !== 'cascade') throw new Error('cascade fixture missing')
+      const branch = cascade.options[0]!
+      const child = branch.children![0]!
+      child.expandedFields = [malformed] as never
+      const result = validatePurchaseFormDefinition(value)
+      expect(result.ok, `expected invalid expanded field ${String(malformed)}`).toBe(false)
+      if (!result.ok) expect(result.issues.length).toBeGreaterThan(0)
+    }
+
+    let option: Record<string, unknown> = {
+      id: randomUUID(), meaningKey: 'level_5', label: '第五层',
+      expandedFields: [{
+        id: randomUUID(), meaningKey: 'expanded_choice', type: 'select', label: '扩展选项', required: true,
+        options: [{ id: randomUUID(), meaningKey: 'choice_one', label: '选项一' }],
+      }],
+    }
+    for (let depth = 4; depth >= 1; depth -= 1) {
+      option = { id: randomUUID(), meaningKey: `level_${depth}`, label: `第${depth}层`, children: [option] }
+    }
+    const fiveLevelCascade = {
+      fields: [{ id: randomUUID(), meaningKey: 'five_level_region', type: 'cascade', label: '五级区服', required: true, options: [option] }],
+    }
+    expect(validatePurchaseFormDefinition(fiveLevelCascade).ok).toBe(true)
+
+    const sixth = { id: randomUUID(), meaningKey: 'level_6', label: '第六层' }
+    const sixthRoot = { id: randomUUID(), meaningKey: 'level_1', label: '第一层', children: [
+      { id: randomUUID(), meaningKey: 'level_2', label: '第二层', children: [
+        { id: randomUUID(), meaningKey: 'level_3', label: '第三层', children: [
+          { id: randomUUID(), meaningKey: 'level_4', label: '第四层', children: [
+            { id: randomUUID(), meaningKey: 'level_5', label: '第五层', children: [sixth] },
+          ] },
+        ] },
+      ] },
+    ] }
+    const sixLevelCascade = {
+      fields: [{ id: randomUUID(), meaningKey: 'six_level_region', type: 'cascade', label: '六级区服', required: true, options: [sixthRoot] }],
+    }
+    expect(validatePurchaseFormDefinition(sixLevelCascade)).toMatchObject({
+      ok: false, issues: expect.arrayContaining([expect.objectContaining({ code: 'OPTION_TREE_LIMIT_EXCEEDED' })]),
+    })
+  })
+
   it('allows incomplete drafts but reports exact stable IDs during explicit completeness checks', () => {
     const { value, digits, text, textarea, select, cascade } = definitionFixture()
     const draft = normalizePurchaseFormAnswers(value, {})

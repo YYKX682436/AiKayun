@@ -14,20 +14,21 @@ const emit = defineEmits<{
 const cascadeLocked = computed(() => props.disabled || props.persistedIds.has(props.field.id.toLowerCase()))
 
 function update(patch: Record<string, unknown>) {
+  if (props.disabled) return
   emit('update:field', { ...props.field, ...patch } as PurchaseFormField)
 }
 function updateOption(index: number, option: PurchaseFormCascadeOption) {
-  if (props.field.type !== 'cascade') return
+  if (props.disabled || props.field.type !== 'cascade') return
   const options = [...props.field.options]
   options[index] = option
   update({ options })
 }
 function removeOption(index: number) {
-  if (props.field.type !== 'cascade' || props.field.options.length <= 1) return
+  if (props.disabled || props.field.type !== 'cascade' || props.field.options.length <= 1) return
   update({ options: props.field.options.filter((_, optionIndex) => optionIndex !== index) })
 }
 function addOption() {
-  if (props.field.type !== 'cascade' || props.field.options.length >= 20) return
+  if (props.disabled || props.field.type !== 'cascade' || props.field.options.length >= 20) return
   const id = crypto.randomUUID()
   update({ options: [...props.field.options, { id, meaningKey: `option_${id.slice(0, 8)}`, label: `选项 ${props.field.options.length + 1}` }] })
 }

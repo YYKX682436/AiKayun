@@ -15,33 +15,38 @@ const emit = defineEmits<{
 const locked = computed(() => props.disabled || props.persistedIds.has(props.option.id.toLowerCase()))
 
 function update(patch: Partial<PurchaseFormCascadeOption>) {
+  if (props.disabled) return
   emit('update:option', { ...props.option, ...patch })
 }
 function addChild() {
-  if (props.depth >= 5 || (props.option.children?.length ?? 0) >= 20) return
+  if (props.disabled || props.depth >= 5 || (props.option.children?.length ?? 0) >= 20) return
   const id = crypto.randomUUID()
   update({ children: [...(props.option.children ?? []), { id, meaningKey: `option_${id.slice(0, 8)}`, label: `子选项 ${(props.option.children?.length ?? 0) + 1}` }] })
 }
 function addExpandedField() {
-  if ((props.option.expandedFields?.length ?? 0) >= 60) return
+  if (props.disabled || (props.option.expandedFields?.length ?? 0) >= 60) return
   const id = crypto.randomUUID()
   const field: PurchaseFormLeafField = { id, meaningKey: `field_${id.slice(0, 8)}`, type: 'text', label: '扩展字段', required: false, maxLength: 1000 }
   update({ expandedFields: [...(props.option.expandedFields ?? []), field] })
 }
 function updateExpanded(index: number, field: PurchaseFormLeafField) {
+  if (props.disabled) return
   const fields = [...(props.option.expandedFields ?? [])]
   fields[index] = field
   update({ expandedFields: fields })
 }
 function removeExpanded(index: number) {
+  if (props.disabled) return
   update({ expandedFields: (props.option.expandedFields ?? []).filter((_, fieldIndex) => fieldIndex !== index) })
 }
 function updateChild(index: number, option: PurchaseFormCascadeOption) {
+  if (props.disabled) return
   const children = [...(props.option.children ?? [])]
   children[index] = option
   update({ children })
 }
 function removeChild(index: number) {
+  if (props.disabled) return
   update({ children: (props.option.children ?? []).filter((_, optionIndex) => optionIndex !== index) })
 }
 </script>

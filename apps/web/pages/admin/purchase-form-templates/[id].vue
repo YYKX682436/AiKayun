@@ -25,7 +25,9 @@ const versions = ref<VersionSummary[]>([])
 const versionsTotal = ref(0)
 const historyPage = ref(1)
 const historyLoading = ref(false)
+const historyReadLoading = ref(false)
 const selectedHistory = shallowRef<TemplateVersion | null>(null)
+const selectedHistoryTargetId = ref('')
 const loading = ref(true)
 const saving = ref(false)
 const freezing = ref(false)
@@ -33,9 +35,11 @@ const errorMessage = ref('')
 const successMessage = ref('')
 const historyError = ref('')
 const isDirty = computed(() => Boolean(template.value && (name.value !== template.value.name || JSON.stringify(definition.value) !== JSON.stringify(persistedDefinition.value))))
+const editorBusy = computed(() => saving.value || freezing.value)
 const definitionValidation = computed(() => validatePurchaseFormDefinition(definition.value))
 const dateLabel = (value: string) => new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
 let generation = 0
+let historyReadGeneration = 0
 
 function collectIds(source: PurchaseFormDefinition) {
   const ids = new Set<string>()
@@ -62,6 +66,9 @@ async function load(targetId = templateId.value) {
   errorMessage.value = ''
   successMessage.value = ''
   historyError.value = ''
+  historyReadGeneration++
+  historyReadLoading.value = false
+  selectedHistoryTargetId.value = ''
   selectedHistory.value = null
   versions.value = []
   versionsTotal.value = 0
@@ -107,8 +114,8 @@ async function loadMoreVersions() {
   await loadVersions(templateId.value, generation, historyPage.value + 1, true)
 }
 
-async function saveDraft(): Promise<boolean> {
-  if (!template.value || saving.value || !definitionValidation.value.ok) return false
+async function saveDraft(allowFreeze = false): Promise<boolean> {
+  if (!template.value || saving.value || (freezing.value && !allowFreeze) || !definitionValidation.value.ok) return false
   const currentId = templateId.value
   const currentGeneration = generation
   saving.value = true
@@ -145,7 +152,7 @@ async function freezeVersion() {
   errorMessage.value = ''
   successMessage.value = ''
   try {
-    if (isDirty.value && !(await saveDraft())) return
+    if (isDirty.value && !(await saveDraft(true))) return
     if (generation !== currentGeneration || currentId !== templateId.value || !template.value) return
     await request<unknown>(`/api/v1/admin/purchase-form-templates/${currentId}/versions`, {
       method: 'POST',
@@ -159,21 +166,29 @@ async function freezeVersion() {
       ? `${error.message}请重新读取后再保存版本。`
       : error instanceof Error ? error.message : '准备版本保存失败。'
   } finally {
-    if (generation === currentGeneration || currentId === templateId.value) freezing.value = false
+    if (generation === currentGeneration) freezing.value = false
   }
 }
 
 async function readHistory(version: VersionSummary) {
   const currentId = templateId.value
   const currentGeneration = generation
+  const requestId = ++historyReadGeneration
+  const targetVersionId = version.id
+  selectedHistoryTargetId.value = targetVersionId
   historyError.value = ''
   selectedHistory.value = null
+  historyReadLoading.value = true
+  const isCurrent = () => generation === currentGeneration && currentId === templateId.value
+    && historyReadGeneration === requestId && selectedHistoryTargetId.value === targetVersionId
   try {
-    const result = await request<TemplateVersion>(`/api/v1/admin/purchase-form-templates/${currentId}/versions/${version.id}`)
-    if (generation !== currentGeneration || currentId !== templateId.value) return
+    const result = await request<TemplateVersion>(`/api/v1/admin/purchase-form-templates/${currentId}/versions/${targetVersionId}`)
+    if (!isCurrent() || result.id !== targetVersionId || result.templateId !== currentId) return
     selectedHistory.value = result
   } catch (error) {
-    if (generation === currentGeneration) historyError.value = error instanceof Error ? error.message : '无法读取此历史版本。'
+    if (isCurrent()) historyError.value = error instanceof Error ? error.message : '无法读取此历史版本。'
+  } finally {
+    if (isCurrent()) historyReadLoading.value = false
   }
 }
 
@@ -238,7 +253,7 @@ onBeforeUnmount(() => { generation++ })
                 :loading="saving"
                 :disabled="!isDirty || !definitionValidation.ok || freezing"
                 class="min-h-11"
-                @click="saveDraft"
+                @click="() => saveDraft()"
               >
                 保存编辑草稿
               </UButton>
@@ -300,6 +315,7 @@ onBeforeUnmount(() => { generation++ })
                     v-model="name"
                     class="w-full"
                     maxlength="120"
+                    :disabled="editorBusy"
                   />
                 </UFormField>
               </UCard>
@@ -307,6 +323,7 @@ onBeforeUnmount(() => { generation++ })
                 <AdminPurchaseFormDefinitionEditor
                   v-model="definition"
                   :persisted-ids="persistedIds"
+                  :disabled="editorBusy"
                 />
               </UCard>
             </div>
@@ -375,6 +392,13 @@ onBeforeUnmount(() => { generation++ })
                     加载更早版本
                   </UButton>
                 </div>
+                <p
+                  v-if="historyReadLoading"
+                  class="mt-3 text-sm text-muted"
+                  role="status"
+                >
+                  正在读取所选历史版本…
+                </p>
                 <div
                   v-if="selectedHistory"
                   class="mt-4 border-t border-default pt-4"

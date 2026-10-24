@@ -298,7 +298,11 @@ function fieldHeader(value: Record<string, unknown>, issues: PurchaseFormIssue[]
 }
 
 function validateLeafField(value: unknown, issues: PurchaseFormIssue[], allIds: Set<string>): value is PurchaseFormLeafField {
-  if (!isRecord(value) || !fieldHeader(value, issues)) return false
+  if (!isRecord(value)) {
+    issues.push({ fieldId: null, code: 'FIELD_DEFINITION_INVALID' })
+    return false
+  }
+  if (!fieldHeader(value, issues)) return false
   const fieldId = value.id as string
   if (allIds.has(fieldId.toLowerCase())) { issues.push({ fieldId, code: 'DUPLICATE_ID' }); return false }
   allIds.add(fieldId.toLowerCase())
@@ -352,10 +356,15 @@ export function validatePurchaseFormDefinition(value: unknown): PurchaseFormVali
   const byteCounter = new TextEncoder()
   const seenObjects = new Set<object>()
   const sizeStack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }]
+  // A legal five-level cascade may contain a leaf field and select options at
+  // its deepest branch. Keep this generic JSON guard above that known shape;
+  // cascade depth, option-node, field, and byte limits remain independently
+  // enforced below.
+  const maximumJsonDepth = PURCHASE_FORM_LIMITS.optionDepth * 3 + 3
   let definitionBytes = 2
   while (sizeStack.length) {
     const item = sizeStack.pop()!
-    if (item.depth > PURCHASE_FORM_LIMITS.optionDepth * 2 + 6) {
+    if (item.depth > maximumJsonDepth) {
       return { ok: false, issues: [{ fieldId: null, code: 'OPTION_TREE_LIMIT_EXCEEDED' }] }
     }
     if (typeof item.value === 'string') {
@@ -398,7 +407,11 @@ export function validatePurchaseFormDefinition(value: unknown): PurchaseFormVali
     value.fields.map(field => ({ field, allowCascade: true }))
   while (stack.length) {
     const row = stack.pop()!
-    if (!isRecord(row.field) || !fieldHeader(row.field, issues)) continue
+    if (!isRecord(row.field)) {
+      issues.push({ fieldId: null, code: 'FIELD_DEFINITION_INVALID' })
+      continue
+    }
+    if (!fieldHeader(row.field, issues)) continue
     fieldCount += 1
     if (fieldCount > PURCHASE_FORM_LIMITS.totalFields) {
       issues.push({ fieldId: row.field.id as string, code: 'FIELD_LIMIT_EXCEEDED' }); break

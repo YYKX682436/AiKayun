@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { sql } from 'kysely'
-import type { Kysely } from 'kysely'
+import type { Kysely, KyselyPlugin, Transaction } from 'kysely'
 import type { FastifyInstance } from 'fastify'
 import { Migrator } from 'kysely/migration'
 import sharp from 'sharp'
@@ -252,6 +252,197 @@ afterAll(async () => {
 })
 
 describe('⑥-2A preparation and private draft foundations on PostgreSQL', () => {
+  it('preserves frozen templates, identities and audit payloads while applying the forward delete fix', async () => {
+    const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
+    const baseline = await migrator.migrateTo('202610240002_purchase_forms_drafts')
+    expect(baseline.error).toBeUndefined()
+    const admin = await makeAdminSession()
+    const fixture = await createTemplateFixture(admin)
+    const catalog = await createCatalog()
+    const product = await db.selectFrom('products').select('revision').where('id', '=', catalog.productId).executeTakeFirstOrThrow()
+    const productAssignment = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/purchase-form`, headers: admin.headers,
+      payload: { expectedRevision: product.revision, mode: 'template', templateVersionId: fixture.versionId },
+    })
+    expect(productAssignment.statusCode).toBe(200)
+    const current = await db.selectFrom('products').select('revision').where('id', '=', catalog.productId).executeTakeFirstOrThrow()
+    const skuAssignment = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/purchase-form`, headers: admin.headers,
+      payload: { expectedRevision: current.revision, mode: 'none' },
+    })
+    expect(skuAssignment.statusCode).toBe(200)
+    const versionBefore = await db.selectFrom('purchase_form_template_versions').selectAll()
+      .where('id', '=', fixture.versionId).executeTakeFirstOrThrow()
+    const identitiesBefore = await db.selectFrom('purchase_form_template_identities').selectAll()
+      .where('template_id', '=', fixture.id).orderBy('id').execute()
+    const eventsBefore = await db.selectFrom('purchase_form_audit_events').selectAll()
+      .where('product_id', '=', catalog.productId).orderBy('created_at').orderBy('id').execute()
+    expect(eventsBefore).toHaveLength(2)
+
+    const upgraded = await migrator.migrateToLatest()
+    expect(upgraded.error).toBeUndefined()
+    expect(await db.selectFrom('purchase_form_template_versions').selectAll()
+      .where('id', '=', fixture.versionId).executeTakeFirstOrThrow()).toEqual(versionBefore)
+    expect(await db.selectFrom('purchase_form_template_identities').selectAll()
+      .where('template_id', '=', fixture.id).orderBy('id').execute()).toEqual(identitiesBefore)
+    expect(await db.selectFrom('purchase_form_audit_events').selectAll()
+      .where('product_id', '=', catalog.productId).orderBy('created_at').orderBy('id').execute()).toEqual(eventsBefore)
+    await expect(sql`UPDATE purchase_form_audit_events SET summary = summary WHERE id = ${eventsBefore[0]!.id}`.execute(db))
+      .rejects.toMatchObject({ code: '23514', constraint: 'purchase_form_history_immutable' })
+    await expect(sql`DELETE FROM purchase_form_audit_events WHERE id = ${eventsBefore[0]!.id}`.execute(db))
+      .rejects.toMatchObject({ code: '23514', constraint: 'purchase_form_history_immutable' })
+    expect((await db.selectFrom('product_purchase_form_settings').select('template_version_id')
+      .where('product_id', '=', catalog.productId).executeTakeFirstOrThrow()).template_version_id).toBe(fixture.versionId)
+  }, 45_000)
+
+  it('rejects malformed nested expanded fields on create and revision without partial writes', async () => {
+    const admin = await makeAdminSession()
+    const fixture = definitionFixture()
+    const created = await inject({
+      method: 'POST', url: '/api/v1/admin/purchase-form-templates', headers: admin.headers,
+      payload: { name: '非法深层字段回归', definition: fixture.definition },
+    })
+    expect(created.statusCode).toBe(201)
+    const templateId = created.json().data.template.id as string
+    const revision = created.json().data.template.revision as number
+    const baselineIdentityCount = Number((await db.selectFrom('purchase_form_template_identities')
+      .select(db.fn.countAll<number>().as('count')).where('template_id', '=', templateId).executeTakeFirstOrThrow()).count)
+    const baselineAuditCount = Number((await db.selectFrom('purchase_form_audit_events')
+      .select(db.fn.countAll<number>().as('count')).where('template_id', '=', templateId).executeTakeFirstOrThrow()).count)
+
+    for (const malformed of [null, 9, []]) {
+      const definition = structuredClone(fixture.definition) as unknown as Record<string, unknown>
+      const fields = definition.fields as Array<Record<string, unknown>>
+      const cascade = fields.find(row => row.type === 'cascade')!
+      const rootOption = (cascade.options as Array<Record<string, unknown>>)[0]!
+      let deepest = (rootOption.children as Array<Record<string, unknown>>)[0]!
+      for (let depth = 3; depth <= 5; depth += 1) {
+        const child = { id: randomUUID(), meaningKey: `deep_option_${depth}`, label: `第${depth}层` }
+        const children = deepest.children as Array<Record<string, unknown>> | undefined
+        deepest.children = children ? [...children, child] : [child]
+        deepest = child
+      }
+      deepest.expandedFields = [malformed]
+      const payload = { name: '非法深层字段回归', definition }
+      const badCreate = await inject({
+        method: 'POST', url: '/api/v1/admin/purchase-form-templates', headers: admin.headers, payload,
+      })
+      expect(badCreate.statusCode, JSON.stringify(badCreate.json())).toBe(400)
+      const badUpdate = await inject({
+        method: 'PUT', url: `/api/v1/admin/purchase-form-templates/${templateId}`, headers: admin.headers,
+        payload: { ...payload, expectedRevision: revision },
+      })
+      expect(badUpdate.statusCode, JSON.stringify(badUpdate.json())).toBe(400)
+      expect(await db.selectFrom('purchase_form_templates').select('revision').where('id', '=', templateId).executeTakeFirstOrThrow())
+        .toEqual({ revision })
+      expect(Number((await db.selectFrom('purchase_form_template_identities').select(db.fn.countAll<number>().as('count'))
+        .where('template_id', '=', templateId).executeTakeFirstOrThrow()).count)).toBe(baselineIdentityCount)
+      expect(Number((await db.selectFrom('purchase_form_audit_events').select(db.fn.countAll<number>().as('count'))
+        .where('template_id', '=', templateId).executeTakeFirstOrThrow()).count)).toBe(baselineAuditCount)
+    }
+
+    let deepest: Record<string, unknown> = {
+      id: randomUUID(), meaningKey: 'deep_choice_5', label: '第五层',
+      expandedFields: [{
+        id: randomUUID(), meaningKey: 'deep_expanded_select', type: 'select', label: '深层单选', required: true,
+        options: [{ id: randomUUID(), meaningKey: 'deep_expanded_option', label: '选项一' }],
+      }],
+    }
+    for (let depth = 4; depth >= 2; depth -= 1) {
+      deepest = { id: randomUUID(), meaningKey: `deep_choice_${depth}`, label: `第${depth}层`, children: [deepest] }
+    }
+    const legalDefinition = structuredClone(fixture.definition)
+    const legalCascade = legalDefinition.fields.find(row => row.type === 'cascade')
+    if (legalCascade?.type !== 'cascade') throw new Error('cascade fixture missing')
+    legalCascade.options = [{ id: randomUUID(), meaningKey: 'legal_root', label: '第一层', children: [deepest as never] }]
+    const legal = await inject({
+      method: 'POST', url: '/api/v1/admin/purchase-form-templates', headers: admin.headers,
+      payload: { name: '五级级联单选扩展', definition: legalDefinition },
+    })
+    expect(legal.statusCode, JSON.stringify(legal.json())).toBe(201)
+  }, 45_000)
+
+  it('deletes only safe prepared products while retaining immutable purchase-form audit identities', async () => {
+    const admin = await makeAdminSession()
+    const fixture = await createTemplateFixture(admin)
+    const putProductAssignment = async (productId: string, mode: 'template' | 'not_configured', versionId?: string) => {
+      const product = await db.selectFrom('products').select('revision').where('id', '=', productId).executeTakeFirstOrThrow()
+      return inject({
+        method: 'PUT', url: `/api/v1/admin/products/${productId}/purchase-form`, headers: admin.headers,
+        payload: { expectedRevision: product.revision, mode, ...(versionId ? { templateVersionId: versionId } : {}) },
+      })
+    }
+    const deleteAtCurrentRevision = async (productId: string) => {
+      const product = await db.selectFrom('products').select('revision').where('id', '=', productId).executeTakeFirstOrThrow()
+      return inject({
+        method: 'DELETE', url: `/api/v1/admin/products/${productId}`, headers: admin.headers,
+        payload: { expectedRevision: product.revision },
+      })
+    }
+    const retainedEvents = async (productId: string) => db.selectFrom('purchase_form_audit_events').selectAll()
+      .where('product_id', '=', productId).orderBy('created_at').orderBy('id').execute()
+
+    const configured = await createCatalog()
+    expect((await putProductAssignment(configured.productId, 'template', fixture.versionId)).statusCode).toBe(200)
+    const configuredEvents = await retainedEvents(configured.productId)
+    expect(configuredEvents).toHaveLength(1)
+    const configuredDelete = await deleteAtCurrentRevision(configured.productId)
+    expect(configuredDelete.statusCode, JSON.stringify(configuredDelete.json())).toBe(200)
+    expect(await db.selectFrom('products').select('id').where('id', '=', configured.productId).execute()).toHaveLength(0)
+    expect(await retainedEvents(configured.productId)).toEqual(configuredEvents)
+    expect(configuredEvents[0]).toMatchObject({ product_id: configured.productId, operation: 'product_assignment_updated' })
+
+    const cleared = await createCatalog()
+    expect((await putProductAssignment(cleared.productId, 'template', fixture.versionId)).statusCode).toBe(200)
+    expect((await putProductAssignment(cleared.productId, 'not_configured')).statusCode).toBe(200)
+    const clearedEvents = await retainedEvents(cleared.productId)
+    expect(await db.selectFrom('product_purchase_form_settings').select('product_id').where('product_id', '=', cleared.productId).execute()).toEqual([])
+    const clearedDelete = await deleteAtCurrentRevision(cleared.productId)
+    expect(clearedDelete.statusCode, JSON.stringify(clearedDelete.json())).toBe(200)
+    expect(await retainedEvents(cleared.productId)).toEqual(clearedEvents)
+
+    const inherited = await createCatalog()
+    const skuProduct = await db.selectFrom('products').select('revision').where('id', '=', inherited.productId).executeTakeFirstOrThrow()
+    const override = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${inherited.productId}/variants/${inherited.skuId}/purchase-form`, headers: admin.headers,
+      payload: { expectedRevision: skuProduct.revision, mode: 'template', templateVersionId: fixture.versionId },
+    })
+    expect(override.statusCode).toBe(200)
+    const currentSkuProduct = await db.selectFrom('products').select('revision').where('id', '=', inherited.productId).executeTakeFirstOrThrow()
+    const restoreInheritance = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${inherited.productId}/variants/${inherited.skuId}/purchase-form`, headers: admin.headers,
+      payload: { expectedRevision: currentSkuProduct.revision, mode: 'product_default' },
+    })
+    expect(restoreInheritance.statusCode).toBe(200)
+    expect(await db.selectFrom('sku_purchase_form_overrides').selectAll().where('product_id', '=', inherited.productId).execute()).toEqual([])
+    const inheritedEvents = await retainedEvents(inherited.productId)
+    expect(inheritedEvents).toHaveLength(2)
+    const inheritedDelete = await deleteAtCurrentRevision(inherited.productId)
+    expect(inheritedDelete.statusCode, JSON.stringify(inheritedDelete.json())).toBe(200)
+    expect(await retainedEvents(inherited.productId)).toEqual(inheritedEvents)
+
+    const stocked = await createCatalog()
+    expect((await putProductAssignment(stocked.productId, 'template', fixture.versionId)).statusCode).toBe(200)
+    const product = await db.selectFrom('products').select('revision').where('id', '=', stocked.productId).executeTakeFirstOrThrow()
+    const sku = await db.selectFrom('product_variants').select(['revision', 'inventory_revision'])
+      .where('id', '=', stocked.skuId).executeTakeFirstOrThrow()
+    const quantityMode = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${stocked.productId}/variants/${stocked.skuId}/inventory-mode`, headers: admin.headers,
+      payload: {
+        expectedRevision: product.revision, expectedSkuRevision: sku.revision,
+        expectedInventoryRevision: sku.inventory_revision, inventoryMode: 'quantity',
+      },
+    })
+    expect(quantityMode.statusCode, JSON.stringify(quantityMode.json())).toBe(200)
+    await db.updateTable('product_variant_quantity_inventory').set({ stocked: 1 })
+      .where('product_variant_id', '=', stocked.skuId).execute()
+    const blocked = await deleteAtCurrentRevision(stocked.productId)
+    expect(blocked.statusCode).toBe(409)
+    expect(blocked.json().error.code).toBe('PRODUCT_HAS_INVENTORY')
+    expect(await db.selectFrom('products').select('id').where('id', '=', stocked.productId).execute()).toHaveLength(1)
+    expect(await retainedEvents(stocked.productId)).toHaveLength(1)
+  }, 45_000)
+
   it('revision-checks admin template edits, freezes immutable history and stores only preparation associations', async () => {
     const unauthorized = await inject({ method: 'GET', url: '/api/v1/admin/purchase-form-templates' })
     expect(unauthorized.statusCode).toBe(401)
@@ -375,7 +566,9 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     })
     expect(quoteAfter.statusCode).toBe(200)
     expect(quoteAfter.json().data.canContinue).toBe(true)
-    expect(quoteAfter.json().data.items[0].lineAmount).toBe(quoteBefore.json().data.items[0].lineAmount)
+    expect(quoteBefore.json().data.items[0].lineTotal).toBe('12.50')
+    expect(quoteAfter.json().data.items[0].lineTotal).toBe('12.50')
+    expect(quoteAfter.json().data.items[0].lineTotal).toBe(quoteBefore.json().data.items[0].lineTotal)
     const order = await inject({
       method: 'POST', url: '/api/v1/checkout/orders', headers: buyerHeaders,
       payload: { idempotencyKey: randomUUID(), quoteToken: quoteAfter.json().data.quoteToken, items: [{ skuId: catalog.skuId, quantity: 1 }] },
@@ -490,6 +683,81 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     await expect(createPurchaseDraft(db, configA, ownerB, fixture.versionId)).rejects.toMatchObject({ status: 401 })
   }, 45_000)
 
+  it('serializes draft creation and guest claiming against the per-owner active draft cap', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const fill = async (owner: ReturnType<typeof customerOwner> | ReturnType<typeof guestOwner>, count: number) => {
+      const ids: string[] = []
+      for (let index = 0; index < count; index += 1) {
+        ids.push((await createPurchaseDraft(db, configA, owner, fixture.versionId)).id)
+      }
+      return ids
+    }
+    const countForCustomer = async (customerId: string) => Number((await db.selectFrom('purchase_drafts')
+      .select(db.fn.countAll<number>().as('count')).where('customer_id', '=', customerId)
+      .where('status', '=', 'active').where('expires_at', '>', new Date()).executeTakeFirstOrThrow()).count)
+    const countForGuest = async (guestId: string) => Number((await db.selectFrom('purchase_drafts')
+      .select(db.fn.countAll<number>().as('count')).where('guest_order_session_id', '=', guestId)
+      .where('status', '=', 'active').where('expires_at', '>', new Date()).executeTakeFirstOrThrow()).count)
+
+    for (const kind of ['customer', 'guest'] as const) {
+      const identity = kind === 'customer' ? await makeCustomer() : await makeGuest()
+      const owner = kind === 'customer' ? customerOwner(identity as OwnerCustomer) : guestOwner(identity as Guest)
+      await fill(owner, 49)
+      const concurrent = await Promise.allSettled([
+        createPurchaseDraft(db, configA, owner, fixture.versionId),
+        createPurchaseDraft(db, configA, owner, fixture.versionId),
+      ])
+      expect(concurrent.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+      expect(concurrent.filter(result => result.status === 'rejected')).toHaveLength(1)
+      if (kind === 'customer') expect(await countForCustomer((identity as OwnerCustomer).id)).toBe(50)
+      else expect(await countForGuest((identity as Guest).id)).toBe(50)
+    }
+
+    const alreadyClaimedCustomer = await makeCustomer()
+    const alreadyClaimedGuest = await makeGuest()
+    await fill(customerOwner(alreadyClaimedCustomer), 49)
+    const claimedDraft = await createPurchaseDraft(db, configA, guestOwner(alreadyClaimedGuest), fixture.versionId)
+    expect(await claimGuestPurchaseDrafts(db, alreadyClaimedCustomer, alreadyClaimedGuest.token, [claimedDraft.id]))
+      .toEqual({ claimedCount: 1, alreadyClaimedCount: 0 })
+    expect(await countForCustomer(alreadyClaimedCustomer.id)).toBe(50)
+    expect(await claimGuestPurchaseDrafts(db, alreadyClaimedCustomer, alreadyClaimedGuest.token, [claimedDraft.id]))
+      .toEqual({ claimedCount: 0, alreadyClaimedCount: 1 })
+
+    const fullCustomer = await makeCustomer()
+    const fullGuest = await makeGuest()
+    await fill(customerOwner(fullCustomer), 50)
+    const unclaimed = await createPurchaseDraft(db, configA, guestOwner(fullGuest), fixture.versionId)
+    await expect(claimGuestPurchaseDrafts(db, fullCustomer, fullGuest.token, [unclaimed.id]))
+      .rejects.toMatchObject({ status: 409, code: 'PURCHASE_DRAFT_LIMIT' })
+    await expect(getPurchaseDraft(db, configA, guestOwner(fullGuest), unclaimed.id)).resolves.toMatchObject({ id: unclaimed.id })
+
+    const batchCustomer = await makeCustomer()
+    const batchGuest = await makeGuest()
+    await fill(customerOwner(batchCustomer), 49)
+    const batch = await Promise.all([
+      createPurchaseDraft(db, configA, guestOwner(batchGuest), fixture.versionId),
+      createPurchaseDraft(db, configA, guestOwner(batchGuest), fixture.versionId),
+    ])
+    await expect(claimGuestPurchaseDrafts(db, batchCustomer, batchGuest.token, batch.map(row => row.id)))
+      .rejects.toMatchObject({ status: 409, code: 'PURCHASE_DRAFT_LIMIT' })
+    for (const draft of batch) {
+      await expect(getPurchaseDraft(db, configA, guestOwner(batchGuest), draft.id)).resolves.toMatchObject({ id: draft.id })
+      await expect(getPurchaseDraft(db, configA, customerOwner(batchCustomer), draft.id)).rejects.toMatchObject({ status: 404 })
+    }
+
+    const racingCustomer = await makeCustomer()
+    const racingGuest = await makeGuest()
+    await fill(customerOwner(racingCustomer), 49)
+    const guestDraft = await createPurchaseDraft(db, configA, guestOwner(racingGuest), fixture.versionId)
+    const raced = await Promise.allSettled([
+      createPurchaseDraft(db, configA, customerOwner(racingCustomer), fixture.versionId),
+      claimGuestPurchaseDrafts(db, racingCustomer, racingGuest.token, [guestDraft.id]),
+    ])
+    expect(raced.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(raced.filter(result => result.status === 'rejected')).toHaveLength(1)
+    expect(await countForCustomer(racingCustomer.id)).toBe(50)
+  }, 120_000)
+
   it('stores private images, enforces field ownership and replacement identity, and isolates both cleaners', async () => {
     const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
     const customer = await makeCustomer()
@@ -560,6 +828,107 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     expect(deleted.attachments.map(attachment => attachment.id)).toEqual([replacement.attachmentId])
   }, 45_000)
 
+  it('releases a confirmed stale upload reservation so the same image field can be retried immediately', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const customer = await makeCustomer()
+    const owner = customerOwner(customer)
+    const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const storage = new PurchaseAttachmentStorage(privateRoot)
+    const png = await sharp({ create: { width: 9, height: 7, channels: 4, background: '#4b258a' } }).png().toBuffer()
+    let release!: () => void
+    let paused!: () => void
+    const pausedSignal = new Promise<void>(resolve => { paused = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    async function* pausedStream() {
+      yield png
+      paused()
+      await gate
+    }
+    const upload = uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: pausedStream(),
+    })
+    await pausedSignal
+    const saved = await savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, values: {},
+    })
+    expect(saved.revision).toBe(draft.revision + 1)
+    release()
+    await expect(upload).rejects.toMatchObject({ status: 409, code: 'PURCHASE_DRAFT_REVISION_CONFLICT' })
+
+    const staleRows = await db.selectFrom('purchase_draft_attachments').select(['id', 'status'])
+      .where('draft_id', '=', draft.id).execute()
+    expect(staleRows.filter(row => row.status !== 'deleting')).toEqual([])
+    const retry = await uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: draft.id, expectedRevision: saved.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    expect(retry.mimeType).toBe('image/webp')
+    const ready = await db.selectFrom('purchase_draft_attachments').select(['id', 'status'])
+      .where('draft_id', '=', draft.id).execute()
+    expect(ready).toContainEqual({ id: retry.attachmentId, status: 'ready' })
+    const retryRead = await readPurchaseDraftAttachment(db, storage, owner, draft.id, retry.attachmentId)
+    expect(retryRead.sha256).toBe(retry.sha256)
+    await savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: saved.revision, values: { [fixture.ids.imageId]: [retry.attachmentId] },
+    })
+    const cleanup = await reconcilePurchaseDrafts(db, storage, { repair: true })
+    expect(cleanup.removedFiles).toBe(0)
+    expect(await db.selectFrom('purchase_draft_attachments').select('id').where('id', '=', retry.attachmentId).execute())
+      .toHaveLength(1)
+    expect(await readPurchaseDraftAttachment(db, storage, owner, draft.id, retry.attachmentId)
+      .then(file => file.sha256)).toBe(retry.sha256)
+    expect((await reconcilePurchaseDrafts(db, storage, { repair: true })).removedFiles).toBe(0)
+  }, 45_000)
+
+  it('preserves a ready file when the database commit succeeds but its acknowledgement is lost', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const customer = await makeCustomer()
+    const owner = customerOwner(customer)
+    const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const storage = new PurchaseAttachmentStorage(privateRoot)
+    const png = await sharp({ create: { width: 11, height: 8, channels: 4, background: '#736326' } }).png().toBuffer()
+    let transactionCount = 0
+    const databaseWithLostCommitAck = new Proxy(db, {
+      get(target, property) {
+        if (property === 'transaction') {
+          return () => {
+            const builder = target.transaction()
+            return {
+              execute: async <T>(callback: (trx: Transaction<Database>) => Promise<T>): Promise<T> => {
+                const result = await builder.execute(callback)
+                transactionCount += 1
+                if (transactionCount === 2) throw new Error('test simulated a lost commit acknowledgement')
+                return result
+              },
+            }
+          }
+        }
+        const value = Reflect.get(target, property, target) as unknown
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    }) as Kysely<Database>
+    await expect(uploadPurchaseDraftAttachment(databaseWithLostCommitAck, configA, storage, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })).rejects.toMatchObject({ status: 400, code: 'PURCHASE_ATTACHMENT_UPLOAD_FAILED' })
+    expect(transactionCount).toBe(2)
+    const committed = await db.selectFrom('purchase_draft_attachments').selectAll()
+      .where('draft_id', '=', draft.id).where('status', '=', 'ready').executeTakeFirstOrThrow()
+    expect(committed.byte_size).not.toBeNull()
+    const committedBytes = await storage.readVerified(committed.id, committed.storage_key, committed.byte_size!, committed.sha256!)
+    expect(createHash('sha256').update(committedBytes).digest('hex')).toBe(committed.sha256)
+
+    await savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, values: { [fixture.ids.imageId]: [committed.id] },
+    })
+    const firstCleanup = await reconcilePurchaseDrafts(db, storage, { repair: true })
+    const secondCleanup = await reconcilePurchaseDrafts(db, storage, { repair: true })
+    expect(firstCleanup.removedFiles).toBe(0)
+    expect(secondCleanup.removedFiles).toBe(0)
+    expect((await readPurchaseDraftAttachment(db, storage, owner, draft.id, committed.id)).sha256).toBe(committed.sha256)
+  }, 45_000)
+
   it('recovers interrupted uploads and rejects a stale completion after draft deletion', async () => {
     const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
     const customer = await makeCustomer()
@@ -587,11 +956,136 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     release()
     await expect(uploading).rejects.toMatchObject({ status: 404 })
     const cleanupTime = new Date(Date.now() + 25 * 60 * 60_000)
+    expect(await db.selectFrom('purchase_draft_attachments').select('id').where('id', '=', pending.id).execute()).toHaveLength(0)
+    expect((await storage.scanFiles()).some(file => file.id === pending.id)).toBe(false)
     const repaired = await reconcilePurchaseDrafts(db, storage, { repair: true, now: cleanupTime, graceHours: 24 })
-    expect(repaired.removedFiles).toBeGreaterThanOrEqual(1)
+    expect(repaired.removedFiles).toBe(0)
     expect(await db.selectFrom('purchase_drafts').select('id').where('id', '=', draft.id).execute()).toHaveLength(0)
     expect((await storage.scanFiles()).some(file => file.id === pending.id)).toBe(false)
     const retry = await reconcilePurchaseDrafts(db, storage, { repair: true, now: cleanupTime, graceHours: 24 })
     expect(retry.removedFiles).toBe(0)
   }, 45_000)
+
+  it('rechecks renewed draft expiry after an old-ready candidate query and rejects renewal after cleanup wins', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const customer = await makeCustomer()
+    const owner = customerOwner(customer)
+    const storage = new PurchaseAttachmentStorage(privateRoot)
+    const png = await sharp({ create: { width: 10, height: 6, channels: 4, background: '#2d7242' } }).png().toBuffer()
+    const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const attachment = await uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    await savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, values: { [fixture.ids.imageId]: [attachment.attachmentId] },
+    })
+    await db.updateTable('purchase_drafts').set({ expires_at: new Date(Date.now() + 24 * 60 * 60_000) })
+      .where('id', '=', draft.id).execute()
+    const revisionBeforeRenewal = (await db.selectFrom('purchase_drafts').select('revision')
+      .where('id', '=', draft.id).executeTakeFirstOrThrow()).revision
+
+    await sql`CREATE TABLE purchase_draft_reconcile_gate (id integer PRIMARY KEY)`.execute(db)
+    await sql`INSERT INTO purchase_draft_reconcile_gate (id) VALUES (1)`.execute(db)
+    await sql`
+      CREATE FUNCTION pause_purchase_draft_expiry_for_test() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        PERFORM id FROM purchase_draft_reconcile_gate WHERE id = 1 FOR UPDATE;
+        RETURN NEW;
+      END;
+      $$
+    `.execute(db)
+    await sql`CREATE TRIGGER zz_purchase_draft_expiry_gate_for_test
+      BEFORE UPDATE OF expires_at ON purchase_drafts
+      FOR EACH ROW EXECUTE FUNCTION pause_purchase_draft_expiry_for_test()`.execute(db)
+
+    let releaseTrigger!: () => void
+    let lockedGate!: (pid: number) => void
+    const triggerGate = new Promise<void>(resolve => { releaseTrigger = resolve })
+    const gateReady = new Promise<number>(resolve => { lockedGate = resolve })
+    let releaseCandidate!: () => void
+    let candidateReached!: () => void
+    const candidateGate = new Promise<void>(resolve => { releaseCandidate = resolve })
+    const candidateReady = new Promise<void>(resolve => { candidateReached = resolve })
+    let renewResult: Awaited<ReturnType<typeof renewPurchaseDraft>> | undefined
+    let reconcileResult: Awaited<ReturnType<typeof reconcilePurchaseDrafts>> | undefined
+    const gateHolder = db.transaction().execute(async trx => {
+      await sql`SELECT id FROM purchase_draft_reconcile_gate WHERE id = 1 FOR UPDATE`.execute(trx)
+      const pid = await sql<{ pid: number }>`SELECT pg_backend_pid() AS pid`.execute(trx)
+      lockedGate(Number(pid.rows[0]!.pid))
+      await triggerGate
+    })
+    const gatePid = await gateReady
+    let renewalError: unknown
+    const renewal = renewPurchaseDraft(db, owner, draft.id, revisionBeforeRenewal)
+      .then(value => { renewResult = value }, error => { renewalError = error })
+    const waitForLock = async (blockerPid: number) => {
+      const deadline = Date.now() + 15_000
+      while (Date.now() < deadline) {
+        const blocked = await sql<{ pid: number }>`
+          SELECT activity.pid
+          FROM pg_stat_activity AS activity
+          WHERE activity.wait_event_type = 'Lock'
+            AND activity.datname = current_database()
+            AND ${blockerPid} = ANY(pg_blocking_pids(activity.pid))
+          LIMIT 1
+        `.execute(db)
+        if (blocked.rows[0]) return Number(blocked.rows[0].pid)
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      throw new Error('Timed out waiting for the renewal trigger to block on its PostgreSQL gate')
+    }
+    await waitForLock(gatePid)
+    const plugin: KyselyPlugin = {
+      transformQuery: ({ node }) => node,
+      async transformResult(args) {
+        const candidate = args.result.rows.some(row => row.id === attachment.attachmentId && row.draft_id === draft.id)
+        if (candidate) {
+          candidateReached()
+          await candidateGate
+        }
+        return args.result
+      },
+    }
+    const reconcileNow = new Date(Date.now() + 2 * 24 * 60 * 60_000)
+    let cleaningError: unknown
+    const cleaning = reconcilePurchaseDrafts(db.withPlugin(plugin), storage, {
+      repair: true, now: reconcileNow, graceHours: 24,
+    }).then(value => { reconcileResult = value }, error => { cleaningError = error })
+    await candidateReady
+    releaseTrigger()
+    await gateHolder
+    await renewal
+    expect(renewalError).toBeUndefined()
+    expect(renewResult?.revision).toBe(revisionBeforeRenewal + 1)
+    releaseCandidate()
+    await cleaning
+    expect(cleaningError).toBeUndefined()
+    expect(reconcileResult?.removedFiles).toBe(0)
+    expect(await db.selectFrom('purchase_drafts').select(['status', 'expires_at']).where('id', '=', draft.id).executeTakeFirstOrThrow())
+      .toMatchObject({ status: 'active' })
+    expect(await db.selectFrom('purchase_draft_attachments').select('status').where('id', '=', attachment.attachmentId).executeTakeFirstOrThrow())
+      .toEqual({ status: 'ready' })
+    const afterRenewal = await getPurchaseDraft(db, configA, owner, draft.id)
+    expect(afterRenewal.attachments.map(row => row.id)).toEqual([attachment.attachmentId])
+    expect((await readPurchaseDraftAttachment(db, storage, owner, draft.id, attachment.attachmentId)).sha256).toBe(attachment.sha256)
+
+    await sql`DROP TRIGGER zz_purchase_draft_expiry_gate_for_test ON purchase_drafts`.execute(db)
+    await sql`DROP FUNCTION pause_purchase_draft_expiry_for_test()`.execute(db)
+    await sql`DROP TABLE purchase_draft_reconcile_gate`.execute(db)
+
+    expect(afterRenewal.revision).toBe(revisionBeforeRenewal + 1)
+    const expiring = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const expiringAttachment = await uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: expiring.id, expectedRevision: expiring.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    const cleanupTime = new Date(Date.now() + 31 * 24 * 60 * 60_000)
+    const cleaned = await reconcilePurchaseDrafts(db, storage, { repair: true, now: cleanupTime, graceHours: 0, batchSize: 500 })
+    expect(cleaned.removedFiles).toBeGreaterThanOrEqual(1)
+    await expect(renewPurchaseDraft(db, owner, expiring.id, expiring.revision)).rejects.toMatchObject({ status: 404 })
+    expect(await db.selectFrom('purchase_draft_attachments').select('id').where('id', '=', expiringAttachment.attachmentId).execute())
+      .toEqual([])
+  }, 60_000)
 })

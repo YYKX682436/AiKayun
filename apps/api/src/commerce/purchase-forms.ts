@@ -274,7 +274,7 @@ export async function createPurchaseDraft(
 ): Promise<{ id: string; revision: number; expiresAt: string }> {
   if (!uuidPattern.test(templateVersionId)) throw new PurchaseDraftServiceError(400, 'PURCHASE_TEMPLATE_VERSION_INVALID', '填写模板版本无效。')
   return db.transaction().execute(async (trx) => {
-    const identity = await validateAndLockOwner(trx, owner)
+    const identity = await validateAndLockOwner(trx, owner, 'update')
     await loadDraftTemplate(trx, templateVersionId)
     let countQuery = trx.selectFrom('purchase_drafts').select(db.fn.countAll<number>().as('count'))
       .where('status', '=', 'active').where('expires_at', '>', now)
@@ -522,6 +522,15 @@ export async function claimGuestPurchaseDrafts(
       toClaim.push(draft)
     }
     if (toClaim.length) {
+      const activeCustomerDrafts = await trx.selectFrom('purchase_drafts')
+        .select(db.fn.countAll<number>().as('count'))
+        .where('customer_id', '=', customerOwner.customerId)
+        .where('guest_order_session_id', 'is', null)
+        .where('status', '=', 'active').where('expires_at', '>', now)
+        .executeTakeFirstOrThrow()
+      if (Number(activeCustomerDrafts.count) + toClaim.length > PURCHASE_DRAFT_MAX_PER_OWNER) {
+        throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_LIMIT', '可保存的填写草稿数量已达到上限。')
+      }
       const transferredAttachments = await trx.selectFrom('purchase_draft_attachments').select(['byte_size', 'reserved_bytes'])
         .where('draft_id', 'in', toClaim.map(draft => draft.id)).where('status', 'in', ['uploading', 'ready', 'failed']).execute()
       const transferredBytes = transferredAttachments.reduce((total, attachment) => total + (attachment.byte_size ?? attachment.reserved_bytes), 0)
@@ -537,6 +546,37 @@ export async function claimGuestPurchaseDrafts(
     }
     return { claimedCount, alreadyClaimedCount }
   })
+}
+
+async function releaseUncommittedPurchaseDraftUpload(
+  db: Kysely<Database>,
+  storage: PurchaseAttachmentStorage,
+  draftId: string,
+  attachmentId: string,
+  storageKey: string,
+): Promise<void> {
+  const transitioned = await db.transaction().execute(async (trx) => {
+    const draft = await trx.selectFrom('purchase_drafts').select(['id', 'status'])
+      .where('id', '=', draftId).forUpdate().executeTakeFirst()
+    if (!draft) return false
+    const attachment = await trx.selectFrom('purchase_draft_attachments').select(['id', 'status'])
+      .where('draft_id', '=', draftId).where('id', '=', attachmentId).forUpdate().executeTakeFirst()
+    if (!attachment || attachment.status !== 'uploading') return false
+    const reference = await trx.selectFrom('purchase_draft_attachment_references').select('attachment_id')
+      .where('draft_id', '=', draftId).where('attachment_id', '=', attachmentId).executeTakeFirst()
+    if (reference) return false
+    const updated = await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: new Date() })
+      .where('draft_id', '=', draftId).where('id', '=', attachmentId).where('status', '=', 'uploading')
+      .returning('id').executeTakeFirst()
+    return Boolean(updated)
+  })
+  if (!transitioned) return
+
+  // The deleting state releases field and owner capacity immediately. A failed
+  // unlink leaves a retryable row for reconcilePurchaseDrafts.
+  await storage.remove(attachmentId, storageKey)
+  await db.deleteFrom('purchase_draft_attachments').where('id', '=', attachmentId)
+    .where('status', '=', 'deleting').execute()
 }
 
 export async function uploadPurchaseDraftAttachment(
@@ -566,7 +606,6 @@ export async function uploadPurchaseDraftAttachment(
   const reservedBytes = input.expectedBytes ?? PURCHASE_ATTACHMENT_INPUT_LIMIT_BYTES
   const attachmentId = randomUUID()
   const storageKey = storage.storageKey(attachmentId)
-  let objectStored = false
   await db.transaction().execute(async (trx) => {
     const identity = await validateAndLockOwner(trx, owner, 'update')
     const draft = await lockOwnedDraft(trx, identity, input.draftId, 'update')
@@ -603,7 +642,6 @@ export async function uploadPurchaseDraftAttachment(
   try {
     const prepared = await processPurchaseImageUpload(input.stream, input.claimedMimeType)
     const createdKey = await storage.store(attachmentId, prepared.bytes)
-    objectStored = true
     const finalized = await db.transaction().execute(async (trx) => {
       const identity = await validateAndLockOwner(trx, owner, 'update')
       const draft = await lockOwnedDraft(trx, identity, input.draftId, 'update')
@@ -643,15 +681,12 @@ export async function uploadPurchaseDraftAttachment(
       sha256: finalized.sha256,
     }
   } catch (error) {
-    // Once a file is durably linked, a failed finalize response may still be an
-    // unknown commit outcome. Leave it for the reconciler to inspect instead of
-    // risking removal of a file whose ready row committed.
-    if (!objectStored) {
-      await storage.remove(attachmentId, storageKey).catch(() => undefined)
-      await db.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: new Date() })
-        .where('id', '=', attachmentId).where('status', '=', 'uploading').execute().catch(() => undefined)
-      await db.deleteFrom('purchase_draft_attachments').where('id', '=', attachmentId)
-        .where('status', '=', 'deleting').execute().catch(() => undefined)
+    // Service/decoder failures are determinate. Recheck the draft and row under
+    // the normal draft -> attachment lock order before releasing their quota.
+    // Raw database/commit errors remain ambiguous, so preserve their object and
+    // reservation for the reconciler rather than risking a committed ready row.
+    if (error instanceof PurchaseDraftServiceError || error instanceof PurchaseAttachmentError) {
+      await releaseUncommittedPurchaseDraftUpload(db, storage, input.draftId, attachmentId, storageKey).catch(() => undefined)
     }
     if (error instanceof PurchaseDraftServiceError || error instanceof PurchaseAttachmentError) throw error
     throw new PurchaseDraftServiceError(400, 'PURCHASE_ATTACHMENT_UPLOAD_FAILED', '图片未能安全保存，请检查文件后重试。')
@@ -723,12 +758,17 @@ export async function reconcilePurchaseDrafts(
         .where(eb => eb.or([eb('draft.status', '=', 'deleting'), eb('draft.expires_at', '<=', now)]))
         .orderBy('attachment.created_at').orderBy('attachment.id').limit(batchSize).execute()
       for (const candidate of oldReady) {
-        const draft = await trx.selectFrom('purchase_drafts').select(['id', 'status'])
+        const draft = await trx.selectFrom('purchase_drafts').select(['id', 'status', 'expires_at'])
           .where('id', '=', candidate.draft_id).forUpdate().skipLocked().executeTakeFirst()
         if (!draft) continue
-        const attachment = await trx.selectFrom('purchase_draft_attachments').select('id')
-          .where('id', '=', candidate.id).where('status', '=', 'ready').forUpdate().executeTakeFirst()
+        const stillExpired = draft.status === 'deleting' || (draft.status === 'active' && draft.expires_at <= now)
+        if (!stillExpired) continue
+        const attachment = await trx.selectFrom('purchase_draft_attachments').select(['id', 'created_at'])
+          .where('id', '=', candidate.id).where('draft_id', '=', candidate.draft_id)
+          .where('status', '=', 'ready').where('created_at', '<=', cutoff)
+          .forUpdate().skipLocked().executeTakeFirst()
         if (!attachment) continue
+        if (attachment.created_at > cutoff) continue
         const reference = await trx.selectFrom('purchase_draft_attachment_references').select('attachment_id')
           .where('draft_id', '=', candidate.draft_id).where('attachment_id', '=', candidate.id).executeTakeFirst()
         if (!reference) {

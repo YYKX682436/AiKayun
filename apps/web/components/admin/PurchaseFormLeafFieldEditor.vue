@@ -22,40 +22,53 @@ const fieldTypeItems = [
 ]
 
 function update(patch: Record<string, unknown>) {
+  if (props.disabled) return
   emit('update:field', { ...props.field, ...patch } as PurchaseFormLeafField)
 }
 
 function changeType(type: string) {
+  if (locked.value || type === props.field.type) return
   const base = {
     id: props.field.id,
     meaningKey: props.field.meaningKey,
     label: props.field.label,
     required: props.field.required,
+    ...(props.field.helpText ? { helpText: props.field.helpText } : {}),
   }
+  let next: PurchaseFormLeafField
   if (type === 'select') {
-    update({ ...base, type, options: [{ id: crypto.randomUUID(), meaningKey: `option_${crypto.randomUUID().slice(0, 8)}`, label: '选项一' }] })
+    const optionId = crypto.randomUUID()
+    next = { ...base, type, options: [{ id: optionId, meaningKey: `option_${optionId.slice(0, 8)}`, label: '选项一' }] }
   } else if (type === 'image') {
-    update({ ...base, type, maxCount: 1 })
+    next = { ...base, type, maxCount: 1 }
   } else {
-    update({ ...base, type, maxLength: type === 'digits' ? 128 : 1000 })
+    const textType = type as 'text' | 'textarea' | 'digits'
+    const placeholder = 'placeholder' in props.field ? props.field.placeholder : undefined
+    next = {
+      ...base,
+      ...(placeholder ? { placeholder } : {}),
+      type: textType,
+      maxLength: textType === 'digits' ? 128 : 1000,
+    }
   }
+  emit('update:field', next)
 }
 
 function addOption() {
-  if (props.field.type !== 'select' || props.field.options.length >= 20) return
+  if (props.disabled || props.field.type !== 'select' || props.field.options.length >= 20) return
   const options = [...props.field.options, { id: crypto.randomUUID(), meaningKey: `option_${crypto.randomUUID().slice(0, 8)}`, label: `选项 ${props.field.options.length + 1}` }]
   update({ options })
 }
 
 function updateOption(index: number, patch: Record<string, string>) {
-  if (props.field.type !== 'select') return
+  if (props.disabled || props.field.type !== 'select') return
   const options = [...props.field.options]
   options[index] = { ...options[index]!, ...patch }
   update({ options })
 }
 
 function removeOption(index: number) {
-  if (props.field.type !== 'select' || props.field.options.length <= 1) return
+  if (props.disabled || props.field.type !== 'select' || props.field.options.length <= 1) return
   update({ options: props.field.options.filter((_, optionIndex) => optionIndex !== index) })
 }
 </script>

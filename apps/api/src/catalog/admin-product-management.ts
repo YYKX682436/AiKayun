@@ -775,8 +775,12 @@ async function deleteProduct(
     const galleryMediaIds = mediaReferences.filter((reference) => reference.source === 'gallery')
       .sort((left, right) => (left.sort_order ?? 0) - (right.sort_order ?? 0)).map((reference) => reference.media_id)
 
-    // Remove only empty quantity state and product-owned relations. The RESTRICT
-    // foreign keys on SKU history/resources remain the final protection layer.
+    // Remove the reversible preparation associations inside the same approved
+    // deletion transaction. Immutable purchase-form audit events retain their
+    // original UUID identities without catalog foreign keys. The RESTRICT
+    // foreign keys on real SKU history/resources remain the final protection.
+    await trx.deleteFrom('sku_purchase_form_overrides').where('product_id', '=', productId).execute()
+    await trx.deleteFrom('product_purchase_form_settings').where('product_id', '=', productId).execute()
     await trx.deleteFrom('product_variant_quantity_inventory').where('product_id', '=', productId).execute()
     // Product deletion removes only its own reference rows. Media is shared and
     // remains protected by the RESTRICT foreign key while any product uses it.

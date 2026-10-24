@@ -57,6 +57,7 @@ beforeAll(async () => {
   expect(upgraded.results?.map(row => row.migrationName)).toEqual([
     '202610240001_kayixin_readonly',
     '202610240002_purchase_forms_drafts',
+    '202610240003_purchase_form_audit_product_identity',
   ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])
