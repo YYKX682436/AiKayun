@@ -54,7 +54,10 @@ beforeAll(async () => {
     await trx.updateTable('supplier_connections').set({ tested_version_id: legacyVersionId, enabled: true }).where('id', '=', legacyId).execute()
   })
   const upgraded = await migrator.migrateToLatest(); if (upgraded.error) throw upgraded.error
-  expect(upgraded.results?.map(row => row.migrationName)).toEqual(['202610240001_kayixin_readonly'])
+  expect(upgraded.results?.map(row => row.migrationName)).toEqual([
+    '202610240001_kayixin_readonly',
+    '202610240002_purchase_forms_drafts',
+  ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])
   app = await createApp({ db, config, logger: process.env.AIKAYUN_TEST_SUPPLIER_LOGGING === 'true' }); await app.ready()

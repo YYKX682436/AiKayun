@@ -6,6 +6,8 @@
 
 `PRIVATE_FILE_ROOT` 是绝对路径，默认位于仓库之外的 `$XDG_DATA_HOME/aikayun/private-files`。配置启动检查会拒绝相对路径、仓库内路径以及与公开 `MEDIA_ROOT` 相同或互相嵌套的目录。Compose 通过独立 `private_files` 命名卷持久化它，并由一次性 root 初始化容器把挂载根目录交给非 root API 用户。公开商品图继续留在 `product_media` 卷。私有对象不进入 web 静态目录、公开图片路由或 CDN。
 
+⑥-2A在同一私有卷中增加隔离的 `purchase-attachments/` 子目录，但附件不属于本文件的数字商品交付对象；本文件的 `private-files:check/repair` 不会扫描或删除该命名空间。购买图片模型、授权与独立 `purchase-drafts:check/repair` 见[本地填写模板与私有草稿基础](purchase-form-preparation-6-2a.md)。
+
 服务端当前限制单文件最大 **100 MiB**，每个 API 实例最多同时处理 4 个上传。允许 ZIP、PDF、UTF-8 TXT/Markdown/CSV/JSON、PNG/JPEG/WebP/GIF、MP3 和 MP4；需要解码的图片限制为最多 1600 万像素。服务端不信任浏览器 MIME 声明：按扩展名和内容结构检查格式，拒绝空内容、扩展名与文件头不匹配、无效 UTF-8、缺少 ZIP 目录结束记录、缺少 PDF 结束标志和无法完整解码的图片。大文件通过 Node 流式写入和 SHA-256 计算，不以整个文件缓冲区入内存。磁盘文件名由随机 UUID 生成；上传名只作受限元数据，展示名单独保存并检查危险控制字符和格式扩展名。
 
 对象布局为 `objects/<UUID前两位>/<UUID>.bin`，临时状态留在 `.staging/<UUID>.part`。目录与文件不跟随符号链接，使用独占创建、不覆盖硬链接发布、文件/目录 `fsync`、只读权限以及打开句柄 inode/根目录复验。发布顺序是：先写 `uploading` 行和临时文件；完整写盘、内容校验与摘要完成后原子发布对象，再把数据库行改为 `staged`。失败时清理对象并保留可识别的失败状态。上传结果本身不能销售。

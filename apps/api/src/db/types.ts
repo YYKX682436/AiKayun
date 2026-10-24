@@ -166,6 +166,115 @@ export interface ProductVariantFulfillmentTable {
   updated_at: Generated<Date>
 }
 
+export type PurchaseFormIdentityKind = 'field' | 'option'
+export type PurchaseFormTemplateOperation =
+  | 'template_created' | 'template_updated' | 'template_version_saved'
+  | 'product_assignment_updated' | 'sku_override_updated'
+export type PurchaseFormDraftStatus = 'active' | 'deleting'
+export type PurchaseDraftAttachmentStatus = 'uploading' | 'ready' | 'failed' | 'deleting'
+
+export interface PurchaseFormTemplatesTable {
+  id: string
+  name: string
+  definition: ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>
+  revision: Generated<number>
+  latest_version_number: Generated<number>
+  created_by_admin_id: string
+  updated_by_admin_id: string
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
+
+export interface PurchaseFormTemplateVersionsTable {
+  id: string
+  template_id: string
+  version_number: number
+  name: string
+  definition: ColumnType<Record<string, unknown>, Record<string, unknown>, never>
+  sha256: string
+  created_by_admin_id: string
+  created_at: Generated<Date>
+}
+
+export interface PurchaseFormTemplateIdentitiesTable {
+  template_id: string
+  id: string
+  identity_kind: PurchaseFormIdentityKind
+  meaning_key: string
+  semantic_type: string | null
+  parent_id: string | null
+  created_at: Generated<Date>
+}
+
+export interface ProductPurchaseFormSettingsTable {
+  product_id: string
+  mode: 'none' | 'template'
+  template_version_id: string | null
+  updated_by_admin_id: string
+  updated_at: Generated<Date>
+}
+
+export interface SkuPurchaseFormOverridesTable {
+  product_id: string
+  product_variant_id: string
+  mode: 'none' | 'template'
+  template_version_id: string | null
+  updated_by_admin_id: string
+  updated_at: Generated<Date>
+}
+
+export interface PurchaseFormAuditEventsTable {
+  id: string
+  administrator_id: string
+  operation: PurchaseFormTemplateOperation
+  template_id: string | null
+  product_id: string | null
+  product_variant_id: string | null
+  summary: ColumnType<Record<string, unknown>, Record<string, unknown>, never>
+  created_at: Generated<Date>
+}
+
+export interface PurchaseDraftsTable {
+  id: string
+  customer_id: string | null
+  guest_order_session_id: string | null
+  claimed_from_guest_order_session_id: string | null
+  template_version_id: string
+  normalization_version: Generated<number>
+  revision: Generated<number>
+  status: Generated<PurchaseFormDraftStatus>
+  encrypted_payload: Buffer
+  payload_nonce: Buffer
+  payload_auth_tag: Buffer
+  encryption_key_id: string
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+  expires_at: ColumnType<Date, Date | string, Date | string>
+}
+
+export interface PurchaseDraftAttachmentsTable {
+  id: string
+  draft_id: string
+  field_id: string
+  status: Generated<PurchaseDraftAttachmentStatus>
+  storage_key: string
+  mime_type: Generated<'image/webp'>
+  byte_size: number | null
+  reserved_bytes: number
+  width: number | null
+  height: number | null
+  sha256: string | null
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
+
+export interface PurchaseDraftAttachmentReferencesTable {
+  draft_id: string
+  attachment_id: string
+  field_id: string
+  created_at: Generated<Date>
+}
+
 export interface ProductVariantFulfillmentVersionsTable {
   id: string
   product_variant_id: string
@@ -1000,6 +1109,15 @@ export interface Database {
   guest_order_sessions: GuestOrderSessionsTable
   product_variant_fulfillment: ProductVariantFulfillmentTable
   product_variant_fulfillment_versions: ProductVariantFulfillmentVersionsTable
+  purchase_form_templates: PurchaseFormTemplatesTable
+  purchase_form_template_versions: PurchaseFormTemplateVersionsTable
+  purchase_form_template_identities: PurchaseFormTemplateIdentitiesTable
+  product_purchase_form_settings: ProductPurchaseFormSettingsTable
+  sku_purchase_form_overrides: SkuPurchaseFormOverridesTable
+  purchase_form_audit_events: PurchaseFormAuditEventsTable
+  purchase_drafts: PurchaseDraftsTable
+  purchase_draft_attachments: PurchaseDraftAttachmentsTable
+  purchase_draft_attachment_references: PurchaseDraftAttachmentReferencesTable
   supplier_connection_tests: SupplierConnectionTestsTable
   supplier_connections: SupplierConnectionsTable
   supplier_connection_credentials: SupplierConnectionCredentialsTable

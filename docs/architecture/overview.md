@@ -183,3 +183,7 @@ Compose 启动时先等 PostgreSQL 健康，再运行一次性迁移容器，之
 ## 供应商只读连接（⑥-1）
 
 原供应商管理在⑥-1增加 `kayixin_customer_v3`，与 `http_json_v1` 并存。连接、凭据和配置继续版本化；新协议只开放账户、分页商品及包含规格/购买模板的详情读取，不进入旧自动履约 worker。只读测试按配置版本保存 `catalog_read_v3` 范围，与旧履约测试资格分离；API 和 PostgreSQL 同时禁止其成为可售 API 履约配置。上游报价和供货观察不写本地 SKU、库存或资金历史。具体字段、安全边界、真实站点未验证项及⑥-2接续事实见[卡易信客户 V3 只读接入](../supplier-kayixin-v3-readonly.md)。
+
+## 本地购买填写准备（⑥-2A）
+
+⑥-2A通过 `202610240002_purchase_forms_drafts` 增加本地填写模板、稳定身份/不可变版本、商品/SKU准备关联、加密顾客/游客草稿及 `PRIVATE_FILE_ROOT/purchase-attachments` 私有图片命名空间。关联只供后台准备与预览，未接入购物车、报价、下单或公共商品响应；顾客填写和附件路由未注册，旧 checkout 与原无填写商品的资格不变。数据对象、规范化、会话认领、配额、清理恢复及⑥-2B/C边界见[⑥-2A本地填写模板与私有草稿基础](../purchase-form-preparation-6-2a.md)。

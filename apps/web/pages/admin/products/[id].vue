@@ -2436,6 +2436,15 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 </div>
               </section>
 
+              <AdminProductPurchaseFormAssignmentPanel
+                v-if="product"
+                :product-id="productId"
+                :product-revision="product.revision"
+                :variants="product.variants"
+                :disabled="isArchived"
+                @revision="setProductRevision"
+              />
+
               <section
                 id="variants"
                 aria-labelledby="variants-title"

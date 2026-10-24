@@ -2909,5 +2909,6 @@ export function failure(code: string, message: string, requestId: string): ApiEr
 }
 
 export * from './supplier-catalog.js'
+export * from './purchase-forms.js'
 export type SupplierProviderType = Static<typeof SupplierProviderTypeSchema>
 export type SupplierAuthScheme = Static<typeof SupplierAuthSchemeSchema>

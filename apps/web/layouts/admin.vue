@@ -13,6 +13,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     to: '/admin/products',
   },
   {
+    label: '购买填写模板',
+    icon: 'i-lucide-list-checks',
+    to: '/admin/purchase-form-templates',
+  },
+  {
     label: '顾客管理',
     icon: 'i-lucide-users-round',
     to: '/admin/customers',

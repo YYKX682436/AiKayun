@@ -29,6 +29,7 @@ import { defaultProductIdentityFactory } from './catalog/admin-products.js'
 import type { ProductIdentityFactory } from './catalog/admin-products.js'
 import { registerAdminCategoryRoutes } from './catalog/admin-categories.js'
 import { registerAdminProductDetailRoutes } from './catalog/admin-product-details.js'
+import { registerAdminPurchaseFormRoutes } from './catalog/admin-purchase-forms.js'
 import { registerAdminVariantMatrixRoutes } from './catalog/admin-variant-matrix.js'
 import { registerAdminProductPriceRoutes } from './catalog/admin-product-prices.js'
 import { registerAdminInventoryRoutes } from './catalog/admin-inventory.js'
@@ -69,7 +70,7 @@ export async function createApp(options: {
     logger: options.logger === false ? false : {
       level: config.nodeEnv === 'production' ? 'info' : 'debug',
       redact: {
-        paths: ['req.headers.cookie', 'req.headers.authorization', 'req.headers.x-csrf-token', 'res.headers.set-cookie', 'req.body.bearerToken', 'req.body.credentials', 'req.headers.x-signature'],
+        paths: ['req.headers.cookie', 'req.headers.authorization', 'req.headers.x-csrf-token', 'res.headers.set-cookie', 'req.body', 'req.body.bearerToken', 'req.body.credentials', 'req.headers.x-signature'],
         censor: '[REDACTED]',
       },
     },
@@ -194,6 +195,7 @@ export async function createApp(options: {
   registerAdminProductManagementRoutes(app, db, config, identityFactory)
   registerAdminCategoryRoutes(app, db, config)
   registerAdminProductDetailRoutes(app, db, config)
+  registerAdminPurchaseFormRoutes(app, db, config)
   registerAdminVariantMatrixRoutes(app, db, config, identityFactory)
   registerAdminProductPriceRoutes(app, db, config)
   registerAdminInventoryRoutes(app, db, config)

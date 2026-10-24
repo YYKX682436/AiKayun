@@ -1,0 +1,511 @@
+<script setup lang="ts">
+import type { ProductDetail, PurchaseTemplateSummary } from '@aikayun/contracts'
+import { AdminApiError, useAdminApi } from '~/composables/useAdminApi'
+
+type Variant = Pick<ProductDetail['variants'][number], 'id' | 'skuCode' | 'retiredAt'>
+type AssignmentVersion = { id: string; templateId: string; templateName: string; versionNumber: number }
+type ProductAssignment = { productId: string; productRevision: number; mode: 'not_configured' | 'none' | 'template'; templateVersion: AssignmentVersion | null }
+type SkuAssignment = { productId: string; variantId: string; productRevision: number; mode: 'product_default' | 'none' | 'template'; templateVersion: AssignmentVersion | null; productDefault: ProductAssignment }
+type VersionOption = { id: string; templateId: string; versionNumber: number; name: string; createdAt: string }
+type ListResponse<T> = { items: T[]; total: number; page: number; pageSize: number }
+type VersionResponse = { items: VersionOption[]; total: number; page: number; pageSize: number }
+
+const props = defineProps<{
+  productId: string
+  productRevision: number
+  variants: Variant[]
+  disabled?: boolean
+}>()
+const emit = defineEmits<{ revision: [revision: number] }>()
+const { request } = useAdminApi()
+const loading = ref(true)
+const saving = ref('')
+const errorMessage = ref('')
+const successMessage = ref('')
+const staleRevision = ref(false)
+const templates = ref<PurchaseTemplateSummary[]>([])
+const selectedVariantId = ref('')
+const productAssignment = shallowRef<ProductAssignment | null>(null)
+const skuAssignment = shallowRef<SkuAssignment | null>(null)
+
+const productMode = ref<ProductAssignment['mode']>('not_configured')
+const productTemplateId = ref('')
+const productVersionId = ref('')
+const productVersions = ref<VersionOption[]>([])
+const productVersionTotal = ref(0)
+const productVersionPage = ref(1)
+const productVersionsLoading = ref(false)
+const skuMode = ref<SkuAssignment['mode']>('product_default')
+const skuTemplateId = ref('')
+const skuVersionId = ref('')
+const skuVersions = ref<VersionOption[]>([])
+const skuVersionTotal = ref(0)
+const skuVersionPage = ref(1)
+const skuVersionsLoading = ref(false)
+const activeVariants = computed(() => props.variants.filter(variant => !variant.retiredAt))
+const selectedVariant = computed(() => props.variants.find(variant => variant.id === selectedVariantId.value) ?? null)
+const templateItems = computed(() => templates.value.map(template => ({ label: `${template.name} · ${template.latestVersionNumber} 个版本`, value: template.id })))
+const productVersionItems = computed(() => productVersions.value.map(version => ({ label: `v${version.versionNumber} · ${version.name}`, value: version.id })))
+const skuVersionItems = computed(() => skuVersions.value.map(version => ({ label: `v${version.versionNumber} · ${version.name}`, value: version.id })))
+const productModes = [
+  { label: '暂未指定模板', value: 'not_configured' },
+  { label: '明确不使用模板', value: 'none' },
+  { label: '关联模板版本（准备）', value: 'template' },
+]
+const skuModes = [
+  { label: '跟随商品默认', value: 'product_default' },
+  { label: '明确不使用模板', value: 'none' },
+  { label: '使用 SKU 覆盖版本（准备）', value: 'template' },
+]
+let generation = 0
+let locallyEmittedRevision: number | null = null
+let productVersionRequest = 0
+let skuVersionRequest = 0
+
+function ensureVersionOption(target: VersionOption[], assignment: AssignmentVersion | null) {
+  if (!assignment || target.some(version => version.id === assignment.id)) return target
+  return [{ id: assignment.id, templateId: assignment.templateId, versionNumber: assignment.versionNumber, name: assignment.templateName, createdAt: '' }, ...target]
+}
+
+async function loadVersions(kind: 'product' | 'sku', templateId: string, current = generation, page = 1, append = false) {
+  const requestId = kind === 'product' ? ++productVersionRequest : ++skuVersionRequest
+  const isCurrent = () => generation === current
+    && requestId === (kind === 'product' ? productVersionRequest : skuVersionRequest)
+    && templateId === (kind === 'product' ? productTemplateId.value : skuTemplateId.value)
+  if (!templateId) {
+    if (kind === 'product') { productVersions.value = []; productVersionTotal.value = 0; productVersionPage.value = 1; productVersionsLoading.value = false }
+    else { skuVersions.value = []; skuVersionTotal.value = 0; skuVersionPage.value = 1; skuVersionsLoading.value = false }
+    return
+  }
+  if (kind === 'product') productVersionsLoading.value = true
+  else skuVersionsLoading.value = true
+  try {
+    const result = await request<VersionResponse>(`/api/v1/admin/purchase-form-templates/${templateId}/versions?page=${page}&pageSize=100`)
+    if (!isCurrent()) return
+    const currentItems = kind === 'product' ? productVersions.value : skuVersions.value
+    const items = append
+      ? [...currentItems, ...result.items.filter(item => !currentItems.some(existing => existing.id === item.id))]
+      : result.items
+    if (kind === 'product') {
+      productVersions.value = ensureVersionOption(items, productAssignment.value?.templateVersion?.templateId === templateId ? productAssignment.value.templateVersion : null)
+      productVersionTotal.value = result.total
+      productVersionPage.value = result.page
+    } else {
+      skuVersions.value = ensureVersionOption(items, skuAssignment.value?.templateVersion?.templateId === templateId ? skuAssignment.value.templateVersion : null)
+      skuVersionTotal.value = result.total
+      skuVersionPage.value = result.page
+    }
+  } catch (error) {
+    if (isCurrent()) errorMessage.value = error instanceof Error ? error.message : '模板版本列表读取失败。'
+  } finally {
+    if (isCurrent()) {
+      if (kind === 'product') productVersionsLoading.value = false
+      else skuVersionsLoading.value = false
+    }
+  }
+}
+
+function loadMoreVersions(kind: 'product' | 'sku') {
+  if (kind === 'product') {
+    if (productVersionsLoading.value || productVersions.value.length >= productVersionTotal.value) return
+    void loadVersions(kind, productTemplateId.value, generation, productVersionPage.value + 1, true)
+  } else {
+    if (skuVersionsLoading.value || skuVersions.value.length >= skuVersionTotal.value) return
+    void loadVersions(kind, skuTemplateId.value, generation, skuVersionPage.value + 1, true)
+  }
+}
+
+async function loadSkuAssignment(variantId: string, current = generation) {
+  if (!variantId) {
+    skuAssignment.value = null
+    skuMode.value = 'product_default'
+    skuTemplateId.value = ''
+    skuVersionId.value = ''
+    skuVersions.value = []
+    return
+  }
+  const result = await request<SkuAssignment>(`/api/v1/admin/products/${props.productId}/variants/${variantId}/purchase-form`)
+  if (generation !== current || variantId !== selectedVariantId.value) return
+  skuAssignment.value = result
+  skuMode.value = result.mode
+  skuTemplateId.value = result.templateVersion?.templateId ?? ''
+  skuVersionId.value = result.templateVersion?.id ?? ''
+  staleRevision.value ||= result.productRevision !== props.productRevision
+  await loadVersions('sku', skuTemplateId.value, current)
+}
+
+async function load() {
+  const current = ++generation
+  const previousVariantId = selectedVariantId.value
+  loading.value = true
+  saving.value = ''
+  errorMessage.value = ''
+  successMessage.value = ''
+  staleRevision.value = false
+  try {
+    const [assignment, templatePage] = await Promise.all([
+      request<ProductAssignment>(`/api/v1/admin/products/${props.productId}/purchase-form`),
+      request<ListResponse<PurchaseTemplateSummary>>('/api/v1/admin/purchase-form-templates?page=1&pageSize=100'),
+    ])
+    if (generation !== current || props.productId !== assignment.productId) return
+    productAssignment.value = assignment
+    templates.value = templatePage.items
+    productMode.value = assignment.mode
+    productTemplateId.value = assignment.templateVersion?.templateId ?? ''
+    productVersionId.value = assignment.templateVersion?.id ?? ''
+    staleRevision.value = assignment.productRevision !== props.productRevision
+    productVersions.value = productTemplateId.value ? ensureVersionOption([], assignment.templateVersion) : []
+    selectedVariantId.value = activeVariants.value.some(variant => variant.id === previousVariantId)
+      ? previousVariantId
+      : activeVariants.value[0]?.id ?? props.variants[0]?.id ?? ''
+    await Promise.all([
+      loadVersions('product', productTemplateId.value, current),
+      loadSkuAssignment(selectedVariantId.value, current),
+    ])
+  } catch (error) {
+    if (generation !== current) return
+    errorMessage.value = error instanceof Error ? error.message : '商品填写模板准备关联读取失败。'
+  } finally {
+    if (generation === current) loading.value = false
+  }
+}
+
+async function saveProductAssignment() {
+  if (!productAssignment.value || props.disabled || saving.value || staleRevision.value) return
+  const current = generation
+  const productId = props.productId
+  saving.value = 'product'
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    const result = await request<ProductAssignment>(`/api/v1/admin/products/${productId}/purchase-form`, {
+      method: 'PUT',
+      body: {
+        expectedRevision: productAssignment.value.productRevision,
+        mode: productMode.value,
+        ...(productMode.value === 'template' ? { templateVersionId: productVersionId.value } : {}),
+      },
+    })
+    if (generation !== current || props.productId !== productId) return
+    productAssignment.value = result
+    productMode.value = result.mode
+    productTemplateId.value = result.templateVersion?.templateId ?? ''
+    productVersionId.value = result.templateVersion?.id ?? ''
+    staleRevision.value = false
+    locallyEmittedRevision = result.productRevision
+    emit('revision', result.productRevision)
+    successMessage.value = '商品默认模板准备关联已保存；尚未应用到顾客购买。'
+  } catch (error) {
+    if (generation !== current) return
+    errorMessage.value = error instanceof AdminApiError && error.status === 409 ? `${error.message}请重新读取商品后再保存。` : error instanceof Error ? error.message : '商品默认关联保存失败。'
+    if (error instanceof AdminApiError && error.status === 409) staleRevision.value = true
+  } finally { if (generation === current) saving.value = '' }
+}
+
+async function saveSkuAssignment() {
+  if (!skuAssignment.value || !selectedVariant.value || props.disabled || saving.value || staleRevision.value) return
+  const current = generation
+  const productId = props.productId
+  const variantId = selectedVariantId.value
+  saving.value = `sku:${variantId}`
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    const result = await request<SkuAssignment>(`/api/v1/admin/products/${productId}/variants/${variantId}/purchase-form`, {
+      method: 'PUT',
+      body: {
+        expectedRevision: skuAssignment.value.productRevision,
+        mode: skuMode.value,
+        ...(skuMode.value === 'template' ? { templateVersionId: skuVersionId.value } : {}),
+      },
+    })
+    if (generation !== current || props.productId !== productId || selectedVariantId.value !== variantId) return
+    skuAssignment.value = result
+    skuMode.value = result.mode
+    skuTemplateId.value = result.templateVersion?.templateId ?? ''
+    skuVersionId.value = result.templateVersion?.id ?? ''
+    staleRevision.value = false
+    locallyEmittedRevision = result.productRevision
+    emit('revision', result.productRevision)
+    successMessage.value = `SKU ${selectedVariant.value.skuCode} 准备覆盖已保存；尚未应用到顾客购买。`
+  } catch (error) {
+    if (generation !== current) return
+    errorMessage.value = error instanceof AdminApiError && error.status === 409 ? `${error.message}请重新读取商品后再保存。` : error instanceof Error ? error.message : 'SKU 覆盖保存失败。'
+    if (error instanceof AdminApiError && error.status === 409) staleRevision.value = true
+  } finally { if (generation === current) saving.value = '' }
+}
+
+watch(() => props.productId, () => { void load() })
+watch(() => props.productRevision, (revision) => {
+  if (revision === locallyEmittedRevision) {
+    locallyEmittedRevision = null
+    if (productAssignment.value) productAssignment.value = { ...productAssignment.value, productRevision: revision }
+    if (skuAssignment.value) skuAssignment.value = { ...skuAssignment.value, productRevision: revision }
+    return
+  }
+  void load()
+})
+watch(selectedVariantId, (variantId, previous) => {
+  if (!variantId || variantId === previous || loading.value) return
+  const current = generation
+  errorMessage.value = ''
+  successMessage.value = ''
+  void loadSkuAssignment(variantId, current).catch(error => {
+    if (generation === current) errorMessage.value = error instanceof Error ? error.message : 'SKU 模板准备关联读取失败。'
+  })
+})
+watch(productTemplateId, (value, previous) => {
+  if (value === previous) return
+  if (productAssignment.value?.templateVersion?.templateId !== value) productVersionId.value = ''
+  productVersions.value = []
+  productVersionTotal.value = 0
+  productVersionPage.value = 1
+  void loadVersions('product', value)
+})
+watch(skuTemplateId, (value, previous) => {
+  if (value === previous) return
+  if (skuAssignment.value?.templateVersion?.templateId !== value) skuVersionId.value = ''
+  skuVersions.value = []
+  skuVersionTotal.value = 0
+  skuVersionPage.value = 1
+  void loadVersions('sku', value)
+})
+onMounted(() => { void load() })
+onBeforeUnmount(() => { generation++ })
+</script>
+
+<template>
+  <section
+    id="purchase-form-preparation"
+    aria-labelledby="purchase-form-preparation-title"
+    :data-assignment-ready="!loading"
+    class="py-6"
+  >
+    <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <p class="text-sm font-medium text-primary">
+          阶段 ⑥-2A
+        </p>
+        <h2
+          id="purchase-form-preparation-title"
+          class="mt-1 text-lg font-semibold text-highlighted"
+        >
+          购买填写准备关联
+        </h2>
+        <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
+          分别保存商品默认与 SKU 覆盖。它们只记录将来拟使用的不可变版本，不参与当前报价、库存、可售资格、结算或履约。
+        </p>
+      </div>
+      <UBadge
+        color="warning"
+        variant="soft"
+      >
+        准备配置，尚未应用
+      </UBadge>
+    </header>
+    <UAlert
+      v-if="staleRevision"
+      class="mb-4"
+      color="warning"
+      variant="soft"
+      title="商品修订已变化。"
+      description="重新读取最新商品与关联后再保存，避免覆盖其他商品配置。"
+      role="alert"
+    >
+      <template #actions>
+        <UButton
+          size="sm"
+          color="warning"
+          variant="outline"
+          :loading="loading"
+          @click="load"
+        >
+          重新读取
+        </UButton>
+      </template>
+    </UAlert>
+    <UAlert
+      v-if="errorMessage"
+      class="mb-4"
+      color="error"
+      variant="soft"
+      :title="errorMessage"
+      role="alert"
+    />
+    <UAlert
+      v-if="successMessage"
+      class="mb-4"
+      color="success"
+      variant="soft"
+      :title="successMessage"
+      role="status"
+    />
+    <USkeleton
+      v-if="loading"
+      class="h-64 rounded-xl"
+      aria-label="读取模板关联"
+    />
+    <div
+      v-else
+      class="grid min-w-0 gap-4 xl:grid-cols-2"
+    >
+      <article class="min-w-0 rounded-xl border border-default bg-elevated p-4 sm:p-5">
+        <h3 class="font-semibold text-highlighted">
+          商品默认模板
+        </h3>
+        <p class="mt-1 text-sm leading-6 text-muted">
+          SKU 选择“跟随商品默认”时将查看此准备关联。当前交易不会读取此配置。
+        </p>
+        <div class="mt-4 space-y-4">
+          <UFormField label="关联方式">
+            <USelect
+              v-model="productMode"
+              :items="productModes"
+              class="w-full"
+              :disabled="disabled || staleRevision"
+            />
+          </UFormField>
+          <UFormField
+            v-if="productMode === 'template'"
+            label="本地模板"
+          >
+            <USelect
+              v-model="productTemplateId"
+              :items="templateItems"
+              class="w-full"
+              :disabled="disabled || staleRevision"
+              placeholder="选择模板"
+            />
+          </UFormField>
+          <UFormField
+            v-if="productMode === 'template'"
+            label="冻结版本"
+          >
+            <USelect
+              v-model="productVersionId"
+              :items="productVersionItems"
+              class="w-full"
+              :disabled="disabled || staleRevision || !productTemplateId"
+              placeholder="选择版本"
+            />
+          </UFormField>
+          <UButton
+            v-if="productVersions.length < productVersionTotal"
+            size="sm"
+            color="neutral"
+            variant="outline"
+            class="w-full"
+            :loading="productVersionsLoading"
+            :disabled="disabled || staleRevision"
+            @click="loadMoreVersions('product')"
+          >
+            加载更多商品版本
+          </UButton>
+          <p
+            v-if="productAssignment?.templateVersion"
+            class="break-words text-xs text-muted"
+          >
+            当前准备版本：{{ productAssignment.templateVersion.templateName }} · v{{ productAssignment.templateVersion.versionNumber }}
+          </p>
+          <div class="flex justify-end">
+            <UButton
+              :loading="saving === 'product'"
+              :disabled="disabled || staleRevision || !productAssignment || saving !== '' || (productMode === 'template' && (!productTemplateId || !productVersionId))"
+              @click="saveProductAssignment"
+            >
+              保存商品准备关联
+            </UButton>
+          </div>
+        </div>
+      </article>
+
+      <article class="min-w-0 rounded-xl border border-default bg-elevated p-4 sm:p-5">
+        <h3 class="font-semibold text-highlighted">
+          SKU 覆盖
+        </h3>
+        <p class="mt-1 text-sm leading-6 text-muted">
+          无覆盖与“明确不使用模板”是两种不同含义。覆盖仅保存准备关系，不会授予供应商采购资格。
+        </p>
+        <div class="mt-4 space-y-4">
+          <UFormField label="SKU">
+            <USelect
+              v-model="selectedVariantId"
+              :items="variants.map(variant => ({ label: `${variant.skuCode}${variant.retiredAt ? ' · 已退役' : ''}`, value: variant.id }))"
+              class="w-full"
+              :disabled="disabled || variants.length === 0"
+              placeholder="选择 SKU"
+            />
+          </UFormField>
+          <UFormField label="覆盖方式">
+            <USelect
+              v-model="skuMode"
+              :items="skuModes"
+              class="w-full"
+              :disabled="disabled || staleRevision || !selectedVariant || Boolean(selectedVariant.retiredAt)"
+            />
+          </UFormField>
+          <UFormField
+            v-if="skuMode === 'template'"
+            label="本地模板"
+          >
+            <USelect
+              v-model="skuTemplateId"
+              :items="templateItems"
+              class="w-full"
+              :disabled="disabled || staleRevision || Boolean(selectedVariant?.retiredAt)"
+              placeholder="选择模板"
+            />
+          </UFormField>
+          <UFormField
+            v-if="skuMode === 'template'"
+            label="冻结版本"
+          >
+            <USelect
+              v-model="skuVersionId"
+              :items="skuVersionItems"
+              class="w-full"
+              :disabled="disabled || staleRevision || !skuTemplateId || Boolean(selectedVariant?.retiredAt)"
+              placeholder="选择版本"
+            />
+          </UFormField>
+          <UButton
+            v-if="skuVersions.length < skuVersionTotal"
+            size="sm"
+            color="neutral"
+            variant="outline"
+            class="w-full"
+            :loading="skuVersionsLoading"
+            :disabled="disabled || staleRevision || Boolean(selectedVariant?.retiredAt)"
+            @click="loadMoreVersions('sku')"
+          >
+            加载更多 SKU 版本
+          </UButton>
+          <p
+            v-if="skuMode === 'product_default' && productAssignment"
+            class="text-xs text-muted"
+          >
+            当前继承商品默认：{{ productAssignment.mode === 'template' ? `${productAssignment.templateVersion?.templateName} · v${productAssignment.templateVersion?.versionNumber}` : productAssignment.mode === 'none' ? '明确不使用模板' : '暂未指定' }}
+          </p>
+          <p
+            v-else-if="skuAssignment?.templateVersion"
+            class="break-words text-xs text-muted"
+          >
+            当前 SKU 准备版本：{{ skuAssignment.templateVersion.templateName }} · v{{ skuAssignment.templateVersion.versionNumber }}
+          </p>
+          <div class="flex justify-end">
+            <UButton
+              :loading="saving === `sku:${selectedVariantId}`"
+              :disabled="disabled || staleRevision || !skuAssignment || !selectedVariant || Boolean(selectedVariant.retiredAt) || saving !== '' || (skuMode === 'template' && (!skuTemplateId || !skuVersionId))"
+              @click="saveSkuAssignment"
+            >
+              保存 SKU 准备覆盖
+            </UButton>
+          </div>
+        </div>
+      </article>
+    </div>
+    <p class="mt-3 text-xs leading-5 text-muted">
+      模板列表只用于管理员准备关联。公开商品接口不会返回这些关联，也不会打开顾客填写、图片上传、购物车或结算入口。
+    </p>
+  </section>
+</template>
