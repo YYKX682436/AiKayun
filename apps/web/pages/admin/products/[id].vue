@@ -977,7 +977,9 @@ async function handleSectionError(section: string, error: unknown) {
 }
 
 function setProductRevision(revision: number) {
-  if (product.value) product.value = { ...product.value, revision }
+  if (product.value && Number.isSafeInteger(revision) && revision > product.value.revision) {
+    product.value = { ...product.value, revision }
+  }
 }
 
 async function saveBasic() {

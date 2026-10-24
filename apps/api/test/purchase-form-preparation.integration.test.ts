@@ -881,6 +881,59 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     expect((await reconcilePurchaseDrafts(db, storage, { repair: true })).removedFiles).toBe(0)
   }, 45_000)
 
+  it('releases the upload reservation when storage initialization fails before finalization begins', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const customer = await makeCustomer()
+    const owner = customerOwner(customer)
+    const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const storage = new PurchaseAttachmentStorage(privateRoot)
+    const png = await sharp({ create: { width: 9, height: 7, channels: 4, background: '#4b258a' } }).png().toBuffer()
+    const existingObjectIds = new Set((await storage.scanFiles()).filter(file => file.location === 'object').map(file => file.id))
+    let transactionCount = 0
+    const databaseWithTransactionCount = new Proxy(db, {
+      get(target, property) {
+        if (property === 'transaction') {
+          return () => {
+            const builder = target.transaction()
+            return {
+              execute: async <T>(callback: (trx: Transaction<Database>) => Promise<T>): Promise<T> => {
+                transactionCount += 1
+                return builder.execute(callback)
+              },
+            }
+          }
+        }
+        const value = Reflect.get(target, property, target) as unknown
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    }) as Kysely<Database>
+    const storageWithInjectedInitializationFailure = Object.create(storage) as PurchaseAttachmentStorage
+    storageWithInjectedInitializationFailure.ensureReady = async () => {
+      // The synthetic ENOSPC is injected at the store() -> ensureReady() boundary,
+      // after the reservation transaction committed and before finalization starts.
+      expect(transactionCount).toBe(1)
+      throw Object.assign(new Error('test-injected ENOSPC during private storage initialization'), { code: 'ENOSPC' })
+    }
+
+    await expect(uploadPurchaseDraftAttachment(databaseWithTransactionCount, configA, storageWithInjectedInitializationFailure, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })).rejects.toMatchObject({ code: 'PURCHASE_ATTACHMENT_STORAGE_FAILED' })
+    // Reservation plus conditional cleanup; the final confirmation transaction never starts.
+    expect(transactionCount).toBe(2)
+    expect(await db.selectFrom('purchase_draft_attachments').select(['id', 'status'])
+      .where('draft_id', '=', draft.id).execute()).toEqual([])
+    expect((await storage.scanFiles()).filter(file => file.location === 'object' && !existingObjectIds.has(file.id))).toEqual([])
+
+    const retry = await uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    expect((await db.selectFrom('purchase_draft_attachments').select('status')
+      .where('id', '=', retry.attachmentId).executeTakeFirstOrThrow()).status).toBe('ready')
+    expect((await readPurchaseDraftAttachment(db, storage, owner, draft.id, retry.attachmentId)).sha256).toBe(retry.sha256)
+  }, 45_000)
+
   it('preserves a ready file when the database commit succeeds but its acknowledgement is lost', async () => {
     const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
     const customer = await makeCustomer()
@@ -977,9 +1030,9 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
       draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
       claimedMimeType: 'image/png', stream: Readable.from([png]),
     })
-    await savePurchaseDraft(db, configA, owner, {
-      draftId: draft.id, expectedRevision: draft.revision, values: { [fixture.ids.imageId]: [attachment.attachmentId] },
-    })
+    const referencesBeforeRenewal = await db.selectFrom('purchase_draft_attachment_references').select('attachment_id')
+      .where('draft_id', '=', draft.id).where('attachment_id', '=', attachment.attachmentId).execute()
+    expect(referencesBeforeRenewal).toEqual([])
     await db.updateTable('purchase_drafts').set({ expires_at: new Date(Date.now() + 24 * 60 * 60_000) })
       .where('id', '=', draft.id).execute()
     const revisionBeforeRenewal = (await db.selectFrom('purchase_drafts').select('revision')
@@ -1000,13 +1053,22 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
       BEFORE UPDATE OF expires_at ON purchase_drafts
       FOR EACH ROW EXECUTE FUNCTION pause_purchase_draft_expiry_for_test()`.execute(db)
 
+    const cleanupGate = async () => {
+      await sql`DROP TRIGGER IF EXISTS zz_purchase_draft_expiry_gate_for_test ON purchase_drafts`.execute(db)
+      await sql`DROP FUNCTION IF EXISTS pause_purchase_draft_expiry_for_test()`.execute(db)
+      await sql`DROP TABLE IF EXISTS purchase_draft_reconcile_gate`.execute(db)
+    }
+
     let releaseTrigger!: () => void
-    let lockedGate!: (pid: number) => void
-    const triggerGate = new Promise<void>(resolve => { releaseTrigger = resolve })
-    const gateReady = new Promise<number>(resolve => { lockedGate = resolve })
     let releaseCandidate!: () => void
+    let releaseTriggerForCleanup: (() => void) | undefined
+    let releaseCandidateForCleanup: (() => void) | undefined
+    try {
+    let lockedGate!: (pid: number) => void
+    const triggerGate = new Promise<void>(resolve => { releaseTrigger = resolve; releaseTriggerForCleanup = resolve })
+    const gateReady = new Promise<number>(resolve => { lockedGate = resolve })
     let candidateReached!: () => void
-    const candidateGate = new Promise<void>(resolve => { releaseCandidate = resolve })
+    const candidateGate = new Promise<void>(resolve => { releaseCandidate = resolve; releaseCandidateForCleanup = resolve })
     const candidateReady = new Promise<void>(resolve => { candidateReached = resolve })
     let renewResult: Awaited<ReturnType<typeof renewPurchaseDraft>> | undefined
     let reconcileResult: Awaited<ReturnType<typeof reconcilePurchaseDrafts>> | undefined
@@ -1062,18 +1124,26 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     releaseCandidate()
     await cleaning
     expect(cleaningError).toBeUndefined()
-    expect(reconcileResult?.removedFiles).toBe(0)
-    expect(await db.selectFrom('purchase_drafts').select(['status', 'expires_at']).where('id', '=', draft.id).executeTakeFirstOrThrow())
-      .toMatchObject({ status: 'active' })
+    expect(reconcileResult).toMatchObject({ expiredDrafts: 0, removedFiles: 0 })
+    const renewedDraft = await db.selectFrom('purchase_drafts').select(['status', 'expires_at'])
+      .where('id', '=', draft.id).executeTakeFirstOrThrow()
+    expect(renewedDraft.status).toBe('active')
+    expect(renewedDraft.expires_at.getTime()).toBeGreaterThan(reconcileNow.getTime())
     expect(await db.selectFrom('purchase_draft_attachments').select('status').where('id', '=', attachment.attachmentId).executeTakeFirstOrThrow())
       .toEqual({ status: 'ready' })
     const afterRenewal = await getPurchaseDraft(db, configA, owner, draft.id)
     expect(afterRenewal.attachments.map(row => row.id)).toEqual([attachment.attachmentId])
+    const objectPath = join(privateRoot, 'purchase-attachments', storage.storageKey(attachment.attachmentId))
+    expect(createHash('sha256').update(await readFile(objectPath)).digest('hex')).toBe(attachment.sha256)
+    expect((await readPurchaseDraftAttachment(db, storage, owner, draft.id, attachment.attachmentId)).sha256).toBe(attachment.sha256)
+    const repeatedCleanup = await reconcilePurchaseDrafts(db, storage, { repair: true, now: reconcileNow, graceHours: 24 })
+    expect(repeatedCleanup.removedFiles).toBe(0)
+    expect(await db.selectFrom('purchase_draft_attachments').select('status')
+      .where('id', '=', attachment.attachmentId).executeTakeFirstOrThrow()).toEqual({ status: 'ready' })
+    expect(createHash('sha256').update(await readFile(objectPath)).digest('hex')).toBe(attachment.sha256)
     expect((await readPurchaseDraftAttachment(db, storage, owner, draft.id, attachment.attachmentId)).sha256).toBe(attachment.sha256)
 
-    await sql`DROP TRIGGER zz_purchase_draft_expiry_gate_for_test ON purchase_drafts`.execute(db)
-    await sql`DROP FUNCTION pause_purchase_draft_expiry_for_test()`.execute(db)
-    await sql`DROP TABLE purchase_draft_reconcile_gate`.execute(db)
+    await cleanupGate()
 
     expect(afterRenewal.revision).toBe(revisionBeforeRenewal + 1)
     const expiring = await createPurchaseDraft(db, configA, owner, fixture.versionId)
@@ -1087,5 +1157,10 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     await expect(renewPurchaseDraft(db, owner, expiring.id, expiring.revision)).rejects.toMatchObject({ status: 404 })
     expect(await db.selectFrom('purchase_draft_attachments').select('id').where('id', '=', expiringAttachment.attachmentId).execute())
       .toEqual([])
+    } finally {
+      releaseTriggerForCleanup?.()
+      releaseCandidateForCleanup?.()
+      await cleanupGate()
+    }
   }, 60_000)
 })

@@ -16,6 +16,15 @@ function responseGate() {
   }
 }
 
+async function releaseAndSettle<T extends { status(): number }>(page: Page, gate: ReturnType<typeof responseGate>, response: Promise<T>): Promise<T> {
+  gate.release()
+  const delivered = await response
+  await page.evaluate(() => new Promise<void>(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+  }))
+  return delivered
+}
+
 async function attachAdmin(page: Page): Promise<void> {
   const token = createBrowserAdminSession()
   await page.context().addCookies([{
@@ -218,7 +227,10 @@ test('edits, freezes, previews, and prepares product/SKU references without expo
   await page.getByRole('button', { name: `${versionTwo.name} · v2` }).click()
   const versionTwoPreview = page.getByRole('paragraph').filter({ hasText: `${versionTwo.name} · v2` })
   await expect(versionTwoPreview).toBeVisible()
-  firstHistoryGate.release()
+  const firstHistoryDelivered = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/purchase-form-templates/${templateId}/versions/${versionOne.id}`
+    && response.request().method() === 'GET')
+  expect((await releaseAndSettle(page, firstHistoryGate, firstHistoryDelivered)).status()).toBe(200)
   await expect(versionTwoPreview).toBeVisible()
 
   const oldHistoryErrorGate = responseGate()
@@ -239,7 +251,10 @@ test('edits, freezes, previews, and prepares product/SKU references without expo
   await oldHistoryErrorGate.reached
   await page.getByRole('button', { name: `${versionTwo.name} · v2` }).click()
   await expect(versionTwoPreview).toBeVisible()
-  oldHistoryErrorGate.release()
+  const oldHistoryErrorDelivered = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/purchase-form-templates/${templateId}/versions/${versionOne.id}`
+    && response.request().method() === 'GET')
+  expect((await releaseAndSettle(page, oldHistoryErrorGate, oldHistoryErrorDelivered)).status()).toBe(500)
   await expect(versionTwoPreview).toBeVisible()
   await expect(page.getByRole('alert')).toHaveCount(0)
 
@@ -403,7 +418,10 @@ test('isolates delayed SKU reads and saves by product/SKU request generation', a
   await page.getByRole('option', { name: new RegExp(variantA.skuCode) }).click()
   await expect(assignmentMode).toContainText('明确不使用模板')
   await expect(saveSku).toBeEnabled()
-  failureGate.release()
+  const failedSkuRead = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/variants/${variantB.id}/purchase-form`
+    && response.request().method() === 'GET')
+  expect((await releaseAndSettle(page, failureGate, failedSkuRead)).status()).toBe(500)
   await expect(assignmentMode).toContainText('明确不使用模板')
   await expect(assignment.getByRole('alert')).toHaveCount(0)
   await expect(assignment.getByRole('status')).toHaveCount(0)
@@ -419,7 +437,10 @@ test('isolates delayed SKU reads and saves by product/SKU request generation', a
   await page.getByRole('option', { name: new RegExp(variantA.skuCode) }).click()
   await expect(assignmentMode).toContainText('明确不使用模板')
   await expect(saveSku).toBeEnabled()
-  bGate.release()
+  const delayedSkuRead = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/variants/${variantB.id}/purchase-form`
+    && response.request().method() === 'GET')
+  expect((await releaseAndSettle(page, bGate, delayedSkuRead)).status()).toBe(200)
   await expect(assignmentMode).toContainText('明确不使用模板')
   await expect(saveSku).toBeEnabled()
 
@@ -445,7 +466,10 @@ test('isolates delayed SKU reads and saves by product/SKU request generation', a
   await skuPicker.click()
   await page.getByRole('option', { name: new RegExp(variantB.skuCode) }).click()
   await expect(assignmentMode).toContainText('跟随商品默认')
-  aSaveGate.release()
+  const delayedSkuSave = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/variants/${variantA.id}/purchase-form`
+    && response.request().method() === 'PUT')
+  expect((await releaseAndSettle(page, aSaveGate, delayedSkuSave)).status()).toBe(200)
   await expect(saveSku).toBeEnabled()
   await expect(assignmentMode).toContainText('跟随商品默认')
   await expect(assignment.getByRole('status')).toHaveCount(0)
@@ -455,4 +479,51 @@ test('isolates delayed SKU reads and saves by product/SKU request generation', a
   const savedB = await page.request.get(`/api/v1/admin/products/${product.id}/variants/${variantB.id}/purchase-form`)
   expect((await savedA.json()).data.mode).toBe('template')
   expect((await savedB.json()).data.mode).toBe('product_default')
+
+  const beforeLateNoop = await page.request.get(`/api/v1/admin/products/${product.id}`)
+  expect(beforeLateNoop.status()).toBe(200)
+  const revisionBeforeLateNoop = ((await beforeLateNoop.json()).data as Product).revision
+  await skuPicker.click()
+  await page.getByRole('option', { name: new RegExp(variantA.skuCode) }).click()
+  await expect(assignmentMode).toContainText('使用 SKU 覆盖版本（准备）')
+  const noOpASaveGate = responseGate()
+  delayedASave = noOpASaveGate
+  await saveSku.click()
+  await noOpASaveGate.reached
+
+  await skuPicker.click()
+  await page.getByRole('option', { name: new RegExp(variantB.skuCode) }).click()
+  await expect(assignmentMode).toContainText('跟随商品默认')
+  await assignmentMode.click()
+  await page.getByRole('option', { name: '明确不使用模板' }).click()
+  const changedBSave = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/variants/${variantB.id}/purchase-form`
+    && response.request().method() === 'PUT')
+  await saveSku.click()
+  const changedBResponse = await changedBSave
+  expect(changedBResponse.status()).toBe(200)
+  expect(changedBResponse.request().postDataJSON().expectedRevision).toBe(revisionBeforeLateNoop)
+  expect((await changedBResponse.json()).data.productRevision).toBe(revisionBeforeLateNoop + 1)
+  await expect(assignment.getByRole('status')).toContainText(`SKU ${variantB.skuCode} 准备覆盖已保存`)
+  await expect(page.getByText(new RegExp(`商品修订 ${revisionBeforeLateNoop + 1} ·`))).toBeVisible()
+
+  const lateNoOpAResponse = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/variants/${variantA.id}/purchase-form`
+    && response.request().method() === 'PUT')
+  const lateNoOpA = await releaseAndSettle(page, noOpASaveGate, lateNoOpAResponse)
+  expect(lateNoOpA.status()).toBe(200)
+  expect((await lateNoOpA.json()).data.productRevision).toBe(revisionBeforeLateNoop)
+  await expect(page.getByText(new RegExp(`商品修订 ${revisionBeforeLateNoop + 1} ·`))).toBeVisible()
+  await expect(assignment.getByRole('status')).toContainText(`SKU ${variantB.skuCode} 准备覆盖已保存`)
+  await expect(assignment.getByRole('alert')).toHaveCount(0)
+
+  const unchangedBSave = page.waitForResponse(response => new URL(response.url()).pathname
+    === `/api/v1/admin/products/${product.id}/variants/${variantB.id}/purchase-form`
+    && response.request().method() === 'PUT')
+  await saveSku.click()
+  const unchangedBResponse = await unchangedBSave
+  expect(unchangedBResponse.status()).toBe(200)
+  expect(unchangedBResponse.request().postDataJSON().expectedRevision).toBe(revisionBeforeLateNoop + 1)
+  expect((await unchangedBResponse.json()).data.productRevision).toBe(revisionBeforeLateNoop + 1)
+  await expect(page.getByText(new RegExp(`商品修订 ${revisionBeforeLateNoop + 1} ·`))).toBeVisible()
 })

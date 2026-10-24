@@ -67,8 +67,27 @@ let generation = 0
 let skuRequestGeneration = 0
 let skuSaveGeneration = 0
 let locallyEmittedRevision: number | null = null
+let highestObservedProductRevision = props.productRevision
 let productVersionRequest = 0
 let skuVersionRequest = 0
+
+function notifyNewProductRevision(revision: number, productId: string, currentGeneration: number): void {
+  if (generation !== currentGeneration || props.productId !== productId) return
+  highestObservedProductRevision = Math.max(highestObservedProductRevision, props.productRevision)
+  if (!Number.isSafeInteger(revision) || revision <= highestObservedProductRevision) return
+  highestObservedProductRevision = revision
+  locallyEmittedRevision = revision
+  emit('revision', revision)
+}
+
+function applyObservedRevision(revision: number) {
+  if (productAssignment.value) {
+    productAssignment.value = { ...productAssignment.value, productRevision: Math.max(productAssignment.value.productRevision, revision) }
+  }
+  if (skuAssignment.value) {
+    skuAssignment.value = { ...skuAssignment.value, productRevision: Math.max(skuAssignment.value.productRevision, revision) }
+  }
+}
 
 function ensureVersionOption(target: VersionOption[], assignment: AssignmentVersion | null) {
   if (!assignment || target.some(version => version.id === assignment.id)) return target
@@ -224,8 +243,7 @@ async function saveProductAssignment() {
     productTemplateId.value = result.templateVersion?.templateId ?? ''
     productVersionId.value = result.templateVersion?.id ?? ''
     staleRevision.value = false
-    locallyEmittedRevision = result.productRevision
-    emit('revision', result.productRevision)
+    notifyNewProductRevision(result.productRevision, productId, current)
     successMessage.value = '商品默认模板准备关联已保存；尚未应用到顾客购买。'
   } catch (error) {
     if (generation !== current) return
@@ -262,8 +280,7 @@ async function saveSkuAssignment() {
     // revision while this product remains selected, but it must not update a
     // different product after navigation or a newer component load.
     if (generation === current && props.productId === productId) {
-      locallyEmittedRevision = result.productRevision
-      emit('revision', result.productRevision)
+      notifyNewProductRevision(result.productRevision, productId, current)
     }
     if (!isCurrent()) return
     skuAssignment.value = result
@@ -279,15 +296,22 @@ async function saveSkuAssignment() {
   } finally { if (saving.value === saveToken) saving.value = '' }
 }
 
-watch(() => props.productId, () => { void load() })
+watch(() => props.productId, () => {
+  highestObservedProductRevision = props.productRevision
+  locallyEmittedRevision = null
+  void load()
+}, { flush: 'sync' })
 watch(() => props.productRevision, (revision) => {
+  if (revision < highestObservedProductRevision) return
+  const previouslyObserved = highestObservedProductRevision
+  highestObservedProductRevision = revision
   if (revision === locallyEmittedRevision) {
     locallyEmittedRevision = null
-    if (productAssignment.value) productAssignment.value = { ...productAssignment.value, productRevision: revision }
-    if (skuAssignment.value) skuAssignment.value = { ...skuAssignment.value, productRevision: revision }
+    applyObservedRevision(revision)
     staleRevision.value = false
     return
   }
+  if (revision === previouslyObserved) return
   void load()
 })
 watch(selectedVariantId, (variantId, previous) => {

@@ -163,15 +163,18 @@ export class PurchaseAttachmentStorage {
 
   async store(id: string, bytes: Buffer): Promise<string> {
     this.assertId(id)
-    await this.ensureReady()
-    const storageKey = this.storageKey(id)
-    const stagingPath = join(this.stagingRoot, `${id}.part`)
-    const objectPath = this.resolveObject(storageKey, id)
-    const shard = join(this.objectsRoot, id.slice(0, 2))
-    await mkdir(shard, { recursive: true, mode: 0o700 })
-    await chmodDirectory(shard)
     let handle: Awaited<ReturnType<typeof open>> | undefined
+    const stagingPath = join(this.stagingRoot, `${id}.part`)
     try {
+      // Keep every filesystem preparation step inside the storage boundary.
+      // A failure here happens before the database finalization transaction and
+      // is therefore a determinate storage failure, not an unknown DB commit.
+      await this.ensureReady()
+      const storageKey = this.storageKey(id)
+      const objectPath = this.resolveObject(storageKey, id)
+      const shard = join(this.objectsRoot, id.slice(0, 2))
+      await mkdir(shard, { recursive: true, mode: 0o700 })
+      await chmodDirectory(shard)
       handle = await open(stagingPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
       await handle.writeFile(bytes)
       await handle.sync()
