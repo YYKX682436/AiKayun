@@ -216,9 +216,10 @@ test('edits, freezes, previews, and prepares product/SKU references without expo
   await page.getByRole('button', { name: v1ButtonLabel }).click()
   await firstHistoryGate.reached
   await page.getByRole('button', { name: `${versionTwo.name} · v2` }).click()
-  await expect(page.getByText(`${versionTwo.name} · v2`, { exact: true })).toBeVisible()
+  const versionTwoPreview = page.getByRole('paragraph').filter({ hasText: `${versionTwo.name} · v2` })
+  await expect(versionTwoPreview).toBeVisible()
   firstHistoryGate.release()
-  await expect(page.getByText(`${versionTwo.name} · v2`, { exact: true })).toBeVisible()
+  await expect(versionTwoPreview).toBeVisible()
 
   const oldHistoryErrorGate = responseGate()
   let holdOldHistoryError = true
@@ -237,9 +238,9 @@ test('edits, freezes, previews, and prepares product/SKU references without expo
   await page.getByRole('button', { name: v1ButtonLabel }).click()
   await oldHistoryErrorGate.reached
   await page.getByRole('button', { name: `${versionTwo.name} · v2` }).click()
-  await expect(page.getByText(`${versionTwo.name} · v2`, { exact: true })).toBeVisible()
+  await expect(versionTwoPreview).toBeVisible()
   oldHistoryErrorGate.release()
-  await expect(page.getByText(`${versionTwo.name} · v2`, { exact: true })).toBeVisible()
+  await expect(versionTwoPreview).toBeVisible()
   await expect(page.getByRole('alert')).toHaveCount(0)
 
   const created = await page.request.post('/api/v1/admin/products', {
