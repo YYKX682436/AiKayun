@@ -4,11 +4,12 @@ import { AdminApiError, useAdminApi } from '~/composables/useAdminApi'
 
 type Variant = Pick<ProductDetail['variants'][number], 'id' | 'skuCode' | 'retiredAt'>
 type AssignmentVersion = { id: string; templateId: string; templateName: string; versionNumber: number }
-type ProductAssignment = { productId: string; productRevision: number; mode: 'not_configured' | 'none' | 'template'; templateVersion: AssignmentVersion | null }
-type SkuAssignment = { productId: string; variantId: string; productRevision: number; mode: 'product_default' | 'none' | 'template'; templateVersion: AssignmentVersion | null; productDefault: ProductAssignment }
+type ProductAssignment = { productId: string; productRevision: number; mode: 'not_configured' | 'none' | 'template'; templateVersion: AssignmentVersion | null; appliedMode: 'none' | 'template' | null; appliedTemplateVersion: AssignmentVersion | null; pendingApply: boolean }
+type SkuAssignment = { productId: string; variantId: string; productRevision: number; mode: 'product_default' | 'none' | 'template'; templateVersion: AssignmentVersion | null; productDefault: ProductAssignment; appliedMode: 'inherit' | 'none' | 'template' | null; appliedTemplateVersion: AssignmentVersion | null; pendingApply: boolean }
 type VersionOption = { id: string; templateId: string; versionNumber: number; name: string; createdAt: string }
 type ListResponse<T> = { items: T[]; total: number; page: number; pageSize: number }
 type VersionResponse = { items: VersionOption[]; total: number; page: number; pageSize: number }
+type Lifecycle = { status: 'preparing' | 'active' | 'paused' }
 
 const props = defineProps<{
   productId: string
@@ -25,6 +26,7 @@ const errorMessage = ref('')
 const successMessage = ref('')
 const staleRevision = ref(false)
 const templates = ref<PurchaseTemplateSummary[]>([])
+const lifecycleStatus = ref<Lifecycle['status']>('preparing')
 const selectedVariantId = ref('')
 const productAssignment = shallowRef<ProductAssignment | null>(null)
 const skuAssignment = shallowRef<SkuAssignment | null>(null)
@@ -63,6 +65,11 @@ const skuModes = [
   { label: '明确不使用模板', value: 'none' },
   { label: '使用 SKU 覆盖版本（准备）', value: 'template' },
 ]
+function appliedSummary(mode: string | null, version: AssignmentVersion | null): string {
+  if (mode === null) return '未应用（继承商品默认）'
+  if (mode === 'none') return '已应用：不要求填写'
+  return version ? `已应用：${version.templateName} v${version.versionNumber}` : '已应用模板'
+}
 let generation = 0
 let skuRequestGeneration = 0
 let skuSaveGeneration = 0
@@ -204,13 +211,15 @@ async function load() {
   successMessage.value = ''
   staleRevision.value = false
   try {
-    const [assignment, templatePage] = await Promise.all([
+    const [assignment, templatePage, lifecycle] = await Promise.all([
       request<ProductAssignment>(`/api/v1/admin/products/${props.productId}/purchase-form`),
       request<ListResponse<PurchaseTemplateSummary>>('/api/v1/admin/purchase-form-templates?page=1&pageSize=100'),
+      request<Lifecycle>('/api/v1/admin/storefront/purchase-forms'),
     ])
     if (generation !== current || props.productId !== assignment.productId) return
     productAssignment.value = assignment
     templates.value = templatePage.items
+    lifecycleStatus.value = lifecycle.status
     productMode.value = assignment.mode
     productTemplateId.value = assignment.templateVersion?.templateId ?? ''
     productVersionId.value = assignment.templateVersion?.id ?? ''
@@ -304,6 +313,51 @@ async function saveSkuAssignment() {
   } finally { if (saving.value === saveToken) saving.value = '' }
 }
 
+async function applyProductAssignment() {
+  const assignment = productAssignment.value
+  if (!assignment || lifecycleStatus.value === 'preparing' || !assignment.pendingApply || saving.value || staleRevision.value) return
+  const detail = `商品默认规则会应用到未单独覆盖的 SKU。当前商品共有 ${activeVariants.value.length} 个有效 SKU；其中单独覆盖的 SKU 仍使用各自规则。已成交订单保持原快照。`
+  if (!window.confirm(`确认应用商品购买填写规则？\n\n${detail}`)) return
+  saving.value = 'apply-product'
+  errorMessage.value = ''
+  try {
+    await request('/api/v1/admin/products/' + encodeURIComponent(props.productId) + '/purchase-form/apply', {
+      method: 'POST', body: {
+        expectedRevision: assignment.productRevision,
+        expectedMode: assignment.mode,
+        expectedTemplateVersionId: assignment.templateVersion?.id ?? null,
+      },
+    })
+    await load()
+    successMessage.value = '商品默认规则已应用到当前顾客购买。'
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '应用商品购买规则失败。'
+  } finally { saving.value = '' }
+}
+
+async function applySkuAssignment() {
+  const assignment = skuAssignment.value
+  const variant = selectedVariant.value
+  if (!assignment || !variant || lifecycleStatus.value === 'preparing' || !assignment.pendingApply || saving.value || staleRevision.value) return
+  const detail = `SKU ${variant.skuCode} 的购买填写规则将立即作用于新购买。已成交订单保持原快照。自动履约不会收到填写内容；如需处理，请由管理员在订单中查看。`
+  if (!window.confirm(`确认应用此 SKU 的购买填写规则？\n\n${detail}`)) return
+  saving.value = `apply-sku:${variant.id}`
+  errorMessage.value = ''
+  try {
+    await request(`/api/v1/admin/products/${encodeURIComponent(props.productId)}/variants/${encodeURIComponent(variant.id)}/purchase-form/apply`, {
+      method: 'POST', body: {
+        expectedRevision: assignment.productRevision,
+        expectedMode: assignment.mode,
+        expectedTemplateVersionId: assignment.templateVersion?.id ?? null,
+      },
+    })
+    await load()
+    successMessage.value = `SKU ${variant.skuCode} 的购买规则已应用。`
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '应用 SKU 购买规则失败。'
+  } finally { saving.value = '' }
+}
+
 watch(() => props.productId, () => {
   highestObservedProductRevision = props.productRevision
   locallyEmittedRevision = null
@@ -372,7 +426,7 @@ onBeforeUnmount(() => { generation++; skuRequestGeneration++; skuSaveGeneration+
     <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
       <div>
         <p class="text-sm font-medium text-primary">
-          阶段 ⑥-2A
+          阶段 ⑥-2C-1
         </p>
         <h2
           id="purchase-form-preparation-title"
@@ -381,14 +435,14 @@ onBeforeUnmount(() => { generation++; skuRequestGeneration++; skuSaveGeneration+
           购买填写准备关联
         </h2>
         <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
-          分别保存商品默认与 SKU 覆盖。它们只记录将来拟使用的不可变版本，不参与当前报价、库存、可售资格、结算或履约。
+          准备关联指向冻结模板版本。保存只更新准备配置；点击“保存并应用”后才会改变新购买要求，已成交订单资料保持不变。
         </p>
       </div>
       <UBadge
-        color="warning"
+        :color="lifecycleStatus === 'active' ? 'success' : lifecycleStatus === 'paused' ? 'warning' : 'neutral'"
         variant="soft"
       >
-        准备配置，尚未应用
+        {{ lifecycleStatus === 'preparing' ? '尚未首次启用' : lifecycleStatus === 'active' ? '购买填写已启用' : '购买填写已暂停' }}
       </UBadge>
     </header>
     <UAlert
@@ -442,7 +496,7 @@ onBeforeUnmount(() => { generation++; skuRequestGeneration++; skuSaveGeneration+
           商品默认模板
         </h3>
         <p class="mt-1 text-sm leading-6 text-muted">
-          SKU 选择“跟随商品默认”时将查看此准备关联。当前交易不会读取此配置。
+          SKU 选择“跟随商品默认”时使用这里应用的冻结版本。准备更改须明确应用后才会进入顾客购买。
         </p>
         <div class="mt-4 space-y-4">
           <UFormField label="关联方式">
@@ -495,6 +549,12 @@ onBeforeUnmount(() => { generation++; skuRequestGeneration++; skuSaveGeneration+
           >
             当前准备版本：{{ productAssignment.templateVersion.templateName }} · v{{ productAssignment.templateVersion.versionNumber }}
           </p>
+          <p
+            v-if="productAssignment"
+            class="text-xs text-muted"
+          >
+            当前生效规则：{{ appliedSummary(productAssignment.appliedMode, productAssignment.appliedTemplateVersion) }}
+          </p>
           <div class="flex justify-end">
             <UButton
               :loading="saving === 'product'"
@@ -504,6 +564,18 @@ onBeforeUnmount(() => { generation++; skuRequestGeneration++; skuSaveGeneration+
               保存商品准备关联
             </UButton>
           </div>
+          <UButton
+            v-if="lifecycleStatus !== 'preparing' && productAssignment?.pendingApply"
+            color="primary"
+            variant="soft"
+            icon="i-lucide-check-check"
+            class="w-full min-h-11"
+            :loading="saving === 'apply-product'"
+            :disabled="disabled || staleRevision || saving !== ''"
+            @click="applyProductAssignment"
+          >
+            保存并应用到顾客购买
+          </UButton>
         </div>
       </article>
 
@@ -512,7 +584,7 @@ onBeforeUnmount(() => { generation++; skuRequestGeneration++; skuSaveGeneration+
           SKU 覆盖
         </h3>
         <p class="mt-1 text-sm leading-6 text-muted">
-          无覆盖与“明确不使用模板”是两种不同含义。覆盖仅保存准备关系，不会授予供应商采购资格。
+          无覆盖与“明确不使用模板”含义不同。购买资料会归档到订单，自动履约不会收到这些内容，也不会获得上游采购资格。
         </p>
         <div class="mt-4 space-y-4">
           <UFormField label="SKU">
@@ -580,6 +652,12 @@ onBeforeUnmount(() => { generation++; skuRequestGeneration++; skuSaveGeneration+
           >
             当前 SKU 准备版本：{{ skuAssignment.templateVersion.templateName }} · v{{ skuAssignment.templateVersion.versionNumber }}
           </p>
+          <p
+            v-if="skuAssignmentMatchesSelection && skuAssignment"
+            class="text-xs text-muted"
+          >
+            当前生效规则：{{ appliedSummary(skuAssignment.appliedMode, skuAssignment.appliedTemplateVersion) }}
+          </p>
           <div class="flex justify-end">
             <UButton
               :loading="skuSaving"
@@ -589,6 +667,18 @@ onBeforeUnmount(() => { generation++; skuRequestGeneration++; skuSaveGeneration+
               保存 SKU 准备覆盖
             </UButton>
           </div>
+          <UButton
+            v-if="lifecycleStatus !== 'preparing' && skuAssignmentMatchesSelection && skuAssignment?.pendingApply"
+            color="primary"
+            variant="soft"
+            icon="i-lucide-check-check"
+            class="w-full min-h-11"
+            :loading="saving === `apply-sku:${selectedVariantId}`"
+            :disabled="disabled || staleRevision || saving !== '' || skuLoading"
+            @click="applySkuAssignment"
+          >
+            保存并应用此 SKU 规则
+          </UButton>
         </div>
       </article>
     </div>

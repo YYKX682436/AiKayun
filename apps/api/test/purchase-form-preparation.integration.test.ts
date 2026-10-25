@@ -271,18 +271,28 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     const admin = await makeAdminSession()
     const fixture = await createTemplateFixture(admin)
     const catalog = await createCatalog()
-    const product = await db.selectFrom('products').select('revision').where('id', '=', catalog.productId).executeTakeFirstOrThrow()
-    const productAssignment = await inject({
-      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/purchase-form`, headers: admin.headers,
-      payload: { expectedRevision: product.revision, mode: 'template', templateVersionId: fixture.versionId },
-    })
-    expect(productAssignment.statusCode).toBe(200)
-    const current = await db.selectFrom('products').select('revision').where('id', '=', catalog.productId).executeTakeFirstOrThrow()
-    const skuAssignment = await inject({
-      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/purchase-form`, headers: admin.headers,
-      payload: { expectedRevision: current.revision, mode: 'none' },
-    })
-    expect(skuAssignment.statusCode).toBe(200)
+    // Seed the historical 6-2A schema directly. The current application requires the
+    // activation-state migration before writes; this scenario verifies the forward migration
+    // preserves the legacy associations and immutable audit records byte-for-byte.
+    await sql`INSERT INTO product_purchase_form_settings (product_id, mode, template_version_id, updated_by_admin_id)
+      VALUES (${catalog.productId}, 'template', ${fixture.versionId}, ${adminId})`.execute(db)
+    const productRevisionAfterDefault = await db.updateTable('products').set({ updated_at: new Date() })
+      .where('id', '=', catalog.productId).returning('revision').executeTakeFirstOrThrow()
+    await sql`INSERT INTO purchase_form_audit_events
+      (id, administrator_id, operation, product_id, summary)
+      VALUES (${randomUUID()}, ${adminId}, 'product_assignment_updated', ${catalog.productId},
+        ${JSON.stringify({ mode: 'template', templateVersionId: fixture.versionId, revision: productRevisionAfterDefault.revision })}::jsonb)`
+      .execute(db)
+    await sql`INSERT INTO sku_purchase_form_overrides
+      (product_id, product_variant_id, mode, template_version_id, updated_by_admin_id)
+      VALUES (${catalog.productId}, ${catalog.skuId}, 'none', NULL, ${adminId})`.execute(db)
+    const productRevisionAfterOverride = await db.updateTable('products').set({ updated_at: new Date() })
+      .where('id', '=', catalog.productId).returning('revision').executeTakeFirstOrThrow()
+    await sql`INSERT INTO purchase_form_audit_events
+      (id, administrator_id, operation, product_id, product_variant_id, summary)
+      VALUES (${randomUUID()}, ${adminId}, 'sku_override_updated', ${catalog.productId}, ${catalog.skuId},
+        ${JSON.stringify({ mode: 'none', templateVersionId: null, revision: productRevisionAfterOverride.revision })}::jsonb)`
+      .execute(db)
     const versionBefore = await db.selectFrom('purchase_form_template_versions').selectAll()
       .where('id', '=', fixture.versionId).executeTakeFirstOrThrow()
     const identitiesBefore = await db.selectFrom('purchase_form_template_identities').selectAll()
@@ -468,74 +478,6 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     expect(await db.selectFrom('purchase_order_attachment_objects').select('id').where('id', '=', object.id).execute())
       .toHaveLength(0)
     expect((await orderStorage.scanFiles()).some(file => file.id === object.id)).toBe(false)
-  }, 45_000)
-
-  it('replays an image order after its response is lost without reading the deleted source or preparing another archive', async () => {
-    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
-    const catalog = await createCatalog()
-    const product = await db.selectFrom('products').select('revision')
-      .where('id', '=', catalog.productId).executeTakeFirstOrThrow()
-    const assigned = await inject({
-      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/purchase-form`, headers: adminHeaders(),
-      payload: { expectedRevision: product.revision, mode: 'template', templateVersionId: fixture.versionId },
-    })
-    expect(assigned.statusCode, JSON.stringify(assigned.json())).toBe(200)
-
-    const customer = await makeCustomer()
-    const owner = customerOwner(customer)
-    const draftStorage = new PurchaseAttachmentStorage(privateRoot)
-    const orderStorage = new PurchaseOrderAttachmentStorage(privateRoot)
-    const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
-    const png = await sharp({ create: { width: 7, height: 9, channels: 4, background: '#704a2b' } }).png().toBuffer()
-    const image = await uploadPurchaseDraftAttachment(db, configA, draftStorage, owner, {
-      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
-      claimedMimeType: 'image/png', stream: Readable.from([png]),
-    })
-    const saved = await savePurchaseDraft(db, configA, owner, {
-      draftId: draft.id, expectedRevision: draft.revision, values: {
-        [fixture.ids.accountId]: '00092', [fixture.ids.selectId]: fixture.options.planA,
-        [fixture.ids.cascadeId]: { path: [fixture.ids.regionId, fixture.ids.serverId],
-          expanded: { [fixture.ids.playerId]: 'Replay' } },
-        [fixture.ids.imageId]: [image.attachmentId],
-      },
-    })
-    const csrfResponse = await inject({ method: 'GET', url: '/api/v1/customer/auth/csrf' })
-    expect(csrfResponse.statusCode).toBe(200)
-    const headers = {
-      origin,
-      cookie: `aikayun_customer_session=${customer.token}; ${cookieFrom(csrfResponse, 'aikayun_customer_csrf')}`,
-      'x-csrf-token': csrfResponse.json().data.csrfToken as string,
-    }
-    const items = [{ lineId: randomUUID(), skuId: catalog.skuId, quantity: 1,
-      draftId: draft.id, draftRevision: saved.revision }]
-    const quote = await inject({ method: 'POST', url: '/api/v1/checkout/quote', headers,
-      payload: { version: 2, items } })
-    expect(quote.statusCode, JSON.stringify(quote.json())).toBe(200)
-    expect(quote.json().data.canContinue).toBe(true)
-    const body = { version: 2, items, idempotencyKey: randomUUID(),
-      quoteToken: quote.json().data.quoteToken as string }
-    const first = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: body })
-    expect(first.statusCode, JSON.stringify(first.json())).toBe(201)
-    const firstOrder = first.json().data.order as { id: string; items: Array<{ id: string }> }
-    expect(firstOrder.items).toHaveLength(1)
-    const archivedBefore = await db.selectFrom('purchase_order_attachment_objects').selectAll()
-      .where('source_draft_id', '=', draft.id).execute()
-    expect(archivedBefore).toHaveLength(1)
-    expect(archivedBefore[0]?.status).toBe('retained')
-
-    await requestPurchaseDraftDeletion(db, owner, draft.id, saved.revision)
-    await reconcilePurchaseDrafts(db, draftStorage, { repair: true })
-    expect((await draftStorage.scanFiles()).some(file => file.id === image.attachmentId)).toBe(false)
-    // The client does not need the lost 201 response: the original request body alone recovers the order.
-    const replay = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: body })
-    expect(replay.statusCode, JSON.stringify(replay.json())).toBe(200)
-    expect(replay.json().data.order.id).toBe(firstOrder.id)
-    const archivedAfter = await db.selectFrom('purchase_order_attachment_objects').selectAll()
-      .where('source_draft_id', '=', draft.id).execute()
-    expect(archivedAfter).toEqual(archivedBefore)
-    expect(createHash('sha256').update((await readOwnedOrderPurchaseAttachment(
-      db, orderStorage, owner, firstOrder.items[0]!.id, image.attachmentId,
-    )).bytes).digest('hex')).toBe(image.sha256)
   }, 45_000)
 
   it('retains immutable order values and a private image after draft cleanup with ownership and historical-key checks', async () => {
@@ -1184,7 +1126,9 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
       draftId: draft.id, expectedRevision: saved.revision, values: {},
     })
     const deleting = await requestPurchaseDraftAttachmentDeletion(db, owner, draft.id, first.attachmentId, removedFromDraft.revision)
-    expect(deleting.revision).toBe(removedFromDraft.revision + 1)
+    expect(deleting.revision).toBe(removedFromDraft.revision)
+    expect((await db.selectFrom('purchase_draft_attachments').select('status')
+      .where('id', '=', first.attachmentId).executeTakeFirstOrThrow()).status).toBe('deleting')
 
     const legacyStorage = new PrivateFileStorage(privateRoot)
     await legacyStorage.ensureReady()
@@ -1256,13 +1200,15 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     await savePurchaseDraft(db, configA, owner, {
       draftId: draft.id, expectedRevision: saved.revision, values: { [fixture.ids.imageId]: [retry.attachmentId] },
     })
-    const cleanup = await reconcilePurchaseDrafts(db, storage, { repair: true })
-    expect(cleanup.removedFiles).toBe(0)
+    expect((await storage.scanFiles()).some(file => file.id === retry.attachmentId)).toBe(true)
+    await reconcilePurchaseDrafts(db, storage, { repair: true })
     expect(await db.selectFrom('purchase_draft_attachments').select('id').where('id', '=', retry.attachmentId).execute())
       .toHaveLength(1)
+    expect((await storage.scanFiles()).some(file => file.id === retry.attachmentId)).toBe(true)
     expect(await readPurchaseDraftAttachment(db, storage, owner, draft.id, retry.attachmentId)
       .then(file => file.sha256)).toBe(retry.sha256)
-    expect((await reconcilePurchaseDrafts(db, storage, { repair: true })).removedFiles).toBe(0)
+    await reconcilePurchaseDrafts(db, storage, { repair: true })
+    expect((await storage.scanFiles()).some(file => file.id === retry.attachmentId)).toBe(true)
   }, 45_000)
 
   it('releases the upload reservation when storage initialization fails before finalization begins', async () => {
@@ -1547,4 +1493,92 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
       await cleanupGate()
     }
   }, 60_000)
+
+  it('replays an image order after its response is lost without reading the deleted source or preparing another archive', async () => {
+    // This lifecycle-changing scenario runs last because the production state machine
+    // deliberately has no active-to-preparing transition.
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const catalog = await createCatalog()
+    const product = await db.selectFrom('products').select('revision')
+      .where('id', '=', catalog.productId).executeTakeFirstOrThrow()
+    const assigned = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/purchase-form`, headers: adminHeaders(),
+      payload: { expectedRevision: product.revision, mode: 'template', templateVersionId: fixture.versionId },
+    })
+    expect(assigned.statusCode, JSON.stringify(assigned.json())).toBe(200)
+    const impact = await inject({ method: 'GET', url: '/api/v1/admin/storefront/purchase-forms', headers: adminHeaders() })
+    const activated = await inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
+      headers: adminHeaders(), payload: { expectedStatus: 'preparing', nextStatus: 'active',
+        expectedImpactHash: impact.json().data.impactHash } })
+    expect(activated.statusCode, JSON.stringify(activated.json())).toBe(200)
+
+    const customer = await makeCustomer()
+    const owner = customerOwner(customer)
+    const draftStorage = new PurchaseAttachmentStorage(privateRoot)
+    const orderStorage = new PurchaseOrderAttachmentStorage(privateRoot)
+    const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const png = await sharp({ create: { width: 7, height: 9, channels: 4, background: '#704a2b' } }).png().toBuffer()
+    const image = await uploadPurchaseDraftAttachment(db, configA, draftStorage, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    const saved = await savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, values: {
+        [fixture.ids.accountId]: '00092', [fixture.ids.selectId]: fixture.options.planA,
+        [fixture.ids.cascadeId]: { path: [fixture.ids.regionId, fixture.ids.serverId],
+          expanded: { [fixture.ids.playerId]: 'Replay' } },
+        [fixture.ids.imageId]: [image.attachmentId],
+      },
+    })
+    const csrfResponse = await inject({ method: 'GET', url: '/api/v1/customer/auth/csrf' })
+    expect(csrfResponse.statusCode).toBe(200)
+    const headers = {
+      origin,
+      cookie: `aikayun_customer_session=${customer.token}; ${cookieFrom(csrfResponse, 'aikayun_customer_csrf')}`,
+      'x-csrf-token': csrfResponse.json().data.csrfToken as string,
+    }
+    const items = [{ lineId: randomUUID(), skuId: catalog.skuId, quantity: 1,
+      draftId: draft.id, draftRevision: saved.revision }]
+    const quote = await inject({ method: 'POST', url: '/api/v1/checkout/quote', headers,
+      payload: { version: 2, items } })
+    expect(quote.statusCode, JSON.stringify(quote.json())).toBe(200)
+    expect(quote.json().data.canContinue).toBe(true)
+    const body = { version: 2, items, idempotencyKey: randomUUID(),
+      quoteToken: quote.json().data.quoteToken as string }
+    const first = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: body })
+    expect(first.statusCode, JSON.stringify(first.json())).toBe(201)
+    const firstOrder = first.json().data.order as { id: string; items: Array<{ id: string }> }
+    expect(firstOrder.items).toHaveLength(1)
+    const archivedBefore = await db.selectFrom('purchase_order_attachment_objects').selectAll()
+      .where('source_draft_id', '=', draft.id).execute()
+    expect(archivedBefore).toHaveLength(1)
+    expect(archivedBefore[0]?.status).toBe('retained')
+
+    await requestPurchaseDraftDeletion(db, owner, draft.id, saved.revision)
+    await reconcilePurchaseDrafts(db, draftStorage, { repair: true })
+    expect((await draftStorage.scanFiles()).some(file => file.id === image.attachmentId)).toBe(false)
+    // The client does not need the lost 201 response: the original request body alone recovers the order.
+    const replay = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: body })
+    expect(replay.statusCode, JSON.stringify(replay.json())).toBe(200)
+    expect(replay.json().data.order.id).toBe(firstOrder.id)
+    const archivedAfter = await db.selectFrom('purchase_order_attachment_objects').selectAll()
+      .where('source_draft_id', '=', draft.id).execute()
+    expect(archivedAfter).toEqual(archivedBefore)
+    expect(createHash('sha256').update((await readOwnedOrderPurchaseAttachment(
+      db, orderStorage, owner, firstOrder.items[0]!.id, image.attachmentId,
+    )).bytes).digest('hex')).toBe(image.sha256)
+  }, 45_000)
+
+  it('refuses a legacy-schema downgrade that would reopen paused purchase forms', async () => {
+    const paused = await inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
+      headers: adminHeaders(), payload: { expectedStatus: 'active', nextStatus: 'paused' } })
+    expect(paused.statusCode, JSON.stringify(paused.json())).toBe(200)
+    const rollback = await new Migrator({ db, provider: new AppMigrationProvider() })
+      .migrateTo('202610250002_purchase_snapshot_manifest_r1')
+    expect(rollback.error).toMatchObject({ code: '55000' })
+    expect(await db.selectFrom('storefront_customer_policy').select('purchase_forms_status')
+      .executeTakeFirstOrThrow()).toEqual({ purchase_forms_status: 'paused' })
+    await expect(sql`SELECT purchase_forms_enabled FROM storefront_customer_policy`.execute(db))
+      .rejects.toMatchObject({ code: '42703' })
+  })
 })

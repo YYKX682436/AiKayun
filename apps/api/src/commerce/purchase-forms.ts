@@ -8,6 +8,7 @@ import { hashToken } from '../auth/security.js'
 import type { Database, PurchaseDraftAttachmentsTable, PurchaseDraftsTable } from '../db/types.js'
 import { PurchaseAttachmentError, PurchaseAttachmentStorage, PURCHASE_ATTACHMENT_INPUT_LIMIT_BYTES, processPurchaseImageUpload } from '../media/purchase-attachment-storage.js'
 import { decryptPurchaseDraft, encryptPurchaseDraft, purchaseFormContentIdentity } from './purchase-form-crypto.js'
+import { effectivePurchaseFormForSku } from './purchase-form-config.js'
 
 export const PURCHASE_DRAFT_TTL_DAYS = 30
 export const PURCHASE_DRAFT_MAX_PER_OWNER = 50
@@ -39,6 +40,7 @@ export interface PurchaseDraftView {
   expiresAt: string
   values: PurchaseFormValues
   attachments: Array<Pick<Selectable<PurchaseDraftAttachmentsTable>, 'id' | 'field_id' | 'mime_type' | 'byte_size' | 'width' | 'height' | 'sha256'>>
+  templateChanged: boolean
 }
 
 export interface PurchaseDraftWriteResult {
@@ -49,6 +51,7 @@ export interface PurchaseDraftWriteResult {
   incompleteFieldIds: string[]
   normalizedValues: PurchaseFormValues
   normalizedContentHash: string
+  replacedAttachmentIds?: string[]
 }
 
 export interface ValidatedPurchaseDraft extends PurchaseDraftWriteResult {
@@ -249,8 +252,13 @@ function activeImageFieldLimit(definition: PurchaseFormDefinition, values: Purch
   return null
 }
 
-function assertAttachmentCapacity(attachments: DraftAttachmentRow[], replacement?: { id: string; byteSize: number }, newReservation?: { id: string; bytes: number }): void {
-  const candidates = attachments.filter(attachment => attachment.status !== 'deleting')
+function assertAttachmentCapacity(
+  attachments: DraftAttachmentRow[],
+  replacement?: { id: string; byteSize: number },
+  newReservation?: { id: string; bytes: number },
+  excludingIds: ReadonlySet<string> = new Set(),
+): void {
+  const candidates = attachments.filter(attachment => attachment.status !== 'deleting' && !excludingIds.has(attachment.id))
   const count = candidates.length + (newReservation ? 1 : 0)
   if (count > PURCHASE_FORM_LIMITS.attachmentsPerDraft) {
     throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_LIMIT', '此填写草稿已达到图片数量上限。')
@@ -303,22 +311,32 @@ export async function createPurchaseDraft(
   now = new Date(),
 ): Promise<{ id: string; revision: number; expiresAt: string }> {
   if (!uuidPattern.test(templateVersionId)) throw new PurchaseDraftServiceError(400, 'PURCHASE_TEMPLATE_VERSION_INVALID', '填写模板版本无效。')
-  return db.transaction().execute(async (trx) => {
-    const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
-    await loadDraftTemplate(trx, templateVersionId)
-    let countQuery = trx.selectFrom('purchase_drafts').select(db.fn.countAll<number>().as('count'))
+  return db.transaction().execute(trx => createPurchaseDraftInTransaction(trx, config, owner, templateVersionId, now))
+}
+
+export async function createPurchaseDraftInTransaction(
+  trx: Transaction<Database>,
+  config: AppConfig,
+  owner: PurchaseDraftOwner,
+  templateVersionId: string,
+  now = new Date(),
+): Promise<{ id: string; revision: number; expiresAt: string }> {
+  if (!uuidPattern.test(templateVersionId)) throw new PurchaseDraftServiceError(400, 'PURCHASE_TEMPLATE_VERSION_INVALID', '填写模板版本无效。')
+  const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
+  await loadDraftTemplate(trx, templateVersionId)
+  let countQuery = trx.selectFrom('purchase_drafts').select(trx.fn.countAll<number>().as('count'))
       .where('status', '=', 'active').where('expires_at', '>', now)
-    countQuery = identity.kind === 'customer'
-      ? countQuery.where('customer_id', '=', identity.customerId)
-      : countQuery.where('guest_order_session_id', '=', identity.guestSessionId)
-    const current = await countQuery.executeTakeFirstOrThrow()
-    if (Number(current.count) >= PURCHASE_DRAFT_MAX_PER_OWNER) {
-      throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_LIMIT', '可保存的填写草稿数量已达到上限。')
-    }
-    const id = randomUUID()
-    const expiresAt = new Date(now.getTime() + PURCHASE_DRAFT_TTL_DAYS * 24 * 60 * 60 * 1000)
-    const encrypted = encryptPurchaseDraft(config, id, {})
-    await trx.insertInto('purchase_drafts').values({
+  countQuery = identity.kind === 'customer'
+    ? countQuery.where('customer_id', '=', identity.customerId)
+    : countQuery.where('guest_order_session_id', '=', identity.guestSessionId)
+  const current = await countQuery.executeTakeFirstOrThrow()
+  if (Number(current.count) >= PURCHASE_DRAFT_MAX_PER_OWNER) {
+    throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_LIMIT', '可保存的填写草稿数量已达到上限。')
+  }
+  const id = randomUUID()
+  const expiresAt = new Date(now.getTime() + PURCHASE_DRAFT_TTL_DAYS * 24 * 60 * 60 * 1000)
+  const encrypted = encryptPurchaseDraft(config, id, {})
+  await trx.insertInto('purchase_drafts').values({
       id,
       ...draftInsertOwner(identity),
       template_version_id: templateVersionId,
@@ -330,9 +348,8 @@ export async function createPurchaseDraft(
       payload_auth_tag: encrypted.authTag,
       encryption_key_id: encrypted.keyId,
       expires_at: expiresAt,
-    }).execute()
-    return { id, revision: 1, expiresAt: expiresAt.toISOString() }
-  })
+  }).execute()
+  return { id, revision: 1, expiresAt: expiresAt.toISOString() }
 }
 
 export async function getPurchaseDraft(
@@ -340,9 +357,26 @@ export async function getPurchaseDraft(
   config: AppConfig,
   owner: PurchaseDraftOwner,
   draftId: string,
+  skuId?: string,
 ): Promise<PurchaseDraftView> {
   return db.transaction().execute(async (trx) => {
     const identity = await validateAndLockPurchaseDraftOwner(trx, owner)
+    let templateChanged = false
+    if (skuId) {
+      const effective = await effectivePurchaseFormForSku(trx, skuId, { lockStatus: 'share' })
+      if (!effective.templateVersionId || !effective.templateId) throw draftNotFound()
+      if (!uuidPattern.test(draftId)) throw draftNotFound()
+      const pinned = await trx.selectFrom('purchase_drafts as draft')
+        .innerJoin('purchase_form_template_versions as version', 'version.id', 'draft.template_version_id')
+        .select(['version.template_id']).where('draft.id', '=', draftId)
+        .where(identity.kind === 'customer' ? 'draft.customer_id' : 'draft.guest_order_session_id', '=',
+          identity.kind === 'customer' ? identity.customerId : identity.guestSessionId)
+        .executeTakeFirst()
+      if (!pinned || pinned.template_id !== effective.templateId) throw draftNotFound()
+      const pinnedVersion = await trx.selectFrom('purchase_drafts').select('template_version_id')
+        .where('id', '=', draftId).executeTakeFirst()
+      templateChanged = pinnedVersion?.template_version_id !== effective.templateVersionId
+    }
     const draft = await lockOwnedDraft(trx, identity, draftId, 'share')
     const definition = await loadDraftTemplate(trx, draft.template_version_id)
     const attachments = await listDraftAttachments(trx, draft.id, false)
@@ -361,6 +395,7 @@ export async function getPurchaseDraft(
       expiresAt: draft.expires_at.toISOString(),
       values: normalized.value,
       attachments: attachments.filter(attachment => attachment.status === 'ready'),
+      templateChanged,
     }
   })
 }
@@ -370,17 +405,28 @@ export async function savePurchaseDraftInTransaction(
   config: AppConfig,
   owner: PurchaseDraftOwner,
   input: { draftId: string; expectedRevision: number; values: unknown },
-  options: { coordinatedCartEdit?: boolean } = {},
+  options: {
+    coordinatedCartEdit?: boolean
+    expectedTemplateVersionId?: string
+    replacements?: Array<{ oldAttachmentId: string; newAttachmentId: string }>
+  } = {},
 ): Promise<PurchaseDraftWriteResult> {
   const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
   const draft = await lockOwnedDraft(trx, identity, input.draftId, 'update')
+  if (options.expectedTemplateVersionId && draft.template_version_id !== options.expectedTemplateVersionId) {
+    throw new PurchaseDraftServiceError(409, 'PURCHASE_TEMPLATE_VERSION_CONFLICT', '填写模板版本已变化，请重新确认资料。')
+  }
   if (!options.coordinatedCartEdit) await assertDraftNotBoundToCart(trx, draft.id)
   if (!Number.isSafeInteger(input.expectedRevision) || draft.revision !== input.expectedRevision) {
     throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已被其他操作修改，请重新读取。')
   }
   const definition = await loadDraftTemplate(trx, draft.template_version_id)
   const attachments = await listDraftAttachments(trx, draft.id, true)
-  assertAttachmentCapacity(attachments)
+  const replacementIds = new Set((options.replacements ?? []).map(replacement => replacement.oldAttachmentId))
+  if (replacementIds.size !== (options.replacements ?? []).length) {
+    throw new PurchaseDraftServiceError(400, 'PURCHASE_ATTACHMENT_REPLACEMENT_INVALID', '图片替换请求无效。')
+  }
+  assertAttachmentCapacity(attachments, undefined, undefined, replacementIds)
   const normalized = normalizeForDraft(definition, input.values, attachments)
   const refs = collectImageReferences(definition, normalized.value)
   const attachmentById = new Map(attachments.map(attachment => [attachment.id, attachment]))
@@ -388,12 +434,29 @@ export async function savePurchaseDraftInTransaction(
     || attachmentById.get(reference.attachmentId)?.status !== 'ready')) {
     throw validationError(refs.map(reference => ({ fieldId: reference.fieldId, code: 'ATTACHMENT_NOT_OWNED' })))
   }
+  for (const replacement of options.replacements ?? []) {
+    const oldAttachment = attachmentById.get(replacement.oldAttachmentId)
+    const newAttachment = attachmentById.get(replacement.newAttachmentId)
+    const newIsReferenced = refs.some(reference => reference.attachmentId === replacement.newAttachmentId)
+    const oldReference = await trx.selectFrom('purchase_draft_attachment_references').select('attachment_id')
+      .where('draft_id', '=', draft.id).where('attachment_id', '=', replacement.oldAttachmentId).forShare().executeTakeFirst()
+    if (!oldAttachment || !newAttachment || oldAttachment.status !== 'ready' || newAttachment.status !== 'ready'
+      || oldAttachment.field_id !== newAttachment.field_id || !oldReference || !newIsReferenced
+      || replacement.oldAttachmentId === replacement.newAttachmentId) {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_REPLACEMENT_INVALID', '待替换图片已变化，请重新读取后重试。')
+    }
+  }
   const complete = normalizeForDraft(definition, input.values, attachments, true)
   const payload = Buffer.from(canonicalPurchaseFormJson(normalized.value), 'utf8')
   if (payload.length > PURCHASE_FORM_LIMITS.requestBytes - 16 * 1024) {
     throw new PurchaseDraftServiceError(413, 'PURCHASE_DRAFT_TOO_LARGE', '填写资料超过保存容量上限。')
   }
   const encrypted = encryptPurchaseDraft(config, draft.id, normalized.value)
+  const previousReferences = await trx.selectFrom('purchase_draft_attachment_references')
+    .select('attachment_id').where('draft_id', '=', draft.id).execute()
+  const currentReferenceIds = new Set(refs.map(reference => reference.attachmentId))
+  const retiredAttachmentIds = previousReferences.map(row => row.attachment_id)
+    .filter(attachmentId => !currentReferenceIds.has(attachmentId))
   await trx.deleteFrom('purchase_draft_attachment_references').where('draft_id', '=', draft.id).execute()
   for (const reference of refs) {
     await trx.insertInto('purchase_draft_attachment_references').values({
@@ -401,6 +464,10 @@ export async function savePurchaseDraftInTransaction(
       attachment_id: reference.attachmentId,
       field_id: reference.fieldId,
     }).execute()
+  }
+  if (retiredAttachmentIds.length) {
+    await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: new Date() })
+      .where('draft_id', '=', draft.id).where('id', 'in', retiredAttachmentIds).where('status', '=', 'ready').execute()
   }
   const updated = await trx.updateTable('purchase_drafts').set({
     encrypted_payload: encrypted.ciphertext,
@@ -416,6 +483,7 @@ export async function savePurchaseDraftInTransaction(
     incompleteFieldIds: complete.incompleteFieldIds,
     normalizedValues: normalized.value,
     normalizedContentHash: purchaseFormContentIdentity(draft.template_version_id, normalized.value),
+    ...(retiredAttachmentIds.length ? { replacedAttachmentIds: retiredAttachmentIds } : {}),
   }
 }
 
@@ -424,8 +492,9 @@ export async function savePurchaseDraft(
   config: AppConfig,
   owner: PurchaseDraftOwner,
   input: { draftId: string; expectedRevision: number; values: unknown },
+  options: { replacements?: Array<{ oldAttachmentId: string; newAttachmentId: string }> } = {},
 ): Promise<PurchaseDraftWriteResult> {
-  return db.transaction().execute(trx => savePurchaseDraftInTransaction(trx, config, owner, input))
+  return db.transaction().execute(trx => savePurchaseDraftInTransaction(trx, config, owner, input, options))
 }
 
 export async function validatePurchaseDraftForPurchaseInTransaction(
@@ -493,6 +562,28 @@ export async function validatePurchaseDraftForPurchase(
   return db.transaction().execute(trx => validatePurchaseDraftForPurchaseInTransaction(
     trx, config, owner, { draftId },
   ))
+}
+
+export async function inspectPurchaseDraftCompleteness(
+  db: Kysely<Database>,
+  config: AppConfig,
+  owner: PurchaseDraftOwner,
+  draftId: string,
+  expectedRevision: number,
+): Promise<{ revision: number; complete: boolean; incompleteFieldIds: string[] }> {
+  return db.transaction().execute(async trx => {
+    const identity = await validateAndLockPurchaseDraftOwner(trx, owner)
+    const draft = await lockOwnedDraft(trx, identity, draftId, 'share')
+    if (!Number.isSafeInteger(expectedRevision) || draft.revision !== expectedRevision) {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已变化，请重新读取后校验。')
+    }
+    const definition = await loadDraftTemplate(trx, draft.template_version_id)
+    const attachments = await listDraftAttachments(trx, draft.id, false)
+    const values = decryptPurchaseDraft(config, draft.id, envelope(draft))
+    const complete = normalizeForDraft(definition, values, attachments, true)
+    return { revision: draft.revision, complete: complete.incompleteFieldIds.length === 0,
+      incompleteFieldIds: complete.incompleteFieldIds }
+  })
 }
 
 export async function renewPurchaseDraft(
@@ -690,10 +781,12 @@ export async function uploadPurchaseDraftAttachment(
   owner: PurchaseDraftOwner,
   input: {
     draftId: string
+    skuId?: string
     expectedRevision: number
     fieldId: string
     claimedMimeType: string
     expectedBytes?: number
+    replaceAttachmentId?: string
     stream: AsyncIterable<Buffer | Uint8Array | string>
   },
 ): Promise<{ attachmentId: string; fieldId: string; mimeType: 'image/webp'; byteSize: number; width: number; height: number; sha256: string }> {
@@ -710,14 +803,33 @@ export async function uploadPurchaseDraftAttachment(
   const reservedBytes = input.expectedBytes ?? PURCHASE_ATTACHMENT_INPUT_LIMIT_BYTES
   const attachmentId = randomUUID()
   const storageKey = storage.storageKey(attachmentId)
+  const replaceAttachmentId = input.replaceAttachmentId?.toLowerCase()
   await db.transaction().execute(async (trx) => {
     const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
     const draft = await lockOwnedDraft(trx, identity, input.draftId, 'update')
+    if (input.skuId) {
+      const effective = await effectivePurchaseFormForSku(trx, input.skuId, { lockStatus: 'share' })
+      if (!effective.templateVersionId || effective.templateVersionId !== draft.template_version_id) {
+        throw new PurchaseDraftServiceError(409, 'PURCHASE_TEMPLATE_VERSION_CONFLICT', '填写模板版本已变化，请重新开始当前 SKU 的资料填写。')
+      }
+    }
     if (draft.revision !== input.expectedRevision) throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已被其他操作修改，请重新读取。')
     const definition = await loadDraftTemplate(trx, draft.template_version_id)
     const attachments = await listDraftAttachments(trx, draft.id, true)
-    assertAttachmentCapacity(attachments, undefined, { id: attachmentId, bytes: reservedBytes })
-    await assertOwnerAttachmentCapacity(trx, identity, reservedBytes)
+    const oldAttachment = replaceAttachmentId ? attachments.find(attachment => attachment.id.toLowerCase() === replaceAttachmentId) : undefined
+    if (replaceAttachmentId && (!oldAttachment || oldAttachment.status !== 'ready'
+      || oldAttachment.field_id.toLowerCase() !== input.fieldId.toLowerCase())) {
+      throw new PurchaseDraftServiceError(404, 'PURCHASE_ATTACHMENT_NOT_FOUND', '找不到可替换的填写图片。')
+    }
+    if (oldAttachment) {
+      const reference = await trx.selectFrom('purchase_draft_attachment_references').select('attachment_id')
+        .where('draft_id', '=', draft.id).where('attachment_id', '=', oldAttachment.id).forShare().executeTakeFirst()
+      if (!reference) throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_REPLACEMENT_INVALID', '原图片已不在当前填写内容中。')
+    }
+    const excluded = new Set(oldAttachment ? [oldAttachment.id] : [])
+    assertAttachmentCapacity(attachments, undefined, { id: attachmentId, bytes: reservedBytes }, excluded)
+    await assertOwnerAttachmentCapacity(trx, identity, oldAttachment ? 0 : reservedBytes,
+      oldAttachment ? { attachmentId: oldAttachment.id, byteSize: reservedBytes } : undefined)
     const activeAttachments = attachments.filter(attachment => attachment.status === 'ready')
     const currentValues = decryptPurchaseDraft(config, draft.id, envelope(draft))
     const normalized = normalizeForDraft(definition, currentValues, activeAttachments)
@@ -725,7 +837,8 @@ export async function uploadPurchaseDraftAttachment(
     if (fieldLimit === null) {
       throw new PurchaseDraftServiceError(400, 'PURCHASE_ATTACHMENT_FIELD_INVALID', '图片字段当前不可用。', [input.fieldId])
     }
-    if (attachments.filter(attachment => attachment.field_id === input.fieldId.toLowerCase() && attachment.status !== 'deleting').length >= fieldLimit) {
+    if (attachments.filter(attachment => attachment.field_id === input.fieldId.toLowerCase() && attachment.status !== 'deleting'
+      && attachment.id !== oldAttachment?.id).length >= fieldLimit) {
       throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_FIELD_LIMIT', '此图片字段已达到附件数量上限。', [input.fieldId])
     }
     await trx.insertInto('purchase_draft_attachments').values({
@@ -749,21 +862,37 @@ export async function uploadPurchaseDraftAttachment(
     const finalized = await db.transaction().execute(async (trx) => {
       const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
       const draft = await lockOwnedDraft(trx, identity, input.draftId, 'update')
+      if (input.skuId) {
+        const effective = await effectivePurchaseFormForSku(trx, input.skuId, { lockStatus: 'share' })
+        if (!effective.templateVersionId || effective.templateVersionId !== draft.template_version_id) {
+          throw new PurchaseDraftServiceError(409, 'PURCHASE_TEMPLATE_VERSION_CONFLICT', '填写模板版本已变化，请重新开始当前 SKU 的资料填写。')
+        }
+      }
       if (draft.revision !== input.expectedRevision) throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已被其他操作修改，请重新读取。')
       const definition = await loadDraftTemplate(trx, draft.template_version_id)
       const currentValues = decryptPurchaseDraft(config, draft.id, envelope(draft))
       const otherAttachments = await listDraftAttachments(trx, draft.id, true)
       const existing = otherAttachments.find(attachment => attachment.id === attachmentId)
+      const oldAttachment = replaceAttachmentId
+        ? otherAttachments.find(attachment => attachment.id.toLowerCase() === replaceAttachmentId) : undefined
       const currentNormalized = normalizeForDraft(definition, currentValues, otherAttachments.filter(row => row.status === 'ready')).value
       const currentFieldLimit = activeImageFieldLimit(definition, currentNormalized, input.fieldId)
       if (!existing || existing.status !== 'uploading' || currentFieldLimit === null) {
         throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_UPLOAD_STALE', '图片字段或填写草稿已变化，请重新上传。', [input.fieldId])
       }
-      if (otherAttachments.filter(attachment => attachment.field_id === input.fieldId.toLowerCase() && attachment.status !== 'deleting').length > currentFieldLimit) {
+      if (replaceAttachmentId && (!oldAttachment || oldAttachment.status !== 'ready'
+        || oldAttachment.field_id.toLowerCase() !== input.fieldId.toLowerCase())) {
+        throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_REPLACEMENT_INVALID', '原图片已变化，请重新读取后替换。')
+      }
+      if (otherAttachments.filter(attachment => attachment.field_id === input.fieldId.toLowerCase() && attachment.status !== 'deleting'
+        && attachment.id !== oldAttachment?.id && attachment.id !== attachmentId).length >= currentFieldLimit) {
         throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_FIELD_LIMIT', '此图片字段已达到附件数量上限。', [input.fieldId])
       }
-      assertAttachmentCapacity(otherAttachments, { id: attachmentId, byteSize: prepared.byteSize })
-      await assertOwnerAttachmentCapacity(trx, identity, 0, { attachmentId, byteSize: prepared.byteSize })
+      assertAttachmentCapacity(otherAttachments, { id: attachmentId, byteSize: prepared.byteSize }, undefined,
+        new Set(oldAttachment ? [oldAttachment.id] : []))
+      await assertOwnerAttachmentCapacity(trx, identity, oldAttachment ? 0 : prepared.byteSize, oldAttachment
+        ? { attachmentId: oldAttachment.id, byteSize: prepared.byteSize }
+        : { attachmentId, byteSize: prepared.byteSize })
       await trx.updateTable('purchase_draft_attachments').set({
         status: 'ready',
         storage_key: createdKey,

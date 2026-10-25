@@ -36,7 +36,8 @@ import { assertGuestSession, guestSessionCookie } from './orders.js'
 import { PurchaseDraftServiceError, claimGuestPurchaseDraftsInTransaction,
   savePurchaseDraftInTransaction, validatePurchaseDraftForPurchaseInTransaction } from './purchase-forms.js'
 import { normalizePurchaseLineRequests, preparedPurchaseFormVersion, purchaseLineContentIdentity,
-  purchaseLineRequestHash, PurchaseLineError } from './purchase-lines.js'
+  purchaseLineRequestHash, PurchaseLineError, resolvePurchaseLinesInTransaction } from './purchase-lines.js'
+import { effectivePurchaseFormForSku, readPurchaseFormsStatus } from './purchase-form-config.js'
 
 const maxCartLines = 50
 const maxLineQuantity = 99
@@ -70,6 +71,7 @@ function emptyCart(): CustomerCart {
 }
 
 async function cartSnapshot(db: Db, customerId: string, config: AppConfig): Promise<CustomerCart> {
+  const purchaseFormsStatus = await readPurchaseFormsStatus(db, 'share')
   const saved = await db.selectFrom('customer_cart_items')
     .select(['line_id', 'sku_id', 'quantity', 'revision', 'draft_id', 'draft_revision',
       'template_version_id', 'normalization_version', 'content_identity'])
@@ -83,10 +85,8 @@ async function cartSnapshot(db: Db, customerId: string, config: AppConfig): Prom
   for (const row of saved) quantities.set(row.sku_id, (quantities.get(row.sku_id) ?? 0) + row.quantity)
   const quote = await quoteCheckoutItems(db, [...quantities].map(([skuId, quantity]) => ({ skuId, quantity })),
     customerId, config, { skipPurchaseFormRequirement: true })
-  const policy = await db.selectFrom('storefront_customer_policy').select('purchase_forms_enabled')
-    .where('singleton', '=', true).executeTakeFirstOrThrow()
   const formVersions = new Map<string, string | null>()
-  if (policy.purchase_forms_enabled) {
+  if (purchaseFormsStatus !== 'preparing') {
     for (const skuId of quantities.keys()) formVersions.set(skuId, await preparedPurchaseFormVersion(db, skuId))
   }
   const bySku = new Map(quote.items.map(item => [item.skuId, item]))
@@ -103,8 +103,10 @@ async function cartSnapshot(db: Db, customerId: string, config: AppConfig): Prom
       || draft.expires_at <= new Date() || draft.revision !== row.draft_revision
       || draft.template_version_id !== row.template_version_id)
     const requiredVersion = formVersions.get(row.sku_id) ?? null
-    const formRequired = policy.purchase_forms_enabled && requiredVersion !== null
-      && (!row.draft_id || row.template_version_id !== requiredVersion)
+    const formPaused = purchaseFormsStatus === 'paused' && requiredVersion !== null
+    const formVersionChanged = requiredVersion !== null && row.template_version_id !== requiredVersion
+    const formRequired = purchaseFormsStatus === 'active' && requiredVersion !== null
+      && (!row.draft_id || formVersionChanged)
     return {
       ...base,
       lineId: row.line_id,
@@ -116,9 +118,11 @@ async function cartSnapshot(db: Db, customerId: string, config: AppConfig): Prom
       contentIdentity: row.content_identity,
       quantity: row.quantity,
       lineTotal: base.unitPrice === null ? null : settleAmount(multiplyUnitAmount(base.unitPrice, row.quantity)),
-      canPurchase: base.canPurchase && !invalidDraft && !formRequired,
+      canPurchase: base.canPurchase && !invalidDraft && !formRequired && !formPaused,
       reason: invalidDraft ? 'purchase_form_invalid' as const
-        : formRequired ? 'purchase_form_required' as const : base.reason,
+        : formPaused ? 'purchase_forms_paused' as const
+          : formVersionChanged ? 'purchase_form_version_changed' as const
+            : formRequired ? 'purchase_form_required' as const : base.reason,
     }
   })
   return {
@@ -298,6 +302,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
       const added = await db.transaction().execute(async (trx) => {
         const customer = request.customer!
         await lockCustomer(trx, customer, true)
+        await readPurchaseFormsStatus(trx, 'share')
         const found = await lockExistingSkus(trx, [body.skuId])
         if (!found.has(body.skuId)) throw new CartError(404, 'SKU_NOT_FOUND', '所选商品规格已不存在。')
         if ('version' in body) {
@@ -484,23 +489,66 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
   }, async (request, reply) => {
     try {
       const { lineId } = request.params as { lineId: string }
-      const body = request.body as { expectedLineRevision: number; expectedDraftRevision: number; values: Record<string, unknown> }
+      const body = request.body as {
+        expectedLineRevision: number
+        expectedDraftRevision: number | null
+        draftRevision?: number
+        values?: Record<string, unknown>
+        replacements?: Array<{ oldAttachmentId: string; newAttachmentId: string }>
+        replacementDraft?: { draftId: string; draftRevision: number }
+      }
       const retainedLineId = await db.transaction().execute(async (trx) => {
         const customer = request.customer!
         await lockCustomer(trx, customer, true)
         const line = await trx.selectFrom('customer_cart_items').selectAll()
           .where('customer_id', '=', customer.id).where('line_id', '=', lineId)
           .forUpdate().executeTakeFirst()
-        if (!line || !line.draft_id) throw new CartError(404, 'CART_ITEM_NOT_FOUND', '购物车中没有可编辑的填写购买行。')
+        if (!line) throw new CartError(404, 'CART_ITEM_NOT_FOUND', '购物车中没有可编辑的填写购买行。')
         if (line.revision !== body.expectedLineRevision || line.draft_revision !== body.expectedDraftRevision) {
           throw new CartError(409, 'CART_LINE_REVISION_CONFLICT', '购买行或填写资料已变化，请刷新后再编辑。')
         }
+        const effective = await effectivePurchaseFormForSku(trx, line.sku_id, { lockStatus: 'share' })
         await lockExistingSkus(trx, [line.sku_id])
+        if (body.replacementDraft) {
+          const duplicate = await trx.selectFrom('customer_cart_items').select('line_id')
+            .where('customer_id', '=', customer.id).where('draft_id', '=', body.replacementDraft.draftId)
+            .where('line_id', '!=', lineId).forUpdate().executeTakeFirst()
+          if (duplicate) throw new CartError(409, 'PURCHASE_DRAFT_ALREADY_BOUND', '这份新填写资料已绑定其他购买行。')
+          const [resolved] = await resolvePurchaseLinesInTransaction(trx, config, { kind: 'customer', customer }, [{
+            lineId, skuId: line.sku_id, quantity: line.quantity,
+            draftId: body.replacementDraft.draftId, draftRevision: body.replacementDraft.draftRevision,
+          }], 'update')
+          if (!resolved?.validatedDraft) throw new CartError(409, 'PURCHASE_FORM_REQUIRED', '请先完成当前 SKU 的填写资料。')
+          const collision = await trx.selectFrom('customer_cart_items').select(['line_id', 'quantity'])
+            .where('customer_id', '=', customer.id).where('sku_id', '=', line.sku_id)
+            .where('content_identity', '=', resolved.contentIdentity).where('line_id', '!=', lineId)
+            .forUpdate().executeTakeFirst()
+          if (collision) {
+            if (collision.quantity + line.quantity > maxLineQuantity) {
+              throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
+            }
+            await trx.deleteFrom('customer_cart_items').where('line_id', '=', lineId).execute()
+            await trx.updateTable('customer_cart_items').set({ quantity: collision.quantity + line.quantity })
+              .where('line_id', '=', collision.line_id).execute()
+            return collision.line_id
+          }
+          await trx.updateTable('customer_cart_items').set({
+            draft_id: resolved.draftId, draft_revision: resolved.draftRevision,
+            template_version_id: resolved.templateVersionId,
+            normalization_version: resolved.normalizationVersion,
+            content_identity: resolved.contentIdentity,
+          }).where('line_id', '=', lineId).execute()
+          return lineId
+        }
+        if (!line.draft_id || !body.values || body.expectedDraftRevision === null || !body.draftRevision) {
+          throw new CartError(400, 'PURCHASE_DRAFT_INVALID', '请提供已保存的填写内容或新的草稿引用。')
+        }
         const saved = await savePurchaseDraftInTransaction(trx, config, { kind: 'customer', customer }, {
-          draftId: line.draft_id, expectedRevision: body.expectedDraftRevision, values: body.values,
-        }, { coordinatedCartEdit: true })
-        if (!saved.complete) throw new CartError(409, 'PURCHASE_DRAFT_INCOMPLETE', '请完成所有必填填写资料。')
-        const prepared = await preparedPurchaseFormVersion(trx, line.sku_id)
+          draftId: line.draft_id, expectedRevision: body.draftRevision, values: body.values,
+        }, { coordinatedCartEdit: true, ...(effective.templateVersionId ? { expectedTemplateVersionId: effective.templateVersionId } : {}),
+          ...(body.replacements ? { replacements: body.replacements } : {}) })
+        if (!saved.complete) return lineId
+        const prepared = effective.templateVersionId
         if (prepared !== line.template_version_id) {
           throw new CartError(409, 'PURCHASE_FORM_VERSION_CHANGED', '商品填写模板绑定已变化，请重新确认购买资料。')
         }
@@ -588,6 +636,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           }
           return { changed: false, skippedSkuIds: previous.skipped_sku_ids }
         }
+        await readPurchaseFormsStatus(trx, 'share')
         if (v2 && lineItems!.some(item => item.draftId)) {
           const guestToken = request.cookies[guestSessionCookie]
           if (!guestToken || !/^[A-Za-z0-9_-]{43}$/u.test(guestToken)) {

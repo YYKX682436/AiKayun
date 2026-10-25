@@ -82,7 +82,7 @@ export interface StorefrontCustomerPolicyTable {
   require_phone: Generated<boolean>
   guest_checkout_enabled: Generated<boolean>
   guest_free_claim_enabled: Generated<boolean>
-  purchase_forms_enabled: Generated<boolean>
+  purchase_forms_status: Generated<PurchaseFormsStatus>
   unpaid_order_timeout_minutes: Generated<number>
   wallet_top_up_enabled: Generated<boolean>
   wallet_top_up_min_amount: ColumnType<string, string | undefined, string>
@@ -95,6 +95,8 @@ export interface StorefrontCustomerPolicyTable {
   withdrawal_methods: ColumnType<WithdrawalPayoutMethod[], WithdrawalPayoutMethod[] | undefined, WithdrawalPayoutMethod[]>
   updated_at: Generated<Date>
 }
+
+export type PurchaseFormsStatus = 'preparing' | 'active' | 'paused'
 
 export type CustomerStatus = 'active' | 'disabled' | 'deleted'
 
@@ -177,7 +179,8 @@ export interface ProductVariantFulfillmentTable {
 export type PurchaseFormIdentityKind = 'field' | 'option'
 export type PurchaseFormTemplateOperation =
   | 'template_created' | 'template_updated' | 'template_version_saved'
-  | 'product_assignment_updated' | 'sku_override_updated'
+  | 'product_assignment_updated' | 'sku_override_updated' | 'product_assignment_applied'
+  | 'sku_override_applied' | 'purchase_forms_status_changed'
 export type PurchaseFormDraftStatus = 'active' | 'deleting'
 export type PurchaseDraftAttachmentStatus = 'uploading' | 'ready' | 'failed' | 'deleting'
 
@@ -216,8 +219,10 @@ export interface PurchaseFormTemplateIdentitiesTable {
 
 export interface ProductPurchaseFormSettingsTable {
   product_id: string
-  mode: 'none' | 'template'
+  mode: 'not_configured' | 'none' | 'template'
   template_version_id: string | null
+  applied_mode: 'none' | 'template' | null
+  applied_template_version_id: string | null
   updated_by_admin_id: string
   updated_at: Generated<Date>
 }
@@ -225,8 +230,10 @@ export interface ProductPurchaseFormSettingsTable {
 export interface SkuPurchaseFormOverridesTable {
   product_id: string
   product_variant_id: string
-  mode: 'none' | 'template'
+  mode: 'product_default' | 'none' | 'template'
   template_version_id: string | null
+  applied_mode: 'none' | 'template' | null
+  applied_template_version_id: string | null
   updated_by_admin_id: string
   updated_at: Generated<Date>
 }

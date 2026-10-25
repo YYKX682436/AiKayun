@@ -206,6 +206,9 @@ export const ProductPurchaseFormAssignmentSchema = Type.Object({
   productRevision: Type.Integer({ minimum: 1 }),
   mode: Type.Union([Type.Literal('not_configured'), Type.Literal('none'), Type.Literal('template')]),
   templateVersion: Type.Union([PurchaseFormAssignmentVersionSchema, Type.Null()]),
+  appliedMode: Type.Union([Type.Literal('none'), Type.Literal('template'), Type.Null()]),
+  appliedTemplateVersion: Type.Union([PurchaseFormAssignmentVersionSchema, Type.Null()]),
+  pendingApply: Type.Boolean(),
 }, { additionalProperties: false })
 
 export const SkuPurchaseFormAssignmentSchema = Type.Object({
@@ -215,6 +218,87 @@ export const SkuPurchaseFormAssignmentSchema = Type.Object({
   mode: Type.Union([Type.Literal('product_default'), Type.Literal('none'), Type.Literal('template')]),
   templateVersion: Type.Union([PurchaseFormAssignmentVersionSchema, Type.Null()]),
   productDefault: ProductPurchaseFormAssignmentSchema,
+  appliedMode: Type.Union([Type.Literal('inherit'), Type.Literal('none'), Type.Literal('template'), Type.Null()]),
+  appliedTemplateVersion: Type.Union([PurchaseFormAssignmentVersionSchema, Type.Null()]),
+  pendingApply: Type.Boolean(),
+}, { additionalProperties: false })
+
+export const PurchaseFormsStatusSchema = Type.Union([
+  Type.Literal('preparing'), Type.Literal('active'), Type.Literal('paused'),
+])
+export const PurchaseFormsLifecycleSchema = Type.Object({
+  status: PurchaseFormsStatusSchema,
+  impactHash: Type.String({ pattern: '^[a-f0-9]{64}$' }),
+  productCount: Type.Integer({ minimum: 0 }),
+  skuCount: Type.Integer({ minimum: 0 }),
+  skuWithTemplateCount: Type.Integer({ minimum: 0 }),
+  templateVersionCount: Type.Integer({ minimum: 0 }),
+  invalidTemplateVersionCount: Type.Integer({ minimum: 0 }),
+  manualHandlingSkuCount: Type.Integer({ minimum: 0 }),
+  automaticFulfillmentSkuCount: Type.Integer({ minimum: 0 }),
+  pendingProductApplyCount: Type.Integer({ minimum: 0 }),
+  pendingSkuApplyCount: Type.Integer({ minimum: 0 }),
+  readyToActivate: Type.Boolean(),
+}, { additionalProperties: false })
+export const PurchaseFormsTransitionBodySchema = Type.Object({
+  expectedStatus: PurchaseFormsStatusSchema,
+  nextStatus: Type.Union([Type.Literal('active'), Type.Literal('paused')]),
+  expectedImpactHash: Type.Optional(Type.String({ pattern: '^[a-f0-9]{64}$' })),
+}, { additionalProperties: false })
+export const ProductPurchaseFormApplyBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  expectedMode: Type.Union([Type.Literal('not_configured'), Type.Literal('none'), Type.Literal('template')]),
+  expectedTemplateVersionId: Type.Union([IdentitySchema, Type.Null()]),
+}, { additionalProperties: false })
+export const SkuPurchaseFormApplyBodySchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  expectedMode: Type.Union([Type.Literal('product_default'), Type.Literal('none'), Type.Literal('template')]),
+  expectedTemplateVersionId: Type.Union([IdentitySchema, Type.Null()]),
+}, { additionalProperties: false })
+
+export const StorefrontPurchaseFormSchema = Type.Object({
+  skuId: IdentitySchema,
+  status: PurchaseFormsStatusSchema,
+  required: Type.Boolean(),
+  templateVersionId: Type.Union([IdentitySchema, Type.Null()]),
+  templateName: Type.Union([Type.String(), Type.Null()]),
+  versionNumber: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+  definition: Type.Union([PurchaseFormDefinitionSchema, Type.Null()]),
+}, { additionalProperties: false })
+export const PurchaseDraftCreateBodySchema = Type.Object({ skuId: IdentitySchema }, { additionalProperties: false })
+export const PurchaseDraftAttachmentSchema = Type.Object({
+  id: IdentitySchema,
+  fieldId: IdentitySchema,
+  mimeType: Type.Literal('image/webp'),
+  byteSize: Type.Integer({ minimum: 1, maximum: PURCHASE_FORM_LIMITS.attachmentBytes }),
+  width: Type.Integer({ minimum: 1, maximum: 8192 }),
+  height: Type.Integer({ minimum: 1, maximum: 8192 }),
+  url: Type.String({ minLength: 1, maxLength: 2048 }),
+}, { additionalProperties: false })
+export const PurchaseDraftSchema = Type.Object({
+  id: IdentitySchema,
+  skuId: IdentitySchema,
+  templateVersionId: IdentitySchema,
+  revision: Type.Integer({ minimum: 1 }),
+  normalizationVersion: Type.Integer({ minimum: 1 }),
+  expiresAt: Type.String({ format: 'date-time' }),
+  values: Type.Record(IdentitySchema, Type.Unknown()),
+  attachments: Type.Array(PurchaseDraftAttachmentSchema, { maxItems: PURCHASE_FORM_LIMITS.attachmentsPerDraft }),
+  templateChanged: Type.Boolean(),
+}, { additionalProperties: false })
+export const PurchaseDraftValidationBodySchema = Type.Object({ expectedRevision: Type.Integer({ minimum: 1 }) }, { additionalProperties: false })
+export const PurchaseDraftValidationSchema = Type.Object({
+  complete: Type.Boolean(),
+  incompleteFieldIds: Type.Array(IdentitySchema, { maxItems: PURCHASE_FORM_LIMITS.totalFields }),
+}, { additionalProperties: false })
+export const PurchaseDraftDeleteBodySchema = Type.Object({ expectedRevision: Type.Integer({ minimum: 1 }) }, { additionalProperties: false })
+export const PurchaseDraftAttachmentUploadSchema = Type.Object({
+  attachmentId: IdentitySchema,
+  fieldId: IdentitySchema,
+  mimeType: Type.Literal('image/webp'),
+  byteSize: Type.Integer({ minimum: 1, maximum: PURCHASE_FORM_LIMITS.attachmentBytes }),
+  width: Type.Integer({ minimum: 1, maximum: 8192 }),
+  height: Type.Integer({ minimum: 1, maximum: 8192 }),
 }, { additionalProperties: false })
 
 export const PurchaseTemplateMutationSchema = Type.Object({
@@ -223,8 +307,13 @@ export const PurchaseTemplateMutationSchema = Type.Object({
 }, { additionalProperties: false })
 
 export const PurchaseDraftSaveBodySchema = Type.Object({
+  skuId: IdentitySchema,
   expectedRevision: Type.Integer({ minimum: 1 }),
   values: Type.Record(Type.String({ format: 'uuid' }), Type.Unknown()),
+  replacements: Type.Optional(Type.Array(Type.Object({
+    oldAttachmentId: IdentitySchema,
+    newAttachmentId: IdentitySchema,
+  }, { additionalProperties: false }), { maxItems: PURCHASE_FORM_LIMITS.attachmentsPerDraft })),
 }, { additionalProperties: false })
 
 export const OrderPurchaseAttachmentSchema = Type.Object({
@@ -268,6 +357,22 @@ export const OrderPurchaseSnapshotSchema = Type.Union([
   }, { additionalProperties: false }),
 ])
 
+export const OrderPurchaseDataSchema = Type.Object({
+  state: Type.Union([Type.Literal('legacy'), Type.Literal('none'), Type.Literal('filled')]),
+  templateVersionId: Type.Union([IdentitySchema, Type.Null()]),
+  templateName: Type.Union([Type.String(), Type.Null()]),
+  templateVersionNumber: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+  definition: Type.Union([PurchaseFormDefinitionSchema, Type.Null()]),
+  values: Type.Union([Type.Record(IdentitySchema, Type.Unknown()), Type.Null()]),
+  attachments: Type.Array(Type.Object({
+    attachmentId: IdentitySchema,
+    fieldId: IdentitySchema,
+    byteSize: Type.Integer({ minimum: 1, maximum: PURCHASE_FORM_LIMITS.attachmentBytes }),
+    sha256: Type.String({ pattern: '^[a-f0-9]{64}$' }),
+    url: Type.String({ minLength: 1, maxLength: 2048 }),
+  }, { additionalProperties: false }), { maxItems: PURCHASE_FORM_LIMITS.attachmentsPerDraft }),
+}, { additionalProperties: false })
+
 export interface PurchaseFormLeafFieldBase {
   id: string
   meaningKey: string
@@ -301,9 +406,16 @@ export type PurchaseTemplateListQuery = Static<typeof PurchaseTemplateListQueryS
 export type PurchaseTemplateVersionsQuery = Static<typeof PurchaseTemplateVersionsQuerySchema>
 export type ProductPurchaseFormAssignmentBody = Static<typeof ProductPurchaseFormAssignmentBodySchema>
 export type SkuPurchaseFormAssignmentBody = Static<typeof SkuPurchaseFormAssignmentBodySchema>
+export type PurchaseFormsLifecycle = Static<typeof PurchaseFormsLifecycleSchema>
+export type PurchaseFormsTransitionBody = Static<typeof PurchaseFormsTransitionBodySchema>
+export type StorefrontPurchaseForm = Static<typeof StorefrontPurchaseFormSchema>
+export type PurchaseDraft = Static<typeof PurchaseDraftSchema>
+export type PurchaseDraftCreateBody = Static<typeof PurchaseDraftCreateBodySchema>
+export type PurchaseDraftValidation = Static<typeof PurchaseDraftValidationSchema>
 export type PurchaseDraftSaveBody = Static<typeof PurchaseDraftSaveBodySchema>
 export type OrderPurchaseAttachment = Static<typeof OrderPurchaseAttachmentSchema>
 export type OrderPurchaseSnapshot = Static<typeof OrderPurchaseSnapshotSchema>
+export type OrderPurchaseData = Static<typeof OrderPurchaseDataSchema>
 
 export type PurchaseFormIssue = { fieldId: string | null; code: string }
 export type PurchaseFormValidationResult<T> =

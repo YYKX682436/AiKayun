@@ -44,7 +44,7 @@ const submitting = computed(() => activeSubmissionGeneration.value === pageGener
 const quoteGeneration = ref<number | null>(null)
 let pageDisposed = false
 
-useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
+if (import.meta.server) useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 
 useSeoMeta({ title: '结算报价预览', description: '查看所选商品的当前结算报价。', robots: 'noindex, nofollow' })
 
@@ -138,9 +138,26 @@ function statusLabel(item: CheckoutQuoteItem): string {
     case 'purchase_form_invalid': return '购买资料已失效，请重新确认'
     case 'purchase_form_version_changed': return '填写模板已变化，请重新确认'
     case 'purchase_form_required': return '此商品需要填写购买资料'
+    case 'purchase_forms_paused': return '填写商品已暂停新订单'
     case 'product_not_found': return '商品已删除或无法读取'
     default: return item.canPurchase ? '可继续报价' : '暂不可购买'
   }
+}
+
+function purchaseEditPath(item: CheckoutQuoteItem): string {
+  if (!item.productId) return '/cart'
+  const query = new URLSearchParams({ skuId: item.skuId, quantity: String(item.quantity) })
+  if (item.draftId) query.set('draftId', item.draftId)
+  const cartLine = item.lineId
+    ? shoppingCart.cartView.value?.items.find(candidate => candidate.lineId === item.lineId)
+    : undefined
+  if (cartLine?.lineId) {
+    query.set('editLineId', cartLine.lineId)
+    if (cartLine.lineRevision !== null) query.set('lineRevision', String(cartLine.lineRevision))
+    if (cartLine.draftRevision !== null) query.set('expectedDraftRevision', String(cartLine.draftRevision))
+  }
+  query.set('returnToCheckout', '1')
+  return `/products/${encodeURIComponent(item.productId)}?${query.toString()}`
 }
 
 function cloneSelection(selection: CheckoutSelection | null): CheckoutSelection | null {
@@ -491,7 +508,7 @@ function formatDate(value: string): string {
         variant="subtle"
         icon="i-lucide-shield-check"
         title="下单前会重新验证"
-        description="报价用于预览；只有商家明确开启人工数字交付的商品可以下单。下单会原子创建订单并预留数量库存。当前正价订单只会进入待付款，支付宝和微信支付尚未开放。"
+        description="报价用于预览；下单时会重新检查当前商品、库存、购买填写和已配置的履约能力，并原子创建订单、预留数量库存。付款方式以订单详情页实际提供的选项为准。"
       />
 
       <UAlert
@@ -616,6 +633,28 @@ function formatDate(value: string): string {
                 class="mt-3"
                 :purchase-limits="item.purchaseLimits"
               />
+              <div
+                v-if="item.purchasePreview"
+                class="mt-4 space-y-3"
+              >
+                <StorefrontPurchaseDataPreview
+                  title="本次购买资料"
+                  :definition="item.purchasePreview.definition"
+                  :values="item.purchasePreview.values"
+                  :attachments="item.purchasePreview.attachments.map(attachment => ({ id: attachment.id, fieldId: attachment.fieldId, url: attachment.url, byteSize: attachment.byteSize }))"
+                />
+                <NuxtLink
+                  v-if="item.draftId && !submitting && !pendingOwnerBlocked"
+                  :to="purchaseEditPath(item)"
+                  class="inline-flex min-h-11 items-center gap-2 rounded-lg px-2 text-sm font-medium text-primary underline underline-offset-2 hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                >
+                  <UIcon
+                    name="i-lucide-pencil"
+                    aria-hidden="true"
+                  />
+                  编辑此购买行资料并重新报价
+                </NuxtLink>
+              </div>
             </div>
             <dl class="grid grid-cols-2 gap-x-5 text-right text-sm sm:min-w-36 sm:grid-cols-1 sm:gap-y-1">
               <div>

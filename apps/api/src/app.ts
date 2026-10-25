@@ -30,6 +30,7 @@ import type { ProductIdentityFactory } from './catalog/admin-products.js'
 import { registerAdminCategoryRoutes } from './catalog/admin-categories.js'
 import { registerAdminProductDetailRoutes } from './catalog/admin-product-details.js'
 import { registerAdminPurchaseFormRoutes } from './catalog/admin-purchase-forms.js'
+import { registerAdminPurchaseFormLifecycleRoutes } from './catalog/admin-purchase-form-lifecycle.js'
 import { registerAdminVariantMatrixRoutes } from './catalog/admin-variant-matrix.js'
 import { registerAdminProductPriceRoutes } from './catalog/admin-product-prices.js'
 import { registerAdminInventoryRoutes } from './catalog/admin-inventory.js'
@@ -41,6 +42,7 @@ import { registerAdminApiFulfillmentRoutes } from './catalog/admin-api-fulfillme
 import { registerProductMediaRoutes } from './media/admin.js'
 import { registerPublicProductRoutes } from './catalog/public-products.js'
 import { registerCustomerCartRoutes } from './commerce/customer-cart.js'
+import { registerCustomerPurchaseFormRoutes } from './commerce/customer-purchase-forms.js'
 import { registerOrderRoutes } from './commerce/orders.js'
 import { registerPrivateFileDownloadRoutes } from './commerce/private-file-downloads.js'
 import { registerPaymentRoutes } from './payments/routes.js'
@@ -112,7 +114,10 @@ export async function createApp(options: {
       || request.url.startsWith('/api/v1/checkout/')
       || request.url.startsWith('/api/v1/guest/')
       || request.url.startsWith('/api/v1/admin/')) {
-      reply.header('cache-control', 'no-store')
+      const cacheControl = String(reply.getHeader('cache-control') ?? '').toLowerCase()
+      if (!cacheControl.split(',').some((directive) => directive.trim() === 'private')) {
+        reply.header('cache-control', 'no-store')
+      }
     }
     return payload
   })
@@ -183,6 +188,7 @@ export async function createApp(options: {
   registerAdminAuthRoutes(app, db, config, dummyPasswordHash)
   registerCustomerAuthRoutes(app, db, config, dummyPasswordHash)
   registerCustomerCartRoutes(app, db, config)
+  await registerCustomerPurchaseFormRoutes(app, db, config)
   registerOrderRoutes(app, db, config)
   registerPrivateFileDownloadRoutes(app, db, config)
   registerRefundRoutes(app, db, config)
@@ -196,6 +202,7 @@ export async function createApp(options: {
   registerAdminCategoryRoutes(app, db, config)
   registerAdminProductDetailRoutes(app, db, config)
   registerAdminPurchaseFormRoutes(app, db, config)
+  registerAdminPurchaseFormLifecycleRoutes(app, db, config)
   registerAdminVariantMatrixRoutes(app, db, config, identityFactory)
   registerAdminProductPriceRoutes(app, db, config)
   registerAdminInventoryRoutes(app, db, config)

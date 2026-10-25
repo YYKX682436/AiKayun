@@ -160,7 +160,7 @@ async function freezeVersion() {
     })
     if (generation !== currentGeneration || currentId !== templateId.value) return
     await load(currentId)
-    if (generation === currentGeneration + 1) successMessage.value = '不可变准备版本已保存；顾客购买填写仍未启用。'
+    if (generation === currentGeneration + 1) successMessage.value = '不可变准备版本已保存；现行购买规则未改变，关联需单独应用。'
   } catch (error) {
     if (generation === currentGeneration) errorMessage.value = error instanceof AdminApiError && error.status === 409
       ? `${error.message}请重新读取后再保存版本。`

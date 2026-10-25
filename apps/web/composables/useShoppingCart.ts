@@ -626,6 +626,13 @@ export function useShoppingCart() {
   const ready = computed(() => readyState.value
     && ownerIdentityVersion.value === activeIdentityVersion.value
     && ownerId.value === customerId.value)
+  // Guest cart mutations are local and preserve pending owner-bound merge
+  // batches, so they remain available while the guest quote is refreshing.
+  // Customer mutations wait for the authoritative account cart to load.
+  const canAddToCart = computed(() => customerApi.sessionResolved.value
+    && ownerIdentityVersion.value === activeIdentityVersion.value
+    && ownerId.value === customerId.value
+    && (!customerId.value || ready.value))
   const busy = computed(() => busyState.value && busyIdentityVersion.value === activeIdentityVersion.value)
   const errorMessage = computed(() => ownerIdentityVersion.value === activeIdentityVersion.value ? errorState.value : null)
   const noticeMessage = computed(() => ownerIdentityVersion.value === activeIdentityVersion.value ? noticeState.value : null)
@@ -742,8 +749,8 @@ export function useShoppingCart() {
     }
   }
 
-  // This is a line-level primitive for the later ⑥-2C entry flow. No form
-  // editor or upload action is exposed by the current storefront.
+  // The storefront passes the current owner-bound draft reference here; the
+  // server validates it before persisting the cart purchase line.
   async function addWithDraft(skuId: string, quantity: number, draftId: string, draftRevision: number): Promise<string | null> {
     const scope = currentScope()
     if (!isUuid(skuId) || !isUuid(draftId) || !Number.isSafeInteger(quantity)
@@ -819,6 +826,37 @@ export function useShoppingCart() {
     } finally {
       finishOperation(scope, operationVersion)
     }
+  }
+
+  async function replaceGuestPurchaseFormLine(
+    lineId: string,
+    expectedDraftId: string | null,
+    expectedDraftRevision: number | null,
+    draftId: string,
+    draftRevision: number,
+  ): Promise<string | null> {
+    const scope = currentScope()
+    if (scope.customerId || !isUuid(lineId) || !isUuid(draftId) || !Number.isSafeInteger(draftRevision) || draftRevision < 1) return null
+    const operationVersion = beginOperation(scope)
+    if (operationVersion === null) return null
+    try {
+      const snapshot = await mutateGuestCart(scope, operationVersion, (currentStore) => {
+        const store = currentStore.version === 2 ? upgradeGuestStore(currentStore) : currentStore
+        const line = store.unclaimedItems.find(item => item.lineId.toLowerCase() === lineId.toLowerCase())
+        const currentDraftId = line && 'draftId' in line ? line.draftId ?? null : null
+        const currentDraftRevision = line && 'draftRevision' in line ? line.draftRevision ?? null : null
+        if (!line || currentDraftId !== expectedDraftId || currentDraftRevision !== expectedDraftRevision) {
+          throw new Error('游客购买行已在其他标签页变化，请刷新购物车后重试。')
+        }
+        return { ...store, unclaimedItems: store.unclaimedItems.map(item => item.lineId === line.lineId
+          ? { ...item, draftId, draftRevision } : item) }
+      })
+      if (snapshot && scopeIsActive(scope)) await refreshGuestQuote(scope, snapshot)
+      return snapshot ? lineId : null
+    } catch (error) {
+      if (operationIsCurrent(scope, operationVersion)) errorState.value = readError(error, '游客购买行资料更新失败，请刷新后重试。')
+      return null
+    } finally { finishOperation(scope, operationVersion) }
   }
 
   async function setQuantity(lineIdOrSkuId: string, quantity: number): Promise<void> {
@@ -1027,6 +1065,7 @@ export function useShoppingCart() {
     currentLineCount,
     currentQuantity,
     ready,
+    canAddToCart,
     busy,
     errorMessage,
     noticeMessage,
@@ -1035,6 +1074,7 @@ export function useShoppingCart() {
     add,
     addWithDraft,
     editPurchaseFormLine,
+    replaceGuestPurchaseFormLine,
     setQuantity,
     remove,
     clear,

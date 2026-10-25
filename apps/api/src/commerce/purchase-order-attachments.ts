@@ -161,16 +161,55 @@ export async function persistOrderPurchaseSnapshotInTransaction(
 }
 
 export type OwnedOrderPurchaseSnapshot = OrderPurchaseSnapshot
+type PurchaseSnapshotDb = Kysely<Database> | Transaction<Database>
+
+/** Internal order-detail loader. Call only after the parent order is authorized. */
+export async function readOrderPurchaseSnapshot(
+  db: PurchaseSnapshotDb,
+  config: AppConfig,
+  orderItemId: string,
+): Promise<OrderPurchaseSnapshot> {
+  const snapshot = await db.selectFrom('order_item_purchase_snapshots').selectAll()
+    .where('order_item_id', '=', orderItemId).executeTakeFirst()
+  if (!snapshot) return { state: 'legacy', orderItemId, templateVersionId: null,
+    normalizationVersion: null, contentIdentity: null, values: null, attachments: [] }
+  const rows = await db.selectFrom('order_item_purchase_attachments').selectAll()
+    .where('order_item_id', '=', orderItemId).orderBy('ordinal').execute()
+  if (snapshot.attachment_ids.length > 10 || new Set(snapshot.attachment_ids).size !== snapshot.attachment_ids.length
+    || rows.length !== snapshot.attachment_ids.length
+    || snapshot.attachment_ids.some((id, index) => typeof id !== 'string'
+      || rows[index]?.ordinal !== index + 1 || rows[index]?.source_attachment_id !== id)) {
+    throw new PurchaseDraftServiceError(503, 'PURCHASE_ORDER_SNAPSHOT_INVALID', '成交资料暂时无法读取。')
+  }
+  const attachments = rows.map(row => ({ attachmentId: row.source_attachment_id,
+    fieldId: row.field_id, byteSize: row.byte_size, sha256: row.sha256 }))
+  if (snapshot.template_version_id === null) return { state: 'none', orderItemId,
+    templateVersionId: null, normalizationVersion: null, contentIdentity: snapshot.content_identity,
+    values: null, attachments }
+  if (snapshot.normalization_version !== PURCHASE_FORM_NORMALIZATION_VERSION || !snapshot.encryption_key_id
+    || !snapshot.encrypted_values || !snapshot.values_nonce || !snapshot.values_auth_tag) {
+    throw new PurchaseDraftServiceError(503, 'PURCHASE_ORDER_SNAPSHOT_INVALID', '成交资料暂时无法读取。')
+  }
+  const values = decryptPurchaseOrderValues(config, orderItemId, {
+    keyId: snapshot.encryption_key_id, ciphertext: snapshot.encrypted_values,
+    nonce: snapshot.values_nonce, authTag: snapshot.values_auth_tag,
+  })
+  return { state: 'filled', orderItemId, templateVersionId: snapshot.template_version_id,
+    normalizationVersion: snapshot.normalization_version, contentIdentity: snapshot.content_identity,
+    values, attachments }
+}
 
 async function ownedOrderItem(
   trx: Transaction<Database>,
   owner: PurchaseDraftOwner,
   orderItemId: string,
+  orderId?: string,
 ): Promise<boolean> {
   const identity = await validateAndLockPurchaseDraftOwner(trx, owner)
-  const query = trx.selectFrom('order_items as item')
+  let query = trx.selectFrom('order_items as item')
     .innerJoin('orders as order', 'order.id', 'item.order_id')
     .select('item.id').where('item.id', '=', orderItemId)
+  if (orderId) query = query.where('order.id', '=', orderId)
   const row = identity.kind === 'customer'
     ? await query.where('order.customer_id', '=', identity.customerId).executeTakeFirst()
     : await query.where('order.guest_order_session_id', '=', identity.guestSessionId).executeTakeFirst()
@@ -239,9 +278,10 @@ export async function readOwnedOrderPurchaseAttachment(
   owner: PurchaseDraftOwner,
   orderItemId: string,
   sourceAttachmentId: string,
+  orderId?: string,
 ): Promise<{ bytes: Buffer; mimeType: 'image/webp'; byteSize: number; sha256: string }> {
   const object = await db.transaction().execute(async trx => {
-    if (!await ownedOrderItem(trx, owner, orderItemId)) {
+    if (!await ownedOrderItem(trx, owner, orderItemId, orderId)) {
       throw new PurchaseDraftServiceError(404, 'ORDER_ATTACHMENT_NOT_FOUND', '找不到可访问的成交图片。')
     }
     const row = await trx.selectFrom('order_item_purchase_attachments as reference')
@@ -255,6 +295,28 @@ export async function readOwnedOrderPurchaseAttachment(
     }
     return row
   })
+  const bytes = await storage.readVerified(object.id, object.storage_key, object.byte_size, object.sha256)
+  return { bytes, mimeType: 'image/webp', byteSize: object.byte_size, sha256: object.sha256 }
+}
+
+/** Admin route must perform admin authentication before calling this function. */
+export async function readAdminOrderPurchaseAttachment(
+  db: Kysely<Database>,
+  storage: PurchaseOrderAttachmentStorage,
+  orderId: string,
+  orderItemId: string,
+  sourceAttachmentId: string,
+): Promise<{ bytes: Buffer; mimeType: 'image/webp'; byteSize: number; sha256: string }> {
+  const object = await db.selectFrom('order_item_purchase_attachments as reference')
+    .innerJoin('order_items as item', 'item.id', 'reference.order_item_id')
+    .innerJoin('purchase_order_attachment_objects as object', 'object.id', 'reference.archive_object_id')
+    .select(['object.id', 'object.storage_key', 'object.byte_size', 'object.sha256', 'object.status'])
+    .where('item.order_id', '=', orderId).where('item.id', '=', orderItemId)
+    .where('reference.source_attachment_id', '=', sourceAttachmentId)
+    .executeTakeFirst()
+  if (!object || object.status !== 'retained') {
+    throw new PurchaseDraftServiceError(404, 'ORDER_ATTACHMENT_NOT_FOUND', '找不到可访问的成交图片。')
+  }
   const bytes = await storage.readVerified(object.id, object.storage_key, object.byte_size, object.sha256)
   return { bytes, mimeType: 'image/webp', byteSize: object.byte_size, sha256: object.sha256 }
 }

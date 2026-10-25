@@ -41,6 +41,7 @@ import { requireAdmin, verifyCsrf } from '../auth/admin.js'
 import type { Database, PurchaseFormTemplateIdentitiesTable, PurchaseFormTemplateOperation } from '../db/types.js'
 import { CatalogError, catalogDatabaseFailure, sendCatalogError } from './errors.js'
 import { assertProductNotArchived, lockProductAtRevision } from './admin-product-guards.js'
+import { effectivePurchaseFormForSku, readPurchaseFormsStatus } from '../commerce/purchase-form-config.js'
 
 const templateNameMaxCharacters = 120
 const defaultPageSize = 50
@@ -196,14 +197,22 @@ async function productDefaultAssignment(db: Kysely<Database>, productId: string)
   const product = await db.selectFrom('products').select(['id', 'revision'])
     .where('id', '=', productId).executeTakeFirst()
   if (!product) throw new CatalogError(404, 'PRODUCT_NOT_FOUND', 'The product does not exist')
-  const row = await db.selectFrom('product_purchase_form_settings').select(['mode', 'template_version_id'])
+  const row = await db.selectFrom('product_purchase_form_settings').select(['mode', 'template_version_id', 'applied_mode', 'applied_template_version_id'])
     .where('product_id', '=', productId).executeTakeFirst()
   const mode = row?.mode ?? 'not_configured'
+  const status = await readPurchaseFormsStatus(db)
+  const appliedMode = status === 'preparing' ? null : row?.applied_mode ?? 'none'
+  const appliedVersionId = row?.applied_template_version_id ?? null
   return {
     productId,
     productRevision: product.revision,
     mode,
     templateVersion: row?.template_version_id ? await versionSummary(db, row.template_version_id) : null,
+    appliedMode,
+    appliedTemplateVersion: appliedVersionId ? await versionSummary(db, appliedVersionId) : null,
+    pendingApply: status !== 'preparing' && Boolean(row)
+      && (row?.applied_mode !== (mode === 'template' ? 'template' : 'none')
+        || appliedVersionId !== (mode === 'template' ? row?.template_version_id ?? null : null)),
   }
 }
 
@@ -212,8 +221,13 @@ async function skuAssignment(db: Kysely<Database>, productId: string, variantId:
   const variant = await db.selectFrom('product_variants').select('id')
     .where('id', '=', variantId).where('product_id', '=', productId).executeTakeFirst()
   if (!variant) throw new CatalogError(404, 'SKU_NOT_FOUND', 'The SKU does not belong to this product')
-  const row = await db.selectFrom('sku_purchase_form_overrides').select(['mode', 'template_version_id'])
+  const row = await db.selectFrom('sku_purchase_form_overrides').select(['mode', 'template_version_id', 'applied_mode', 'applied_template_version_id'])
     .where('product_id', '=', productId).where('product_variant_id', '=', variantId).executeTakeFirst()
+  const status = await readPurchaseFormsStatus(db)
+  const effective = await effectivePurchaseFormForSku(db, variantId)
+  const pendingApply = status !== 'preparing' && Boolean(row)
+    && (row?.applied_mode !== (row?.mode === 'product_default' ? null : row?.mode)
+      || row?.applied_template_version_id !== (row?.mode === 'template' ? row?.template_version_id ?? null : null))
   return {
     productId,
     variantId,
@@ -221,6 +235,10 @@ async function skuAssignment(db: Kysely<Database>, productId: string, variantId:
     mode: row?.mode ?? 'product_default',
     templateVersion: row?.template_version_id ? await versionSummary(db, row.template_version_id) : null,
     productDefault: product,
+    appliedMode: status === 'preparing' ? null : row?.applied_mode === null || !row ? 'inherit'
+      : row.applied_mode,
+    appliedTemplateVersion: effective.templateVersionId ? await versionSummary(db, effective.templateVersionId) : null,
+    pendingApply,
   }
 }
 
@@ -481,16 +499,24 @@ export function registerAdminPurchaseFormRoutes(app: FastifyInstance, db: Kysely
     try {
       const versionId = assertAssignmentBody(body.mode, body.templateVersionId, ['not_configured', 'none', 'template'])
       await db.transaction().execute(async (trx) => {
+        const status = await readPurchaseFormsStatus(trx, 'share')
         const product = await lockProductAtRevision(trx, id, body.expectedRevision)
         assertProductNotArchived(product)
         await assertVersionExists(trx, versionId)
         const current = await trx.selectFrom('product_purchase_form_settings').selectAll().where('product_id', '=', id).executeTakeFirst()
-        const unchanged = body.mode === 'not_configured' ? !current
-          : current?.mode === body.mode && current.template_version_id === versionId
+        const removeUnconfiguredPreparation = status === 'preparing' && body.mode === 'not_configured'
+        const unchanged = current
+          ? current.mode === body.mode && current.template_version_id === versionId
+          : removeUnconfiguredPreparation
         let revision = product.revision
         if (!unchanged) {
-          await trx.deleteFrom('product_purchase_form_settings').where('product_id', '=', id).execute()
-          if (body.mode !== 'not_configured') {
+          if (removeUnconfiguredPreparation) {
+            await trx.deleteFrom('product_purchase_form_settings').where('product_id', '=', id).execute()
+          } else if (current) {
+            await trx.updateTable('product_purchase_form_settings').set({
+              mode: body.mode, template_version_id: versionId, updated_by_admin_id: administratorId,
+            }).where('product_id', '=', id).execute()
+          } else {
             await trx.insertInto('product_purchase_form_settings').values({
               product_id: id, mode: body.mode, template_version_id: versionId, updated_by_admin_id: administratorId,
             }).execute()
@@ -538,6 +564,7 @@ export function registerAdminPurchaseFormRoutes(app: FastifyInstance, db: Kysely
     try {
       const versionId = assertAssignmentBody(body.mode, body.templateVersionId, ['product_default', 'none', 'template'])
       const revision = await db.transaction().execute(async (trx) => {
+        const status = await readPurchaseFormsStatus(trx, 'share')
         const product = await lockProductAtRevision(trx, id, body.expectedRevision)
         assertProductNotArchived(product)
         const variant = await trx.selectFrom('product_variants').select('id')
@@ -546,11 +573,19 @@ export function registerAdminPurchaseFormRoutes(app: FastifyInstance, db: Kysely
         await assertVersionExists(trx, versionId)
         const current = await trx.selectFrom('sku_purchase_form_overrides').selectAll()
           .where('product_id', '=', id).where('product_variant_id', '=', variantId).executeTakeFirst()
-        const unchanged = body.mode === 'product_default' ? !current
-          : current?.mode === body.mode && current.template_version_id === versionId
+        const removeDefaultPreparation = status === 'preparing' && body.mode === 'product_default'
+        const unchanged = current
+          ? current.mode === body.mode && current.template_version_id === versionId
+          : removeDefaultPreparation
         if (unchanged) return product.revision
-        await trx.deleteFrom('sku_purchase_form_overrides').where('product_id', '=', id).where('product_variant_id', '=', variantId).execute()
-        if (body.mode !== 'product_default') {
+        if (removeDefaultPreparation) {
+          await trx.deleteFrom('sku_purchase_form_overrides').where('product_id', '=', id)
+            .where('product_variant_id', '=', variantId).execute()
+        } else if (current) {
+          await trx.updateTable('sku_purchase_form_overrides').set({
+            mode: body.mode, template_version_id: versionId, updated_by_admin_id: administratorId,
+          }).where('product_id', '=', id).where('product_variant_id', '=', variantId).execute()
+        } else {
           await trx.insertInto('sku_purchase_form_overrides').values({
             product_id: id, product_variant_id: variantId, mode: body.mode,
             template_version_id: versionId, updated_by_admin_id: administratorId,

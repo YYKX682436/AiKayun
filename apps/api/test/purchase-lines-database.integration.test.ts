@@ -190,8 +190,8 @@ afterAll(async () => { if (db) await db.destroy() })
 
 describe('⑥-2B forward purchase data gates in PostgreSQL', () => {
   it('preserves old deleted-SKU cart and order facts without inventing form snapshots', async () => {
-    expect(await db.selectFrom('storefront_customer_policy').select('purchase_forms_enabled')
-      .executeTakeFirstOrThrow()).toMatchObject({ purchase_forms_enabled: false })
+    expect(await db.selectFrom('storefront_customer_policy').select('purchase_forms_status')
+      .executeTakeFirstOrThrow()).toMatchObject({ purchase_forms_status: 'preparing' })
     const oldLine = await db.selectFrom('customer_cart_items').selectAll()
       .where('customer_id', '=', oldCustomerId).executeTakeFirstOrThrow()
     expect(oldLine).toMatchObject({
@@ -625,5 +625,20 @@ describe('⑥-2B forward purchase data gates in PostgreSQL', () => {
       .where('id', '=', archiveObjectId).execute()).rejects.toMatchObject({
       constraint: 'purchase_order_attachment_delete_guard',
     })
+  })
+
+  it('preserves a legacy enabled storefront purchase-form flag as active on forward upgrade', async () => {
+    const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
+    const downgraded = await migrator.migrateTo('202610250002_purchase_snapshot_manifest_r1')
+    expect(downgraded.error).toBeUndefined()
+    await sql`UPDATE storefront_customer_policy SET purchase_forms_enabled = true WHERE singleton = true`.execute(db)
+    const upgraded = await migrator.migrateToLatest()
+    expect(upgraded.error).toBeUndefined()
+    expect(await db.selectFrom('storefront_customer_policy').select('purchase_forms_status')
+      .executeTakeFirstOrThrow()).toEqual({ purchase_forms_status: 'active' })
+    expect(await db.selectFrom('orders').select('request_sha256').where('id', '=', oldOrderId)
+      .executeTakeFirstOrThrow()).toEqual({ request_sha256: 'b'.repeat(64) })
+    await expect(sql`SELECT purchase_forms_enabled FROM storefront_customer_policy`.execute(db))
+      .rejects.toMatchObject({ code: '42703' })
   })
 })

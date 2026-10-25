@@ -21,6 +21,16 @@ function lineKey(item: CheckoutQuoteItem): string {
   return item.lineId ?? `legacy:${item.skuId}`
 }
 
+function purchaseEditPath(item: CheckoutQuoteItem): string {
+  if (!item.productId) return '/cart'
+  const query = new URLSearchParams({ skuId: item.skuId, quantity: String(item.quantity) })
+  if (item.lineId) query.set('editLineId', item.lineId)
+  if (item.lineRevision !== null) query.set('lineRevision', String(item.lineRevision))
+  if (item.draftRevision !== null) query.set('expectedDraftRevision', String(item.draftRevision))
+  if (item.draftId) query.set('draftId', item.draftId)
+  return `/products/${encodeURIComponent(item.productId)}?${query.toString()}`
+}
+
 const selectedItems = computed(() => items.value.filter(item => selectedLineKeys.value.includes(lineKey(item))))
 const selectedCount = computed(() => selectedItems.value.reduce((total, item) => total + item.quantity, 0))
 const selectedQuoteItems = computed<CartSkuQuantity[] | CheckoutRequestLineV2[] | null>(() => {
@@ -63,6 +73,7 @@ function statusLabel(item: CheckoutQuoteItem): string {
     case 'purchase_form_invalid': return '购买资料已失效，请重新确认'
     case 'purchase_form_version_changed': return '填写模板已变化，请重新确认'
     case 'purchase_form_required': return '此商品需要填写购买资料'
+    case 'purchase_forms_paused': return '填写商品已暂停新订单'
     default: return item.canPurchase ? '可继续报价' : '暂不可购买'
   }
 }
@@ -329,6 +340,17 @@ onMounted(() => {
                   class="mt-3"
                   :purchase-limits="item.purchaseLimits"
                 />
+                <NuxtLink
+                  v-if="item.productId && (item.templateVersionId || item.draftId || ['purchase_form_required', 'purchase_form_invalid', 'purchase_form_version_changed', 'purchase_forms_paused'].includes(item.reason ?? ''))"
+                  :to="purchaseEditPath(item)"
+                  class="mt-3 inline-flex min-h-11 items-center gap-2 rounded-lg px-2 text-sm font-medium text-primary underline underline-offset-2 hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                >
+                  <UIcon
+                    name="i-lucide-pencil"
+                    aria-hidden="true"
+                  />
+                  {{ item.draftId ? '编辑购买资料' : '重新填写购买资料' }}
+                </NuxtLink>
                 <div class="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
                   <span class="text-muted">单价 <strong class="font-medium tabular-nums text-highlighted">{{ item.unitPrice === null ? '暂不可计价' : `¥${item.unitPrice}` }}</strong></span>
                   <span class="text-muted">小计 <strong class="font-medium tabular-nums text-highlighted">{{ item.lineTotal === null ? '暂不可计价' : `¥${item.lineTotal}` }}</strong></span>

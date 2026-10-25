@@ -62,7 +62,7 @@ test('edits, freezes, previews, and prepares product/SKU references without expo
   await page.goto('/admin/purchase-form-templates')
   await expect(page.locator('#admin-main').getByRole('heading', { name: '购买填写模板', exact: true })).toBeVisible()
   await expect(page.locator('#admin-main')).toHaveAttribute('data-purchase-templates-ready', 'true')
-  await expect(page.getByText('准备配置，尚未应用到顾客购买。', { exact: true })).toBeVisible()
+  await expect(page.getByRole('region', { name: '购买填写启用状态' })).toContainText('准备中')
   await page.getByRole('button', { name: '新建模板' }).click()
   await expect(page).toHaveURL(/\/admin\/purchase-form-templates\/[0-9a-f-]+$/u)
   await expect(page.getByRole('heading', { name: /新购买填写模板/u })).toBeVisible()
@@ -179,7 +179,7 @@ test('edits, freezes, previews, and prepares product/SKU references without expo
   await expect(fields.getByRole('button', { name: '添加字段' })).toBeDisabled()
   await expect(expandedType).toBeDisabled()
   freezeVersionGate.release()
-  await expect(page.getByText('不可变准备版本已保存；顾客购买填写仍未启用。')).toBeVisible()
+  await expect(page.getByText('不可变准备版本已保存；现行购买规则未改变，关联需单独应用。')).toBeVisible()
   await expect(page.getByText(/E2E 本地账号填写模板 v1 · v1/u).first()).toBeVisible()
   await page.getByRole('button', { name: /E2E 本地账号填写模板 v1 · v1/u }).click()
   await expect(page.getByRole('heading', { name: '历史版本交互预览' })).toBeVisible()
@@ -204,7 +204,7 @@ test('edits, freezes, previews, and prepares product/SKU references without expo
   const v1ButtonLabel = 'E2E 本地账号填写模板 v1 · v1'
   await page.getByLabel('模板名称').fill('E2E 本地账号填写模板 v2')
   await page.getByRole('button', { name: '保存为准备配置版本' }).click()
-  await expect(page.getByText('不可变准备版本已保存；顾客购买填写仍未启用。')).toBeVisible()
+  await expect(page.getByText('不可变准备版本已保存；现行购买规则未改变，关联需单独应用。')).toBeVisible()
   const versionsResponse = await page.request.get(`/api/v1/admin/purchase-form-templates/${templateId}/versions?page=1&pageSize=100`)
   const versions = (await versionsResponse.json()).data.items as Array<{ id: string; name: string; versionNumber: number }>
   const versionOne = versions.find(version => version.versionNumber === 1)!
@@ -273,7 +273,7 @@ test('edits, freezes, previews, and prepares product/SKU references without expo
   await expectClientMounted(page, '#purchase-form-preparation')
   const assignment = page.locator('#purchase-form-preparation')
   await expect(assignment).toHaveAttribute('data-assignment-ready', 'true')
-  await expect(assignment.getByText('准备配置，尚未应用', { exact: true })).toBeVisible()
+  await expect(assignment.getByText('尚未首次启用', { exact: true })).toBeVisible()
   await assignment.getByRole('combobox', { name: '关联方式' }).click()
   await page.getByRole('option', { name: '关联模板版本（准备）' }).click()
   await assignment.getByRole('combobox', { name: '本地模板' }).click()

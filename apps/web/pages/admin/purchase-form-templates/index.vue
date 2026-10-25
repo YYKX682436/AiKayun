@@ -89,7 +89,7 @@ onBeforeUnmount(() => { generation++ })
               购买填写模板
             </h1>
             <p class="mt-2 max-w-3xl text-sm leading-6 text-muted">
-              定义本地字段、稳定身份和版本历史。当前版本仅供后台准备与预览，尚未应用到顾客购买。
+              定义本地购买字段和不可变版本，明确控制商品填写规则何时应用于顾客购买。
             </p>
           </div>
           <UButton
@@ -104,14 +104,7 @@ onBeforeUnmount(() => { generation++ })
           </UButton>
         </header>
 
-        <UAlert
-          class="mt-6"
-          color="warning"
-          variant="soft"
-          icon="i-lucide-info"
-          title="准备配置，尚未应用到顾客购买。"
-          description="模板冻结和商品/SKU 关联都不会改变可售状态、报价、库存或履约资格。正式顾客填写入口将在交易链路接通后另行开放。"
-        />
+        <AdminPurchaseFormsLifecyclePanel />
         <UAlert
           v-if="createError"
           class="mt-4"

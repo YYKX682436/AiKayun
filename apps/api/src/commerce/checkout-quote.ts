@@ -73,7 +73,7 @@ type QuoteSkuRow = {
   sku_24h_purchased: number | null
   guest_checkout_enabled: boolean
   guest_free_claim_enabled: boolean
-  purchase_forms_enabled: boolean
+  purchase_forms_status: 'preparing' | 'active' | 'paused'
   required_purchase_form_version_id: string | null
 }
 
@@ -282,9 +282,11 @@ export async function quoteCheckoutItems(
       sku_purchase_counts.recent_purchased AS sku_24h_purchased,
       policy.guest_checkout_enabled,
       policy.guest_free_claim_enabled,
-      policy.purchase_forms_enabled,
-      CASE WHEN sku_form.product_variant_id IS NOT NULL
-        THEN sku_form.template_version_id ELSE product_form.template_version_id
+      policy.purchase_forms_status,
+      CASE WHEN sku_form.applied_mode IS NOT NULL
+        THEN CASE WHEN sku_form.applied_mode = 'template' THEN sku_form.applied_template_version_id ELSE NULL END
+        WHEN product_form.applied_mode = 'template' THEN product_form.applied_template_version_id
+        ELSE NULL
       END AS required_purchase_form_version_id
     FROM requested
     LEFT JOIN product_variants AS variant ON variant.id = requested.sku_id
@@ -417,6 +419,7 @@ export async function quoteCheckoutItems(
       templateVersionId: null,
       normalizationVersion: null,
       contentIdentity: null,
+      purchasePreview: null,
       sourceLineIds: [],
     }
     let reason = reasonForSku(row)
@@ -431,8 +434,10 @@ export async function quoteCheckoutItems(
     }
     if (requiresLogin) reason ??= 'login_required_for_purchase_limit'
     else if (productLimits.exceeded || skuLimits.exceeded) reason ??= 'purchase_limit_exceeded'
-    if (!options.skipPurchaseFormRequirement && row.purchase_forms_enabled
-      && row.required_purchase_form_version_id) reason ??= 'purchase_form_required'
+    if (!options.skipPurchaseFormRequirement && row.required_purchase_form_version_id) {
+      if (row.purchase_forms_status === 'paused') reason ??= 'purchase_forms_paused'
+      else if (row.purchase_forms_status === 'active') reason ??= 'purchase_form_required'
+    }
     item.reason = reason
     item.canPurchase = reason === null
     return item
@@ -458,7 +463,7 @@ export async function quoteCheckoutItems(
   const legacyItems = quoteLines.map(({ lineId: _lineId, lineRevision: _lineRevision,
     draftId: _draftId, draftRevision: _draftRevision, templateVersionId: _templateVersionId,
     normalizationVersion: _normalizationVersion, contentIdentity: _contentIdentity,
-    sourceLineIds: _sourceLineIds, ...legacy }) => legacy)
+    purchasePreview: _purchasePreview, sourceLineIds: _sourceLineIds, ...legacy }) => legacy)
   const quoteToken = createHash('sha256').update(JSON.stringify({ ...stableQuote, items: legacyItems })).digest('hex')
   return {
     quotedAt: new Date().toISOString(),
@@ -481,13 +486,15 @@ export async function quoteCheckoutPurchaseLines(
     owner.kind === 'customer' ? owner.customer.id : null, config,
     { skipPurchaseFormRequirement: true })
   const lines = await resolvePurchaseLinesInTransaction(trx, config, owner, inputItems, lock)
-  const policy = await trx.selectFrom('storefront_customer_policy').select('purchase_forms_enabled')
+  const policy = await trx.selectFrom('storefront_customer_policy').select('purchase_forms_status')
     .where('singleton', '=', true).executeTakeFirstOrThrow()
   const bySku = new Map(base.items.map(item => [item.skuId, item]))
   const quoteLines: CheckoutQuoteItem[] = lines.map((line) => {
     const item = bySku.get(line.skuId)
     if (!item) throw new Error('Resolved purchase line is missing its SKU quote')
-    const formRequired = policy.purchase_forms_enabled && line.preparationVersionId !== null && !line.draftId
+    const hasRequiredForm = line.effectiveFormVersionId !== null
+    const paused = policy.purchase_forms_status === 'paused' && hasRequiredForm
+    const formRequired = policy.purchase_forms_status === 'active' && hasRequiredForm && !line.draftId
     return {
       ...item,
       lineId: line.lineId,
@@ -498,15 +505,26 @@ export async function quoteCheckoutPurchaseLines(
       normalizationVersion: line.normalizationVersion,
       contentIdentity: line.contentIdentity,
       sourceLineIds: line.sourceLineIds,
+      purchasePreview: line.validatedDraft && line.effectiveFormDefinition && line.templateVersionId
+        ? { templateVersionId: line.templateVersionId, definition: line.effectiveFormDefinition,
+            values: line.validatedDraft.normalizedValues,
+            attachments: line.validatedDraft.attachments.map(attachment => ({
+              id: attachment.id, fieldId: attachment.fieldId, mimeType: 'image/webp' as const,
+              byteSize: attachment.byteSize, width: attachment.width, height: attachment.height,
+              url: `/api/v1/storefront/purchase-drafts/${line.draftId}/attachments/${attachment.id}`,
+            })) }
+        : null,
       quantity: line.quantity,
       lineTotal: item.unitPrice === null ? null : settleAmount(multiplyUnitAmount(item.unitPrice, line.quantity)),
-      canPurchase: item.canPurchase && !formRequired,
-      reason: formRequired ? 'purchase_form_required' : item.reason,
+      canPurchase: item.canPurchase && !formRequired && !paused,
+      reason: paused ? 'purchase_forms_paused' : formRequired ? 'purchase_form_required' : item.reason,
     }
   })
   const stable = {
     currency: base.currency,
-    items: quoteLines,
+    // Quote tokens bind to contentIdentity and the frozen binding, never to a
+    // serialized copy of private answers.
+    items: quoteLines.map(item => ({ ...item, purchasePreview: null })),
     pricedSubtotal: base.pricedSubtotal,
     totalAmount: base.totalAmount,
     totalComplete: base.totalComplete,
@@ -515,7 +533,8 @@ export async function quoteCheckoutPurchaseLines(
     guestCheckoutEnabled: base.guestCheckoutEnabled,
     guestFreeClaimEnabled: base.guestFreeClaimEnabled,
     policyReasons: base.policyReasons,
-    preparationBindings: lines.map(line => ({ lineId: line.lineId, versionId: line.preparationVersionId })),
+    purchaseFormsStatus: policy.purchase_forms_status,
+    appliedFormBindings: lines.map(line => ({ lineId: line.lineId, versionId: line.effectiveFormVersionId })),
   }
   const quoteToken = createHash('sha256').update(JSON.stringify(stable)).digest('hex')
   return { quote: { ...base, items: quoteLines, canContinue: stable.canContinue, quoteToken }, lines }

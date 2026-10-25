@@ -4,7 +4,7 @@ import { AdminApiError, useAdminApi } from '~/composables/useAdminApi'
 
 definePageMeta({ layout: 'admin', middleware: 'admin-auth' })
 useSeoMeta({ title: '订单详情' })
-useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
+if (import.meta.server) useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 
 const route = useRoute()
 const orderId = computed(() => String(route.params.id))
@@ -54,6 +54,13 @@ function supplierOperationStatusLabel(state: AdminOrderDetail['supplierOperation
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
+}
+
+function adminPurchaseAttachmentUrl(itemId: string, attachmentId: string): string {
+  const currentOrderId = data.value?.order.id
+  return currentOrderId
+    ? `/api/v1/admin/orders/${encodeURIComponent(currentOrderId)}/items/${encodeURIComponent(itemId)}/purchase-attachments/${encodeURIComponent(attachmentId)}`
+    : ''
 }
 
 function refundStatusLabel(status: AdminOrderRefunds['items'][number]['status']): string {
@@ -1245,6 +1252,20 @@ onBeforeUnmount(() => { sequence++ })
                   </div>
                 </dl>
 
+                <StorefrontPurchaseDataPreview
+                  v-if="item.purchaseData.state === 'filled'"
+                  class="mt-4"
+                  :title="`${item.purchaseData.templateName ?? '购买资料'} · 人工处理参考${item.purchaseData.templateVersionNumber ? ` v${item.purchaseData.templateVersionNumber}` : ''}`"
+                  :definition="item.purchaseData.definition"
+                  :values="item.purchaseData.values"
+                  :attachments="item.purchaseData.attachments.map(attachment => ({
+                    id: attachment.attachmentId,
+                    fieldId: attachment.fieldId,
+                    url: adminPurchaseAttachmentUrl(item.id, attachment.attachmentId),
+                    byteSize: attachment.byteSize,
+                  }))"
+                />
+
                 <UAlert
                   v-if="item.fulfillmentMethod === 'code_pool' && data.order.status === 'processing' && item.fulfillmentStatus === 'failed'"
                   class="mt-3"
@@ -1337,57 +1358,133 @@ onBeforeUnmount(() => { sequence++ })
           >
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <h2 id="supplier-operations-title" class="font-semibold text-highlighted">外部供应商交付操作</h2>
+                <h2
+                  id="supplier-operations-title"
+                  class="font-semibold text-highlighted"
+                >
+                  外部供应商交付操作
+                </h2>
                 <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
                   每件商品使用独立持久化操作与稳定幂等键。未知结果只能查询原操作；系统不会因此再次创建交付。
                 </p>
               </div>
-              <UBadge color="neutral" variant="soft">{{ data.supplierOperations.length }} 个单位</UBadge>
+              <UBadge
+                color="neutral"
+                variant="soft"
+              >
+                {{ data.supplierOperations.length }} 个单位
+              </UBadge>
             </div>
             <ol class="mt-4 grid gap-3">
-              <li v-for="operation in data.supplierOperations" :key="operation.id" class="min-w-0 rounded-lg border border-default bg-default p-3 sm:p-4">
+              <li
+                v-for="operation in data.supplierOperations"
+                :key="operation.id"
+                class="min-w-0 rounded-lg border border-default bg-default p-3 sm:p-4"
+              >
                 <div class="flex min-w-0 flex-wrap items-start justify-between gap-3">
                   <div class="min-w-0">
-                    <p class="font-medium text-highlighted">第 {{ operation.unitIndex }} 件 · {{ operation.supplierName }} · {{ supplierOperationStatusLabel(operation.state) }}</p>
-                    <p class="mt-1 break-all font-mono text-xs text-muted">操作 {{ operation.operationId }} · 商品 {{ operation.supplierProductId }}</p>
-                    <p class="mt-1 break-all font-mono text-xs text-dimmed">幂等键 {{ operation.idempotencyKey }}</p>
+                    <p class="font-medium text-highlighted">
+                      第 {{ operation.unitIndex }} 件 · {{ operation.supplierName }} · {{ supplierOperationStatusLabel(operation.state) }}
+                    </p>
+                    <p class="mt-1 break-all font-mono text-xs text-muted">
+                      操作 {{ operation.operationId }} · 商品 {{ operation.supplierProductId }}
+                    </p>
+                    <p class="mt-1 break-all font-mono text-xs text-dimmed">
+                      幂等键 {{ operation.idempotencyKey }}
+                    </p>
                   </div>
-                  <UBadge :color="operation.state === 'succeeded' ? 'success' : operation.state === 'failed' ? 'error' : operation.state === 'unknown' || operation.state === 'manual_review' ? 'warning' : 'info'" variant="soft">
+                  <UBadge
+                    :color="operation.state === 'succeeded' ? 'success' : operation.state === 'failed' ? 'error' : operation.state === 'unknown' || operation.state === 'manual_review' ? 'warning' : 'info'"
+                    variant="soft"
+                  >
                     {{ supplierOperationStatusLabel(operation.state) }}
                   </UBadge>
                 </div>
                 <dl class="mt-3 grid gap-2 border-t border-default pt-3 text-xs sm:grid-cols-2 xl:grid-cols-4">
-                  <div><dt class="text-muted">供应商操作 ID</dt><dd class="mt-1 break-all font-mono text-highlighted">{{ operation.providerOperationId ?? '尚未返回' }}</dd></div>
-                  <div><dt class="text-muted">创建请求</dt><dd class="mt-1 text-highlighted">{{ operation.createRequestedAt ? formatDate(operation.createRequestedAt) : '尚未发出' }} · {{ operation.createAttemptCount }} 次</dd></div>
-                  <div><dt class="text-muted">最近查单</dt><dd class="mt-1 text-highlighted">{{ operation.lastQueryAt ? formatDate(operation.lastQueryAt) : '尚未查询' }} · {{ operation.queryAttemptCount }} 次</dd></div>
-                  <div><dt class="text-muted">HTTP / 分类 / 错误</dt><dd class="mt-1 break-words text-highlighted">{{ operation.lastHttpStatus ?? '—' }} · {{ operation.lastFailureClass ?? '—' }} · {{ operation.lastErrorCode ?? '—' }}</dd></div>
+                  <div>
+                    <dt class="text-muted">
+                      供应商操作 ID
+                    </dt><dd class="mt-1 break-all font-mono text-highlighted">
+                      {{ operation.providerOperationId ?? '尚未返回' }}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt class="text-muted">
+                      创建请求
+                    </dt><dd class="mt-1 text-highlighted">
+                      {{ operation.createRequestedAt ? formatDate(operation.createRequestedAt) : '尚未发出' }} · {{ operation.createAttemptCount }} 次
+                    </dd>
+                  </div>
+                  <div>
+                    <dt class="text-muted">
+                      最近查单
+                    </dt><dd class="mt-1 text-highlighted">
+                      {{ operation.lastQueryAt ? formatDate(operation.lastQueryAt) : '尚未查询' }} · {{ operation.queryAttemptCount }} 次
+                    </dd>
+                  </div>
+                  <div>
+                    <dt class="text-muted">
+                      HTTP / 分类 / 错误
+                    </dt><dd class="mt-1 break-words text-highlighted">
+                      {{ operation.lastHttpStatus ?? '—' }} · {{ operation.lastFailureClass ?? '—' }} · {{ operation.lastErrorCode ?? '—' }}
+                    </dd>
+                  </div>
                 </dl>
-                <p v-if="operation.nextActionAt" class="mt-2 text-xs text-muted">下次恢复检查：{{ formatDate(operation.nextActionAt) }}</p>
-                <div v-if="operation.events.length" class="mt-3 border-t border-default pt-3">
-                  <p class="text-xs font-medium text-highlighted">最近状态事件</p>
+                <p
+                  v-if="operation.nextActionAt"
+                  class="mt-2 text-xs text-muted"
+                >
+                  下次恢复检查：{{ formatDate(operation.nextActionAt) }}
+                </p>
+                <div
+                  v-if="operation.events.length"
+                  class="mt-3 border-t border-default pt-3"
+                >
+                  <p class="text-xs font-medium text-highlighted">
+                    最近状态事件
+                  </p>
                   <ul class="mt-2 grid gap-1 text-xs text-muted sm:grid-cols-2">
-                    <li v-for="event in operation.events.slice(-6).reverse()" :key="`${event.eventType}-${event.createdAt}`" class="flex min-w-0 flex-wrap gap-x-2">
+                    <li
+                      v-for="event in operation.events.slice(-6).reverse()"
+                      :key="`${event.eventType}-${event.createdAt}`"
+                      class="flex min-w-0 flex-wrap gap-x-2"
+                    >
                       <time :datetime="event.createdAt">{{ formatDate(event.createdAt) }}</time>
                       <span>{{ event.eventType }}</span>
                       <span>{{ event.classification ?? '' }}</span>
                       <span>{{ event.httpStatus ?? '' }}</span>
-                      <span v-if="event.errorCode" class="text-warning">{{ event.errorCode }}</span>
+                      <span
+                        v-if="event.errorCode"
+                        class="text-warning"
+                      >{{ event.errorCode }}</span>
                     </li>
                   </ul>
                 </div>
                 <div class="mt-3 flex flex-wrap gap-2">
                   <UButton
                     v-if="!['succeeded', 'failed', 'create_in_flight', 'query_in_flight'].includes(operation.state)"
-                    size="sm" color="neutral" variant="outline" icon="i-lucide-search"
-                    :loading="supplierActionId === operation.id" :disabled="Boolean(supplierActionId)"
+                    size="sm"
+                    color="neutral"
+                    variant="outline"
+                    icon="i-lucide-search"
+                    :loading="supplierActionId === operation.id"
+                    :disabled="Boolean(supplierActionId)"
                     @click="runSupplierAction(operation.id, 'query')"
-                  >查询同一供应商操作</UButton>
+                  >
+                    查询同一供应商操作
+                  </UButton>
                   <UButton
                     v-if="operation.state === 'failed' && operation.lastFailureClass === 'supplier_rejected' && data.order.status === 'processing'"
-                    size="sm" color="warning" variant="outline" icon="i-lucide-rotate-cw"
-                    :loading="supplierActionId === operation.id" :disabled="Boolean(supplierActionId)"
+                    size="sm"
+                    color="warning"
+                    variant="outline"
+                    icon="i-lucide-rotate-cw"
+                    :loading="supplierActionId === operation.id"
+                    :disabled="Boolean(supplierActionId)"
                     @click="runSupplierAction(operation.id, 'retry')"
-                  >恢复明确拒绝的单位</UButton>
+                  >
+                    恢复明确拒绝的单位
+                  </UButton>
                 </div>
               </li>
             </ol>

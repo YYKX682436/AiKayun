@@ -1,4 +1,5 @@
 import { Type, type Static, type TSchema } from 'typebox'
+import { OrderPurchaseDataSchema, PurchaseDraftAttachmentSchema, PurchaseFormDefinitionSchema } from './purchase-forms.js'
 
 export const RequestMetaSchema = Type.Object({
   requestId: Type.String(),
@@ -13,6 +14,7 @@ export const ApiErrorSchema = Type.Object({
   error: Type.Object({
     code: Type.String(),
     message: Type.String(),
+    fieldIds: Type.Optional(Type.Array(Type.String({ format: 'uuid' }), { maxItems: 60 })),
   }),
   meta: RequestMetaSchema,
 })
@@ -953,11 +955,26 @@ export const CustomerCartLineQuantityBodySchema = Type.Object({
   quantity: PurchaseLineQuantitySchema,
   expectedLineRevision: Type.Integer({ minimum: 1 }),
 }, { additionalProperties: false })
-export const CustomerCartLinePurchaseFormBodySchema = Type.Object({
-  expectedLineRevision: Type.Integer({ minimum: 1 }),
-  expectedDraftRevision: PurchaseLineDraftRevisionSchema,
-  values: Type.Record(Type.String({ format: 'uuid' }), Type.Unknown()),
-}, { additionalProperties: false })
+export const CustomerCartLinePurchaseFormBodySchema = Type.Union([
+  Type.Object({
+    expectedLineRevision: Type.Integer({ minimum: 1 }),
+    expectedDraftRevision: PurchaseLineDraftRevisionSchema,
+    draftRevision: PurchaseLineDraftRevisionSchema,
+    values: Type.Record(Type.String({ format: 'uuid' }), Type.Unknown()),
+    replacements: Type.Optional(Type.Array(Type.Object({
+      oldAttachmentId: Type.String({ format: 'uuid' }),
+      newAttachmentId: Type.String({ format: 'uuid' }),
+    }, { additionalProperties: false }), { maxItems: 10 })),
+  }, { additionalProperties: false }),
+  Type.Object({
+    expectedLineRevision: Type.Integer({ minimum: 1 }),
+    expectedDraftRevision: Type.Union([PurchaseLineDraftRevisionSchema, Type.Null()]),
+    replacementDraft: Type.Object({
+      draftId: Type.String({ format: 'uuid' }),
+      draftRevision: PurchaseLineDraftRevisionSchema,
+    }, { additionalProperties: false }),
+  }, { additionalProperties: false }),
+])
 
 export const CustomerCartMergeBodyV1Schema = Type.Object({
   mergeId: Type.String({ format: 'uuid' }),
@@ -1005,6 +1022,7 @@ export const CheckoutQuoteReasonSchema = Type.Union([
   Type.Literal('purchase_form_invalid'),
   Type.Literal('purchase_form_version_changed'),
   Type.Literal('purchase_form_required'),
+  Type.Literal('purchase_forms_paused'),
 ])
 
 export const CheckoutQuoteItemSchema = Type.Object({
@@ -1016,6 +1034,12 @@ export const CheckoutQuoteItemSchema = Type.Object({
   templateVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   normalizationVersion: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
   contentIdentity: Type.Union([Type.String({ pattern: '^[a-f0-9]{64}$' }), Type.Null()]),
+  purchasePreview: Type.Union([Type.Object({
+    templateVersionId: Type.String({ format: 'uuid' }),
+    definition: PurchaseFormDefinitionSchema,
+    values: Type.Record(Type.String({ format: 'uuid' }), Type.Unknown()),
+    attachments: Type.Array(PurchaseDraftAttachmentSchema, { maxItems: 10 }),
+  }, { additionalProperties: false }), Type.Null()]),
   skuId: Type.String({ format: 'uuid' }),
   productId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   productName: Type.Union([Type.String({ minLength: 1, maxLength: 200 }), Type.Null()]),
@@ -1649,6 +1673,7 @@ export const OrderItemSchema = Type.Object({
   fulfillmentStatus: OrderFulfillmentStatusSchema,
   fulfilledQuantity: Type.Integer({ minimum: 0 }),
   fulfillmentReservedQuantity: Type.Integer({ minimum: 0 }),
+  purchaseData: OrderPurchaseDataSchema,
   fulfillmentAttempts: Type.Array(OrderFulfillmentAttemptSchema),
   deliveries: Type.Array(OrderDeliverySchema),
 }, { additionalProperties: false })
@@ -2999,8 +3024,8 @@ export function success<T>(data: T, requestId: string): ApiSuccess<T> {
   return { data, meta: { requestId } }
 }
 
-export function failure(code: string, message: string, requestId: string): ApiError {
-  return { error: { code, message }, meta: { requestId } }
+export function failure(code: string, message: string, requestId: string, fieldIds?: string[]): ApiError {
+  return { error: { code, message, ...(fieldIds?.length ? { fieldIds } : {}) }, meta: { requestId } }
 }
 
 export * from './supplier-catalog.js'

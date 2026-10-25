@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { sql, type Kysely } from 'kysely'
 import type { FastifyInstance } from 'fastify'
 import { createApp } from '../src/app.js'
@@ -171,6 +171,32 @@ async function addCartItem(customer: CustomerFixture, skuId: string, quantity: n
   })
 }
 
+async function findQueryBlockedBy(queryFragment: string, blockerPid: number, excludePid?: number): Promise<number | null> {
+  const activity = await sql<{ pid: number }>`
+    SELECT activity.pid
+    FROM pg_stat_activity AS activity
+    WHERE activity.datname = current_database()
+      AND activity.application_name = 'aikayun-api'
+      AND activity.state = 'active'
+      AND activity.wait_event_type = 'Lock'
+      AND activity.query ILIKE ${`%${queryFragment}%`}
+      AND (${excludePid ?? -1} = -1 OR activity.pid <> ${excludePid ?? -1})
+      AND ${blockerPid} = ANY(pg_blocking_pids(activity.pid))
+    LIMIT 1
+  `.execute(db)
+  return activity.rows[0] ? Number(activity.rows[0].pid) : null
+}
+
+async function waitForQueryBlockedBy(queryFragment: string, blockerPid: number): Promise<number> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const pid = await findQueryBlockedBy(queryFragment, blockerPid)
+    if (pid !== null) return pid
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Expected a PostgreSQL query containing ${queryFragment} to wait on PID ${blockerPid}`)
+}
+
 async function quote(items: Array<{ skuId: string; quantity: number }>, customer?: CustomerFixture,
   remoteAddress?: string) {
   const csrf = customer?.csrf ?? await customerCsrf()
@@ -221,7 +247,365 @@ afterAll(async () => {
   if (db) await db.destroy()
 })
 
+beforeEach(async () => {
+  // Each scenario starts from the real migrated lifecycle default. Production never permits
+  // returning from active to preparing; schema reset is confined to the dedicated _test DB.
+  if (app) await app.close()
+  await sql`drop schema public cascade`.execute(db)
+  await sql`create schema public`.execute(db)
+  const { Migrator } = await import('kysely/migration')
+  const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
+  const migrated = await migrator.migrateToLatest()
+  if (migrated.error) throw migrated.error
+  const repeated = await migrator.migrateToLatest()
+  if (repeated.error) throw repeated.error
+  app = await createApp({ db, config, logger: false })
+  await app.ready()
+})
+
 describe('customer cart and checkout quote with PostgreSQL', () => {
+  it('activates a frozen SKU form explicitly, uses owner-bound HTTP drafts and preserves orders across pause', async () => {
+    const admin = await createAdminSession()
+    const [catalog] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual' })
+    await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true })
+      .where('product_variant_id', '=', catalog!.skuId).execute()
+    const accountId = randomUUID()
+    const regionId = randomUUID()
+    const optionId = randomUUID()
+    const forgedOptionId = randomUUID()
+    const definition = { fields: [
+      { id: accountId, meaningKey: 'account_id', type: 'digits', label: '账号编号', required: true, maxLength: 64 },
+      { id: regionId, meaningKey: 'region', type: 'select', label: '区服', required: true,
+        options: [{ id: optionId, meaningKey: 'east', label: '东区' }] },
+    ] }
+    const adminHeaders = { origin: testOrigin, cookie: admin.cookie, 'x-csrf-token': admin.csrf }
+    const templateResponse = await app.inject({ method: 'POST', url: '/api/v1/admin/purchase-form-templates',
+      headers: adminHeaders, payload: { name: '正式流程 PostgreSQL 模板', definition } })
+    expect(templateResponse.statusCode, JSON.stringify(templateResponse.json())).toBe(201)
+    const template = templateResponse.json().data.template as { id: string; revision: number }
+    const frozen = await app.inject({ method: 'POST', url: `/api/v1/admin/purchase-form-templates/${template.id}/versions`,
+      headers: adminHeaders, payload: { expectedRevision: template.revision } })
+    expect(frozen.statusCode, JSON.stringify(frozen.json())).toBe(201)
+    const versionId = frozen.json().data.id as string
+    const product = await db.selectFrom('products').select('revision')
+      .where('id', '=', catalog!.productId).executeTakeFirstOrThrow()
+    const prepared = await app.inject({ method: 'PUT', url: `/api/v1/admin/products/${catalog!.productId}/purchase-form`,
+      headers: adminHeaders, payload: { expectedRevision: product.revision, mode: 'template', templateVersionId: versionId } })
+    expect(prepared.statusCode, JSON.stringify(prepared.json())).toBe(200)
+
+    const preparingForm = await app.inject({ method: 'GET', url: `/api/v1/storefront/skus/${catalog!.skuId}/purchase-form` })
+    expect(preparingForm.json().data).toMatchObject({ status: 'preparing', required: false, templateVersionId: null })
+    const owner = await createCustomer()
+    const inactiveCreate = await app.inject({ method: 'POST', url: '/api/v1/storefront/purchase-drafts',
+      headers: customerHeaders(owner), payload: { skuId: catalog!.skuId } })
+    expect(inactiveCreate.statusCode).toBe(409)
+
+    const impact = await app.inject({ method: 'GET', url: '/api/v1/admin/storefront/purchase-forms', headers: adminHeaders })
+    expect(impact.json().data).toMatchObject({ status: 'preparing', readyToActivate: true })
+    const staleActivation = await app.inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
+      headers: adminHeaders, payload: { expectedStatus: 'preparing', nextStatus: 'active', expectedImpactHash: '0'.repeat(64) } })
+    expect(staleActivation.statusCode).toBe(409)
+    expect(staleActivation.json().error.code).toBe('PURCHASE_FORMS_IMPACT_CHANGED')
+    const activated = await app.inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
+      headers: adminHeaders, payload: { expectedStatus: 'preparing', nextStatus: 'active', expectedImpactHash: impact.json().data.impactHash } })
+    expect(activated.statusCode, JSON.stringify(activated.json())).toBe(200)
+    expect(activated.json().data.status).toBe('active')
+
+    const activeForm = await app.inject({ method: 'GET', url: `/api/v1/storefront/skus/${catalog!.skuId}/purchase-form` })
+    expect(activeForm.json().data).toMatchObject({ status: 'active', required: true, templateVersionId: versionId, definition })
+    const draftResponse = await app.inject({ method: 'POST', url: '/api/v1/storefront/purchase-drafts',
+      headers: customerHeaders(owner), payload: { skuId: catalog!.skuId } })
+    expect(draftResponse.statusCode, JSON.stringify(draftResponse.json())).toBe(201)
+    const draft = draftResponse.json().data as { id: string; revision: number }
+    const ownerRead = await app.inject({ method: 'GET', url: `/api/v1/storefront/purchase-drafts/${draft.id}?skuId=${catalog!.skuId}`,
+      headers: { cookie: owner.sessionCookie } })
+    expect(ownerRead.statusCode).toBe(200)
+    expect(ownerRead.headers['cache-control']).toContain('no-store')
+    expect(JSON.stringify(ownerRead.json())).not.toMatch(/cipher|nonce|auth.?tag|storage.?key|file.?path/iu)
+    const foreign = await createCustomer()
+    expect((await app.inject({ method: 'GET', url: `/api/v1/storefront/purchase-drafts/${draft.id}?skuId=${catalog!.skuId}`,
+      headers: { cookie: foreign.sessionCookie } })).statusCode).toBe(404)
+
+    const incomplete = await app.inject({ method: 'PUT', url: `/api/v1/storefront/purchase-drafts/${draft.id}`,
+      headers: customerHeaders(owner), payload: { skuId: catalog!.skuId, expectedRevision: 1,
+        values: { [accountId]: '000000000000000012345678' } } })
+    expect(incomplete.statusCode, JSON.stringify(incomplete.json())).toBe(200)
+    expect(incomplete.json().data).toMatchObject({ revision: 2, complete: false, incompleteFieldIds: [regionId] })
+    const forgedValue = await app.inject({ method: 'PUT', url: `/api/v1/storefront/purchase-drafts/${draft.id}`,
+      headers: customerHeaders(owner), payload: { skuId: catalog!.skuId, expectedRevision: 2,
+        values: { [accountId]: '000000000000000012345678', [regionId]: forgedOptionId } } })
+    expect(forgedValue.statusCode).toBe(400)
+    const completed = await app.inject({ method: 'PUT', url: `/api/v1/storefront/purchase-drafts/${draft.id}`,
+      headers: customerHeaders(owner), payload: { skuId: catalog!.skuId, expectedRevision: 2,
+        values: { [accountId]: '000000000000000012345678', [regionId]: optionId } } })
+    expect(completed.statusCode, JSON.stringify(completed.json())).toBe(200)
+    expect(completed.json().data).toMatchObject({ revision: 3, complete: true, incompleteFieldIds: [] })
+    const validation = await app.inject({ method: 'POST', url: `/api/v1/storefront/purchase-drafts/${draft.id}/validate`,
+      headers: customerHeaders(owner), payload: { expectedRevision: 3 } })
+    expect(validation.statusCode).toBe(200)
+    expect(validation.json().data).toMatchObject({ revision: 3, complete: true })
+
+    const guestCsrf = await customerCsrf()
+    const guestSession = await app.inject({ method: 'POST', url: '/api/v1/guest/session',
+      headers: { origin: testOrigin, cookie: guestCsrf.cookie, 'x-csrf-token': guestCsrf.token } })
+    expect(guestSession.statusCode).toBe(201)
+    const guestCookie = cookieFrom(guestSession, 'aikayun_guest_order_session')
+    const guestHeaders = { origin: testOrigin, cookie: `${guestCookie}; ${guestCsrf.cookie}`, 'x-csrf-token': guestCsrf.token }
+    const guestDraftResponse = await app.inject({ method: 'POST', url: '/api/v1/storefront/purchase-drafts',
+      headers: guestHeaders, payload: { skuId: catalog!.skuId } })
+    expect(guestDraftResponse.statusCode).toBe(201)
+    const guestDraft = guestDraftResponse.json().data as { id: string; revision: number }
+    const untouchedResponse = await app.inject({ method: 'POST', url: '/api/v1/storefront/purchase-drafts',
+      headers: guestHeaders, payload: { skuId: catalog!.skuId } })
+    expect(untouchedResponse.statusCode).toBe(201)
+    const untouched = untouchedResponse.json().data as { id: string; revision: number }
+    const guestSaved = await app.inject({ method: 'PUT', url: `/api/v1/storefront/purchase-drafts/${guestDraft.id}`,
+      headers: guestHeaders, payload: { skuId: catalog!.skuId, expectedRevision: guestDraft.revision,
+        values: { [accountId]: '0007', [regionId]: optionId } } })
+    expect(guestSaved.statusCode, JSON.stringify(guestSaved.json())).toBe(200)
+    const guestLineId = randomUUID()
+    const merge = await app.inject({ method: 'POST', url: '/api/v1/customer/cart/merge',
+      headers: { ...customerHeaders(owner), cookie: `${owner.sessionCookie}; ${owner.csrf.cookie}; ${guestCookie}` },
+      payload: { version: 2, mergeId: randomUUID(), items: [{ lineId: guestLineId, skuId: catalog!.skuId,
+        quantity: 1, draftId: guestDraft.id, draftRevision: guestSaved.json().data.revision }] } })
+    expect(merge.statusCode, JSON.stringify(merge.json())).toBe(200)
+    expect(merge.json().data.cart.items).toHaveLength(1)
+    const retainedGuestLineId = merge.json().data.cart.items[0].lineId as string
+    expect((await app.inject({ method: 'GET', url: `/api/v1/storefront/purchase-drafts/${guestDraft.id}?skuId=${catalog!.skuId}`,
+      headers: { cookie: owner.sessionCookie } })).statusCode).toBe(200)
+    expect((await app.inject({ method: 'GET', url: `/api/v1/storefront/purchase-drafts/${untouched.id}?skuId=${catalog!.skuId}`,
+      headers: { cookie: owner.sessionCookie } })).statusCode).toBe(404)
+    expect((await app.inject({ method: 'GET', url: `/api/v1/storefront/purchase-drafts/${untouched.id}?skuId=${catalog!.skuId}`,
+      headers: { cookie: guestCookie } })).statusCode).toBe(200)
+
+    const duplicateDraftResponse = await app.inject({ method: 'POST', url: '/api/v1/storefront/purchase-drafts',
+      headers: customerHeaders(owner), payload: { skuId: catalog!.skuId } })
+    const duplicateDraft = duplicateDraftResponse.json().data as { id: string; revision: number }
+    const duplicateSaved = await app.inject({ method: 'PUT', url: `/api/v1/storefront/purchase-drafts/${duplicateDraft.id}`,
+      headers: customerHeaders(owner), payload: { skuId: catalog!.skuId, expectedRevision: duplicateDraft.revision,
+        values: { [accountId]: '0007', [regionId]: optionId } } })
+    const duplicateAdd = await app.inject({ method: 'POST', url: '/api/v1/customer/cart/items', headers: customerHeaders(owner),
+      payload: { version: 2, skuId: catalog!.skuId, quantity: 1, draftId: duplicateDraft.id,
+        draftRevision: duplicateSaved.json().data.revision } })
+    expect(duplicateAdd.statusCode).toBe(200)
+    expect(duplicateAdd.json().data).toMatchObject({ retainedLineId: retainedGuestLineId, cart: { itemCount: 1, totalQuantity: 2 } })
+
+    const differentDraftResponse = await app.inject({ method: 'POST', url: '/api/v1/storefront/purchase-drafts',
+      headers: customerHeaders(owner), payload: { skuId: catalog!.skuId } })
+    const differentDraft = differentDraftResponse.json().data as { id: string; revision: number }
+    const differentSaved = await app.inject({ method: 'PUT', url: `/api/v1/storefront/purchase-drafts/${differentDraft.id}`,
+      headers: customerHeaders(owner), payload: { skuId: catalog!.skuId, expectedRevision: differentDraft.revision,
+        values: { [accountId]: '0008', [regionId]: optionId } } })
+    const differentAdd = await app.inject({ method: 'POST', url: '/api/v1/customer/cart/items', headers: customerHeaders(owner),
+      payload: { version: 2, skuId: catalog!.skuId, quantity: 1, draftId: differentDraft.id,
+        draftRevision: differentSaved.json().data.revision } })
+    expect(differentAdd.statusCode).toBe(200)
+    const cart = await app.inject({ method: 'GET', url: '/api/v1/customer/cart', headers: { cookie: owner.sessionCookie } })
+    const lines = cart.json().data.items as Array<{ lineId: string; skuId: string; quantity: number; draftId: string; draftRevision: number }>
+    expect(lines).toHaveLength(2)
+    expect(lines.find(line => line.lineId === retainedGuestLineId)?.quantity).toBe(2)
+    const items = lines.map(line => ({ lineId: line.lineId, skuId: line.skuId, quantity: line.quantity,
+      draftId: line.draftId, draftRevision: line.draftRevision }))
+    const quoteResponse = await app.inject({ method: 'POST', url: '/api/v1/checkout/quote', headers: customerHeaders(owner),
+      payload: { version: 2, items } })
+    expect(quoteResponse.statusCode).toBe(200)
+    expect(quoteResponse.json().data.canContinue).toBe(true)
+    expect(quoteResponse.json().data.items).toHaveLength(2)
+    expect(quoteResponse.json().data.items.some((item: { purchasePreview: { values: Record<string, unknown> } | null }) =>
+      item.purchasePreview?.values[accountId] === '0008')).toBe(true)
+    const orderBody = { version: 2, items, idempotencyKey: randomUUID(), quoteToken: quoteResponse.json().data.quoteToken as string }
+    const orderCreated = await app.inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders(owner), payload: orderBody })
+    expect(orderCreated.statusCode, JSON.stringify(orderCreated.json())).toBe(201)
+    const orderId = orderCreated.json().data.order.id as string
+    expect(orderCreated.json().data.order.items).toHaveLength(2)
+    expect(orderCreated.json().data.order.items.find((item: { lineId: string }) => item.lineId === retainedGuestLineId)?.quantity).toBe(2)
+
+    const pause = await app.inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
+      headers: adminHeaders, payload: { expectedStatus: 'active', nextStatus: 'paused' } })
+    expect(pause.statusCode).toBe(200)
+    expect(pause.json().data.status).toBe('paused')
+    const replay = await app.inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders(owner), payload: orderBody })
+    expect(replay.statusCode).toBe(200)
+    expect(replay.json().data).toMatchObject({ created: false, order: { id: orderId } })
+    const newPausedQuote = await app.inject({ method: 'POST', url: '/api/v1/checkout/quote', headers: customerHeaders(owner),
+      payload: { version: 2, items } })
+    expect(newPausedQuote.statusCode).toBe(200)
+    expect(newPausedQuote.json().data.canContinue).toBe(false)
+    expect(newPausedQuote.json().data.items.every((item: { reason: string }) => item.reason === 'purchase_forms_paused')).toBe(true)
+    const deniedNewOrder = await app.inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders(owner),
+      payload: { ...orderBody, idempotencyKey: randomUUID(), quoteToken: newPausedQuote.json().data.quoteToken } })
+    expect(deniedNewOrder.statusCode).toBe(409)
+    expect(await db.selectFrom('orders').select('id').where('customer_id', '=', owner.id).execute()).toHaveLength(1)
+
+    const [legacyCatalog] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual' })
+    await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true })
+      .where('product_variant_id', '=', legacyCatalog!.skuId).execute()
+    const legacyQuote = await quote([{ skuId: legacyCatalog!.skuId, quantity: 1 }], owner)
+    expect(legacyQuote.json().data.canContinue).toBe(true)
+    const legacyOrder = await app.inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders(owner),
+      payload: { items: [{ skuId: legacyCatalog!.skuId, quantity: 1 }], idempotencyKey: randomUUID(),
+        quoteToken: legacyQuote.json().data.quoteToken } })
+    expect(legacyOrder.statusCode).toBe(201)
+
+    const optionalField = randomUUID()
+    const optionalTemplateResponse = await app.inject({ method: 'POST', url: '/api/v1/admin/purchase-form-templates',
+      headers: adminHeaders, payload: { name: '全选填模板', definition: { fields: [
+        { id: optionalField, meaningKey: 'optional_note', type: 'text', label: '可选资料', required: false },
+      ] } } })
+    expect(optionalTemplateResponse.statusCode).toBe(201)
+    const optionalTemplate = optionalTemplateResponse.json().data.template as { id: string; revision: number }
+    const optionalFrozen = await app.inject({ method: 'POST', url: `/api/v1/admin/purchase-form-templates/${optionalTemplate.id}/versions`,
+      headers: adminHeaders, payload: { expectedRevision: optionalTemplate.revision } })
+    const optionalVersionId = optionalFrozen.json().data.id as string
+    const [optionalCatalog] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual' })
+    await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true })
+      .where('product_variant_id', '=', optionalCatalog!.skuId).execute()
+    const optionalProductRevision = await db.selectFrom('products').select('revision')
+      .where('id', '=', optionalCatalog!.productId).executeTakeFirstOrThrow()
+    const optionalPrepared = await app.inject({ method: 'PUT', url: `/api/v1/admin/products/${optionalCatalog!.productId}/purchase-form`,
+      headers: adminHeaders, payload: { expectedRevision: optionalProductRevision.revision, mode: 'template', templateVersionId: optionalVersionId } })
+    expect(optionalPrepared.statusCode).toBe(200)
+    const optionalRevision = optionalPrepared.json().data.productRevision as number
+    const applied = await app.inject({ method: 'POST', url: `/api/v1/admin/products/${optionalCatalog!.productId}/purchase-form/apply`,
+      headers: adminHeaders, payload: { expectedRevision: optionalRevision, expectedMode: 'template', expectedTemplateVersionId: optionalVersionId } })
+    expect(applied.statusCode).toBe(200)
+    const optionalForm = await app.inject({ method: 'GET', url: `/api/v1/storefront/skus/${optionalCatalog!.skuId}/purchase-form` })
+    expect(optionalForm.json().data).toMatchObject({ required: true, templateVersionId: optionalVersionId })
+    const optionalQuote = await quote([{ skuId: optionalCatalog!.skuId, quantity: 1 }], owner)
+    expect(optionalQuote.json().data.items[0]).toMatchObject({ canPurchase: false, reason: 'purchase_forms_paused' })
+
+    const resume = await app.inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
+      headers: adminHeaders, payload: { expectedStatus: 'paused', nextStatus: 'active' } })
+    expect(resume.statusCode).toBe(200)
+    expect(resume.json().data.status).toBe('active')
+  })
+
+  it('applies a SKU template before cart-line edits with one PostgreSQL lock order', async () => {
+    const admin = await createAdminSession()
+    const adminHeaders = { origin: testOrigin, cookie: admin.cookie, 'x-csrf-token': admin.csrf }
+    const customer = await createCustomer()
+    const [catalog] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual' })
+    await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true })
+      .where('product_variant_id', '=', catalog!.skuId).execute()
+    const makeVersion = async (name: string, fieldId: string) => {
+      const templateResponse = await app.inject({ method: 'POST', url: '/api/v1/admin/purchase-form-templates',
+        headers: adminHeaders, payload: { name, definition: { fields: [
+          { id: fieldId, meaningKey: 'account', type: 'text', label: '账号', required: true, maxLength: 80 },
+        ] } } })
+      expect(templateResponse.statusCode, JSON.stringify(templateResponse.json())).toBe(201)
+      const template = templateResponse.json().data.template as { id: string; revision: number }
+      const frozen = await app.inject({ method: 'POST', url: `/api/v1/admin/purchase-form-templates/${template.id}/versions`,
+        headers: adminHeaders, payload: { expectedRevision: template.revision } })
+      expect(frozen.statusCode, JSON.stringify(frozen.json())).toBe(201)
+      return frozen.json().data.id as string
+    }
+    const firstFieldId = randomUUID()
+    const firstVersionId = await makeVersion('SKU 并发旧模板', firstFieldId)
+    const product = await db.selectFrom('products').select('revision').where('id', '=', catalog!.productId).executeTakeFirstOrThrow()
+    const prepared = await app.inject({ method: 'PUT', url: `/api/v1/admin/products/${catalog!.productId}/purchase-form`,
+      headers: adminHeaders, payload: { expectedRevision: product.revision, mode: 'template', templateVersionId: firstVersionId } })
+    expect(prepared.statusCode, JSON.stringify(prepared.json())).toBe(200)
+    const impact = await app.inject({ method: 'GET', url: '/api/v1/admin/storefront/purchase-forms', headers: adminHeaders })
+    const activated = await app.inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
+      headers: adminHeaders, payload: { expectedStatus: 'preparing', nextStatus: 'active',
+        expectedImpactHash: impact.json().data.impactHash } })
+    expect(activated.statusCode).toBe(200)
+
+    const draftResponse = await app.inject({ method: 'POST', url: '/api/v1/storefront/purchase-drafts',
+      headers: customerHeaders(customer), payload: { skuId: catalog!.skuId } })
+    expect(draftResponse.statusCode).toBe(201)
+    const draft = draftResponse.json().data as { id: string; revision: number }
+    const saved = await app.inject({ method: 'PUT', url: `/api/v1/storefront/purchase-drafts/${draft.id}`,
+      headers: customerHeaders(customer), payload: { skuId: catalog!.skuId, expectedRevision: draft.revision,
+        values: { [firstFieldId]: 'account-0007' } } })
+    expect(saved.statusCode).toBe(200)
+    const added = await app.inject({ method: 'POST', url: '/api/v1/customer/cart/items', headers: customerHeaders(customer),
+      payload: { version: 2, skuId: catalog!.skuId, quantity: 1,
+        draftId: draft.id, draftRevision: saved.json().data.revision } })
+    expect(added.statusCode, JSON.stringify(added.json())).toBe(200)
+    const cartLine = added.json().data.cart.items[0] as {
+      lineId: string; lineRevision: number; draftRevision: number
+    }
+
+    const secondVersionId = await makeVersion('SKU 并发新模板', randomUUID())
+    const currentProduct = await db.selectFrom('products').select('revision')
+      .where('id', '=', catalog!.productId).executeTakeFirstOrThrow()
+    const staged = await app.inject({ method: 'PUT',
+      url: `/api/v1/admin/products/${catalog!.productId}/variants/${catalog!.skuId}/purchase-form`,
+      headers: adminHeaders, payload: { expectedRevision: currentProduct.revision, mode: 'template',
+        templateVersionId: secondVersionId } })
+    expect(staged.statusCode, JSON.stringify(staged.json())).toBe(200)
+
+    let releaseGate!: () => void
+    let reportGatePid!: (pid: number) => void
+    const gate = new Promise<void>(resolve => { releaseGate = resolve })
+    const gatePidPromise = new Promise<number>(resolve => { reportGatePid = resolve })
+    const gateHolder = db.transaction().execute(async trx => {
+      await trx.selectFrom('storefront_customer_policy').select('singleton')
+        .where('singleton', '=', true).forShare().executeTakeFirstOrThrow()
+      const pid = await sql<{ pid: number }>`SELECT pg_backend_pid() AS pid`.execute(trx)
+      reportGatePid(Number(pid.rows[0]!.pid))
+      await gate
+    })
+    const gatePid = await gatePidPromise
+    let applyResponse: Awaited<ReturnType<typeof app.inject>> | undefined
+    let editResponse: Awaited<ReturnType<typeof app.inject>> | undefined
+    let applyError: unknown
+    let editError: unknown
+    const applyRequest = (async () => {
+      const apply = await app.inject({ method: 'POST',
+        url: `/api/v1/admin/products/${catalog!.productId}/variants/${catalog!.skuId}/purchase-form/apply`,
+        headers: adminHeaders,
+        payload: { expectedRevision: staged.json().data.productRevision, expectedMode: 'template',
+          expectedTemplateVersionId: secondVersionId } })
+      applyResponse = apply
+    })().catch((error: unknown) => { applyError = error })
+    let editRequest: Promise<void> | undefined
+
+    try {
+      const applyPid = await waitForQueryBlockedBy('storefront_customer_policy', gatePid)
+      editRequest = (async () => {
+        const edited = await app.inject({ method: 'PATCH',
+          url: `/api/v1/customer/cart/lines/${cartLine.lineId}/purchase-form`,
+          headers: customerHeaders(customer), payload: {
+            expectedLineRevision: cartLine.lineRevision, expectedDraftRevision: cartLine.draftRevision,
+            draftRevision: cartLine.draftRevision, values: { [firstFieldId]: 'account-0008' },
+          } })
+        editResponse = edited
+      })().catch((error: unknown) => { editError = error })
+      const editDeadline = Date.now() + 5_000
+      let editBlockedPid: number | null = null
+      while (Date.now() < editDeadline && !editResponse && !editError) {
+        editBlockedPid = await findQueryBlockedBy('storefront_customer_policy', gatePid, applyPid)
+        if (editBlockedPid !== null) break
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      expect(Boolean(editResponse || editBlockedPid), 'cart edit either finishes before apply or waits on lifecycle status').toBe(true)
+      if (editBlockedPid !== null) {
+        const variantStillAvailable = await db.transaction().execute(async trx => {
+          const row = await trx.selectFrom('product_variants').select('id').where('id', '=', catalog!.skuId)
+            .forUpdate().skipLocked().executeTakeFirst()
+          return Boolean(row)
+        })
+        expect(variantStillAvailable, 'cart edits wait for lifecycle status before locking an SKU').toBe(true)
+      }
+      releaseGate()
+      await Promise.all([applyRequest, editRequest])
+    } finally {
+      releaseGate()
+      await gateHolder
+      await applyRequest
+      await editRequest
+    }
+    expect(applyError).toBeUndefined()
+    expect(applyResponse?.statusCode, JSON.stringify(applyResponse?.json())).toBe(200)
+    expect(editError).toBeUndefined()
+    expect([200, 409]).toContain(editResponse?.statusCode)
+    if (editResponse?.statusCode === 409) {
+      expect(editResponse.json().error.code).toBe('PURCHASE_TEMPLATE_VERSION_CONFLICT')
+    }
+  })
+
   it('claims only specified guest drafts with cart merge atomically and replays after guest expiry', async () => {
     const admin = await createAdminSession()
     const fieldId = randomUUID()
@@ -244,8 +628,15 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     const [catalog] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual' })
     await db.insertInto('product_purchase_form_settings').values({
       product_id: catalog!.productId, mode: 'template', template_version_id: versionId,
+      applied_mode: 'template', applied_template_version_id: versionId,
       updated_by_admin_id: admin.id,
     }).execute()
+    const lifecycle = await app.inject({ method: 'GET', url: '/api/v1/admin/storefront/purchase-forms',
+      headers: { origin: testOrigin, cookie: admin.cookie, 'x-csrf-token': admin.csrf } })
+    const activated = await app.inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
+      headers: { origin: testOrigin, cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { expectedStatus: 'preparing', nextStatus: 'active', expectedImpactHash: lifecycle.json().data.impactHash } })
+    expect(activated.statusCode, JSON.stringify(activated.json())).toBe(200)
     const csrf = await customerCsrf()
     const guestResponse = await app.inject({ method: 'POST', url: '/api/v1/guest/session',
       headers: { origin: testOrigin, cookie: csrf.cookie, 'x-csrf-token': csrf.token } })
@@ -328,8 +719,15 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     const versionId = frozen.json().data.id as string
     await db.insertInto('product_purchase_form_settings').values({
       product_id: catalog!.productId, mode: 'template', template_version_id: versionId,
+      applied_mode: 'template', applied_template_version_id: versionId,
       updated_by_admin_id: admin.id,
     }).execute()
+    const lifecycle = await app.inject({ method: 'GET', url: '/api/v1/admin/storefront/purchase-forms',
+      headers: { origin: testOrigin, cookie: admin.cookie, 'x-csrf-token': admin.csrf } })
+    const activated = await app.inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
+      headers: { origin: testOrigin, cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { expectedStatus: 'preparing', nextStatus: 'active', expectedImpactHash: lifecycle.json().data.impactHash } })
+    expect(activated.statusCode, JSON.stringify(activated.json())).toBe(200)
     const session = await db.selectFrom('customer_sessions').select('id')
       .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()
     const owner = { kind: 'customer' as const, customer: { id: customer.id, sessionId: session.id } }
@@ -355,6 +753,7 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     const [secondCatalog] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual' })
     await db.insertInto('product_purchase_form_settings').values({
       product_id: secondCatalog!.productId, mode: 'template', template_version_id: versionId,
+      applied_mode: 'template', applied_template_version_id: versionId,
       updated_by_admin_id: admin.id,
     }).execute()
     const reusedDraftOnAnotherSku = await app.inject({
@@ -382,9 +781,9 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     expect(overLimitEdit.statusCode).toBe(409)
     expect((await db.selectFrom('customer_cart_items').select('quantity')
       .where('line_id', '=', overLimitLine.lineId).executeTakeFirstOrThrow()).quantity).toBe(2)
-    expect((await quote([{ skuId: catalog!.skuId, quantity: 1 }], customer)).json().data.canContinue).toBe(true)
-    await db.updateTable('storefront_customer_policy').set({ purchase_forms_enabled: true })
-      .where('singleton', '=', true).execute()
+    const beforeActivationQuote = await quote([{ skuId: catalog!.skuId, quantity: 1 }], customer)
+    expect(beforeActivationQuote.json().data).toMatchObject({ canContinue: false,
+      items: [{ reason: 'purchase_form_required' }] })
     const legacyAfterActivation = await quote([{ skuId: catalog!.skuId, quantity: 1 }], customer)
     expect(legacyAfterActivation.statusCode).toBe(200)
     expect(legacyAfterActivation.json().data).toMatchObject({ canContinue: false,
@@ -445,7 +844,7 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     const collision = await app.inject({
       method: 'PATCH', url: `/api/v1/customer/cart/lines/${otherLine.lineId}/purchase-form`,
       headers: customerHeaders(customer), payload: {
-        expectedLineRevision: otherLine.lineRevision, expectedDraftRevision: different.revision,
+        expectedLineRevision: otherLine.lineRevision, expectedDraftRevision: different.revision, draftRevision: different.revision,
         values: { [fieldId]: '00041' },
       },
     })
@@ -488,8 +887,6 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     expect(refreshed.json().data.cart.items[0]).toMatchObject({
       lineId: staleLineId, quantity: 2, draftId: replacementDraft.id,
     })
-    await db.updateTable('storefront_customer_policy').set({ purchase_forms_enabled: false })
-      .where('singleton', '=', true).execute()
   })
 
   it('isolates authenticated carts, merges concurrent adds, supports quantity changes and enforces CSRF', async () => {

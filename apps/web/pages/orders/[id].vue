@@ -35,7 +35,7 @@ let renderedQrValue = ''
 let deliveryPollTimer: number | undefined
 
 useSeoMeta({ title: '订单详情', description: '查看订单状态、成交快照和已完成的数字交付。', robots: 'noindex, nofollow' })
-useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
+if (import.meta.server) useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 
 const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id))
 const hasActiveAttempt = computed(() => Boolean(payment.value?.attempt
@@ -1254,6 +1254,15 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                   </dd>
                 </div>
               </dl>
+
+              <StorefrontPurchaseDataPreview
+                v-if="item.purchaseData.state === 'filled'"
+                class="mt-4"
+                :title="`${item.purchaseData.templateName ?? '购买资料'} · 成交快照${item.purchaseData.templateVersionNumber ? ` v${item.purchaseData.templateVersionNumber}` : ''}`"
+                :definition="item.purchaseData.definition"
+                :values="item.purchaseData.values"
+                :attachments="item.purchaseData.attachments.map(attachment => ({ id: attachment.attachmentId, fieldId: attachment.fieldId, url: attachment.url, byteSize: attachment.byteSize }))"
+              />
 
               <UAlert
                 v-if="['code_pool', 'fixed_content', 'link', 'file', 'api'].includes(item.fulfillmentMethod) && order.status === 'processing' && item.fulfilledQuantity < item.quantity"

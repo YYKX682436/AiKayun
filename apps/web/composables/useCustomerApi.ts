@@ -93,6 +93,7 @@ export function useCustomerApi() {
 
   function identitySensitivePath(path: string): boolean {
     return path.includes('/api/v1/customer/')
+      || path.startsWith('/api/v1/storefront/purchase-drafts')
       || path === '/api/v1/checkout/quote'
       || path.startsWith('/api/v1/checkout/orders')
       || path.startsWith('/api/v1/orders/')
@@ -101,6 +102,7 @@ export function useCustomerApi() {
 
   function requiresCurrentSessionProbe(path: string): boolean {
     return path.includes('/api/v1/customer/cart')
+      || path.startsWith('/api/v1/storefront/purchase-drafts')
       || path.includes('/api/v1/customer/orders')
       || path === '/api/v1/checkout/quote'
       || path.startsWith('/api/v1/checkout/orders')

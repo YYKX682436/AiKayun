@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto'
 import type { Kysely, Transaction } from 'kysely'
 import { canonicalPurchaseFormJson } from '@aikayun/contracts'
+import type { PurchaseFormDefinition } from '@aikayun/contracts'
 import type { AppConfig } from '../config.js'
 import type { Database } from '../db/types.js'
+import { effectivePurchaseFormForSku } from './purchase-form-config.js'
 import { validatePurchaseDraftForPurchaseInTransaction,
   type PurchaseDraftOwner, type ValidatedPurchaseDraft } from './purchase-forms.js'
 
@@ -29,7 +31,9 @@ export interface ResolvedPurchaseLine extends NormalizedPurchaseLineRequest {
   contentIdentity: string
   normalizedValues: Record<string, unknown> | null
   attachments: Array<{ id: string; fieldId: string; storageKey: string; byteSize: number; sha256: string }>
-  preparationVersionId: string | null
+  effectiveFormVersionId: string | null
+  effectiveFormDefinition: PurchaseFormDefinition | null
+  purchaseFormsStatus: 'preparing' | 'active' | 'paused'
   validatedDraft: ValidatedPurchaseDraft | null
 }
 
@@ -93,14 +97,7 @@ export class PurchaseLineError extends Error {
 export async function preparedPurchaseFormVersion(
   trx: Kysely<Database> | Transaction<Database>, skuId: string,
 ): Promise<string | null> {
-  const variant = await trx.selectFrom('product_variants').select('product_id').where('id', '=', skuId).executeTakeFirst()
-  if (!variant) return null
-  const override = await trx.selectFrom('sku_purchase_form_overrides')
-    .select(['mode', 'template_version_id']).where('product_variant_id', '=', skuId).executeTakeFirst()
-  if (override) return override.mode === 'template' ? override.template_version_id : null
-  const product = await trx.selectFrom('product_purchase_form_settings')
-    .select(['mode', 'template_version_id']).where('product_id', '=', variant.product_id).executeTakeFirst()
-  return product?.mode === 'template' ? product.template_version_id : null
+  return (await effectivePurchaseFormForSku(trx, skuId)).templateVersionId
 }
 
 /** Resolve references from their authenticated owner in the caller's transaction. */
@@ -112,26 +109,28 @@ export async function resolvePurchaseLinesInTransaction(
   lock: 'share' | 'update' = 'share',
 ): Promise<ResolvedPurchaseLine[]> {
   const items = normalizePurchaseLineRequests(rawItems)
-  const prepared = new Map<string, string | null>()
+  const effective = new Map<string, Awaited<ReturnType<typeof effectivePurchaseFormForSku>>>()
   const resolved: ResolvedPurchaseLine[] = []
   for (const item of items) {
-    let preparationVersionId = prepared.get(item.skuId)
-    if (preparationVersionId === undefined) {
-      preparationVersionId = await preparedPurchaseFormVersion(trx, item.skuId)
-      prepared.set(item.skuId, preparationVersionId)
+    let form = effective.get(item.skuId)
+    if (form === undefined) {
+      form = await effectivePurchaseFormForSku(trx, item.skuId, { lockStatus: 'share' })
+      effective.set(item.skuId, form)
     }
     if (!item.draftId) {
       resolved.push({
         ...item, sourceLineIds: [item.lineId], templateVersionId: null, normalizationVersion: null,
         contentIdentity: purchaseLineContentIdentity(item.skuId, null, null, null),
-        normalizedValues: null, attachments: [], preparationVersionId, validatedDraft: null,
+        normalizedValues: null, attachments: [], effectiveFormVersionId: form.templateVersionId,
+        effectiveFormDefinition: form.definition, purchaseFormsStatus: form.status, validatedDraft: null,
       })
       continue
     }
     const draft = await validatePurchaseDraftForPurchaseInTransaction(trx, config, owner, {
       draftId: item.draftId, expectedRevision: item.draftRevision!,
     }, lock)
-    if (!preparationVersionId || draft.templateVersionId !== preparationVersionId) {
+    if (!form.templateVersionId || draft.templateVersionId !== form.templateVersionId
+      || form.status === 'preparing') {
       throw new PurchaseLineError('PURCHASE_FORM_VERSION_CHANGED', '商品填写模板绑定已变化，请重新确认购买资料。', 409)
     }
     resolved.push({
@@ -143,7 +142,9 @@ export async function resolvePurchaseLinesInTransaction(
         draft.normalizationVersion, draft.normalizedValues),
       normalizedValues: draft.normalizedValues,
       attachments: draft.attachments,
-      preparationVersionId,
+      effectiveFormVersionId: form.templateVersionId,
+      effectiveFormDefinition: form.definition,
+      purchaseFormsStatus: form.status,
       validatedDraft: draft,
     })
   }

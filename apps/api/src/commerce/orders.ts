@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyReply } from 'fastify'
+import { Type } from 'typebox'
 import { sql, type Kysely, type Transaction } from 'kysely'
 import {
   AdminOrderDetailSchema,
@@ -33,6 +34,7 @@ import type {
   AdminOrderPage,
   CreateOrderBody,
   ManualFulfillmentDeliveryBody,
+  OrderPurchaseData,
   OrderDetail,
   OrderPage,
   OrderStatus,
@@ -59,6 +61,8 @@ import { normalizePurchaseLineRequests, purchaseLineContentIdentity,
 import { PurchaseDraftServiceError, type PurchaseDraftOwner } from './purchase-forms.js'
 import { PurchaseAttachmentError, PurchaseAttachmentStorage } from '../media/purchase-attachment-storage.js'
 import { PurchaseOrderAttachmentStorage } from '../media/purchase-order-attachment-storage.js'
+import { readAdminOrderPurchaseAttachment, readOrderPurchaseSnapshot, readOwnedOrderPurchaseAttachment } from './purchase-order-attachments.js'
+import { validatePurchaseFormDefinition } from '@aikayun/contracts'
 import { PurchaseOrderDecryptionError, PurchaseOrderKeyUnavailableError } from './purchase-form-crypto.js'
 import { preparePurchaseOrderAttachments, persistOrderPurchaseSnapshotInTransaction,
   type PreparedPurchaseOrderAttachment } from './purchase-order-attachments.js'
@@ -202,7 +206,7 @@ function parseOptions(value: unknown): OrderDetail['items'][number]['options'] {
   return []
 }
 
-export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): Promise<OrderDetail | undefined> {
+export async function loadOrderDetail(db: Db, id: string, config: AppConfig): Promise<OrderDetail | undefined> {
   const order = await orderRow(db, id)
   if (!order) return undefined
   const itemRows = await db.selectFrom('order_items')
@@ -217,6 +221,36 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
     .orderBy('created_at').orderBy('id')
     .execute()
   const itemIds = itemRows.map(item => item.id)
+  const purchaseDataByItem = new Map<string, OrderPurchaseData>()
+  for (const item of itemRows) {
+    const snapshot = await readOrderPurchaseSnapshot(db, config, item.id)
+    let templateName: string | null = null
+    let templateVersionNumber: number | null = null
+    let definition: OrderPurchaseData['definition'] = null
+    if (snapshot.state === 'filled') {
+      const version = await db.selectFrom('purchase_form_template_versions')
+        .select(['version_number', 'name', 'definition'])
+        .where('id', '=', snapshot.templateVersionId).executeTakeFirst()
+      const parsed = version ? validatePurchaseFormDefinition(version.definition) : null
+      if (!version || !parsed?.ok) throw new Error('Order purchase template snapshot is unavailable')
+      templateName = version.name
+      templateVersionNumber = version.version_number
+      definition = parsed.value
+    }
+    const ownerPath = order.customer_id ? 'customer' : 'guest'
+    purchaseDataByItem.set(item.id, {
+      state: snapshot.state,
+      templateVersionId: snapshot.templateVersionId,
+      templateName,
+      templateVersionNumber,
+      definition,
+      values: snapshot.values,
+      attachments: snapshot.attachments.map(attachment => ({
+        ...attachment,
+        url: `/api/v1/${ownerPath}/orders/${order.id}/items/${item.id}/purchase-attachments/${attachment.attachmentId}`,
+      })),
+    })
+  }
   const deliveries = itemIds.length
     ? await db.selectFrom('order_item_fulfillment_deliveries as delivery')
       .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'delivery.fulfillment_attempt_id')
@@ -407,6 +441,7 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
       fulfillmentStatus: item.fulfillment_status,
       fulfilledQuantity: item.fulfilled_quantity,
       fulfillmentReservedQuantity: item.fulfillment_reserved_quantity,
+      purchaseData: purchaseDataByItem.get(item.id)!,
       fulfillmentAttempts: attemptsByItem.get(item.id) ?? [],
       deliveries: deliveriesByItem.get(item.id) ?? [],
     })),
@@ -1198,6 +1233,64 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
   const customerCsrf = verifyDoubleSubmitCsrf(config, CUSTOMER_CSRF_COOKIE)
   const requireAdministrator = requireAdmin(db, config)
   const adminCsrf = verifyAdminCsrf(config)
+  const purchaseOrderStorage = new PurchaseOrderAttachmentStorage(config.privateFileRoot)
+
+  const CustomerPurchaseAttachmentParamsSchema = Type.Object({
+    id: Type.String({ format: 'uuid' }), itemId: Type.String({ format: 'uuid' }),
+    attachmentId: Type.String({ format: 'uuid' }),
+  }, { additionalProperties: false })
+  const sendPurchaseAttachment = (reply: FastifyReply, image: { bytes: Buffer; mimeType: string; byteSize: number }) => {
+    reply.header('cache-control', 'private, no-store')
+    reply.header('content-type', image.mimeType)
+    reply.header('content-length', String(image.byteSize))
+    reply.header('content-disposition', 'inline; filename="purchase-image.webp"')
+    reply.header('x-content-type-options', 'nosniff')
+    reply.header('content-security-policy', "default-src 'none'; sandbox")
+    return reply.send(image.bytes)
+  }
+
+  app.get('/api/v1/customer/orders/:id/items/:itemId/purchase-attachments/:attachmentId', {
+    preHandler: requireCustomerAuth,
+    schema: { tags: ['customer'], summary: 'Read an archived purchase image for an owned customer order',
+      params: CustomerPurchaseAttachmentParamsSchema,
+      response: { 401: ApiErrorSchema, 404: ApiErrorSchema } },
+  }, async (request, reply) => {
+    try {
+      const { id, itemId, attachmentId } = request.params as { id: string; itemId: string; attachmentId: string }
+      const image = await readOwnedOrderPurchaseAttachment(db, purchaseOrderStorage,
+        { kind: 'customer', customer: request.customer! }, itemId, attachmentId, id)
+      return sendPurchaseAttachment(reply, image)
+    } catch (error) { return handleOrderError(error, reply, request.id) }
+  })
+
+  app.get('/api/v1/guest/orders/:id/items/:itemId/purchase-attachments/:attachmentId', {
+    preHandler: optionalCustomerAuth,
+    schema: { tags: ['customer'], summary: 'Read an archived purchase image for the current guest order session',
+      params: CustomerPurchaseAttachmentParamsSchema,
+      response: { 401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema } },
+  }, async (request, reply) => {
+    try {
+      if (request.customer) throw new OrderError(403, 'CUSTOMER_SESSION_ACTIVE', '登录顾客与游客订单会话不能混用。')
+      const { id, itemId, attachmentId } = request.params as { id: string; itemId: string; attachmentId: string }
+      const token = request.cookies[guestSessionCookie]
+      const image = await readOwnedOrderPurchaseAttachment(db, purchaseOrderStorage,
+        { kind: 'guest', guestSessionToken: token ?? '' }, itemId, attachmentId, id)
+      return sendPurchaseAttachment(reply, image)
+    } catch (error) { return handleOrderError(error, reply, request.id) }
+  })
+
+  app.get('/api/v1/admin/orders/:id/items/:itemId/purchase-attachments/:attachmentId', {
+    preHandler: requireAdministrator,
+    schema: { tags: ['admin'], summary: 'Read an archived purchase image for an administrator-authorized order',
+      params: CustomerPurchaseAttachmentParamsSchema,
+      response: { 401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema } },
+  }, async (request, reply) => {
+    try {
+      const { id, itemId, attachmentId } = request.params as { id: string; itemId: string; attachmentId: string }
+      const image = await readAdminOrderPurchaseAttachment(db, purchaseOrderStorage, id, itemId, attachmentId)
+      return sendPurchaseAttachment(reply, image)
+    } catch (error) { return handleOrderError(error, reply, request.id) }
+  })
 
   app.post('/api/v1/guest/session', {
     preHandler: [optionalCustomerAuth, customerCsrf],

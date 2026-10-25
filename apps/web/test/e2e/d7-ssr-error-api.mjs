@@ -28,6 +28,7 @@ const product = {
   categories: [],
   optionGroups: [],
   variants: [{
+    skuId: '550e8400-e29b-41d4-a716-446655440003',
     options: [],
     salePrice: '10.00',
     compareAtPrice: null,
