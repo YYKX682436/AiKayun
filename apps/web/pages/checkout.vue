@@ -10,9 +10,11 @@ import {
 } from '~/utils/checkoutOrderIntent'
 import type { PendingOrderIntentV2 } from '~/utils/checkoutOrderIntent'
 import type { OrderIntentV2 } from '~/utils/checkoutOrderIntent'
+import { bindNewLegacyGuestOrder, forgetCompletedLegacyGuestOrder, legacyGuestOrderOwner } from '~/utils/legacyCheckoutGuestOwner'
 
 const route = useRoute()
 const customerApi = useCustomerApi()
+type CheckoutRequest = typeof customerApi.request
 const shoppingCart = useShoppingCart()
 const quote = ref<CheckoutQuote | null>(null)
 const busy = ref(false)
@@ -154,15 +156,15 @@ function canonicalItems(items: CartSkuQuantity[]): CartSkuQuantity[] {
   return [...counts].sort(([left], [right]) => left.localeCompare(right)).map(([skuId, quantity]) => ({ skuId, quantity }))
 }
 
-async function currentOrderOwnerId(): Promise<string> {
+async function currentOrderOwnerId(request: CheckoutRequest): Promise<string> {
   const customerId = customerApi.session.value?.customer.id
   if (customerId) return customerId
-  const session = await customerApi.request<GuestOrderSession>('/api/v1/guest/session', { method: 'POST' })
+  const session = await request<GuestOrderSession>('/api/v1/guest/session', { method: 'POST' })
   if (!isUuid(session.sessionId)) throw new Error('游客会话无法确认，请稍后重试。')
   return `guest:${session.sessionId}`
 }
 
-function orderIntentKey(items: CartSkuQuantity[], ownerId: string): string {
+function orderIntentKey(items: CartSkuQuantity[], ownerId: string, actualOwnerId: string): string {
   if (!import.meta.client) throw new Error('请在浏览器中继续创建订单。')
   const fingerprint = JSON.stringify(canonicalItems(items))
   const storageKey = `aikayun-order-intent-v1:${ownerId}:${fingerprint}`
@@ -172,8 +174,13 @@ function orderIntentKey(items: CartSkuQuantity[], ownerId: string): string {
   } catch {
     throw new Error('浏览器暂时无法保存安全的提交标识。请启用会话存储后重试。')
   }
-  if (existing && /^[0-9a-f-]{36}$/iu.test(existing)) return existing
+  if (existing && /^[0-9a-f-]{36}$/iu.test(existing)) {
+    const boundOwner = ownerId === 'guest' ? legacyGuestOrderOwner(existing) : null
+    if (boundOwner && boundOwner !== actualOwnerId) throw new PendingOwnerConflictError()
+    return existing
+  }
   const key = crypto.randomUUID()
+  if (ownerId === 'guest') bindNewLegacyGuestOrder(key, actualOwnerId)
   try {
     sessionStorage.setItem(storageKey, key)
   } catch {
@@ -182,20 +189,28 @@ function orderIntentKey(items: CartSkuQuantity[], ownerId: string): string {
   return key
 }
 
-function removeOrderIntent(items: CartSkuQuantity[], ownerId: string): void {
+function removeOrderIntent(items: CartSkuQuantity[], ownerId: string, idempotencyKey: string): void {
   const storageKey = `aikayun-order-intent-v1:${ownerId}:${JSON.stringify(canonicalItems(items))}`
-  try { sessionStorage.removeItem(storageKey) } catch { /* The completed order remains available through order history. */ }
+  try {
+    sessionStorage.removeItem(storageKey)
+    if (ownerId === 'guest') forgetCompletedLegacyGuestOrder(idempotencyKey)
+  } catch { /* The completed order remains available through order history. */ }
 }
 
 function routeSelectionId(): string | null {
   return typeof route.query.intent === 'string' && isUuid(route.query.intent) ? route.query.intent : null
 }
 
-async function submitPendingV2(intent: PendingOrderIntentV2): Promise<string> {
+function guestOrderHeaders(ownerId: string): Record<string, string> | undefined {
+  return ownerId.startsWith('guest:') ? { 'x-aikayun-guest-session-id': ownerId.slice('guest:'.length) } : undefined
+}
+
+async function submitPendingV2(intent: PendingOrderIntentV2, request: CheckoutRequest): Promise<string> {
   let result: CreateOrderResult
   try {
-    result = await customerApi.request<CreateOrderResult>('/api/v1/checkout/orders', {
+    result = await request<CreateOrderResult>('/api/v1/checkout/orders', {
       method: 'POST',
+      headers: guestOrderHeaders(intent.ownerId),
       body: { version: 2, idempotencyKey: intent.idempotencyKey, quoteToken: intent.quoteToken, items: intent.items },
     })
   } catch (error) {
@@ -211,10 +226,12 @@ async function submitPendingV2(intent: PendingOrderIntentV2): Promise<string> {
 }
 
 async function processV2Intent(
-  selection: CheckoutSelection | null, ownerId: string, identityAtStart: number,
+  selection: CheckoutSelection | null, identityAtStart: number,
   quoteToken: string | null,
 ): Promise<string | null> {
-  return withOrderSubmissionLock(async () => {
+  return withOrderSubmissionLock(() => customerApi.withCheckoutIdentity(async (request) => {
+    if (identityAtStart !== customerApi.identityVersion.value) return null
+    const ownerId = await currentOrderOwnerId(request)
     if (identityAtStart !== customerApi.identityVersion.value) return null
     let intent: OrderIntentV2 | null
     if (quoteToken && selection?.version === 2) {
@@ -228,8 +245,8 @@ async function processV2Intent(
     if (!intent || intent.state === 'rejected') return null
     if (intent.state === 'completed') return intent.orderId
     if (identityAtStart !== customerApi.identityVersion.value) return null
-    return submitPendingV2(intent)
-  })
+    return submitPendingV2(intent, request)
+  }))
 }
 
 async function showCompletedOrder(orderId: string, identityAtStart: number): Promise<void> {
@@ -247,30 +264,32 @@ async function createOrder() {
   submitting.value = true
   submitError.value = ''
   try {
-    let ownerId: string
-    if (selection.version === 2) ownerId = await currentOrderOwnerId()
-    else if (customerApi.session.value?.customer.id) ownerId = customerApi.session.value.customer.id
-    else {
-      await customerApi.request<GuestOrderSession>('/api/v1/guest/session', { method: 'POST' })
-      ownerId = 'guest'
-    }
-    if (!identityIsCurrent()) return
     if (selection.version === 2) {
-      const orderId = await processV2Intent(selection, ownerId, identityAtStart, currentQuote.quoteToken)
+      const orderId = await processV2Intent(selection, identityAtStart, currentQuote.quoteToken)
       if (orderId) await showCompletedOrder(orderId, identityAtStart)
     } else {
-      const idempotencyKey = orderIntentKey(selection.items, ownerId)
-      const result = await customerApi.request<CreateOrderResult>('/api/v1/checkout/orders', {
-        method: 'POST', body: { idempotencyKey, quoteToken: currentQuote.quoteToken, items },
-      })
-      if (!identityIsCurrent()) return
-      const orderPath = `/orders/${result.order.id}`
+      const completed = await withOrderSubmissionLock(() => customerApi.withCheckoutIdentity(async (request) => {
+        if (!identityIsCurrent()) return null
+        const actualOwnerId = await currentOrderOwnerId(request)
+        if (!identityIsCurrent()) return null
+        // Keep the historical v1 storage key; new guest keys have a separate
+        // owner receipt so an unknown result cannot cross a later guest session.
+        const ownerId = actualOwnerId.startsWith('guest:') ? 'guest' : actualOwnerId
+        const idempotencyKey = orderIntentKey(selection.items, ownerId, actualOwnerId)
+        const result = await request<CreateOrderResult>('/api/v1/checkout/orders', {
+          method: 'POST', headers: guestOrderHeaders(actualOwnerId),
+          body: { idempotencyKey, quoteToken: currentQuote.quoteToken, items },
+        })
+        return { result, ownerId, idempotencyKey }
+      }))
+      if (!completed || !identityIsCurrent()) return
+      const orderPath = `/orders/${completed.result.order.id}`
       await navigateTo(orderPath)
-      if (identityIsCurrent() && route.path === orderPath) removeOrderIntent(selection.items, ownerId)
+      if (identityIsCurrent() && route.path === orderPath) removeOrderIntent(selection.items, completed.ownerId, completed.idempotencyKey)
     }
   } catch (error) {
     if (!identityIsCurrent()) return
-    if (error instanceof PendingOwnerConflictError) pendingOwnerBlocked.value = true
+    if (error instanceof PendingOwnerConflictError || (error instanceof CustomerApiError && error.code === 'GUEST_SESSION_CHANGED')) pendingOwnerBlocked.value = true
     if (error instanceof CheckoutConflictError) {
       quote.value = error.currentQuote
       submitError.value = `${error.message} 已显示最新报价，请再次确认后重新提交。`
@@ -289,18 +308,16 @@ async function replayPendingV2(selection: CheckoutSelection | null): Promise<voi
   const identityAtStart = customerApi.identityVersion.value
   try {
     if (!hasOrderIntentV2(selection?.version === 2 ? selection.items : null, routeSelectionId())) return
-    const ownerId = await currentOrderOwnerId()
-    if (identityAtStart !== customerApi.identityVersion.value) return
     submitting.value = true
-    const orderId = await processV2Intent(selection, ownerId, identityAtStart, null)
+    const orderId = await processV2Intent(selection, identityAtStart, null)
     if (orderId) await showCompletedOrder(orderId, identityAtStart)
   } catch (error) {
     if (identityAtStart !== customerApi.identityVersion.value) return
-    if (error instanceof PendingOwnerConflictError) pendingOwnerBlocked.value = true
+    if (error instanceof PendingOwnerConflictError || (error instanceof CustomerApiError && error.code === 'GUEST_SESSION_CHANGED')) pendingOwnerBlocked.value = true
     if (error instanceof CheckoutConflictError) {
       quote.value = error.currentQuote
       submitError.value = `${error.message} 已显示最新报价，请再次确认。`
-    } else if (error instanceof PendingOwnerConflictError) {
+    } else if (error instanceof PendingOwnerConflictError || (error instanceof CustomerApiError && error.code === 'GUEST_SESSION_CHANGED')) {
       submitError.value = error.message
     } else {
       submitError.value = '上次提交结果尚未确认。保留原请求标识，继续重试会先核对原订单。'

@@ -54,7 +54,7 @@ function normalizeError(error: unknown): CustomerApiError {
     ? '用户名或密码不正确。'
     : code === 'USERNAME_TAKEN'
       ? '该用户名已被使用，请换一个用户名。'
-      : code === 'REGISTRATION_REQUIREMENTS_NOT_MET' || code === 'CURRENT_PASSWORD_INCORRECT'
+      : code === 'REGISTRATION_REQUIREMENTS_NOT_MET' || code === 'CURRENT_PASSWORD_INCORRECT' || code === 'GUEST_SESSION_CHANGED'
         ? serverMessage ?? '请检查填写内容后重试。'
         : status === 401
           ? '登录状态已失效，请重新登录。'
@@ -297,7 +297,10 @@ export function useCustomerApi() {
       csrfRequestVersion.value += 1
       nuxtApp._customerCsrfPromise = undefined
     }
-    if (!nuxtApp._customerCsrfPromise || force) {
+    // A previously queued promise may itself be waiting for identity. A caller
+    // that already owns that lock must fetch directly instead of waiting for
+    // its own release. Queued fetchToken callbacks re-read the cookie on entry.
+    if (!nuxtApp._customerCsrfPromise || force || identityLockAlreadyHeld) {
       const identityAtStart = identityVersion.value
       const requestVersion = ++csrfRequestVersion.value
       const fetchToken = async (): Promise<string> => {
@@ -369,7 +372,7 @@ export function useCustomerApi() {
     const headers = new Headers(options.headers as HeadersInit | undefined)
     try {
       if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-        if (!isCustomerAuthMutation(path) && authMutationPending.value > 0) {
+        if (!lockAlreadyHeld && !isCustomerAuthMutation(path) && authMutationPending.value > 0) {
           await nuxtApp._customerAuthMutationQueue?.catch(() => {})
           if (identityAtStart !== identityVersion.value) {
             throw new CustomerApiError(0, 'STALE_IDENTITY', '登录状态已变化，请重试此操作。')
@@ -402,7 +405,38 @@ export function useCustomerApi() {
   }
 
   async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+    // Session creation changes an HttpOnly cookie. Keep the exclusive identity
+    // lock until Set-Cookie has completed, including callers outside checkout.
+    if (path === '/api/v1/guest/session') {
+      if (import.meta.client && !navigator.locks) {
+        throw new CustomerApiError(0, 'CROSS_TAB_SYNC_UNAVAILABLE', '当前浏览器不支持安全的跨标签订单恢复。')
+      }
+      return withIdentityMutationLock(async () => {
+        await verifyCurrentSession(path)
+        return performRequest<T>(path, options, true)
+      })
+    }
     return performRequest<T>(path, options)
+  }
+
+  async function withCheckoutIdentity<T>(action: (request: typeof performRequest) => Promise<T>): Promise<T> {
+    if (!import.meta.client || !navigator.locks) {
+      throw new CustomerApiError(0, 'CROSS_TAB_SYNC_UNAVAILABLE', '当前浏览器不支持安全的跨标签订单恢复。')
+    }
+    // Checkout takes order-submission first, then this identity lock, then the
+    // short intent-storage lock. The supplied request never reacquires identity.
+    return navigator.locks.request(customerIdentityLockName, { mode: 'exclusive' }, async () => {
+      await verifyCurrentSession('/api/v1/checkout/orders')
+      const identityAtStart = identityVersion.value
+      const boundRequest: typeof performRequest = async <R>(path: string, options: RequestOptions = {}) => {
+        if (identityAtStart !== identityVersion.value) {
+          throw new CustomerApiError(0, 'STALE_IDENTITY', '登录状态已变化，请重试此操作。')
+        }
+        await verifyCurrentSession(path)
+        return performRequest<R>(path, options, true)
+      }
+      return action(boundRequest)
+    })
   }
 
   async function requestDuringIdentityMutation<T>(path: string, options: RequestOptions): Promise<T> {
@@ -486,6 +520,7 @@ export function useCustomerApi() {
     identityVersion,
     refreshSession,
     request,
+    withCheckoutIdentity,
     register,
     login,
     logout,

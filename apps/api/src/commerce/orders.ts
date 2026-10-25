@@ -12,6 +12,7 @@ import {
   ApiSuccessSchemaOf,
   CheckoutOrderErrorSchema,
   CreateOrderBodySchema,
+  CreateOrderHeadersSchema,
   CreateOrderResultSchema,
   GuestOrderSessionSchema,
   ManualFulfillmentConfigSchema,
@@ -514,6 +515,12 @@ async function existingIdempotentOrder(
   return detail
 }
 
+function assertExpectedGuestOwner(expectedGuestSessionId: string | undefined, ownerType: 'customer' | 'guest', ownerId: string): void {
+  if (expectedGuestSessionId && (ownerType !== 'guest' || expectedGuestSessionId !== ownerId)) {
+    throw new OrderError(409, 'GUEST_SESSION_CHANGED', '游客订单会话已变化，请在原游客会话核对未确认订单。原提交标识已保留。')
+  }
+}
+
 async function createOrderTransaction(
   trx: Transaction<Database>,
   body: CreateOrderBody,
@@ -521,6 +528,7 @@ async function createOrderTransaction(
   guestToken: string | undefined,
   config: AppConfig,
   preparedByLine: ReadonlyMap<string, PreparedPurchaseOrderAttachment[]>,
+  expectedGuestSessionId?: string,
 ): Promise<{ created: boolean; order: OrderDetail }> {
   const v2 = 'version' in body && body.version === 2
   const legacyItems = v2 ? null : normalizeCheckoutItems(body.items)
@@ -538,6 +546,7 @@ async function createOrderTransaction(
     ownerId = await assertGuestSession(trx, guestToken, v2)
     ownerType = 'guest'
   }
+  assertExpectedGuestOwner(expectedGuestSessionId, ownerType, ownerId)
 
   await lockIdempotencyKey(trx, ownerType, ownerId, body.idempotencyKey)
   const existing = await existingIdempotentOrder(trx, ownerType, ownerId, body.idempotencyKey, requestHash, config)
@@ -639,6 +648,7 @@ async function createOrderWithRetry(
   customer: AuthenticatedCustomer | null,
   guestToken: string | undefined,
   config: AppConfig,
+  expectedGuestSessionId?: string,
 ): Promise<{ created: boolean; order: OrderDetail }> {
   const preparedByLine = new Map<string, PreparedPurchaseOrderAttachment[]>()
   if ('version' in body && body.version === 2) {
@@ -654,6 +664,7 @@ async function createOrderWithRetry(
         ownerId = await assertGuestSession(trx, guestToken, true)
         ownerType = 'guest'
       }
+      assertExpectedGuestOwner(expectedGuestSessionId, ownerType, ownerId)
       await lockIdempotencyKey(trx, ownerType, ownerId, body.idempotencyKey)
       const existing = await existingIdempotentOrder(trx, ownerType, ownerId,
         body.idempotencyKey, requestHash, config)
@@ -688,7 +699,7 @@ async function createOrderWithRetry(
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       return await db.transaction().execute(trx => createOrderTransaction(trx, body, customer,
-        guestToken, config, preparedByLine))
+        guestToken, config, preparedByLine, expectedGuestSessionId))
     } catch (error) {
       if (!retryableSqlStates.has(postgresCode(error) ?? '') || attempt === maxAttempts) {
         if (retryableSqlStates.has(postgresCode(error) ?? '')) {
@@ -1233,6 +1244,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
     schema: {
       tags: ['customer'], summary: 'Create an order from a fresh locked checkout quote',
       body: CreateOrderBodySchema,
+      headers: CreateOrderHeadersSchema,
       response: {
         200: ApiSuccessSchemaOf(CreateOrderResultSchema),
         201: ApiSuccessSchemaOf(CreateOrderResultSchema),
@@ -1248,6 +1260,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
         request.customer,
         request.customer ? undefined : request.cookies[guestSessionCookie],
         config,
+        request.headers['x-aikayun-guest-session-id'] as string | undefined,
       )
       reply.header('cache-control', 'no-store')
       return reply.code(result.created ? 201 : 200).send(success(result, request.id))

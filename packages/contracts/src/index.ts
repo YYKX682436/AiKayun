@@ -1066,6 +1066,11 @@ export const CreateOrderBodyV2Schema = Type.Object({
   items: Type.Array(CheckoutRequestLineV2Schema, { minItems: 1, maxItems: 50 }),
 }, { additionalProperties: false })
 export const CreateOrderBodySchema = Type.Union([CreateOrderBodyV1Schema, CreateOrderBodyV2Schema])
+// Optional transport binding preserves historical order bodies and hashes.
+// A supplied guest identity is compared with the authenticated HttpOnly cookie.
+export const CreateOrderHeadersSchema = Type.Object({
+  'x-aikayun-guest-session-id': Type.Optional(Type.String({ format: 'uuid' })),
+}, { additionalProperties: true })
 
 export const OrderStatusSchema = Type.Union([
   Type.Literal('pending_payment'), Type.Literal('processing'),

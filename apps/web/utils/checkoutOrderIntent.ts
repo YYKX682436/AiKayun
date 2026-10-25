@@ -204,15 +204,29 @@ function checkOwner(intent: OrderIntentV2 | null, ownerId: string): OrderIntentV
 
 function attachSelectionId(
   raw: string | null, intents: OrderIntentV2[], intent: PendingOrderIntentV2, selectionId: string | null,
+  rejected: PendingOrderIntentV2 | null = null,
 ): PendingOrderIntentV2 {
-  if (!isUuid(selectionId) || intent.selectionId === selectionId
-    || intent.selectionAliases?.includes(selectionId)) return intent
-  if (exactIntent(intents, selectionId)) throw new Error('结算选择身份已被占用，请返回购物车重试。')
-  if ((intent.selectionAliases?.length ?? 0) >= 100) throw new Error('原订单请求关联过多结算链接，请先核对订单历史。')
-  const updated = intent.selectionId === null
-    ? { ...intent, selectionId }
-    : { ...intent, selectionAliases: [...(intent.selectionAliases ?? []), selectionId] }
-  writeLocal(raw, intents.map(item => item === intent ? updated : item))
+  const ids = [...new Set([
+    intent.selectionId, ...(intent.selectionAliases ?? []),
+    rejected?.selectionId, ...(rejected?.selectionAliases ?? []), selectionId,
+  ].filter(isUuid))]
+  for (const id of ids) {
+    const existing = exactIntent(intents, id)
+    if (existing && existing !== intent && existing !== rejected) {
+      throw new Error('结算选择身份已被占用，请返回购物车重试。')
+    }
+  }
+  const primary = intent.selectionId ?? ids[0] ?? null
+  const aliases = ids.filter(id => id !== primary)
+  if (aliases.length > 100) throw new Error('原订单请求关联过多结算链接，请先核对订单历史。')
+  if (!rejected && primary === intent.selectionId
+    && JSON.stringify(aliases) === JSON.stringify(intent.selectionAliases ?? [])) return intent
+  const updated: PendingOrderIntentV2 = {
+    ...intent, selectionId: primary, selectionAliases: aliases,
+  }
+  // Rejoining a durable pending request transfers every old URL in the same
+  // storage write. Its original key, quote and request body remain intact.
+  writeLocal(raw, intents.filter(item => item !== rejected).map(item => item === intent ? updated : item))
   return updated
 }
 
@@ -253,14 +267,18 @@ export async function prepareOrderIntentV2(
     if (exact?.state === 'completed') return exact
     const pending = checkOwner(intents.find(intent => intent.state === 'pending'
       && intent.fingerprint === fingerprint) ?? null, ownerId)
-    if (pending?.state === 'pending') return attachSelectionId(raw, intents, pending, selectionId)
+    if (pending?.state === 'pending') {
+      return attachSelectionId(raw, intents, pending, selectionId, exact?.state === 'rejected' ? exact : null)
+    }
     if (exact?.state === 'rejected' && exact.quoteToken === quoteToken) {
       throw new Error('原报价已被拒绝，请重新报价后再次确认。')
     }
     const pendingCount = intents.filter(intent => intent.state === 'pending').length
     if (pendingCount >= 50) throw new Error('本机有过多未确认的订单请求，请先核对订单历史。')
     const intent: PendingOrderIntentV2 = {
-      state: 'pending', ownerId, fingerprint, selectionId: isUuid(selectionId) ? selectionId : null,
+      state: 'pending', ownerId, fingerprint,
+      selectionId: exact?.state === 'rejected' ? exact.selectionId : isUuid(selectionId) ? selectionId : null,
+      ...(exact?.state === 'rejected' && exact.selectionAliases ? { selectionAliases: [...exact.selectionAliases] } : {}),
       idempotencyKey: crypto.randomUUID(), quoteToken,
       items: items.map(item => ({ ...item })).sort((left, right) => left.lineId.localeCompare(right.lineId)),
     }

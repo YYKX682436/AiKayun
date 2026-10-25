@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { Kysely, Transaction } from 'kysely'
 import type { AppConfig } from '../config.js'
 import type { OrderPurchaseSnapshot } from '@aikayun/contracts'
+import { PURCHASE_FORM_NORMALIZATION_VERSION } from '@aikayun/contracts'
 import type { Database } from '../db/types.js'
 import { PurchaseAttachmentStorage, PurchaseAttachmentError } from '../media/purchase-attachment-storage.js'
 import { PurchaseOrderAttachmentStorage } from '../media/purchase-order-attachment-storage.js'
@@ -100,6 +101,9 @@ export async function persistOrderPurchaseSnapshotInTransaction(
     }).execute()
     return
   }
+  if (draft.normalizationVersion !== PURCHASE_FORM_NORMALIZATION_VERSION) {
+    throw new PurchaseDraftServiceError(409, 'PURCHASE_NORMALIZATION_VERSION_INVALID', '成交资料版本无效，请重新报价。')
+  }
   if (draft.attachments.length !== preparedAttachments.length) {
     throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_CHANGED', '填写图片已变化，请重新报价。')
   }
@@ -193,6 +197,12 @@ export async function getOwnedOrderPurchaseSnapshot(
     }
     const rows = await trx.selectFrom('order_item_purchase_attachments').selectAll()
       .where('order_item_id', '=', orderItemId).orderBy('ordinal').execute()
+    if (snapshot.attachment_ids.length > 10 || new Set(snapshot.attachment_ids).size !== snapshot.attachment_ids.length
+      || rows.length !== snapshot.attachment_ids.length
+      || snapshot.attachment_ids.some((id, index) => typeof id !== 'string'
+        || rows[index]?.ordinal !== index + 1 || rows[index]?.source_attachment_id !== id)) {
+      throw new PurchaseDraftServiceError(503, 'PURCHASE_ORDER_SNAPSHOT_INVALID', '成交资料暂时无法读取。')
+    }
     const attachments = rows.map(row => ({
       attachmentId: row.source_attachment_id,
       fieldId: row.field_id,
@@ -205,7 +215,7 @@ export async function getOwnedOrderPurchaseSnapshot(
         contentIdentity: snapshot.content_identity, values: null, attachments,
       }
     }
-    if (!snapshot.normalization_version || !snapshot.encryption_key_id || !snapshot.encrypted_values
+    if (snapshot.normalization_version !== PURCHASE_FORM_NORMALIZATION_VERSION || !snapshot.encryption_key_id || !snapshot.encrypted_values
       || !snapshot.values_nonce || !snapshot.values_auth_tag) {
       throw new PurchaseDraftServiceError(503, 'PURCHASE_ORDER_SNAPSHOT_INVALID', '成交资料暂时无法读取。')
     }
