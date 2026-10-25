@@ -39,6 +39,9 @@ test('checkout and a same-SPA profile save complete when CSRF renewal queues beh
   await context.setExtraHTTPHeaders({ 'x-forwarded-for': '198.18.2.201' })
   const probeReady = gate()
   const probeRelease = gate()
+  const orderResponseReady = gate()
+  const releaseOrderResponse = gate()
+  const orderResponseDelivered = gate()
   let policy: Policy | undefined
   let productId: string | undefined
   let holdNextProbe = false
@@ -119,6 +122,14 @@ test('checkout and a same-SPA profile save complete when CSRF renewal queues beh
       csrfRequests += 1
       await route.continue()
     })
+    await page.route('**/api/v1/checkout/orders', async (route) => {
+      const response = await route.fetch()
+      expect(response.status()).toBe(201)
+      orderResponseReady.open()
+      await releaseOrderResponse.promise
+      await route.fulfill({ response })
+      orderResponseDelivered.open()
+    })
     page.on('request', (request) => {
       if (request.method() === 'POST' && request.url().endsWith('/api/v1/checkout/orders')) orderRequests += 1
       if (request.method() === 'PATCH' && request.url().endsWith('/api/v1/customer/profile')) profileRequests += 1
@@ -148,6 +159,10 @@ test('checkout and a same-SPA profile save complete when CSRF renewal queues beh
     expect(orderRequests).toBe(0)
     expect(profileRequests).toBe(0)
     probeRelease.open()
+    await orderResponseReady.promise
+    expect(orderRequests).toBe(1)
+    expect(profileRequests).toBe(0)
+    releaseOrderResponse.open()
     let responses
     try {
       responses = await Promise.all([orderResponse, profileResponse])
@@ -167,12 +182,17 @@ test('checkout and a same-SPA profile save complete when CSRF renewal queues beh
       cwd: resolve(import.meta.dirname, '../../../..'), env: process.env, encoding: 'utf8',
     })
     expect(JSON.parse(orders)).toHaveLength(1)
+    await orderResponseDelivered.promise
     await expect.poll(() => page.evaluate(async lockName => {
       const locks = await navigator.locks.query()
       return [...(locks.held ?? []), ...(locks.pending ?? [])].filter(lock => lock.name === lockName).length
     }, identityLock)).toBe(0)
+    await page.evaluate(() => new Promise<void>(resolveFrames => requestAnimationFrame(() => requestAnimationFrame(() => resolveFrames()))))
+    await expect(page).toHaveURL(/\/account$/u)
+    await expect(page.getByLabel('邮箱', { exact: true })).toHaveValue(email)
   } finally {
     probeRelease.open()
+    releaseOrderResponse.open()
     try {
       if (productId) await pauseProduct(page, productId)
     } finally {

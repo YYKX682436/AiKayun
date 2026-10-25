@@ -13,6 +13,7 @@ import type { OrderIntentV2 } from '~/utils/checkoutOrderIntent'
 import { bindNewLegacyGuestOrder, forgetCompletedLegacyGuestOrder, legacyGuestOrderOwner } from '~/utils/legacyCheckoutGuestOwner'
 
 const route = useRoute()
+const router = useRouter()
 const customerApi = useCustomerApi()
 type CheckoutRequest = typeof customerApi.request
 const shoppingCart = useShoppingCart()
@@ -41,6 +42,7 @@ const pageGeneration = ref(0)
 const activeSubmissionGeneration = ref<number | null>(null)
 const submitting = computed(() => activeSubmissionGeneration.value === pageGeneration.value)
 const quoteGeneration = ref<number | null>(null)
+let pageDisposed = false
 
 useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 
@@ -174,7 +176,10 @@ function captureOperationContext(
 }
 
 function pageContextIsCurrent(context: CheckoutOperationContext): boolean {
-  return context.pageGeneration === pageGeneration.value
+  return !pageDisposed
+    && router.currentRoute.value.path === '/checkout'
+    && router.currentRoute.value.fullPath === context.routeFullPath
+    && context.pageGeneration === pageGeneration.value
     && route.path === '/checkout'
     && route.fullPath === context.routeFullPath
     && routeSelectionId() === context.selectionId
@@ -439,7 +444,10 @@ function onSharedIntentChange(event: StorageEvent): void {
 }
 
 onMounted(() => window.addEventListener('storage', onSharedIntentChange))
-onBeforeUnmount(() => window.removeEventListener('storage', onSharedIntentChange))
+onBeforeUnmount(() => {
+  pageDisposed = true
+  window.removeEventListener('storage', onSharedIntentChange)
+})
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
