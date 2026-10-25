@@ -273,6 +273,7 @@ export const PurchaseDraftAttachmentSchema = Type.Object({
   byteSize: Type.Integer({ minimum: 1, maximum: PURCHASE_FORM_LIMITS.attachmentBytes }),
   width: Type.Integer({ minimum: 1, maximum: 8192 }),
   height: Type.Integer({ minimum: 1, maximum: 8192 }),
+  replacesAttachmentId: Type.Optional(IdentitySchema),
   url: Type.String({ minLength: 1, maxLength: 2048 }),
 }, { additionalProperties: false })
 export const PurchaseDraftSchema = Type.Object({

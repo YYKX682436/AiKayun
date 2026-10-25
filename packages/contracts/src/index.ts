@@ -973,6 +973,11 @@ export const CustomerCartLinePurchaseFormBodySchema = Type.Union([
       draftId: Type.String({ format: 'uuid' }),
       draftRevision: PurchaseLineDraftRevisionSchema,
     }, { additionalProperties: false }),
+    values: Type.Optional(Type.Record(Type.String({ format: 'uuid' }), Type.Unknown())),
+    replacements: Type.Optional(Type.Array(Type.Object({
+      oldAttachmentId: Type.String({ format: 'uuid' }),
+      newAttachmentId: Type.String({ format: 'uuid' }),
+    }, { additionalProperties: false }), { maxItems: 10 })),
   }, { additionalProperties: false }),
 ])
 

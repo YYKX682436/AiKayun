@@ -9,7 +9,7 @@ import { hashPassword } from '../src/auth/password.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
 import { createDatabase } from '../src/db/pool.js'
 import type { Database, ProductInventoryMode, ProductStatus } from '../src/db/types.js'
-import { createPurchaseDraft, savePurchaseDraft, requestPurchaseDraftDeletion } from '../src/commerce/purchase-forms.js'
+import { createPurchaseDraft, getPurchaseDraft, savePurchaseDraft, requestPurchaseDraftDeletion } from '../src/commerce/purchase-forms.js'
 import { getOwnedOrderPurchaseSnapshot } from '../src/commerce/purchase-order-attachments.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
@@ -887,6 +887,114 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     expect(refreshed.json().data.cart.items[0]).toMatchObject({
       lineId: staleLineId, quantity: 2, draftId: replacementDraft.id,
     })
+  })
+
+  it('keeps the last valid cart binding when a customer saves an incomplete edit', async () => {
+    const customer = await createCustomer()
+    const admin = await createAdminSession()
+    const [catalog] = await createCatalog({ mode: 'quantity', stocked: 4, fulfillmentMethod: 'manual' })
+    await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true })
+      .where('product_variant_id', '=', catalog!.skuId).execute()
+
+    const fieldId = randomUUID()
+    const templateResponse = await app.inject({
+      method: 'POST', url: '/api/v1/admin/purchase-form-templates',
+      headers: { origin: testOrigin, cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { name: '部分编辑事务回归', definition: { fields: [
+        { id: fieldId, meaningKey: 'account', type: 'text', label: '账号', required: true, maxLength: 80 },
+      ] } },
+    })
+    expect(templateResponse.statusCode, JSON.stringify(templateResponse.json())).toBe(201)
+    const template = templateResponse.json().data.template as { id: string; revision: number }
+    const frozen = await app.inject({
+      method: 'POST', url: `/api/v1/admin/purchase-form-templates/${template.id}/versions`,
+      headers: { origin: testOrigin, cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { expectedRevision: template.revision },
+    })
+    expect(frozen.statusCode, JSON.stringify(frozen.json())).toBe(201)
+    const versionId = frozen.json().data.id as string
+    const product = await db.selectFrom('products').select('revision')
+      .where('id', '=', catalog!.productId).executeTakeFirstOrThrow()
+    const prepared = await app.inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog!.productId}/purchase-form`,
+      headers: { origin: testOrigin, cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { expectedRevision: product.revision, mode: 'template', templateVersionId: versionId },
+    })
+    expect(prepared.statusCode, JSON.stringify(prepared.json())).toBe(200)
+    const impact = await app.inject({ method: 'GET', url: '/api/v1/admin/storefront/purchase-forms',
+      headers: { origin: testOrigin, cookie: admin.cookie, 'x-csrf-token': admin.csrf } })
+    const activated = await app.inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
+      headers: { origin: testOrigin, cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { expectedStatus: 'preparing', nextStatus: 'active', expectedImpactHash: impact.json().data.impactHash } })
+    expect(activated.statusCode, JSON.stringify(activated.json())).toBe(200)
+
+    const session = await db.selectFrom('customer_sessions').select('id')
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()
+    const owner = { kind: 'customer' as const, customer: { id: customer.id, sessionId: session.id } }
+    const draft = await createPurchaseDraft(db, config, owner, versionId)
+    const initial = await savePurchaseDraft(db, config, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, values: { [fieldId]: 'original-account' },
+    })
+    const added = await app.inject({ method: 'POST', url: '/api/v1/customer/cart/items',
+      headers: customerHeaders(customer), payload: {
+        version: 2, skuId: catalog!.skuId, quantity: 1, draftId: initial.id, draftRevision: initial.revision,
+      } })
+    expect(added.statusCode, JSON.stringify(added.json())).toBe(200)
+    const line = added.json().data.cart.items[0] as {
+      lineId: string; lineRevision: number; draftId: string; draftRevision: number; contentIdentity: string
+    }
+
+    const replacementPath = `/api/v1/customer/cart/lines/${line.lineId}/purchase-form/replacement-draft`
+    const started = await app.inject({
+      method: 'POST', url: replacementPath,
+      headers: customerHeaders(customer), payload: {
+        expectedLineRevision: line.lineRevision, expectedDraftRevision: line.draftRevision,
+      },
+    })
+    expect(started.statusCode, JSON.stringify(started.json())).toBe(201)
+    const replacement = started.json().data as {
+      replacementDraftId: string; replacementDraftRevision: number; sourceDraftId: string
+    }
+    expect(replacement.sourceDraftId).toBe(line.draftId)
+    const partial = await app.inject({
+      method: 'PUT', url: replacementPath,
+      headers: customerHeaders(customer), payload: {
+        expectedLineRevision: line.lineRevision,
+        expectedDraftRevision: line.draftRevision,
+        expectedReplacementDraftRevision: replacement.replacementDraftRevision,
+        omittedSourceAttachmentIds: [],
+        values: {},
+      },
+    })
+    const afterPartialLine = await db.selectFrom('customer_cart_items').selectAll()
+      .where('customer_id', '=', customer.id).where('line_id', '=', line.lineId).executeTakeFirstOrThrow()
+    const afterPartialDraft = await getPurchaseDraft(db, config, owner, line.draftId)
+    expect(partial.statusCode, JSON.stringify({ response: partial.json(), line: afterPartialLine })).toBe(200)
+    expect(partial.json().data).toMatchObject({ complete: false, incompleteFieldIds: [fieldId] })
+    expect(afterPartialLine).toMatchObject({
+      draft_id: line.draftId, draft_revision: line.draftRevision,
+      revision: line.lineRevision, content_identity: line.contentIdentity,
+    })
+    expect(afterPartialDraft.values).toEqual({ [fieldId]: 'original-account' })
+
+    const completed = await app.inject({
+      method: 'PATCH', url: `/api/v1/customer/cart/lines/${line.lineId}/purchase-form`,
+      headers: customerHeaders(customer), payload: {
+        expectedLineRevision: line.lineRevision,
+        expectedDraftRevision: line.draftRevision,
+        replacementDraft: { draftId: replacement.replacementDraftId, draftRevision: partial.json().data.replacementDraftRevision },
+        values: { [fieldId]: 'updated-account' },
+      },
+    })
+    expect(completed.statusCode, JSON.stringify(completed.json())).toBe(200)
+    expect(completed.json().data.cart.items[0]).toMatchObject({
+      lineId: line.lineId, quantity: 1, draftId: replacement.replacementDraftId,
+      draftRevision: partial.json().data.replacementDraftRevision + 1, lineRevision: line.lineRevision + 1,
+    })
+    expect((await getPurchaseDraft(db, config, owner, replacement.replacementDraftId)).values)
+      .toEqual({ [fieldId]: 'updated-account' })
+    expect(await db.selectFrom('purchase_drafts').select('status').where('id', '=', line.draftId).executeTakeFirstOrThrow())
+      .toMatchObject({ status: 'deleting' })
   })
 
   it('isolates authenticated carts, merges concurrent adds, supports quantity changes and enforces CSRF', async () => {

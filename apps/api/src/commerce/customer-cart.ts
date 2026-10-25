@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { Type } from 'typebox'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import { sql, type Kysely, type Transaction } from 'kysely'
 import {
@@ -31,16 +32,49 @@ import type { AppConfig } from '../config.js'
 import type { Database } from '../db/types.js'
 import { optionalCustomer, requireCustomer, type AuthenticatedCustomer, CUSTOMER_CSRF_COOKIE } from '../auth/customer.js'
 import { hashToken, verifyDoubleSubmitCsrf } from '../auth/security.js'
+import { PurchaseAttachmentStorage } from '../media/purchase-attachment-storage.js'
 import { quoteCheckoutItems, quoteCheckoutPurchaseLines, normalizeCheckoutItems, CheckoutQuoteError } from './checkout-quote.js'
 import { assertGuestSession, guestSessionCookie } from './orders.js'
 import { PurchaseDraftServiceError, claimGuestPurchaseDraftsInTransaction,
-  savePurchaseDraftInTransaction, validatePurchaseDraftForPurchaseInTransaction } from './purchase-forms.js'
+  createPurchaseDraftInTransaction, savePurchaseDraftInTransaction,
+  releaseUnreferencedPurchaseDraftAttachment, transferCartReplacementAttachmentsInTransaction,
+  validatePurchaseDraftForPurchaseInTransaction, type PreparedCartReplacementAttachmentCopy } from './purchase-forms.js'
 import { normalizePurchaseLineRequests, preparedPurchaseFormVersion, purchaseLineContentIdentity,
   purchaseLineRequestHash, PurchaseLineError, resolvePurchaseLinesInTransaction } from './purchase-lines.js'
 import { effectivePurchaseFormForSku, readPurchaseFormsStatus } from './purchase-form-config.js'
 
 const maxCartLines = 50
 const maxLineQuantity = 99
+const cartReplacementDraftRequestSchema = Type.Object({
+  expectedLineRevision: Type.Integer({ minimum: 1 }),
+  expectedDraftRevision: Type.Integer({ minimum: 1 }),
+}, { additionalProperties: false })
+const cartReplacementDraftDeleteSchema = Type.Object({
+  expectedLineRevision: Type.Integer({ minimum: 1 }),
+  expectedDraftRevision: Type.Integer({ minimum: 1 }),
+  expectedReplacementDraftRevision: Type.Integer({ minimum: 1 }),
+}, { additionalProperties: false })
+const cartReplacementDraftSaveSchema = Type.Object({
+  expectedLineRevision: Type.Integer({ minimum: 1 }),
+  expectedDraftRevision: Type.Integer({ minimum: 1 }),
+  expectedReplacementDraftRevision: Type.Integer({ minimum: 1 }),
+  values: Type.Record(Type.String({ format: 'uuid' }), Type.Unknown()),
+  omittedSourceAttachmentIds: Type.Array(Type.String({ format: 'uuid' }), { maxItems: 10 }),
+  replacements: Type.Optional(Type.Array(Type.Object({
+    oldAttachmentId: Type.String({ format: 'uuid' }),
+    newAttachmentId: Type.String({ format: 'uuid' }),
+  }, { additionalProperties: false }), { maxItems: 10 })),
+}, { additionalProperties: false })
+const cartReplacementDraftResponseSchema = Type.Object({
+  lineId: Type.String({ format: 'uuid' }),
+  sourceDraftId: Type.String({ format: 'uuid' }),
+  sourceLineRevision: Type.Integer({ minimum: 1 }),
+  sourceDraftRevision: Type.Integer({ minimum: 1 }),
+  replacementDraftId: Type.String({ format: 'uuid' }),
+  replacementDraftRevision: Type.Integer({ minimum: 1 }),
+  templateVersionId: Type.String({ format: 'uuid' }),
+  omittedSourceAttachmentIds: Type.Array(Type.String({ format: 'uuid' }), { maxItems: 10 }),
+}, { additionalProperties: false })
 
 class CartError extends Error {
   constructor(
@@ -189,6 +223,43 @@ function mergeDigest(items: CartSkuQuantity[]): string {
   return createHash('sha256').update(JSON.stringify(items)).digest('hex')
 }
 
+async function discardPendingLineReplacements(trx: Transaction<Database>, lineIds: string[]): Promise<void> {
+  if (!lineIds.length) return
+  const relations = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
+    .where('line_id', 'in', lineIds).orderBy('line_id').forUpdate().execute()
+  if (!relations.length) return
+  const targetIds = relations.map(relation => relation.replacement_draft_id).sort()
+  await trx.selectFrom('purchase_drafts').select('id').where('id', 'in', targetIds).orderBy('id').forUpdate().execute()
+  await trx.deleteFrom('customer_cart_line_replacement_drafts').where('line_id', 'in', lineIds).execute()
+  await trx.updateTable('purchase_drafts').set({ status: 'deleting' }).where('id', 'in', targetIds).execute()
+  await trx.deleteFrom('purchase_draft_attachment_references').where('draft_id', 'in', targetIds).execute()
+  await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: new Date() })
+    .where('draft_id', 'in', targetIds).where('status', 'in', ['uploading', 'ready', 'failed']).execute()
+}
+
+async function releaseUncommittedReplacementCopies(
+  db: Kysely<Database>,
+  storage: PurchaseAttachmentStorage,
+  customer: AuthenticatedCustomer,
+  copies: PreparedCartReplacementAttachmentCopy[],
+): Promise<void> {
+  for (const copy of copies) {
+    try {
+      const existing = await db.selectFrom('purchase_draft_attachments')
+        .select(['draft_id', 'storage_key']).where('id', '=', copy.id).executeTakeFirst()
+      if (!existing) {
+        await storage.remove(copy.id, copy.storageKey)
+        continue
+      }
+      // The transaction outcome may be ambiguous. The regular release primitive
+      // locks draft before attachment and will preserve a row that was actually
+      // committed into the final encrypted purchase values.
+      await releaseUnreferencedPurchaseDraftAttachment(db, storage,
+        { kind: 'customer', customer }, existing.draft_id, copy.id)
+    } catch { /* Keep uncertain copies for the private attachment reconciler. */ }
+  }
+}
+
 type CartLineContent = {
   skuId: string
   quantity: number
@@ -263,6 +334,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
   const authenticateCustomer = requireCustomer(db, config)
   const authenticateOptionalCustomer = optionalCustomer(db, config)
   const csrfCheck = verifyDoubleSubmitCsrf(config, CUSTOMER_CSRF_COOKIE)
+  const purchaseAttachmentStorage = new PurchaseAttachmentStorage(config.privateFileRoot)
 
   app.get('/api/v1/customer/cart', {
     preHandler: authenticateCustomer,
@@ -397,6 +469,11 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
       const changed = await db.transaction().execute(async (trx) => {
         const customer = request.customer!
         await lockCustomer(trx, customer, true)
+        const lines = await trx.selectFrom('customer_cart_items').select('line_id')
+          .where('customer_id', '=', customer.id).where('sku_id', '=', skuId)
+          .where('content_identity', '=', purchaseLineContentIdentity(skuId, null, null, null))
+          .orderBy('line_id').forUpdate().execute()
+        await discardPendingLineReplacements(trx, lines.map(line => line.line_id))
         const deleted = await trx.deleteFrom('customer_cart_items')
           .where('customer_id', '=', customer.id)
           .where('sku_id', '=', skuId)
@@ -427,6 +504,9 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
       const result = await db.transaction().execute(async (trx) => {
         const customer = request.customer!
         await lockCustomer(trx, customer, true)
+        const lines = await trx.selectFrom('customer_cart_items').select('line_id')
+          .where('customer_id', '=', customer.id).orderBy('line_id').forUpdate().execute()
+        await discardPendingLineReplacements(trx, lines.map(line => line.line_id))
         const deleted = await trx.deleteFrom('customer_cart_items')
           .where('customer_id', '=', customer.id).executeTakeFirst()
         return deleted.numDeletedRows > 0n
@@ -468,12 +548,252 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
         if (other.reduce((sum, row) => sum + row.quantity, body.quantity) > maxLineQuantity) {
           throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
         }
-        await trx.updateTable('customer_cart_items').set({ quantity: body.quantity })
-          .where('line_id', '=', lineId).execute()
+        const updated = await trx.updateTable('customer_cart_items').set({ quantity: body.quantity })
+          .where('line_id', '=', lineId).returning('revision').executeTakeFirstOrThrow()
+        const replacement = await trx.selectFrom('customer_cart_line_replacement_drafts').select('line_id')
+          .where('line_id', '=', lineId).forUpdate().executeTakeFirst()
+        if (replacement) {
+          await trx.updateTable('customer_cart_line_replacement_drafts')
+            .set({ source_line_revision: updated.revision }).where('line_id', '=', lineId).execute()
+        }
       })
       const cart = await authenticatedCartSnapshot(db, request.customer!, config)
       reply.header('cache-control', 'no-store')
       return success({ changed: true, merged: false, skippedSkuIds: [], retainedLineId: lineId, cart } satisfies CustomerCartMutation, request.id)
+    } catch (error) { return mapError(error, reply, request.id) }
+  })
+
+  app.post('/api/v1/customer/cart/lines/:lineId/purchase-form/replacement-draft', {
+    logLevel: 'silent', preHandler: [authenticateCustomer, csrfCheck],
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    schema: {
+      tags: ['customer'], summary: 'Start or resume the isolated edit draft for one valid cart line',
+      params: CustomerCartLineParamsSchema, body: cartReplacementDraftRequestSchema,
+      response: { 200: ApiSuccessSchemaOf(cartReplacementDraftResponseSchema), 201: ApiSuccessSchemaOf(cartReplacementDraftResponseSchema),
+        400: ApiErrorSchema, 401: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema, 429: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const { lineId } = request.params as { lineId: string }
+      const body = request.body as { expectedLineRevision: number; expectedDraftRevision: number }
+      const customer = request.customer!
+      const result = await db.transaction().execute(async trx => {
+        await lockCustomer(trx, customer, true)
+        const line = await trx.selectFrom('customer_cart_items').selectAll()
+          .where('customer_id', '=', customer.id).where('line_id', '=', lineId).forUpdate().executeTakeFirst()
+        if (!line || !line.draft_id || line.draft_revision === null) {
+          throw new CartError(404, 'CART_ITEM_NOT_FOUND', '购物车中没有可编辑的资料购买行。')
+        }
+        if (line.revision !== body.expectedLineRevision || line.draft_revision !== body.expectedDraftRevision) {
+          throw new CartError(409, 'CART_LINE_REVISION_CONFLICT', '购买行已变化，请刷新购物车后再编辑。')
+        }
+        const effective = await effectivePurchaseFormForSku(trx, line.sku_id, { lockStatus: 'share' })
+        if (!effective.templateVersionId || effective.templateVersionId !== line.template_version_id) {
+          throw new CartError(409, 'PURCHASE_FORM_VERSION_CHANGED', '商品填写模板已变化，当前购买行仍保留原资料。')
+        }
+        const existing = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
+          .where('line_id', '=', lineId).where('customer_id', '=', customer.id).forUpdate().executeTakeFirst()
+        if (existing) {
+          if (existing.source_draft_id !== line.draft_id || existing.source_line_revision !== line.revision
+            || existing.source_draft_revision !== line.draft_revision) {
+            throw new CartError(409, 'CART_REPLACEMENT_CONFLICT', '此购买行的编辑草稿已失效，请重新打开购买行。')
+          }
+          const target = await trx.selectFrom('purchase_drafts').select(['id', 'revision', 'status', 'expires_at', 'template_version_id'])
+            .where('id', '=', existing.replacement_draft_id).forUpdate().executeTakeFirst()
+          if (!target || target.status !== 'active' || target.expires_at <= new Date()
+            || target.template_version_id !== effective.templateVersionId) {
+            throw new CartError(409, 'CART_REPLACEMENT_EXPIRED', '编辑草稿已过期或模板已变化；原购物车资料仍保留。')
+          }
+          return { httpStatus: 200 as const, value: {
+            lineId, sourceDraftId: line.draft_id, sourceLineRevision: line.revision,
+            sourceDraftRevision: line.draft_revision, replacementDraftId: target.id,
+            replacementDraftRevision: target.revision, templateVersionId: target.template_version_id,
+            omittedSourceAttachmentIds: existing.omitted_source_attachment_ids,
+          } }
+        }
+        const uploading = await trx.selectFrom('purchase_draft_attachments').select('id')
+          .where('draft_id', '=', line.draft_id).where('status', '=', 'uploading').forShare().executeTakeFirst()
+        if (uploading) throw new CartError(409, 'PURCHASE_ATTACHMENT_UPLOAD_IN_PROGRESS', '原图片仍在保存，请稍后再编辑购买资料。')
+        const source = await trx.selectFrom('purchase_drafts').select(['id', 'revision', 'status', 'expires_at', 'template_version_id'])
+          .where('id', '=', line.draft_id).where('customer_id', '=', customer.id).forUpdate().executeTakeFirst()
+        if (!source || source.status !== 'active' || source.expires_at <= new Date()
+          || source.revision !== line.draft_revision || source.template_version_id !== effective.templateVersionId) {
+          throw new CartError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '原购物车资料已过期或变化；请返回购物车重新确认。')
+        }
+        const created = await createPurchaseDraftInTransaction(trx, config,
+          { kind: 'customer', customer }, effective.templateVersionId, new Date(), { replacementCreditDraftId: source.id })
+        await trx.insertInto('customer_cart_line_replacement_drafts').values({
+          line_id: lineId, customer_id: customer.id, source_draft_id: source.id,
+          replacement_draft_id: created.id, source_line_revision: line.revision,
+          source_draft_revision: line.draft_revision, omitted_source_attachment_ids: [],
+        }).execute()
+        return { httpStatus: 201 as const, value: {
+          lineId, sourceDraftId: source.id, sourceLineRevision: line.revision,
+          sourceDraftRevision: line.draft_revision, replacementDraftId: created.id,
+          replacementDraftRevision: created.revision, templateVersionId: effective.templateVersionId,
+          omittedSourceAttachmentIds: [],
+        } }
+      })
+      reply.header('cache-control', 'private, no-store')
+      return reply.code(result.httpStatus).send(success(result.value, request.id))
+    } catch (error) { return mapError(error, reply, request.id) }
+  })
+
+  app.get('/api/v1/customer/cart/lines/:lineId/purchase-form/replacement-draft', {
+    preHandler: [authenticateCustomer],
+    schema: {
+      tags: ['customer'], summary: 'Read safe metadata for one cart line replacement draft',
+      params: CustomerCartLineParamsSchema,
+      response: { 200: ApiSuccessSchemaOf(cartReplacementDraftResponseSchema), 401: ApiErrorSchema,
+        404: ApiErrorSchema, 409: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const { lineId } = request.params as { lineId: string }
+      const customer = request.customer!
+      const result = await db.transaction().execute(async trx => {
+        await lockCustomer(trx, customer, false)
+        const line = await trx.selectFrom('customer_cart_items').selectAll()
+          .where('customer_id', '=', customer.id).where('line_id', '=', lineId).forShare().executeTakeFirst()
+        if (!line || !line.draft_id || line.draft_revision === null) {
+          throw new CartError(404, 'CART_REPLACEMENT_NOT_FOUND', '此购买行没有可恢复的编辑草稿。')
+        }
+        const relation = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
+          .where('line_id', '=', lineId).where('customer_id', '=', customer.id).forShare().executeTakeFirst()
+        if (!relation) throw new CartError(404, 'CART_REPLACEMENT_NOT_FOUND', '此购买行没有可恢复的编辑草稿。')
+        if (line.draft_id !== relation.source_draft_id || line.revision !== relation.source_line_revision
+          || line.draft_revision !== relation.source_draft_revision) {
+          throw new CartError(409, 'CART_REPLACEMENT_CONFLICT', '购买行已变化；原购买资料仍保留。')
+        }
+        const target = await trx.selectFrom('purchase_drafts').select(['id', 'revision', 'status', 'expires_at', 'template_version_id'])
+          .where('id', '=', relation.replacement_draft_id).forShare().executeTakeFirst()
+        if (!target || target.status !== 'active' || target.expires_at <= new Date()) {
+          throw new CartError(410, 'CART_REPLACEMENT_EXPIRED', '编辑草稿已过期；原购物车资料仍保留。')
+        }
+        return {
+          lineId, sourceDraftId: relation.source_draft_id, sourceLineRevision: relation.source_line_revision,
+          sourceDraftRevision: relation.source_draft_revision, replacementDraftId: target.id,
+          replacementDraftRevision: target.revision, templateVersionId: target.template_version_id,
+          omittedSourceAttachmentIds: relation.omitted_source_attachment_ids,
+        }
+      })
+      reply.header('cache-control', 'private, no-store')
+      return success(result, request.id)
+    } catch (error) { return mapError(error, reply, request.id) }
+  })
+
+  app.put('/api/v1/customer/cart/lines/:lineId/purchase-form/replacement-draft', {
+    logLevel: 'silent', preHandler: [authenticateCustomer, csrfCheck],
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    schema: {
+      tags: ['customer'], summary: 'Save a partial isolated draft without changing the valid cart binding',
+      params: CustomerCartLineParamsSchema, body: cartReplacementDraftSaveSchema,
+      response: { 200: ApiSuccessSchemaOf(Type.Object({
+        replacementDraftRevision: Type.Integer({ minimum: 1 }),
+        complete: Type.Boolean(),
+        incompleteFieldIds: Type.Array(Type.String({ format: 'uuid' })),
+      }, { additionalProperties: false })), 400: ApiErrorSchema, 401: ApiErrorSchema,
+        404: ApiErrorSchema, 409: ApiErrorSchema, 413: ApiErrorSchema, 422: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const { lineId } = request.params as { lineId: string }
+      const body = request.body as {
+        expectedLineRevision: number
+        expectedDraftRevision: number
+        expectedReplacementDraftRevision: number
+        values: Record<string, unknown>
+        omittedSourceAttachmentIds: string[]
+        replacements?: Array<{ oldAttachmentId: string; newAttachmentId: string }>
+      }
+      const customer = request.customer!
+      const saved = await db.transaction().execute(async trx => {
+        await lockCustomer(trx, customer, true)
+        const line = await trx.selectFrom('customer_cart_items').selectAll()
+          .where('customer_id', '=', customer.id).where('line_id', '=', lineId).forUpdate().executeTakeFirst()
+        const relation = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
+          .where('line_id', '=', lineId).where('customer_id', '=', customer.id).forUpdate().executeTakeFirst()
+        if (!line || !relation || line.draft_id !== relation.source_draft_id) {
+          throw new CartError(404, 'CART_REPLACEMENT_NOT_FOUND', '找不到此购物车行的编辑草稿。')
+        }
+        if (line.revision !== body.expectedLineRevision || line.draft_revision !== body.expectedDraftRevision
+          || relation.source_line_revision !== line.revision || relation.source_draft_revision !== line.draft_revision) {
+          throw new CartError(409, 'CART_REPLACEMENT_CONFLICT', '原购买行已变化；上次有效资料仍保留。')
+        }
+        const omitted = [...new Set(body.omittedSourceAttachmentIds.map(id => id.toLowerCase()))]
+        if (omitted.length !== body.omittedSourceAttachmentIds.length) {
+          throw new CartError(400, 'CART_REPLACEMENT_ATTACHMENT_INVALID', '图片编辑状态无效。')
+        }
+        if (omitted.length) {
+          const referenced = await trx.selectFrom('purchase_draft_attachments as attachment')
+            .innerJoin('purchase_draft_attachment_references as reference', join => join
+              .onRef('reference.attachment_id', '=', 'attachment.id').onRef('reference.draft_id', '=', 'attachment.draft_id'))
+            .select('attachment.id').where('attachment.draft_id', '=', relation.source_draft_id)
+            .where('attachment.status', '=', 'ready').where('attachment.id', 'in', omitted).forShare().execute()
+          if (referenced.length !== omitted.length) {
+            throw new CartError(409, 'CART_REPLACEMENT_ATTACHMENT_INVALID', '原图片已变化，请刷新后重新编辑。')
+          }
+        }
+        const effective = await effectivePurchaseFormForSku(trx, line.sku_id, { lockStatus: 'share' })
+        if (!effective.templateVersionId || effective.templateVersionId !== line.template_version_id) {
+          throw new CartError(409, 'PURCHASE_FORM_VERSION_CHANGED', '填写模板已变化；原购物车资料仍保留。')
+        }
+        const result = await savePurchaseDraftInTransaction(trx, config, { kind: 'customer', customer }, {
+          draftId: relation.replacement_draft_id,
+          expectedRevision: body.expectedReplacementDraftRevision,
+          values: body.values,
+        }, { expectedTemplateVersionId: effective.templateVersionId,
+          ...(body.replacements ? { replacements: body.replacements } : {}) })
+        await trx.updateTable('customer_cart_line_replacement_drafts')
+          .set({ omitted_source_attachment_ids: omitted })
+          .where('line_id', '=', lineId).execute()
+        return { replacementDraftRevision: result.revision, complete: result.complete,
+          incompleteFieldIds: result.incompleteFieldIds }
+      })
+      reply.header('cache-control', 'private, no-store')
+      return success(saved, request.id)
+    } catch (error) { return mapError(error, reply, request.id) }
+  })
+
+  app.delete('/api/v1/customer/cart/lines/:lineId/purchase-form/replacement-draft', {
+    preHandler: [authenticateCustomer, csrfCheck],
+    schema: {
+      tags: ['customer'], summary: 'Discard the incomplete replacement draft for one cart line',
+      params: CustomerCartLineParamsSchema, body: cartReplacementDraftDeleteSchema,
+      response: { 200: ApiSuccessSchemaOf(Type.Object({ deleted: Type.Literal(true) }, { additionalProperties: false })),
+        401: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const { lineId } = request.params as { lineId: string }
+      const body = request.body as { expectedLineRevision: number; expectedDraftRevision: number; expectedReplacementDraftRevision: number }
+      const customer = request.customer!
+      await db.transaction().execute(async trx => {
+        await lockCustomer(trx, customer, true)
+        const line = await trx.selectFrom('customer_cart_items').selectAll()
+          .where('customer_id', '=', customer.id).where('line_id', '=', lineId).forUpdate().executeTakeFirst()
+        const relation = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
+          .where('line_id', '=', lineId).where('customer_id', '=', customer.id).forUpdate().executeTakeFirst()
+        if (!line || !relation || line.draft_id !== relation.source_draft_id) {
+          throw new CartError(404, 'CART_REPLACEMENT_NOT_FOUND', '找不到可撤销的资料编辑。')
+        }
+        if (line.revision !== body.expectedLineRevision || line.draft_revision !== body.expectedDraftRevision
+          || relation.source_line_revision !== line.revision || relation.source_draft_revision !== line.draft_revision) {
+          throw new CartError(409, 'CART_REPLACEMENT_CONFLICT', '购物车购买行已变化，请刷新后再撤销编辑。')
+        }
+        const target = await trx.selectFrom('purchase_drafts').select(['id', 'revision', 'status'])
+          .where('id', '=', relation.replacement_draft_id).forUpdate().executeTakeFirst()
+        if (!target || target.status !== 'active' || target.revision !== body.expectedReplacementDraftRevision) {
+          throw new CartError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '编辑资料已变化，请刷新后再撤销。')
+        }
+        await trx.deleteFrom('customer_cart_line_replacement_drafts').where('line_id', '=', lineId).execute()
+        await trx.updateTable('purchase_drafts').set({ status: 'deleting' }).where('id', '=', target.id).execute()
+        await trx.deleteFrom('purchase_draft_attachment_references').where('draft_id', '=', target.id).execute()
+        await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: new Date() })
+          .where('draft_id', '=', target.id).where('status', 'in', ['uploading', 'ready', 'failed']).execute()
+      })
+      reply.header('cache-control', 'no-store')
+      return success({ deleted: true }, request.id)
     } catch (error) { return mapError(error, reply, request.id) }
   })
 
@@ -484,9 +804,10 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
       tags: ['customer'], summary: 'Atomically edit a bound draft and its cart line',
       params: CustomerCartLineParamsSchema, body: CustomerCartLinePurchaseFormBodySchema,
       response: { 200: ApiSuccessSchemaOf(CustomerCartMutationSchema), 400: ApiErrorSchema,
-        401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema },
+        401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema, 422: ApiErrorSchema },
     },
   }, async (request, reply) => {
+    const preparedCopies: PreparedCartReplacementAttachmentCopy[] = []
     try {
       const { lineId } = request.params as { lineId: string }
       const body = request.body as {
@@ -510,6 +831,62 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
         const effective = await effectivePurchaseFormForSku(trx, line.sku_id, { lockStatus: 'share' })
         await lockExistingSkus(trx, [line.sku_id])
         if (body.replacementDraft) {
+          if (body.values) {
+            if (!line.draft_id || body.expectedDraftRevision === null || !line.template_version_id
+              || body.expectedDraftRevision !== line.draft_revision) {
+              throw new CartError(409, 'CART_REPLACEMENT_CONFLICT', '原购物车资料已变化，请刷新后继续编辑。')
+            }
+            if (effective.templateVersionId !== line.template_version_id) {
+              throw new CartError(409, 'PURCHASE_FORM_VERSION_CHANGED', '填写模板已变化，原购物车资料仍保留。')
+            }
+            const transferred = await transferCartReplacementAttachmentsInTransaction(trx, { kind: 'customer', customer },
+              purchaseAttachmentStorage, preparedCopies, {
+              lineId, sourceDraftId: line.draft_id, sourceDraftRevision: body.expectedDraftRevision,
+              replacementDraftId: body.replacementDraft.draftId,
+              replacementDraftRevision: body.replacementDraft.draftRevision,
+              sourceLineRevision: body.expectedLineRevision, values: body.values,
+            })
+            const saved = await savePurchaseDraftInTransaction(trx, config, { kind: 'customer', customer }, {
+              draftId: body.replacementDraft.draftId,
+              expectedRevision: body.replacementDraft.draftRevision,
+              values: transferred.values,
+            }, { expectedTemplateVersionId: effective.templateVersionId })
+            if (!saved.complete) {
+              throw new CartError(422, 'PURCHASE_FORM_INCOMPLETE', '资料尚未完整；购物车仍保留上次有效资料，已保存的编辑草稿可继续填写。')
+            }
+            const contentIdentity = purchaseLineContentIdentity(line.sku_id, line.template_version_id,
+              line.normalization_version, saved.normalizedValues)
+            const collision = await trx.selectFrom('customer_cart_items').select(['line_id', 'quantity'])
+              .where('customer_id', '=', customer.id).where('sku_id', '=', line.sku_id)
+              .where('content_identity', '=', contentIdentity).where('line_id', '!=', lineId)
+              .forUpdate().executeTakeFirst()
+            if (collision) {
+              if (collision.quantity + line.quantity > maxLineQuantity) {
+                throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
+              }
+              await trx.deleteFrom('customer_cart_items').where('line_id', '=', lineId).execute()
+              await trx.updateTable('customer_cart_items').set({ quantity: collision.quantity + line.quantity })
+                .where('line_id', '=', collision.line_id).execute()
+              await trx.deleteFrom('customer_cart_line_replacement_drafts').where('line_id', '=', lineId).execute()
+              await trx.updateTable('purchase_drafts').set({ status: 'deleting' }).where('id', '=', line.draft_id).execute()
+              await trx.updateTable('purchase_drafts').set({ status: 'deleting' })
+                .where('id', '=', body.replacementDraft.draftId).execute()
+              await trx.deleteFrom('purchase_draft_attachment_references')
+                .where('draft_id', '=', body.replacementDraft.draftId).execute()
+              await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: new Date() })
+                .where('draft_id', '=', body.replacementDraft.draftId).where('status', 'in', ['ready', 'failed']).execute()
+              return collision.line_id
+            }
+            await trx.updateTable('customer_cart_items').set({
+              draft_id: saved.id, draft_revision: saved.revision,
+              template_version_id: line.template_version_id,
+              normalization_version: line.normalization_version,
+              content_identity: contentIdentity,
+            }).where('line_id', '=', lineId).execute()
+            await trx.deleteFrom('customer_cart_line_replacement_drafts').where('line_id', '=', lineId).execute()
+            await trx.updateTable('purchase_drafts').set({ status: 'deleting' }).where('id', '=', line.draft_id).execute()
+            return lineId
+          }
           const duplicate = await trx.selectFrom('customer_cart_items').select('line_id')
             .where('customer_id', '=', customer.id).where('draft_id', '=', body.replacementDraft.draftId)
             .where('line_id', '!=', lineId).forUpdate().executeTakeFirst()
@@ -547,7 +924,13 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           draftId: line.draft_id, expectedRevision: body.draftRevision, values: body.values,
         }, { coordinatedCartEdit: true, ...(effective.templateVersionId ? { expectedTemplateVersionId: effective.templateVersionId } : {}),
           ...(body.replacements ? { replacements: body.replacements } : {}) })
-        if (!saved.complete) return lineId
+        if (!saved.complete) {
+          // A cart binding and its draft must remain a valid pair at every
+          // committed transaction boundary. Roll back this partial edit while
+          // the customer continues editing locally, then atomically replace
+          // the binding once the draft is complete.
+          throw new CartError(422, 'PURCHASE_FORM_INCOMPLETE', '资料尚未完整；购物车仍保留上次已确认的购买资料，请补齐必填项后再保存。')
+        }
         const prepared = effective.templateVersionId
         if (prepared !== line.template_version_id) {
           throw new CartError(409, 'PURCHASE_FORM_VERSION_CHANGED', '商品填写模板绑定已变化，请重新确认购买资料。')
@@ -575,7 +958,12 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
       const cart = await authenticatedCartSnapshot(db, request.customer!, config)
       reply.header('cache-control', 'no-store')
       return success({ changed: true, merged: false, skippedSkuIds: [], retainedLineId, cart } satisfies CustomerCartMutation, request.id)
-    } catch (error) { return mapError(error, reply, request.id) }
+    } catch (error) {
+      if (preparedCopies.length) await releaseUncommittedReplacementCopies(
+        db, purchaseAttachmentStorage, request.customer!, preparedCopies,
+      )
+      return mapError(error, reply, request.id)
+    }
   })
 
   app.delete('/api/v1/customer/cart/lines/:lineId', {
@@ -592,6 +980,9 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
       const changed = await db.transaction().execute(async (trx) => {
         const customer = request.customer!
         await lockCustomer(trx, customer, true)
+        const line = await trx.selectFrom('customer_cart_items').select('line_id')
+          .where('customer_id', '=', customer.id).where('line_id', '=', lineId).forUpdate().executeTakeFirst()
+        if (line) await discardPendingLineReplacements(trx, [line.line_id])
         const result = await trx.deleteFrom('customer_cart_items')
           .where('customer_id', '=', customer.id).where('line_id', '=', lineId).executeTakeFirst()
         return result.numDeletedRows > 0n

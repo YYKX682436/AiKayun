@@ -33,6 +33,7 @@ import { purchaseFormAuditProductIdentityMigration } from './migrations/20261024
 import { purchaseLinesMigration } from './migrations/202610250001_purchase_lines.js'
 import { purchaseSnapshotManifestR1Migration } from './migrations/202610250002_purchase_snapshot_manifest_r1.js'
 import { purchaseFormActivationStateMigration } from './migrations/202610250003_purchase_form_activation_state.js'
+import { cartReplacementDraftsMigration } from './migrations/202610250004_cart_replacement_drafts.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -70,6 +71,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610250001_purchase_lines': purchaseLinesMigration,
       '202610250002_purchase_snapshot_manifest_r1': purchaseSnapshotManifestR1Migration,
       '202610250003_purchase_form_activation_state': purchaseFormActivationStateMigration,
+      '202610250004_cart_replacement_drafts': cartReplacementDraftsMigration,
     }
   }
 }

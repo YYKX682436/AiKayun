@@ -27,6 +27,7 @@ import {
   readPurchaseDraftAttachment,
   reconcilePurchaseDrafts,
   renewPurchaseDraft,
+  releaseUnreferencedPurchaseDraftAttachment,
   requestPurchaseDraftAttachmentDeletion,
   requestPurchaseDraftDeletion,
   savePurchaseDraft,
@@ -264,6 +265,29 @@ afterAll(async () => {
 })
 
 describe('⑥-2A preparation and private draft foundations on PostgreSQL', () => {
+  it('keeps the fifty-draft owner limit while separately created purchase answers retain capacity', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const customer = await makeCustomer()
+    const owner = customerOwner(customer)
+    const drafts: string[] = []
+    for (let index = 0; index < 50; index++) {
+      const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+      const saved = await savePurchaseDraft(db, configA, owner, {
+        draftId: draft.id, expectedRevision: draft.revision,
+        values: { [fixture.ids.accountId]: `900000000000000000${String(index).padStart(2, '0')}` },
+      })
+      expect(saved.complete).toBe(false)
+      drafts.push(draft.id)
+    }
+    expect(new Set(drafts).size).toBe(50)
+    await expect(createPurchaseDraft(db, configA, owner, fixture.versionId))
+      .rejects.toMatchObject({ code: 'PURCHASE_DRAFT_LIMIT' })
+    expect(await db.selectFrom('purchase_drafts').select('id').where('customer_id', '=', customer.id)
+      .where('status', '=', 'active').execute()).toHaveLength(50)
+    const oneExisting = await getPurchaseDraft(db, configA, owner, drafts[17]!)
+    expect(oneExisting.values[fixture.ids.accountId]).toBe('90000000000000000017')
+  }, 45_000)
+
   it('preserves frozen templates, identities and audit payloads while applying the forward delete fix', async () => {
     const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
     const baseline = await migrator.migrateTo('202610240002_purchase_forms_drafts')
@@ -1154,6 +1178,83 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     expect(check).toMatchObject({ missingObjects: 0, oldOrphanFiles: 0 })
     const deleted = await getPurchaseDraft(db, configA, owner, draft.id)
     expect(deleted.attachments.map(attachment => attachment.id)).toEqual([replacement.attachmentId])
+  }, 45_000)
+
+  it('releases an uploaded single-image replacement after a revision conflict without harming the referenced image', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const customer = await makeCustomer()
+    const owner = customerOwner(customer)
+    const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const storage = new PurchaseAttachmentStorage(privateRoot)
+    const image = await sharp({ create: { width: 13, height: 9, channels: 4, background: '#1b6d84' } }).png().toBuffer()
+    const values = (attachmentId: string, account: string) => ({
+      [fixture.ids.accountId]: account,
+      [fixture.ids.selectId]: fixture.options.planA,
+      [fixture.ids.cascadeId]: { path: [fixture.ids.regionId, fixture.ids.serverId],
+        expanded: { [fixture.ids.playerId]: 'replacement-check' } },
+      [fixture.ids.imageId]: [attachmentId],
+    })
+    const first = await uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([image]),
+    })
+    const initial = await savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, values: values(first.attachmentId, '00041'),
+    })
+    const second = await uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: draft.id, expectedRevision: initial.revision, fieldId: fixture.ids.imageId,
+      replaceAttachmentId: first.attachmentId, claimedMimeType: 'image/png', stream: Readable.from([image]),
+    })
+
+    // This committed edit represents another tab advancing the revision while
+    // keeping A referenced. The replacement request still carries rev 2.
+    const competing = await savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: initial.revision, values: values(first.attachmentId, '00042'),
+    })
+    await expect(savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: initial.revision,
+      values: values(second.attachmentId, '00043'),
+    }, { replacements: [{ oldAttachmentId: first.attachmentId, newAttachmentId: second.attachmentId }] }))
+      .rejects.toMatchObject({ status: 409, code: 'PURCHASE_DRAFT_REVISION_CONFLICT' })
+
+    const beforeRelease = await getPurchaseDraft(db, configA, owner, draft.id)
+    expect(beforeRelease.values).toMatchObject(values(first.attachmentId, '00042'))
+    expect(beforeRelease.attachments.map(attachment => attachment.id)).toContain(first.attachmentId)
+    expect(beforeRelease.attachments.map(attachment => attachment.id)).toContain(second.attachmentId)
+    expect((await readPurchaseDraftAttachment(db, storage, owner, draft.id, first.attachmentId)).sha256).toBe(first.sha256)
+
+    // Without releasing unreferenced B, the unchanged single-image limit
+    // correctly rejects C. This reproduces why failed-save cleanup is needed.
+    await expect(uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: draft.id, expectedRevision: competing.revision, fieldId: fixture.ids.imageId,
+      replaceAttachmentId: first.attachmentId, claimedMimeType: 'image/png', stream: Readable.from([image]),
+    })).rejects.toMatchObject({ status: 409, code: 'PURCHASE_ATTACHMENT_FIELD_LIMIT' })
+
+    await expect(releaseUnreferencedPurchaseDraftAttachment(db, storage, owner, draft.id, second.attachmentId))
+      .resolves.toEqual({ released: true })
+    const afterRelease = await getPurchaseDraft(db, configA, owner, draft.id)
+    expect(afterRelease.values).toMatchObject(values(first.attachmentId, '00042'))
+    expect(afterRelease.attachments.map(attachment => attachment.id)).toEqual([first.attachmentId])
+    await expect(readPurchaseDraftAttachment(db, storage, owner, draft.id, first.attachmentId))
+      .resolves.toMatchObject({ sha256: first.sha256 })
+    expect(await db.selectFrom('purchase_draft_attachments').select('id').where('id', '=', second.attachmentId).execute())
+      .toHaveLength(0)
+
+    // A new replacement can start immediately at the unchanged field limit.
+    const retry = await uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: draft.id, expectedRevision: competing.revision, fieldId: fixture.ids.imageId,
+      replaceAttachmentId: first.attachmentId, claimedMimeType: 'image/png', stream: Readable.from([image]),
+    })
+    const completed = await savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: competing.revision, values: values(retry.attachmentId, '00042'),
+    }, { replacements: [{ oldAttachmentId: first.attachmentId, newAttachmentId: retry.attachmentId }] })
+    expect(completed.revision).toBe(competing.revision + 1)
+    expect((await getPurchaseDraft(db, configA, owner, draft.id)).values)
+      .toMatchObject(values(retry.attachmentId, '00042'))
+    await reconcilePurchaseDrafts(db, storage, { repair: true })
+    expect(await db.selectFrom('purchase_draft_attachments').select('id').where('id', '=', second.attachmentId).execute())
+      .toHaveLength(0)
+    expect((await readPurchaseDraftAttachment(db, storage, owner, draft.id, retry.attachmentId)).sha256).toBe(retry.sha256)
   }, 45_000)
 
   it('releases a confirmed stale upload reservation so the same image field can be retried immediately', async () => {

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { PurchaseFormDefinition, PurchaseFormField, PurchaseFormLeafField } from '@aikayun/contracts'
 
-type Attachment = { id: string; fieldId: string; url: string; mimeType: string; byteSize: number }
+type Attachment = { id: string; fieldId: string; url: string; mimeType: string; byteSize: number; replacesAttachmentId?: string }
 type CascadeValue = { path: string[]; expanded: Record<string, unknown> }
 const props = defineProps<{
   definition: PurchaseFormDefinition

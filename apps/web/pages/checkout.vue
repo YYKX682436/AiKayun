@@ -3,8 +3,9 @@ import type { CartSkuQuantity, CheckoutQuote, CheckoutQuoteItem, CheckoutRequest
 import type { CreateOrderResult } from '@aikayun/contracts'
 import { CheckoutConflictError, CustomerApiError } from '~/composables/useCustomerApi'
 import { loadCheckoutSelection } from '~/utils/checkoutSelection'
+import { saveFreshCheckoutSelection } from '~/utils/checkoutSelection'
 import {
-  completeOrderIntentV2, findOrderIntentBySelectionId, findOrderIntentV2, hasOrderIntentV2,
+  completeOrderIntentV2, findAnyOrderIntentBySelectionId, findOrderIntentBySelectionId, findOrderIntentV2, hasOrderIntentV2,
   PendingOwnerConflictError, prepareOrderIntentV2, rejectOrderIntentV2,
   withOrderSubmissionLock,
 } from '~/utils/checkoutOrderIntent'
@@ -116,9 +117,24 @@ const requestedSelection = computed(() => {
 })
 const requestedSelectionFingerprint = computed(() => selectionFingerprint(requestedSelection.value))
 const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id))
-const loginRedirect = computed(() => `/login?redirect=${encodeURIComponent(route.fullPath)}`)
+const loginRedirect = computed(() => {
+  let target = route.fullPath
+  const selection = requestedSelection.value
+  const selected = selection?.version === 2 && selection.items.length === 1 ? selection.items[0] : undefined
+  const selectedDraftId = selected && 'draftId' in selected && typeof selected.draftId === 'string' ? selected.draftId : null
+  const isCartLine = selectedDraftId !== null && shoppingCart.guestItems.value.some(item =>
+    'draftId' in item && typeof item.draftId === 'string' && item.draftId.toLowerCase() === selectedDraftId.toLowerCase())
+  if (!isCustomer.value && selectedDraftId && !isCartLine && route.query.claimGuestDraft !== '1') {
+    const [pathname, query = ''] = target.split('?', 2)
+    const params = new URLSearchParams(query)
+    params.set('claimGuestDraft', '1')
+    target = `${pathname}?${params.toString()}`
+  }
+  return `/login?redirect=${encodeURIComponent(target)}`
+})
 const purchaseLoginRequired = computed(() => !isCustomer.value
   && Boolean(quote.value?.items.some(item => item.purchaseLimits.requiresLogin)))
+const claimSelectedGuestDraft = computed(() => route.query.claimGuestDraft === '1')
 
 function statusLabel(item: CheckoutQuoteItem): string {
   switch (item.reason) {
@@ -332,6 +348,57 @@ async function showCompletedOrder(orderId: string, context: CheckoutOperationCon
   await navigateTo(`/orders/${orderId}`)
 }
 
+async function claimSelectedGuestDraftAfterLogin(context: CheckoutOperationContext): Promise<boolean> {
+  if (!claimSelectedGuestDraft.value || !isCustomer.value) return true
+  const selection = context.selection
+  const candidate = selection?.version === 2 && selection.items.length === 1 ? selection.items[0] : undefined
+  const candidateDraft = candidate as (CheckoutRequestLineV2 & { draftId?: unknown; draftRevision?: unknown }) | undefined
+  const draftId = candidateDraft?.draftId
+  const draftRevision = candidateDraft?.draftRevision
+  const selected = candidate && typeof draftId === 'string' && typeof draftRevision === 'number'
+    ? candidate as { lineId: string; skuId: string; quantity: number; draftId: string; draftRevision: number }
+    : undefined
+  if (!selected || typeof draftId !== 'string' || typeof draftRevision !== 'number'
+    || !Number.isSafeInteger(draftRevision) || !context.selectionId) {
+    submitError.value = '本次登录继续购买缺少有效的游客资料引用。请返回商品页重新确认。'
+    pendingOwnerBlocked.value = true
+    return false
+  }
+  return withOrderSubmissionLock(async () => {
+    if (!pageContextIsCurrent(context) || !identityContextIsCurrent(context)) return false
+    // Keep any guest-owned pending or completed idempotency request untouched.
+    // Claiming the draft would otherwise silently move its selection to a new
+    // customer identity or key.
+    const priorIntent = await findAnyOrderIntentBySelectionId(context.selectionId!)
+    if (!pageContextIsCurrent(context) || !identityContextIsCurrent(context)) return false
+    if (priorIntent && priorIntent.state !== 'rejected') {
+      pendingOwnerBlocked.value = true
+      submitError.value = '原游客订单请求仍待核实。已保留原资料归属和提交标识，请先使用游客身份核对订单结果。'
+      return false
+    }
+    try {
+      const result = await customerApi.request<{ draftId: string; skuId: string; templateVersionId: string; revision: number; complete: true }>(
+        `/api/v1/customer/purchase-drafts/${encodeURIComponent(draftId)}/claim-selected`, {
+          method: 'POST', body: { skuId: selected.skuId, expectedRevision: draftRevision },
+        },
+      )
+      if (!pageContextIsCurrent(context) || !identityContextIsCurrent(context)) return false
+      const items: CheckoutRequestLineV2[] = [{
+        lineId: selected.lineId, skuId: selected.skuId, quantity: selected.quantity,
+        draftId: result.draftId, draftRevision: result.revision,
+      }]
+      const nextPath = saveFreshCheckoutSelection(items)
+      await router.replace(nextPath)
+      return false
+    } catch (error) {
+      if (pageContextIsCurrent(context) && identityContextIsCurrent(context)) {
+        submitError.value = error instanceof Error ? error.message : '无法认领本次所选游客资料；原资料仍保留。请重新报价后重试。'
+      }
+      return false
+    }
+  })
+}
+
 async function createOrder() {
   const pageContext = captureOperationContext()
   const currentQuote = quote.value
@@ -434,6 +501,8 @@ watch(
     if (!import.meta.client || route.path !== '/checkout') return
     if (typeof route.query.intent === 'string' && !clientReady.value) return
     void (async () => {
+      const claimReady = await claimSelectedGuestDraftAfterLogin(context)
+      if (!claimReady || !pageContextIsCurrent(context)) return
       await replayPendingV2(context)
       if (pageContextIsCurrent(context)) await loadQuote(context)
     })()
@@ -447,6 +516,8 @@ watch(
     const context = captureOperationContext()
     if (!import.meta.client || !clientReady.value || route.path !== '/checkout') return
     void (async () => {
+      const claimReady = await claimSelectedGuestDraftAfterLogin(context)
+      if (!claimReady || !pageContextIsCurrent(context)) return
       await replayPendingV2(context)
       if (pageContextIsCurrent(context)) await loadQuote(context)
     })()

@@ -25,13 +25,17 @@ import { effectivePurchaseFormForSku } from './purchase-form-config.js'
 import {
   PurchaseDraftServiceError,
   createPurchaseDraftInTransaction,
+  claimGuestPurchaseDraftsInTransaction,
   getPurchaseDraft,
   inspectPurchaseDraftCompleteness,
   readPurchaseDraftAttachment,
+  releaseUnreferencedPurchaseDraftAttachment,
   requestPurchaseDraftAttachmentDeletion,
   requestPurchaseDraftDeletion,
   savePurchaseDraftInTransaction,
   uploadPurchaseDraftAttachment,
+  validateAndLockPurchaseDraftOwner,
+  validatePurchaseDraftForPurchaseInTransaction,
   type PurchaseDraftOwner,
 } from './purchase-forms.js'
 import { guestSessionCookie } from './orders.js'
@@ -50,6 +54,26 @@ const draftCreatedSchema = Type.Object({
   expiresAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
 const deletedSchema = Type.Object({ deleted: Type.Literal(true) }, { additionalProperties: false })
+const releaseSchema = Type.Object({ released: Type.Boolean() }, { additionalProperties: false })
+const draftRecoveryListSchema = Type.Array(Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  templateVersionId: Type.String({ format: 'uuid' }),
+  revision: Type.Integer({ minimum: 1 }),
+  expiresAt: Type.String({ format: 'date-time' }),
+  updatedAt: Type.String({ format: 'date-time' }),
+  templateChanged: Type.Boolean(),
+}, { additionalProperties: false }), { maxItems: 50 })
+const selectedDraftClaimBodySchema = Type.Object({
+  skuId: Type.String({ format: 'uuid' }),
+  expectedRevision: Type.Integer({ minimum: 1 }),
+}, { additionalProperties: false })
+const selectedDraftClaimResultSchema = Type.Object({
+  draftId: Type.String({ format: 'uuid' }),
+  skuId: Type.String({ format: 'uuid' }),
+  templateVersionId: Type.String({ format: 'uuid' }),
+  revision: Type.Integer({ minimum: 1 }),
+  complete: Type.Literal(true),
+}, { additionalProperties: false })
 
 function ownerForRequest(request: FastifyRequest): PurchaseDraftOwner {
   if (request.customer) return { kind: 'customer', customer: request.customer }
@@ -87,6 +111,7 @@ function draftResponse(view: Awaited<ReturnType<typeof getPurchaseDraft>>, skuId
       byteSize: attachment.byte_size!,
       width: attachment.width!,
       height: attachment.height!,
+      ...(attachment.replaces_attachment_id ? { replacesAttachmentId: attachment.replaces_attachment_id } : {}),
       url: `/api/v1/storefront/purchase-drafts/${view.id}/attachments/${attachment.id}`,
     })),
   }
@@ -120,6 +145,53 @@ export async function registerCustomerPurchaseFormRoutes(
       return success({ skuId, status: effective.status, required: true,
         templateVersionId: effective.templateVersionId, templateName: effective.templateName,
         versionNumber: effective.versionNumber, definition: effective.definition }, request.id)
+    } catch (error) { return routeError(error, reply, request.id) }
+  })
+
+  app.get('/api/v1/storefront/skus/:skuId/purchase-drafts', {
+    preHandler: optionalCustomerAuth,
+    schema: {
+      tags: ['customer'], summary: 'List safe recovery metadata for the caller-owned drafts of the current SKU form',
+      params: Type.Object({ skuId: Type.String({ format: 'uuid' }) }, { additionalProperties: false }),
+      response: { 200: ApiSuccessSchemaOf(draftRecoveryListSchema), 401: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const { skuId } = request.params as { skuId: string }
+      if (!request.customer && !request.cookies[guestSessionCookie]) {
+        reply.header('cache-control', 'private, no-store')
+        return success([], request.id)
+      }
+      const owner = ownerForRequest(request)
+      const candidates = await db.transaction().execute(async trx => {
+        const effective = await effectivePurchaseFormForSku(trx, skuId, { lockStatus: 'share' })
+        if (!effective.templateId || !effective.templateVersionId) return []
+        const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'share')
+        let query = trx.selectFrom('purchase_drafts as draft')
+          .innerJoin('purchase_form_template_versions as version', 'version.id', 'draft.template_version_id')
+          .select(['draft.id', 'draft.template_version_id', 'draft.revision', 'draft.expires_at', 'draft.updated_at'])
+          .where('version.template_id', '=', effective.templateId)
+          .where('draft.status', '=', 'active').where('draft.expires_at', '>', new Date())
+        query = identity.kind === 'customer'
+          ? query.where('draft.customer_id', '=', identity.customerId).where('draft.guest_order_session_id', 'is', null)
+          : query.where('draft.guest_order_session_id', '=', identity.guestSessionId).where('draft.customer_id', 'is', null)
+        const rows = await query.orderBy('draft.updated_at', 'desc').orderBy('draft.id').limit(50).execute()
+        const bound = identity.kind === 'customer' && rows.length
+          ? new Set((await trx.selectFrom('customer_cart_items').select('draft_id')
+            .where('customer_id', '=', identity.customerId).where('draft_id', 'in', rows.map(row => row.id)).execute())
+            .flatMap(row => row.draft_id ? [row.draft_id] : []))
+          : new Set<string>()
+        return rows.filter(row => !bound.has(row.id)).map(row => ({
+          id: row.id,
+          templateVersionId: row.template_version_id,
+          revision: row.revision,
+          expiresAt: row.expires_at.toISOString(),
+          updatedAt: row.updated_at.toISOString(),
+          templateChanged: row.template_version_id !== effective.templateVersionId,
+        }))
+      })
+      reply.header('cache-control', 'private, no-store')
+      return success(candidates, request.id)
     } catch (error) { return routeError(error, reply, request.id) }
   })
 
@@ -163,6 +235,46 @@ export async function registerCustomerPurchaseFormRoutes(
       const view = await getPurchaseDraft(db, config, ownerForRequest(request), id, skuId)
       reply.header('cache-control', 'private, no-store')
       return success(draftResponse(view, skuId), request.id)
+    } catch (error) { return routeError(error, reply, request.id) }
+  })
+
+  app.post('/api/v1/customer/purchase-drafts/:id/claim-selected', {
+    logLevel: 'silent', preHandler: [optionalCustomerAuth, customerCsrf],
+    schema: {
+      tags: ['customer'], summary: 'Claim only the guest draft explicitly selected for direct checkout',
+      params: DraftIdParamsSchema, body: selectedDraftClaimBodySchema,
+      response: { 200: ApiSuccessSchemaOf(selectedDraftClaimResultSchema), 400: ApiErrorSchema,
+        401: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema, 410: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const customer = request.customer
+      if (!customer) throw new PurchaseDraftServiceError(401, 'UNAUTHORIZED', '请先登录后继续购买。')
+      const guestSessionToken = request.cookies[guestSessionCookie]
+      if (!guestSessionToken) throw new PurchaseDraftServiceError(401, 'GUEST_SESSION_REQUIRED', '原游客会话已失效，请返回原页面重新确认。')
+      const { id } = request.params as { id: string }
+      const body = request.body as { skuId: string; expectedRevision: number }
+      const result = await db.transaction().execute(async trx => {
+        // Reuse the one-way guest claim primitive. Its already-claimed branch
+        // makes a repeated redirect or a lost response safe and idempotent.
+        const claimed = await claimGuestPurchaseDraftsInTransaction(trx, customer, guestSessionToken, [{
+          draftId: id, expectedRevision: body.expectedRevision,
+        }])
+        const effective = await effectivePurchaseFormForSku(trx, body.skuId, { lockStatus: 'share' })
+        if (!effective.templateVersionId) {
+          throw new PurchaseDraftServiceError(409, 'PURCHASE_TEMPLATE_VERSION_CONFLICT', '购买模板已变化，请返回商品页重新填写。')
+        }
+        const revision = claimed.revisions[id]
+        if (!revision) throw new PurchaseDraftServiceError(404, 'PURCHASE_DRAFT_NOT_FOUND', '找不到这份可认领的购买资料。')
+        const validated = await validatePurchaseDraftForPurchaseInTransaction(trx, config,
+          { kind: 'customer', customer }, {
+            draftId: id, expectedRevision: revision, expectedTemplateVersionId: effective.templateVersionId,
+          }, 'update')
+        return { draftId: id, skuId: body.skuId, templateVersionId: validated.templateVersionId,
+          revision: validated.revision, complete: true as const }
+      })
+      reply.header('cache-control', 'private, no-store')
+      return success(result, request.id)
     } catch (error) { return routeError(error, reply, request.id) }
   })
 
@@ -309,6 +421,25 @@ export async function registerCustomerPurchaseFormRoutes(
       const result = await requestPurchaseDraftAttachmentDeletion(db, ownerForRequest(request), id, attachmentId, expectedRevision)
       reply.header('cache-control', 'no-store')
       return success({ revision: result.revision }, request.id)
+    } catch (error) { return routeError(error, reply, request.id) }
+  })
+
+  app.post('/api/v1/storefront/purchase-drafts/:id/attachments/:attachmentId/release', {
+    logLevel: 'silent', preHandler: [optionalCustomerAuth, customerCsrf],
+    schema: {
+      tags: ['customer'], summary: 'Release an unreferenced ready draft image after a failed save',
+      params: DraftAttachmentParamsSchema, body: Type.Object({}, { additionalProperties: false }),
+      response: { 200: ApiSuccessSchemaOf(releaseSchema), 401: ApiErrorSchema, 404: ApiErrorSchema,
+        409: ApiErrorSchema, 410: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const { id, attachmentId } = request.params as { id: string; attachmentId: string }
+      const result = await releaseUnreferencedPurchaseDraftAttachment(
+        db, storage, ownerForRequest(request), id, attachmentId,
+      )
+      reply.header('cache-control', 'no-store')
+      return success(result, request.id)
     } catch (error) { return routeError(error, reply, request.id) }
   })
 }

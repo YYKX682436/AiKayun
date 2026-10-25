@@ -256,6 +256,12 @@ export async function findOrderIntentBySelectionId(selectionId: string, ownerId:
   })
 }
 
+/** Inspect the exact opaque selection without changing or adopting its owner. */
+export async function findAnyOrderIntentBySelectionId(selectionId: string): Promise<OrderIntentV2 | null> {
+  if (!isUuid(selectionId)) return null
+  return withStorageLock(() => exactIntent(readMigrated().intents, selectionId))
+}
+
 export async function prepareOrderIntentV2(
   items: CheckoutRequestLineV2[], ownerId: string, quoteToken: string, selectionId: string | null,
 ): Promise<PendingOrderIntentV2 | CompletedOrderIntentV2> {

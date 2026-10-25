@@ -38,6 +38,18 @@ export function saveCheckoutSelection(items: CheckoutRequestLineV2[]): string {
   return `/checkout?intent=${encodeURIComponent(id)}`
 }
 
+/** Create a new opaque selection after an explicit ownership transition. */
+export function saveFreshCheckoutSelection(items: CheckoutRequestLineV2[]): string {
+  if (!import.meta.client) return '/cart'
+  const fingerprint = selectionFingerprint(items)
+  const selections = readSelections()
+  const id = crypto.randomUUID()
+  sessionStorage.setItem(selectionStorageKey, JSON.stringify([
+    ...selections.slice(-99), { id, fingerprint, items: items.map(item => ({ ...item })) },
+  ]))
+  return `/checkout?intent=${encodeURIComponent(id)}`
+}
+
 export function loadCheckoutSelection(id: string): CheckoutRequestLineV2[] | null {
   if (!import.meta.client || !/^[0-9a-f-]{36}$/iu.test(id)) return null
   const selection = readSelections().find(item => item.id === id)

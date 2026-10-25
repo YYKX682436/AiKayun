@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { toRaw } from 'vue'
-import { validatePurchaseFormDefinition, type ApiSuccess, type CheckoutQuote, type CheckoutQuoteItem, type PurchaseDraft, type PurchaseFormDefinition, type PurchaseFormField, type StorefrontPurchaseForm, type PublicInventorySummary, type PublicProductDetail, type PublicProductVariant } from '@aikayun/contracts'
+import { normalizePurchaseFormAnswers, validatePurchaseFormDefinition, type ApiSuccess, type CheckoutQuote, type CheckoutQuoteItem, type PurchaseDraft, type PurchaseFormDefinition, type PurchaseFormField, type StorefrontPurchaseForm, type PublicInventorySummary, type PublicProductDetail, type PublicProductVariant } from '@aikayun/contracts'
 
 const route = useRoute()
 const siteUrl = usePublicSiteUrl()
@@ -38,6 +38,7 @@ const purchaseQuoteBusy = ref(false)
 let purchaseQuoteSequence = 0
 const purchaseForm = ref<StorefrontPurchaseForm | null>(null)
 const purchaseDraft = ref<PurchaseDraft | null>(null)
+const cartReplacementSourceDraft = ref<PurchaseDraft | null>(null)
 const purchaseValues = ref<Record<string, unknown>>({})
 const purchaseDraftDirty = ref(false)
 const purchaseDraftComplete = ref(false)
@@ -49,14 +50,35 @@ const purchaseFormResetKey = ref(0)
 const immediateLineId = ref('')
 const storefrontInteractive = ref(false)
 let purchaseFormGeneration = 0
+let purchaseFormOperationSequence = 0
+let activePurchaseFormOperation = 0
+let purchaseFormDisposed = false
 let installingPurchaseDraft = false
-const purchaseDraftCache = new Map<string, { form: StorefrontPurchaseForm; draft: PurchaseDraft }>()
+type PurchaseDraftRecovery = {
+  id: string
+  templateVersionId: string
+  revision: number
+  expiresAt: string
+  updatedAt: string
+  templateChanged: boolean
+}
+const purchaseDraftRecoveries = ref<PurchaseDraftRecovery[]>([])
+type PurchaseFormOperationContext = {
+  skuId: string
+  draftId: string
+  draftRevision: number
+  identityVersion: number
+  generation: number
+  operationId: number
+}
 type CartEditContext = {
   lineId: string
   skuId: string
   lineRevision: number | null
   expectedDraftRevision: number | null
   draftId: string | null
+  replacementDraftId: string | null
+  omittedSourceAttachmentIds: string[]
   quantity: number
 }
 const cartEdit = ref<CartEditContext | null>(null)
@@ -67,6 +89,11 @@ const purchaseDefinition = computed<PurchaseFormDefinition | null>(() => {
   if (!definition) return null
   const validated = validatePurchaseFormDefinition(definition)
   return validated.ok ? validated.value : null
+})
+const availablePurchaseDraftRecoveries = computed(() => {
+  const bound = new Set(shoppingCart.guestItems.value.flatMap(item =>
+    'draftId' in item && item.draftId ? [item.draftId] : []))
+  return purchaseDraftRecoveries.value.filter(candidate => !bound.has(candidate.id))
 })
 
 watch(product, (value) => {
@@ -92,31 +119,164 @@ function parseCartEditContext(): CartEditContext | null {
   const lineRevisionValue = typeof query.lineRevision === 'string' ? Number(query.lineRevision) : null
   const expectedDraftRevisionValue = typeof query.expectedDraftRevision === 'string' ? Number(query.expectedDraftRevision) : null
   const draftId = typeof query.draftId === 'string' ? query.draftId : null
+  const replacementDraftId = typeof query.replacementDraftId === 'string' ? query.replacementDraftId : null
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
   if (!uuid.test(lineId) || !uuid.test(skuId)
     || (lineRevisionValue !== null && (!Number.isSafeInteger(lineRevisionValue) || lineRevisionValue < 1))
     || (expectedDraftRevisionValue !== null && (!Number.isSafeInteger(expectedDraftRevisionValue) || expectedDraftRevisionValue < 1))
     || (draftId !== null && !uuid.test(draftId))
+    || (replacementDraftId !== null && !uuid.test(replacementDraftId))
     || !Number.isSafeInteger(quantityValue) || quantityValue < 1 || quantityValue > 99) return null
   return { lineId: lineId.toLowerCase(), skuId: skuId.toLowerCase(), lineRevision: lineRevisionValue,
-    expectedDraftRevision: expectedDraftRevisionValue, draftId: draftId?.toLowerCase() ?? null, quantity: quantityValue }
+    expectedDraftRevision: expectedDraftRevisionValue, draftId: draftId?.toLowerCase() ?? null,
+    replacementDraftId: replacementDraftId?.toLowerCase() ?? null, omittedSourceAttachmentIds: [], quantity: quantityValue }
 }
 
-watch(() => [route.query.editLineId, route.query.skuId, route.query.lineRevision, route.query.expectedDraftRevision, route.query.draftId, route.query.quantity], () => {
+watch(() => [route.query.editLineId, route.query.skuId, route.query.lineRevision, route.query.expectedDraftRevision, route.query.draftId, route.query.replacementDraftId, route.query.quantity], () => {
   cartEdit.value = parseCartEditContext()
 }, { immediate: true, flush: 'sync' })
 const isEditingCartLine = computed(() => Boolean(cartEdit.value && cartEdit.value.skuId === selectedVariant.value?.skuId.toLowerCase()))
+const hasCartReplacementDraft = computed(() => Boolean(isEditingCartLine.value && cartEdit.value?.replacementDraftId
+  && purchaseDraft.value?.id === cartEdit.value.replacementDraftId))
 
-function installPurchaseDraft(draft: PurchaseDraft) {
+function installPurchaseDraft(draft: PurchaseDraft, newPurchaseSelection = false) {
   installingPurchaseDraft = true
   purchaseDraft.value = draft
-  purchaseValues.value = structuredClone(draft.values)
+  purchaseValues.value = clonePurchaseRecord(draft.values)
   purchaseDraftDirty.value = false
   purchaseDraftComplete.value = false
   purchaseFormErrors.value = {}
-  immediateLineId.value = crypto.randomUUID()
+  if (newPurchaseSelection || !immediateLineId.value) immediateLineId.value = crypto.randomUUID()
   purchaseFormResetKey.value++
   nextTick(() => { installingPurchaseDraft = false })
+}
+
+function clonePurchaseRecord(values: Record<string, unknown>): Record<string, unknown> {
+  // Draft answers are JSON by contract; JSON cloning also unwraps nested Vue
+  // proxies received from a reactive cart draft.
+  return JSON.parse(JSON.stringify(values)) as Record<string, unknown>
+}
+
+function mergeReplacementDraftForDisplay(
+  target: PurchaseDraft,
+  source: PurchaseDraft,
+  omittedSourceAttachmentIds: string[],
+  definition: PurchaseFormDefinition,
+): PurchaseDraft {
+  const values = clonePurchaseRecord(target.revision === 1 ? source.values : target.values)
+  const replacedIds = new Set(target.attachments.flatMap(attachment => attachment.replacesAttachmentId
+    ? [attachment.replacesAttachmentId.toLowerCase()] : []))
+  const excludedIds = new Set([...omittedSourceAttachmentIds.map(id => id.toLowerCase()), ...replacedIds])
+  const mergeImageList = (current: unknown, previous: unknown): string[] => {
+    const next = Array.isArray(current) ? current.filter((value): value is string => typeof value === 'string') : []
+    const old = Array.isArray(previous) ? previous.filter((value): value is string => typeof value === 'string') : []
+    return [...old.filter(id => !excludedIds.has(id.toLowerCase()) && !next.includes(id)), ...next]
+  }
+
+  for (const field of definition.fields) {
+    const fieldId = field.id.toLowerCase()
+    if (field.type === 'image') {
+      const merged = mergeImageList(values[fieldId], source.values[fieldId])
+      if (merged.length) values[fieldId] = merged
+      else delete values[fieldId]
+      continue
+    }
+    if (field.type !== 'cascade') continue
+    const sourceRaw = source.values[fieldId]
+    const targetRaw = values[fieldId]
+    const sourceCascade = sourceRaw && typeof sourceRaw === 'object' && !Array.isArray(sourceRaw)
+      ? sourceRaw as { path?: unknown; expanded?: unknown } : null
+    const targetCascade = targetRaw && typeof targetRaw === 'object' && !Array.isArray(targetRaw)
+      ? targetRaw as { path?: unknown; expanded?: unknown } : null
+    const sourcePath = Array.isArray(sourceCascade?.path) ? sourceCascade.path.filter((id): id is string => typeof id === 'string') : []
+    const targetPath = Array.isArray(targetCascade?.path) ? targetCascade.path.filter((id): id is string => typeof id === 'string') : []
+    const path = target.revision === 1 ? sourcePath : targetPath
+    if (!path.length || (sourcePath.length && path.length !== sourcePath.length)
+      || (sourcePath.length && path.some((id, index) => id.toLowerCase() !== sourcePath[index]?.toLowerCase()))) continue
+    const targetExpanded = targetCascade?.expanded && typeof targetCascade.expanded === 'object' && !Array.isArray(targetCascade.expanded)
+      ? targetCascade.expanded as Record<string, unknown> : {}
+    const sourceExpanded = sourceCascade?.expanded && typeof sourceCascade.expanded === 'object' && !Array.isArray(sourceCascade.expanded)
+      ? sourceCascade.expanded as Record<string, unknown> : {}
+    const expanded = { ...sourceExpanded, ...targetExpanded }
+    let options = field.options
+    for (const optionId of path) {
+      const selected = options.find(option => option.id.toLowerCase() === optionId.toLowerCase())
+      if (!selected) break
+      for (const expandedField of selected.expandedFields ?? []) {
+        if (expandedField.type !== 'image') continue
+        const expandedId = expandedField.id.toLowerCase()
+        const merged = mergeImageList(targetExpanded[expandedId], sourceExpanded[expandedId])
+        if (merged.length) expanded[expandedId] = merged
+        else delete expanded[expandedId]
+      }
+      options = selected.children ?? []
+    }
+    values[fieldId] = { path, expanded }
+  }
+  const referenced = new Set<string>()
+  const collect = (raw: unknown) => {
+    if (Array.isArray(raw)) {
+      for (const id of raw) if (typeof id === 'string') referenced.add(id.toLowerCase())
+    }
+    else if (raw && typeof raw === 'object') {
+      for (const nested of Object.values(raw as Record<string, unknown>)) collect(nested)
+    }
+  }
+  collect(values)
+  const sourceAttachments = source.attachments.filter(attachment => referenced.has(attachment.id.toLowerCase())
+    && !excludedIds.has(attachment.id.toLowerCase()))
+  return { ...target, values, attachments: [...target.attachments, ...sourceAttachments] }
+}
+
+function stripSourceImageAnswers(
+  rawValues: Record<string, unknown>,
+  definition: PurchaseFormDefinition,
+  sourceAttachmentIds: ReadonlySet<string>,
+): Record<string, unknown> {
+  const values = clonePurchaseRecord(rawValues)
+  const strip = (raw: unknown) => Array.isArray(raw)
+    ? raw.filter(id => typeof id !== 'string' || !sourceAttachmentIds.has(id.toLowerCase()))
+    : raw
+  for (const field of definition.fields) {
+    const fieldId = field.id.toLowerCase()
+    if (field.type === 'image') {
+      const kept = strip(values[fieldId])
+      if (Array.isArray(kept) && kept.length) values[fieldId] = kept
+      else delete values[fieldId]
+      continue
+    }
+    if (field.type !== 'cascade') continue
+    const raw = values[fieldId]
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const cascade = raw as { path?: unknown; expanded?: unknown }
+    if (!Array.isArray(cascade.path) || !cascade.expanded || typeof cascade.expanded !== 'object' || Array.isArray(cascade.expanded)) continue
+    const expanded = { ...(cascade.expanded as Record<string, unknown>) }
+    let options = field.options
+    for (const optionId of cascade.path) {
+      if (typeof optionId !== 'string') break
+      const selected = options.find(option => option.id.toLowerCase() === optionId.toLowerCase())
+      if (!selected) break
+      for (const expandedField of selected.expandedFields ?? []) {
+        if (expandedField.type !== 'image') continue
+        const expandedId = expandedField.id.toLowerCase()
+        const kept = strip(expanded[expandedId])
+        if (Array.isArray(kept) && kept.length) expanded[expandedId] = kept
+        else delete expanded[expandedId]
+      }
+      options = selected.children ?? []
+    }
+    values[fieldId] = { ...cascade, expanded }
+  }
+  return values
+}
+
+function isCompleteUsingDisplayedAttachments(values: Record<string, unknown>, attachments: PurchaseDraft['attachments']): boolean {
+  const definition = purchaseDefinition.value
+  if (!definition) return false
+  const ids = new Set(attachments.map(attachment => attachment.id.toLowerCase()))
+  const fieldIds = new Map(attachments.map(attachment => [attachment.id.toLowerCase(), attachment.fieldId.toLowerCase()]))
+  const result = normalizePurchaseFormAnswers(definition, values, { requireComplete: true, attachmentIds: ids, attachmentFieldIds: fieldIds })
+  return result.ok && result.incompleteFieldIds.length === 0
 }
 
 function clonePurchaseValues(): Record<string, unknown> {
@@ -144,6 +304,19 @@ const selectedVariant = computed<PublicProductVariant | null>(() => {
     return option?.valueId === selections[group.id]
   })) ?? null
 })
+watch(() => [route.query.editLineId, route.query.skuId, route.query.lineRevision,
+  route.query.expectedDraftRevision, route.query.draftId, route.query.replacementDraftId], () => {
+  if (!storefrontInteractive.value) return
+  purchaseFormGeneration++
+  activePurchaseFormOperation = 0
+  purchaseFormBusy.value = false
+  purchaseForm.value = null
+  purchaseDraft.value = null
+  cartReplacementSourceDraft.value = null
+  purchaseDraftRecoveries.value = []
+  const skuId = selectedVariant.value?.skuId
+  if (skuId) void loadPurchaseFormForSku(skuId, purchaseFormGeneration)
+}, { flush: 'sync' })
 const selectedPurchaseQuote = computed<CheckoutQuoteItem | null>(() =>
   purchaseQuote.value?.items.find(item => item.skuId === selectedVariant.value?.skuId) ?? null,
 )
@@ -157,9 +330,19 @@ const selectedPurchaseItems = computed(() => {
   return [{ skuId: variant.skuId, quantity: quantity.value }]
 })
 const purchaseLoginPath = computed(() => {
-  const intent = shoppingCart.checkoutPath(selectedPurchaseItems.value)
+  const draftId = selectedPurchaseItems.value[0] && 'draftId' in selectedPurchaseItems.value[0]
+    ? selectedPurchaseItems.value[0].draftId : undefined
+  const intent = directPurchasePath(shoppingCart.checkoutPath(selectedPurchaseItems.value), draftId)
   return `/login?redirect=${encodeURIComponent(intent)}`
 })
+
+function directPurchasePath(path: string, draftId?: string): string {
+  if (isCustomer.value || isEditingCartLine.value || !draftId || path === '/cart') return path
+  const [pathname, query = ''] = path.split('?', 2)
+  const params = new URLSearchParams(query)
+  params.set('claimGuestDraft', '1')
+  return `${pathname}?${params.toString()}`
+}
 
 function optionHasVariant(groupId: string, valueId: string): boolean {
   const current = product.value
@@ -205,7 +388,11 @@ async function refreshPurchaseQuote(): Promise<void> {
   const variant = selectedVariant.value
   purchaseQuote.value = null
   purchaseQuoteError.value = ''
-  if (!variant || !import.meta.client || (purchaseForm.value?.required && !purchaseDraftComplete.value)) {
+  // Wait until the SKU's applied form has loaded before quoting. Calling this
+  // from the initial mount while the form is still unknown sends a quote on
+  // every passive product visit, even when the active form still needs data.
+  if (!variant || !import.meta.client || !purchaseForm.value
+    || (purchaseForm.value.required && !purchaseDraftComplete.value)) {
     purchaseQuoteBusy.value = false
     return
   }
@@ -225,10 +412,12 @@ async function refreshPurchaseQuote(): Promise<void> {
 async function loadPurchaseFormForSku(skuId: string, generation: number): Promise<void> {
   purchaseForm.value = null
   purchaseDraft.value = null
+  cartReplacementSourceDraft.value = null
   purchaseValues.value = {}
   purchaseDraftDirty.value = false
   purchaseDraftComplete.value = false
   purchaseFormErrors.value = {}
+  purchaseDraftRecoveries.value = []
   purchaseFormMessage.value = ''
   purchaseFormError.value = ''
   purchaseQuote.value = null
@@ -236,50 +425,206 @@ async function loadPurchaseFormForSku(skuId: string, generation: number): Promis
   purchaseFormBusy.value = true
   try {
     const form = await customerApi.request<StorefrontPurchaseForm>(`/api/v1/storefront/skus/${encodeURIComponent(skuId)}/purchase-form`)
-    if (generation !== purchaseFormGeneration || selectedVariant.value?.skuId !== skuId) return
+    if (!purchasePageIsCurrent(skuId, generation)) return
     purchaseForm.value = form
     if (!form.required) return
-    const cached = purchaseDraftCache.get(skuId)
     const requestedDraftId = cartEdit.value?.skuId === skuId ? cartEdit.value.draftId
       : typeof route.query.draftId === 'string' ? route.query.draftId : null
-    const resumeDraftId = requestedDraftId ?? (cached?.form.templateVersionId === form.templateVersionId ? cached.draft.id : null)
-    if (resumeDraftId) {
+    if (requestedDraftId) {
       try {
-        const current = await customerApi.request<PurchaseDraft>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(resumeDraftId)}?skuId=${encodeURIComponent(skuId)}`)
-        if (generation !== purchaseFormGeneration || selectedVariant.value?.skuId !== skuId) return
+        const current = await customerApi.request<PurchaseDraft>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(requestedDraftId)}?skuId=${encodeURIComponent(skuId)}`)
+        if (!purchasePageIsCurrent(skuId, generation)) return
         if (current.templateVersionId === form.templateVersionId && !current.templateChanged) {
-          installPurchaseDraft(current)
+          if (isCustomer.value && cartEdit.value?.skuId === skuId && cartEdit.value.lineId) {
+            try {
+              const replacement = await customerApi.request<{
+                lineId: string; sourceDraftId: string; sourceLineRevision: number; sourceDraftRevision: number
+                replacementDraftId: string; replacementDraftRevision: number; templateVersionId: string
+                omittedSourceAttachmentIds: string[]
+              }>(`/api/v1/customer/cart/lines/${encodeURIComponent(cartEdit.value.lineId)}/purchase-form/replacement-draft`)
+              if (!purchasePageIsCurrent(skuId, generation)) return
+              if (replacement.sourceDraftId !== current.id || replacement.sourceDraftRevision !== current.revision
+                || replacement.templateVersionId !== form.templateVersionId) {
+                purchaseFormError.value = '购物车编辑草稿已变化；原购买资料仍保留，请返回购物车刷新后继续。'
+                return
+              }
+              const target = await customerApi.request<PurchaseDraft>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(replacement.replacementDraftId)}?skuId=${encodeURIComponent(skuId)}`)
+              if (!purchasePageIsCurrent(skuId, generation)) return
+              if (target.templateVersionId !== form.templateVersionId || target.templateChanged) {
+                purchaseFormError.value = '模板版本已变化；原购物车资料仍保留，请返回购物车重新确认。'
+                return
+              }
+              cartReplacementSourceDraft.value = current
+              cartEdit.value = { ...cartEdit.value, replacementDraftId: target.id,
+                omittedSourceAttachmentIds: replacement.omittedSourceAttachmentIds }
+              installPurchaseDraft(mergeReplacementDraftForDisplay(target, current,
+                replacement.omittedSourceAttachmentIds, purchaseDefinition.value!), true)
+              purchaseDraftComplete.value = isCompleteUsingDisplayedAttachments(purchaseValues.value, purchaseDraft.value!.attachments)
+              purchaseFormMessage.value = '已恢复这行购买资料的未完成编辑；购物车仍保留上次确认的资料。'
+              return
+            } catch (replacementError) {
+              const status = Number((replacementError as { status?: number; statusCode?: number })?.status
+                ?? (replacementError as { statusCode?: number })?.statusCode ?? 0)
+              if (status !== 404) {
+                if (purchasePageIsCurrent(skuId, generation)) purchaseFormError.value = replacementError instanceof Error
+                  ? replacementError.message : '无法恢复购物车资料编辑。'
+                return
+              }
+            }
+          }
+          cartReplacementSourceDraft.value = null
+          installPurchaseDraft(current, true)
           const validation = await customerApi.request<{ revision: number; complete: boolean; incompleteFieldIds: string[] }>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(current.id)}/validate`, {
             method: 'POST', body: { expectedRevision: current.revision },
           })
-          if (generation !== purchaseFormGeneration || selectedVariant.value?.skuId !== skuId) return
+          if (!purchasePageIsCurrent(skuId, generation) || !installedDraftMatches(current.id)) return
           purchaseDraftComplete.value = validation.complete
           if (!validation.complete) setIncompleteErrors(validation.incompleteFieldIds)
           return
         }
-      } catch { /* Expired and old drafts are recovered with a fresh current-version draft. */ }
+        purchaseFormMessage.value = '此草稿属于已更新的模板版本，原资料已保留。请新建当前版本资料后重新确认。'
+        if (cartEdit.value?.draftId === requestedDraftId) {
+          await createCurrentDraft(form, skuId, generation, true)
+        }
+        return
+      } catch {
+        if (!purchasePageIsCurrent(skuId, generation)) return
+        if (cartEdit.value?.skuId === skuId) {
+          purchaseFormError.value = '原购买资料已过期或无法恢复；购物车仍保留原购买行。请重新填写后确认替换。'
+          await createCurrentDraft(form, skuId, generation, true)
+        } else purchaseFormError.value = '无法恢复这份草稿。它可能已过期、已删除或不属于当前账号；原购物车购买行未更改。'
+        return
+      }
     }
-    await createCurrentDraft(form, skuId, generation, Boolean(requestedDraftId || (cached && cached.form.templateVersionId !== form.templateVersionId)))
+    const recoveries = await customerApi.request<PurchaseDraftRecovery[]>(`/api/v1/storefront/skus/${encodeURIComponent(skuId)}/purchase-drafts`)
+    if (!purchasePageIsCurrent(skuId, generation)) return
+    const boundGuestDrafts = new Set(shoppingCart.guestItems.value.flatMap(item => 'draftId' in item && item.draftId ? [item.draftId] : []))
+    purchaseDraftRecoveries.value = recoveries.filter(candidate => !boundGuestDrafts.has(candidate.id))
   } catch (error) {
-    if (generation === purchaseFormGeneration) purchaseFormError.value = error instanceof Error ? error.message : '无法读取当前 SKU 的填写模板。'
+    if (purchasePageIsCurrent(skuId, generation)) purchaseFormError.value = error instanceof Error ? error.message : '无法读取当前 SKU 的填写模板。'
   } finally {
-    if (generation === purchaseFormGeneration) purchaseFormBusy.value = false
+    if (purchasePageIsCurrent(skuId, generation)) {
+      purchaseFormBusy.value = false
+      if (purchaseForm.value && (!purchaseForm.value.required || purchaseDraftComplete.value)) {
+        void refreshPurchaseQuote()
+      }
+    }
   }
+}
+
+function purchasePageIsCurrent(skuId: string, generation: number): boolean {
+  return !purchaseFormDisposed && generation === purchaseFormGeneration
+    && selectedVariant.value?.skuId === skuId
+}
+
+function installedDraftMatches(id: string, revision?: number): boolean {
+  const installed = purchaseDraft.value
+  return installed?.id === id && (revision === undefined || installed.revision === revision)
+}
+
+function draftUpdatedAtLabel(value: string): string {
+  return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value))
+}
+
+function purchaseOperationContext(operationId = activePurchaseFormOperation): PurchaseFormOperationContext | null {
+  const draft = purchaseDraft.value
+  const skuId = selectedVariant.value?.skuId
+  if (!draft || !skuId || !operationId) return null
+  return { skuId, draftId: draft.id, draftRevision: draft.revision,
+    identityVersion: customerApi.identityVersion.value, generation: purchaseFormGeneration, operationId }
+}
+
+function beginPurchaseOperation(): number {
+  const operationId = ++purchaseFormOperationSequence
+  activePurchaseFormOperation = operationId
+  purchaseFormBusy.value = true
+  return operationId
+}
+
+function purchasePageContextIsCurrent(context: PurchaseFormOperationContext, checkRevision = true): boolean {
+  const current = purchaseDraft.value
+  return !purchaseFormDisposed && context.generation === purchaseFormGeneration
+    && context.operationId === activePurchaseFormOperation
+    && context.identityVersion === customerApi.identityVersion.value
+    && selectedVariant.value?.skuId === context.skuId
+    && current?.id === context.draftId
+    && (!checkRevision || current.revision === context.draftRevision)
 }
 
 async function createCurrentDraft(form: StorefrontPurchaseForm, skuId: string, generation: number, changed = false): Promise<void> {
   await customerApi.refreshSession()
-  if (generation !== purchaseFormGeneration) return
+  if (!purchasePageIsCurrent(skuId, generation)) return
+  // Session refresh can establish the page's first authoritative identity and
+  // increment identityVersion. Start the draft operation from that resolved
+  // identity instead of treating the normal initial session probe as stale.
+  const identityVersion = customerApi.identityVersion.value
   if (!customerApi.session.value) await customerApi.request<{ sessionId: string; expiresAt: string }>('/api/v1/guest/session', { method: 'POST' })
+  if (!purchasePageIsCurrent(skuId, generation) || identityVersion !== customerApi.identityVersion.value) return
   const created = await customerApi.request<{ id: string; revision: number; expiresAt: string; templateVersionId: string }>('/api/v1/storefront/purchase-drafts', {
     method: 'POST', body: { skuId },
   })
-  if (generation !== purchaseFormGeneration || selectedVariant.value?.skuId !== skuId) return
+  if (!purchasePageIsCurrent(skuId, generation) || identityVersion !== customerApi.identityVersion.value) return
   const draft = await customerApi.request<PurchaseDraft>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(created.id)}?skuId=${encodeURIComponent(skuId)}`)
-  if (generation !== purchaseFormGeneration || selectedVariant.value?.skuId !== skuId) return
-  installPurchaseDraft(draft)
-  purchaseDraftCache.set(skuId, { form, draft })
+  if (!purchasePageIsCurrent(skuId, generation) || identityVersion !== customerApi.identityVersion.value) return
+  installPurchaseDraft(draft, true)
   if (changed) purchaseFormMessage.value = '填写模板已更新。请按当前版本重新填写并确认。'
+}
+
+async function startAnotherPurchaseDraft(): Promise<void> {
+  const form = purchaseForm.value
+  const skuId = selectedVariant.value?.skuId
+  if (!form?.required || !skuId || purchaseFormBusy.value || purchaseDraft.value) return
+  const generation = purchaseFormGeneration
+  purchaseFormBusy.value = true
+  purchaseFormError.value = ''
+  purchaseFormMessage.value = '正在创建本次购买资料…'
+  try {
+    await createCurrentDraft(form, skuId, generation)
+    if (purchasePageIsCurrent(skuId, generation) && purchaseDraft.value) purchaseFormMessage.value = '已为本次购买准备独立资料。'
+  } catch (error) {
+    if (purchasePageIsCurrent(skuId, generation)) {
+      purchaseFormError.value = error instanceof Error ? error.message : '暂时无法新建购买资料。'
+      purchaseFormMessage.value = ''
+    }
+  } finally {
+    if (purchasePageIsCurrent(skuId, generation)) purchaseFormBusy.value = false
+  }
+}
+
+async function recoverPurchaseDraft(candidate: PurchaseDraftRecovery): Promise<void> {
+  const skuId = selectedVariant.value?.skuId
+  const form = purchaseForm.value
+  if (!skuId || !form?.required || purchaseFormBusy.value || purchaseDraft.value) return
+  const generation = purchaseFormGeneration
+  const identityVersion = customerApi.identityVersion.value
+  purchaseFormBusy.value = true
+  purchaseFormError.value = ''
+  purchaseFormMessage.value = '正在验证并恢复这份私有草稿…'
+  try {
+    const draft = await customerApi.request<PurchaseDraft>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(candidate.id)}?skuId=${encodeURIComponent(skuId)}`)
+    if (!purchasePageIsCurrent(skuId, generation) || identityVersion !== customerApi.identityVersion.value) return
+    if (draft.templateChanged || draft.templateVersionId !== form.templateVersionId) {
+      purchaseFormMessage.value = '此草稿属于旧模板版本，原资料已保留。请新建当前版本资料后重新确认。'
+      return
+    }
+    installPurchaseDraft(draft, true)
+    const validation = await customerApi.request<{ revision: number; complete: boolean; incompleteFieldIds: string[] }>(
+      `/api/v1/storefront/purchase-drafts/${encodeURIComponent(draft.id)}/validate`,
+      { method: 'POST', body: { expectedRevision: draft.revision } },
+    )
+    if (!purchasePageIsCurrent(skuId, generation) || identityVersion !== customerApi.identityVersion.value
+      || !installedDraftMatches(draft.id, draft.revision)) return
+    purchaseDraftComplete.value = validation.complete
+    if (!validation.complete) setIncompleteErrors(validation.incompleteFieldIds)
+    else purchaseFormMessage.value = '已恢复这份已保存资料。'
+  } catch (error) {
+    if (purchasePageIsCurrent(skuId, generation) && identityVersion === customerApi.identityVersion.value) {
+      purchaseFormError.value = error instanceof Error ? error.message : '无法恢复这份草稿。'
+      purchaseFormMessage.value = ''
+    }
+  } finally {
+    if (purchasePageIsCurrent(skuId, generation) && identityVersion === customerApi.identityVersion.value) purchaseFormBusy.value = false
+  }
 }
 
 function setIncompleteErrors(fieldIds: string[]) {
@@ -302,118 +647,249 @@ function setIncompleteErrors(fieldIds: string[]) {
   purchaseFormMessage.value = names.length ? `还需填写：${names.join('、')}` : '请完成所有必填项。'
 }
 
-async function readCurrentDraft(): Promise<PurchaseDraft | null> {
-  const skuId = selectedVariant.value?.skuId
-  const draft = purchaseDraft.value
-  if (!skuId || !draft) return null
-  return customerApi.request<PurchaseDraft>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(draft.id)}?skuId=${encodeURIComponent(skuId)}`)
+async function startCartLineReplacementEdit(): Promise<void> {
+  const edit = cartEdit.value ? { ...cartEdit.value } : null
+  const source = purchaseDraft.value
+  if (!edit || !source || !isCustomer.value || purchaseFormBusy.value || edit.lineRevision === null
+    || edit.expectedDraftRevision === null || edit.draftId !== source.id) return
+  if (edit.replacementDraftId) return
+  const operationId = beginPurchaseOperation()
+  const context = purchaseOperationContext(operationId)
+  if (!context) { activePurchaseFormOperation = 0; purchaseFormBusy.value = false; return }
+  purchaseFormError.value = ''
+  purchaseFormMessage.value = '正在为此购物车行准备独立编辑草稿…'
+  try {
+    const replacement = await customerApi.request<{
+      lineId: string; sourceDraftId: string; sourceLineRevision: number; sourceDraftRevision: number
+      replacementDraftId: string; replacementDraftRevision: number; templateVersionId: string
+      omittedSourceAttachmentIds: string[]
+    }>(`/api/v1/customer/cart/lines/${encodeURIComponent(edit.lineId)}/purchase-form/replacement-draft`, {
+      method: 'POST', body: { expectedLineRevision: edit.lineRevision, expectedDraftRevision: edit.expectedDraftRevision },
+    })
+    if (!purchasePageContextIsCurrent(context) || replacement.sourceDraftId !== source.id
+      || replacement.sourceDraftRevision !== source.revision || replacement.templateVersionId !== purchaseForm.value?.templateVersionId) return
+    const target = await customerApi.request<PurchaseDraft>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(replacement.replacementDraftId)}?skuId=${encodeURIComponent(context.skuId)}`)
+    if (!purchasePageContextIsCurrent(context) || target.templateVersionId !== source.templateVersionId || target.templateChanged) return
+    const definition = purchaseDefinition.value
+    if (!definition) return
+    cartReplacementSourceDraft.value = source
+    cartEdit.value = { ...edit, replacementDraftId: target.id,
+      omittedSourceAttachmentIds: replacement.omittedSourceAttachmentIds }
+    const composite = mergeReplacementDraftForDisplay(target, source,
+      replacement.omittedSourceAttachmentIds, definition)
+    installPurchaseDraft(composite)
+    purchaseValues.value = clonePurchaseRecord(composite.values)
+    purchaseDraftDirty.value = true
+    purchaseDraftComplete.value = isCompleteUsingDisplayedAttachments(purchaseValues.value, composite.attachments)
+    purchaseFormMessage.value = '已准备独立编辑草稿。购物车仍使用上次确认的资料；保存可恢复的编辑后，完整校验时才替换购买行。'
+  } catch (error) {
+    if (purchasePageContextIsCurrent(context, false)) {
+      purchaseFormError.value = error instanceof Error ? error.message : '无法开始安全编辑。购物车中的原资料仍保留。'
+      purchaseFormMessage.value = ''
+    }
+  } finally { finishPurchaseOperation(context) }
+}
+
+async function readCurrentDraft(context: PurchaseFormOperationContext): Promise<PurchaseDraft> {
+  return customerApi.request<PurchaseDraft>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(context.draftId)}?skuId=${encodeURIComponent(context.skuId)}`)
+}
+
+function finishPurchaseOperation(context: PurchaseFormOperationContext): void {
+  if (activePurchaseFormOperation !== context.operationId) return
+  activePurchaseFormOperation = 0
+  purchaseFormBusy.value = false
 }
 
 async function savePurchaseValues(
   allowBusy = false,
   valuesToSave: Record<string, unknown> = purchaseValues.value,
   replacements?: Array<{ oldAttachmentId: string; newAttachmentId: string }>,
+  operationContext?: PurchaseFormOperationContext,
 ): Promise<boolean> {
-  const draft = purchaseDraft.value
-  const skuId = selectedVariant.value?.skuId
-  if (!draft || !skuId || (purchaseFormBusy.value && !allowBusy)) return false
-  purchaseFormBusy.value = true
-  purchaseFormError.value = ''
-  purchaseFormMessage.value = '正在保存填写内容…'
+  if (purchaseFormBusy.value && !allowBusy && !operationContext) return false
+  const operationId = operationContext?.operationId ?? beginPurchaseOperation()
+  const context = operationContext ?? purchaseOperationContext(operationId)
+  if (!context || !purchasePageContextIsCurrent(context)) {
+    if (!operationContext && activePurchaseFormOperation === operationId) {
+      activePurchaseFormOperation = 0
+      purchaseFormBusy.value = false
+    }
+    return false
+  }
+  const currentCartEdit = cartEdit.value ? { ...cartEdit.value } : null
+  const editing = currentCartEdit?.skuId === context.skuId && currentCartEdit.draftId === context.draftId
+  const editingReplacement = currentCartEdit?.skuId === context.skuId
+    && currentCartEdit.replacementDraftId === context.draftId && Boolean(cartReplacementSourceDraft.value)
+  const submittedValues = JSON.parse(JSON.stringify(toRaw(valuesToSave))) as Record<string, unknown>
+  const sourceIds = new Set((cartReplacementSourceDraft.value?.attachments ?? []).map(attachment => attachment.id.toLowerCase()))
+  const storedValues = editingReplacement && purchaseDefinition.value
+    ? stripSourceImageAnswers(submittedValues, purchaseDefinition.value, sourceIds)
+    : submittedValues
+  const storedReplacements = editingReplacement
+    ? replacements?.filter(replacement => !sourceIds.has(replacement.oldAttachmentId.toLowerCase()))
+    : replacements
+  if (purchasePageContextIsCurrent(context)) {
+    purchaseFormError.value = ''
+    purchaseFormMessage.value = '正在保存填写内容…'
+  }
   try {
     let saved: { revision: number; complete: boolean; incompleteFieldIds: string[] }
-    const editing = cartEdit.value?.skuId === skuId && cartEdit.value.draftId === draft.id
-    if (editing && isCustomer.value) {
-      const line = cartEdit.value!
+    if (editingReplacement && customerApi.session.value?.customer.id) {
+      const edit = currentCartEdit!
+      if (edit.lineRevision === null || edit.expectedDraftRevision === null || !edit.replacementDraftId) {
+        throw new Error('购物车编辑版本已变化，请返回购物车后重新打开。')
+      }
+      saved = await customerApi.request<{ replacementDraftRevision: number; complete: boolean; incompleteFieldIds: string[] }>(
+        `/api/v1/customer/cart/lines/${encodeURIComponent(edit.lineId)}/purchase-form/replacement-draft`, {
+          method: 'PUT', body: {
+            expectedLineRevision: edit.lineRevision,
+            expectedDraftRevision: edit.expectedDraftRevision,
+            expectedReplacementDraftRevision: context.draftRevision,
+            values: storedValues,
+            omittedSourceAttachmentIds: edit.omittedSourceAttachmentIds,
+            ...(storedReplacements?.length ? { replacements: storedReplacements } : {}),
+          },
+        }).then(result => ({ revision: result.replacementDraftRevision, complete: result.complete,
+          incompleteFieldIds: result.incompleteFieldIds }))
+    } else if (editing && customerApi.session.value?.customer.id) {
+      const line = currentCartEdit!
       if (line.lineRevision === null || line.expectedDraftRevision === null) throw new Error('购物车购买行版本已变化，请返回购物车后重新打开。')
       const retainedLineId = await shoppingCart.editPurchaseFormLine(line.lineId, {
         expectedLineRevision: line.lineRevision,
         expectedDraftRevision: line.expectedDraftRevision,
-        draftRevision: draft.revision,
-        values: valuesToSave,
+        draftRevision: context.draftRevision,
+        values: submittedValues,
         ...(replacements ? { replacements } : {}),
       })
       if (!retainedLineId) throw new Error(shoppingCart.errorMessage.value ?? '购买行资料暂时无法保存。')
       if (retainedLineId !== line.lineId) {
-        purchaseFormMessage.value = '资料已保存，并与另一相同购买行合并。'
-        await navigateTo('/cart')
+        if (purchasePageContextIsCurrent(context, false)) {
+          purchaseFormMessage.value = '资料已保存，并与另一相同购买行合并。'
+          await navigateTo('/cart')
+        }
         return true
       }
-      const row = shoppingCart.cartView.value?.items.find(item => item.lineId === line.lineId)
-      if (row?.lineRevision !== null && row?.lineRevision !== undefined) {
-        cartEdit.value = { ...line, lineRevision: row.lineRevision, expectedDraftRevision: row.draftRevision }
+      if (purchasePageContextIsCurrent(context, false)) {
+        const row = shoppingCart.cartView.value?.items.find(item => item.lineId === line.lineId)
+        if (row?.lineRevision !== null && row?.lineRevision !== undefined) {
+          cartEdit.value = { ...line, lineRevision: row.lineRevision, expectedDraftRevision: row.draftRevision }
+        }
       }
-      const current = await readCurrentDraft()
-      if (!current) return false
-      const validation = await customerApi.request<{ complete: boolean; incompleteFieldIds: string[] }>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(current.id)}/validate`, {
-        method: 'POST', body: { expectedRevision: current.revision },
-      })
-      saved = { revision: current.revision, ...validation }
+      saved = { revision: context.draftRevision + 1, complete: true, incompleteFieldIds: [] }
     } else {
-      saved = await customerApi.request<{ revision: number; complete: boolean; incompleteFieldIds: string[] }>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(draft.id)}`, {
-        method: 'PUT', body: { skuId, expectedRevision: draft.revision, values: valuesToSave,
+      saved = await customerApi.request<{ revision: number; complete: boolean; incompleteFieldIds: string[] }>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(context.draftId)}`, {
+        method: 'PUT', body: { skuId: context.skuId, expectedRevision: context.draftRevision, values: submittedValues,
           ...(replacements ? { replacements } : {}) },
       })
     }
-    const current = await readCurrentDraft()
-    if (!current) return false
-    installPurchaseDraft(current)
-    purchaseDraftComplete.value = saved.complete
-    purchaseDraftCache.set(skuId, { form: purchaseForm.value!, draft: current })
-    purchaseFormMessage.value = saved.complete ? '已保存，填写资料完整。' : '已保存部分内容；完成必填项后即可购买。'
-    if (!saved.complete) {
+    // The server may have committed while the customer switched SKU, account,
+    // or page. Preserve that success but never write its result into the new UI.
+    if (!purchasePageContextIsCurrent(context)) return true
+    const current = await readCurrentDraft(context)
+    if (!purchasePageContextIsCurrent(context)) return true
+    const displayed = editingReplacement && cartReplacementSourceDraft.value && purchaseDefinition.value
+      ? mergeReplacementDraftForDisplay(current, cartReplacementSourceDraft.value,
+        currentCartEdit!.omittedSourceAttachmentIds, purchaseDefinition.value)
+      : current
+    installPurchaseDraft(displayed)
+    const complete = editingReplacement
+      ? isCompleteUsingDisplayedAttachments(displayed.values, displayed.attachments)
+      : saved.complete
+    purchaseDraftComplete.value = complete
+    purchaseFormMessage.value = editingReplacement
+      ? '已保存独立编辑草稿；购物车仍保留上次确认的资料。'
+      : saved.complete ? '已保存，填写资料完整。' : '已保存部分内容；完成必填项后即可购买。'
+    if (!complete && !editingReplacement) {
       setIncompleteErrors(saved.incompleteFieldIds)
       purchaseFormMessage.value = `已保存部分内容。${purchaseFormMessage.value}`
+    } else if (!complete && editingReplacement) {
+      const validation = normalizePurchaseFormAnswers(purchaseDefinition.value!, displayed.values, {
+        requireComplete: true,
+        attachmentIds: new Set(displayed.attachments.map(attachment => attachment.id.toLowerCase())),
+        attachmentFieldIds: new Map(displayed.attachments.map(attachment => [attachment.id.toLowerCase(), attachment.fieldId.toLowerCase()])),
+      })
+      if (validation.ok) {
+        const savedStatus = purchaseFormMessage.value
+        setIncompleteErrors(validation.incompleteFieldIds)
+        purchaseFormMessage.value = `${savedStatus}${purchaseFormMessage.value ? ` ${purchaseFormMessage.value}` : ''}`
+      }
+      purchaseFormMessage.value += '请补齐必填项后校验并替换购买行。'
+    } else if (editingReplacement) {
+      purchaseFormMessage.value += ' 当前资料完整，可校验后替换购买行。'
     }
     return true
   } catch (error) {
+    if (!purchasePageContextIsCurrent(context, false)) return false
     purchaseFormError.value = error instanceof Error ? error.message : '填写内容保存失败。'
     purchaseFormMessage.value = ''
-    if ((error as { status?: number }).status === 409) {
+    if ((error as { status?: number }).status === 409 || (error as { statusCode?: number }).statusCode === 409) {
       try {
-        const current = await readCurrentDraft()
-        if (current) installPurchaseDraft(current)
+        const current = await readCurrentDraft(context)
+        if (purchasePageContextIsCurrent(context, false) && current.id === context.draftId) installPurchaseDraft(current)
       } catch { /* Keep user-entered values visible if the latest draft is unavailable. */ }
-      purchaseFormError.value = '资料已在其他标签页变化。已读取最新保存版本，请核对后再编辑。'
+      if (purchasePageContextIsCurrent(context, false)) purchaseFormError.value = '资料已在其他标签页变化。已读取最新保存版本，请核对后再编辑。'
     }
     return false
-  } finally { purchaseFormBusy.value = false }
+  } finally { if (!operationContext) finishPurchaseOperation(context) }
 }
 
 async function validatePurchaseValues(): Promise<boolean> {
   const skuId = selectedVariant.value?.skuId
   const form = purchaseForm.value
-  if (!skuId || !form?.required || !purchaseDraft.value) return !form?.required
+  if (!skuId || !form?.required || !purchaseDraft.value || purchaseFormBusy.value) return !form?.required
+  const operationId = beginPurchaseOperation()
+  const context = purchaseOperationContext(operationId)
+  if (!context) { purchaseFormBusy.value = false; return false }
   try {
     const latest = await customerApi.request<StorefrontPurchaseForm>(`/api/v1/storefront/skus/${encodeURIComponent(skuId)}/purchase-form`)
+    if (!purchasePageContextIsCurrent(context)) return false
     if (latest.templateVersionId !== form.templateVersionId || latest.status !== form.status) {
       const generation = ++purchaseFormGeneration
       purchaseForm.value = latest
-      purchaseFormBusy.value = true
-      try { await createCurrentDraft(latest, skuId, generation, true) }
-      finally { if (generation === purchaseFormGeneration) purchaseFormBusy.value = false }
+      await createCurrentDraft(latest, skuId, generation, true)
       return false
     }
-    if (purchaseDraftDirty.value && !await savePurchaseValues()) return false
-    const draft = purchaseDraft.value
-    const result = await customerApi.request<{ revision: number; complete: boolean; incompleteFieldIds: string[] }>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(draft.id)}/validate`, {
-      method: 'POST', body: { expectedRevision: draft.revision },
-    })
-    purchaseDraftComplete.value = result.complete
-    if (!result.complete) { setIncompleteErrors(result.incompleteFieldIds); return false }
-    if (cartEdit.value && !await attachValidatedDraftToCart(draft)) return false
+    if (purchaseDraftDirty.value && !await savePurchaseValues(true, purchaseValues.value, undefined, context)) return false
+    const currentContext = purchaseOperationContext(operationId)
+    if (!currentContext || !purchasePageContextIsCurrent(currentContext)) return false
+    const draft = purchaseDraft.value!
+    if (hasCartReplacementDraft.value && cartReplacementSourceDraft.value && purchaseDefinition.value) {
+      const attachments = draft.attachments
+      const validation = normalizePurchaseFormAnswers(purchaseDefinition.value, purchaseValues.value, {
+        requireComplete: true,
+        attachmentIds: new Set(attachments.map(attachment => attachment.id.toLowerCase())),
+        attachmentFieldIds: new Map(attachments.map(attachment => [attachment.id.toLowerCase(), attachment.fieldId.toLowerCase()])),
+      })
+      const complete = validation.ok && validation.incompleteFieldIds.length === 0
+      purchaseDraftComplete.value = complete
+      if (!complete) {
+        if (validation.ok) setIncompleteErrors(validation.incompleteFieldIds)
+        else purchaseFormError.value = '有字段值或图片已失效，请检查并重新填写。'
+        return false
+      }
+    } else {
+      const result = await customerApi.request<{ revision: number; complete: boolean; incompleteFieldIds: string[] }>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(draft.id)}/validate`, {
+        method: 'POST', body: { expectedRevision: currentContext.draftRevision },
+      })
+      if (!purchasePageContextIsCurrent(currentContext)) return false
+      purchaseDraftComplete.value = result.complete
+      if (!result.complete) { setIncompleteErrors(result.incompleteFieldIds); return false }
+    }
+    if (cartEdit.value && !await attachValidatedDraftToCart(draft, currentContext)) return false
+    if (!purchasePageContextIsCurrent(currentContext)) return false
     purchaseFormErrors.value = {}
     purchaseFormMessage.value = '填写校验通过。'
     await refreshPurchaseQuote()
+    if (!purchasePageContextIsCurrent(currentContext, false)) return false
     return true
   } catch (error) {
-    purchaseFormError.value = error instanceof Error ? error.message : '填写校验失败，请检查内容后重试。'
+    if (purchasePageContextIsCurrent(context, false)) purchaseFormError.value = error instanceof Error ? error.message : '填写校验失败，请检查内容后重试。'
     return false
-  }
+  } finally { finishPurchaseOperation(context) }
 }
 
-async function attachValidatedDraftToCart(draft: PurchaseDraft): Promise<boolean> {
-  const edit = cartEdit.value
+async function attachValidatedDraftToCart(draft: PurchaseDraft, context: PurchaseFormOperationContext): Promise<boolean> {
+  const edit = cartEdit.value ? { ...cartEdit.value } : null
   if (!edit) return true
   if (isCustomer.value) {
     const current = shoppingCart.cartView.value?.items.find(item => item.lineId === edit.lineId)
@@ -429,7 +905,9 @@ async function attachValidatedDraftToCart(draft: PurchaseDraft): Promise<boolean
       expectedLineRevision: edit.lineRevision,
       expectedDraftRevision: edit.expectedDraftRevision,
       replacementDraft: { draftId: draft.id, draftRevision: draft.revision },
+      ...(edit.replacementDraftId === draft.id ? { values: clonePurchaseRecord(purchaseValues.value) } : {}),
     })
+    if (!purchasePageContextIsCurrent(context, false)) return true
     if (!retainedLineId) {
       purchaseFormError.value = shoppingCart.errorMessage.value ?? '填写资料已保存，但购物车购买行没有更新。'
       return false
@@ -441,13 +919,24 @@ async function attachValidatedDraftToCart(draft: PurchaseDraft): Promise<boolean
     }
     const row = shoppingCart.cartView.value?.items.find(item => item.lineId === retainedLineId)
     if (row?.lineRevision !== null && row?.lineRevision !== undefined) {
-      cartEdit.value = { ...edit, draftId: draft.id, lineRevision: row.lineRevision, expectedDraftRevision: row.draftRevision }
+      cartEdit.value = { ...edit, draftId: draft.id, replacementDraftId: null, omittedSourceAttachmentIds: [],
+        lineRevision: row.lineRevision, expectedDraftRevision: row.draftRevision }
     }
+    // Finalizing an isolated cart edit writes the normalized values and copied
+    // attachments once more in the same transaction as the line swap. Adopt
+    // that authoritative revision before the caller validates or quotes again.
+    const committedDraft = await readCurrentDraft(context)
+    if (!purchasePageContextIsCurrent(context, false) || committedDraft.id !== context.draftId) return true
+    installPurchaseDraft(committedDraft)
+    context.draftRevision = committedDraft.revision
+    purchaseDraftComplete.value = isCompleteUsingDisplayedAttachments(committedDraft.values, committedDraft.attachments)
+    cartReplacementSourceDraft.value = null
     return true
   }
   const retainedLineId = await shoppingCart.replaceGuestPurchaseFormLine(
     edit.lineId, edit.draftId, edit.expectedDraftRevision, draft.id, draft.revision,
   )
+  if (!purchasePageContextIsCurrent(context, false)) return true
   if (!retainedLineId) {
     purchaseFormError.value = shoppingCart.errorMessage.value ?? '游客购物车购买行已变化，资料仍保留在当前草稿。'
     return false
@@ -462,22 +951,62 @@ async function attachValidatedDraftToCart(draft: PurchaseDraft): Promise<boolean
   return true
 }
 
+async function releaseUnreferencedUploadedImage(context: PurchaseFormOperationContext, attachmentId: string): Promise<boolean | null> {
+  try {
+    const result = await customerApi.request<{ released: boolean }>(
+      `/api/v1/storefront/purchase-drafts/${encodeURIComponent(context.draftId)}/attachments/${encodeURIComponent(attachmentId)}/release`,
+      { method: 'POST', body: {} },
+    )
+    return result.released
+  } catch { return null }
+}
+
+async function reconcileUploadedImage(context: PurchaseFormOperationContext, attachmentId: string): Promise<'referenced' | 'released' | 'unknown'> {
+  try {
+    // Read the authoritative draft after an uncertain save, then let the API
+    // perform the exact attachment-reference check and release under its
+    // draft -> attachment lock order. Never infer image references by searching
+    // serialized user-entered text for an attachment UUID.
+    const actual = await readCurrentDraft(context)
+    if (purchasePageContextIsCurrent(context, false)) installPurchaseDraft(actual)
+    const released = await releaseUnreferencedUploadedImage(context, attachmentId)
+    if (released === null) return 'unknown'
+    // The release endpoint's locked reference check is authoritative. A later
+    // read failure must not downgrade a confirmed release/reference result.
+    try {
+      const latest = await readCurrentDraft(context)
+      if (purchasePageContextIsCurrent(context, false)) installPurchaseDraft(latest)
+    } catch { /* The already-read authoritative draft and release result remain valid. */ }
+    return released ? 'released' : 'referenced'
+  } catch { return 'unknown' }
+}
+
 async function uploadPurchaseImage(fieldId: string, file: File, replaceAttachmentId?: string, cascadeId?: string) {
-  const draft = purchaseDraft.value
-  const skuId = selectedVariant.value?.skuId
-  if (!draft || !skuId) return
-  purchaseFormBusy.value = true
-  purchaseFormError.value = ''
-  purchaseFormMessage.value = '正在验证并私密保存图片…'
+  if (purchaseFormBusy.value) return
+  const operationId = beginPurchaseOperation()
+  const context = purchaseOperationContext(operationId)
+  if (!context) { finishPurchaseOperation({ operationId } as PurchaseFormOperationContext); return }
+  const baseValues = clonePurchaseValues()
+  const identityVersion = context.identityVersion
+  if (purchasePageContextIsCurrent(context)) {
+    purchaseFormError.value = ''
+    purchaseFormMessage.value = '正在验证并私密保存图片…'
+  }
+  let uploadedAttachmentId: string | null = null
   try {
     const body = new FormData()
-    body.append('skuId', skuId)
-    body.append('expectedRevision', String(draft.revision))
+    body.append('skuId', context.skuId)
+    body.append('expectedRevision', String(context.draftRevision))
     body.append('fieldId', fieldId)
     if (replaceAttachmentId) body.append('replaceAttachmentId', replaceAttachmentId)
     body.append('file', file)
-    const uploaded = await customerApi.request<{ attachmentId: string }>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(draft.id)}/attachments`, { method: 'POST', body })
-    const nextValues = clonePurchaseValues()
+    const uploaded = await customerApi.request<{ attachmentId: string }>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(context.draftId)}/attachments`, { method: 'POST', body })
+    uploadedAttachmentId = uploaded.attachmentId
+    if (!purchasePageContextIsCurrent(context)) {
+      await releaseUnreferencedUploadedImage(context, uploaded.attachmentId)
+      return
+    }
+    const nextValues = baseValues
     const putReference = (previous: unknown) => {
       const ids = Array.isArray(previous) ? previous.filter((entry): entry is string => typeof entry === 'string') : []
       return replaceAttachmentId ? ids.map(id => id === replaceAttachmentId ? uploaded.attachmentId : id) : [...ids, uploaded.attachmentId]
@@ -489,16 +1018,48 @@ async function uploadPurchaseImage(fieldId: string, file: File, replaceAttachmen
       nextValues[cascadeId.toLowerCase()] = { ...cascade, expanded: { ...expanded, [fieldId.toLowerCase()]: putReference(expanded[fieldId.toLowerCase()]) } }
     } else nextValues[fieldId.toLowerCase()] = putReference(nextValues[fieldId.toLowerCase()])
     const saved = await savePurchaseValues(true, nextValues,
-      replaceAttachmentId ? [{ oldAttachmentId: replaceAttachmentId, newAttachmentId: uploaded.attachmentId }] : undefined)
-    if (!saved) throw new Error('图片已完成验证，但资料保存没有提交。原图仍然保留。')
-    purchaseFormMessage.value = '图片已保存。'
+      replaceAttachmentId ? [{ oldAttachmentId: replaceAttachmentId, newAttachmentId: uploaded.attachmentId }] : undefined, context)
+    if (!saved) {
+      const recovery = await reconcileUploadedImage(context, uploaded.attachmentId)
+      if (purchasePageContextIsCurrent(context, false)) {
+        purchaseFormError.value = recovery === 'released'
+          ? '图片上传成功，但保存遇到版本冲突；原图仍然有效，未引用的新图片已安全释放。请立即重新上传。'
+          : recovery === 'referenced'
+            ? ''
+            : '图片上传成功，但无法确认保存结果；为保护已保存资料，未删除新图片。请刷新确认后重试。'
+        purchaseFormMessage.value = recovery === 'referenced' ? '图片及填写资料已保存。' : ''
+      }
+      return
+    }
+    if (purchasePageContextIsCurrent(context, false)) {
+      purchaseFormError.value = ''
+      purchaseFormMessage.value = '图片已保存。'
+    }
   } catch (error) {
-    purchaseFormError.value = error instanceof Error ? error.message : '图片上传或保存失败；原图片及资料仍然保留。'
-    purchaseFormMessage.value = ''
-  } finally { purchaseFormBusy.value = false }
+    let recovery: 'referenced' | 'released' | 'unknown' | null = null
+    if (uploadedAttachmentId) recovery = await reconcileUploadedImage(context, uploadedAttachmentId)
+    if (purchasePageContextIsCurrent(context, false)) {
+      purchaseFormError.value = recovery === 'released'
+        ? '图片上传成功，但保存失败；原图仍然有效，未引用的新图片已安全释放。请立即重新上传。'
+        : error instanceof Error ? error.message : '图片上传或保存失败；原图片及资料仍然保留。'
+      purchaseFormMessage.value = recovery === 'referenced' ? '图片及填写资料已保存。' : ''
+    }
+  } finally { if (identityVersion === customerApi.identityVersion.value || activePurchaseFormOperation === operationId) finishPurchaseOperation(context) }
 }
 
 async function removePurchaseImage(fieldId: string, attachmentId: string, cascadeId?: string) {
+  if (purchaseFormBusy.value) return
+  const operationId = beginPurchaseOperation()
+  const context = purchaseOperationContext(operationId)
+  if (!context) { activePurchaseFormOperation = 0; purchaseFormBusy.value = false; return }
+  if (hasCartReplacementDraft.value && cartEdit.value) {
+    const removed = purchaseDraft.value?.attachments.find(attachment => attachment.id === attachmentId)
+    const sourceId = cartReplacementSourceDraft.value?.attachments.some(attachment => attachment.id === attachmentId)
+      ? attachmentId : removed?.replacesAttachmentId
+    if (sourceId && !cartEdit.value.omittedSourceAttachmentIds.includes(sourceId)) {
+      cartEdit.value = { ...cartEdit.value, omittedSourceAttachmentIds: [...cartEdit.value.omittedSourceAttachmentIds, sourceId] }
+    }
+  }
   const nextValues = clonePurchaseValues()
   const removeId = (previous: unknown) => Array.isArray(previous) ? previous.filter(entry => entry !== attachmentId) : []
   if (cascadeId) {
@@ -507,15 +1068,18 @@ async function removePurchaseImage(fieldId: string, attachmentId: string, cascad
     const expanded = cascade.expanded && typeof cascade.expanded === 'object' && !Array.isArray(cascade.expanded) ? cascade.expanded as Record<string, unknown> : {}
     nextValues[cascadeId.toLowerCase()] = { ...cascade, expanded: { ...expanded, [fieldId.toLowerCase()]: removeId(expanded[fieldId.toLowerCase()]) } }
   } else nextValues[fieldId.toLowerCase()] = removeId(nextValues[fieldId.toLowerCase()])
-  purchaseValues.value = nextValues
-  await savePurchaseValues()
+  if (purchasePageContextIsCurrent(context)) purchaseValues.value = nextValues
+  try { await savePurchaseValues(true, nextValues, undefined, context) }
+  finally { finishPurchaseOperation(context) }
 }
 
-watch(() => selectedVariant.value?.skuId, (skuId, previousSku) => {
-  if (previousSku && purchaseForm.value && purchaseDraft.value) purchaseDraftCache.set(previousSku, { form: purchaseForm.value, draft: purchaseDraft.value })
+watch(() => selectedVariant.value?.skuId, (skuId) => {
   purchaseFormGeneration++
+  activePurchaseFormOperation = 0
   purchaseForm.value = null
   purchaseDraft.value = null
+  cartReplacementSourceDraft.value = null
+  purchaseDraftRecoveries.value = []
   purchaseFormBusy.value = false
   if (skuId && storefrontInteractive.value) void loadPurchaseFormForSku(skuId, purchaseFormGeneration)
   if (storefrontInteractive.value) void refreshPurchaseQuote()
@@ -526,8 +1090,13 @@ watch(() => customerApi.identityVersion.value, () => {
 })
 
 function purchaseFormCacheReset() {
-  purchaseDraftCache.clear()
   purchaseFormGeneration++
+  activePurchaseFormOperation = 0
+  purchaseFormBusy.value = false
+  purchaseForm.value = null
+  purchaseDraft.value = null
+  cartReplacementSourceDraft.value = null
+  purchaseDraftRecoveries.value = []
   const skuId = selectedVariant.value?.skuId
   if (skuId && import.meta.client) void loadPurchaseFormForSku(skuId, purchaseFormGeneration)
 }
@@ -537,12 +1106,17 @@ watch([quantity, () => customerApi.identityVersion.value, purchaseDraftComplete]
 })
 
 onMounted(() => {
+  purchaseFormDisposed = false
   storefrontInteractive.value = true
   const skuId = selectedVariant.value?.skuId
   if (skuId) void loadPurchaseFormForSku(skuId, purchaseFormGeneration)
   void refreshPurchaseQuote()
 })
-onBeforeUnmount(() => { purchaseFormGeneration++ })
+onBeforeUnmount(() => {
+  purchaseFormDisposed = true
+  purchaseFormGeneration++
+  activePurchaseFormOperation = 0
+})
 
 const selectedImageItem = computed(() => product.value?.gallery[selectedImage.value] ?? null)
 const pageTitle = computed(() => product.value?.name ?? '商品详情')
@@ -613,7 +1187,20 @@ async function addSelectedToCart() {
   }
   if (purchaseForm.value?.required) {
     if (!await validatePurchaseValues() || !purchaseDraft.value) return
-    await shoppingCart.addWithDraft(selectedVariant.value.skuId, quantity.value, purchaseDraft.value.id, purchaseDraft.value.revision)
+    const draftId = purchaseDraft.value.id
+    const retainedLineId = await shoppingCart.addWithDraft(selectedVariant.value.skuId, quantity.value, draftId, purchaseDraft.value.revision)
+    if (retainedLineId) {
+      purchaseDraft.value = null
+      cartReplacementSourceDraft.value = null
+      purchaseValues.value = {}
+      purchaseDraftDirty.value = false
+      purchaseDraftComplete.value = false
+      purchaseFormErrors.value = {}
+      immediateLineId.value = ''
+      purchaseDraftRecoveries.value = purchaseDraftRecoveries.value.filter(candidate => candidate.id !== draftId)
+      purchaseFormMessage.value = '已加入购物车。可以新建另一组资料，再购买同款商品。'
+      purchaseFormError.value = ''
+    }
   } else await shoppingCart.add(selectedVariant.value.skuId, quantity.value)
   cartFeedback.value = shoppingCart.errorMessage.value ?? shoppingCart.noticeMessage.value ?? ''
 }
@@ -629,9 +1216,10 @@ async function buySelectedNow() {
   }
   if (purchaseForm.value?.required) {
     if (!await validatePurchaseValues() || !purchaseDraft.value) return
-    await navigateTo(shoppingCart.checkoutPath([{ lineId: immediateLineId.value || purchaseDraft.value.id,
+    const path = shoppingCart.checkoutPath([{ lineId: immediateLineId.value || purchaseDraft.value.id,
       skuId: selectedVariant.value.skuId, quantity: quantity.value, draftId: purchaseDraft.value.id,
-      draftRevision: purchaseDraft.value.revision }]))
+      draftRevision: purchaseDraft.value.revision }])
+    await navigateTo(directPurchasePath(path, purchaseDraft.value.id))
   } else await navigateTo(shoppingCart.checkoutPath([{ skuId: selectedVariant.value.skuId, quantity: quantity.value }]))
 }
 </script>
@@ -916,10 +1504,65 @@ async function buySelectedNow() {
                     role="status"
                     aria-live="polite"
                   >
-                    正在准备当前规格的私有填写草稿…
+                    正在读取当前规格的填写规则…
                   </p>
+                  <div
+                    v-if="purchaseDefinition && purchaseDraft && isEditingCartLine && isCustomer && !hasCartReplacementDraft"
+                    class="mb-4 rounded-lg border border-default bg-default p-4"
+                  >
+                    <p class="text-sm font-medium text-highlighted">安全编辑购物车资料</p>
+                    <p class="mt-1 text-sm leading-6 text-muted">
+                      先创建这行专属的编辑草稿。编辑过程中购物车仍保留最近一次有效资料；确认完整后才替换购买行。
+                    </p>
+                    <UButton
+                      type="button"
+                      color="primary"
+                      variant="soft"
+                      icon="i-lucide-file-pen-line"
+                      class="mt-3 min-h-11 w-full justify-center"
+                      :disabled="purchaseFormBusy || cartEdit?.lineRevision === null || cartEdit?.expectedDraftRevision === null"
+                      @click="startCartLineReplacementEdit"
+                    >
+                      开始安全编辑
+                    </UButton>
+                  </div>
+                  <div
+                    v-if="purchaseDefinition && !purchaseDraft && !purchaseFormBusy && !isEditingCartLine"
+                    class="mb-4 space-y-3 rounded-lg border border-default bg-default p-3 sm:p-4"
+                    aria-label="购买资料草稿恢复与创建"
+                  >
+                    <div v-if="availablePurchaseDraftRecoveries.length" class="space-y-2">
+                      <p class="text-sm font-medium text-highlighted">恢复一组已有草稿</p>
+                      <p class="text-xs leading-5 text-muted">草稿归属和有效期会由服务器重新核验；不同账号请分别新建资料。</p>
+                      <div class="grid gap-2">
+                        <UButton
+                          v-for="candidate in availablePurchaseDraftRecoveries"
+                          :key="candidate.id"
+                          type="button"
+                          color="neutral"
+                          variant="outline"
+                          class="min-h-11 justify-start whitespace-normal text-left"
+                          :disabled="purchaseFormBusy"
+                          @click="recoverPurchaseDraft(candidate)"
+                        >
+                          {{ candidate.templateChanged ? '旧模板草稿 · ' : '继续填写 · ' }}{{ draftUpdatedAtLabel(candidate.updatedAt) }}
+                        </UButton>
+                      </div>
+                    </div>
+                    <UButton
+                      type="button"
+                      color="primary"
+                      variant="soft"
+                      icon="i-lucide-file-plus-2"
+                      class="min-h-11 w-full justify-center"
+                      :disabled="purchaseFormBusy"
+                      @click="startAnotherPurchaseDraft"
+                    >
+                      新建一组购买资料
+                    </UButton>
+                  </div>
                   <StorefrontPurchaseFormEditor
-                    v-if="purchaseDefinition && purchaseDraft"
+                    v-if="purchaseDefinition && purchaseDraft && (!isEditingCartLine || !isCustomer || hasCartReplacementDraft)"
                     :key="`${purchaseDraft.id}:${purchaseFormResetKey}`"
                     :definition="purchaseDefinition"
                     :model-value="purchaseValues"
@@ -1024,7 +1667,7 @@ async function buySelectedNow() {
                     variant="outline"
                     icon="i-lucide-shopping-cart"
                     :loading="shoppingCart.busy.value"
-                    :disabled="!selectedVariant || !shoppingCart.canAddToCart.value || quantity < 1 || quantity > 99 || shoppingCart.busy.value || purchaseFormBusy"
+                    :disabled="!selectedVariant || !shoppingCart.canAddToCart.value || quantity < 1 || quantity > 99 || shoppingCart.busy.value || purchaseFormBusy || (purchaseForm?.required && !purchaseDraftComplete)"
                     @click="addSelectedToCart"
                   >
                     {{ isEditingCartLine ? '保存并返回购物车' : '加入购物车' }}
@@ -1032,7 +1675,7 @@ async function buySelectedNow() {
                   <UButton
                     color="primary"
                     icon="i-lucide-arrow-right"
-                    :disabled="!selectedVariant || !shoppingCart.canAddToCart.value || quantity < 1 || quantity > 99 || shoppingCart.busy.value || purchaseFormBusy || purchaseQuoteBusy || (selectedPurchaseQuote !== null && !selectedPurchaseQuote.canPurchase)"
+                    :disabled="!selectedVariant || !shoppingCart.canAddToCart.value || quantity < 1 || quantity > 99 || shoppingCart.busy.value || purchaseFormBusy || purchaseQuoteBusy || (purchaseForm?.required && !purchaseDraftComplete) || (selectedPurchaseQuote !== null && !selectedPurchaseQuote.canPurchase)"
                     @click="buySelectedNow"
                   >
                     {{ isEditingCartLine ? '更新资料并结算' : '立即购买' }}
