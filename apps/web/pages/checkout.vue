@@ -18,17 +18,29 @@ type CheckoutRequest = typeof customerApi.request
 const shoppingCart = useShoppingCart()
 const quote = ref<CheckoutQuote | null>(null)
 const busy = ref(false)
-const submitting = ref(false)
 const errorMessage = ref('')
 const submitError = ref('')
 const pendingOwnerBlocked = ref(false)
-const sharedIntentRevision = ref(0)
 let requestSequence = 0
 const clientReady = ref(false)
 type CheckoutSelection =
   | { version: 1; items: CartSkuQuantity[] }
   | { version: 2; items: CheckoutRequestLineV2[] }
+type CheckoutOperationContext = {
+  selectionId: string | null
+  requestVersion: 1 | 2 | null
+  selection: CheckoutSelection | null
+  selectionFingerprint: string | null
+  quoteToken: string | null
+  identityVersion: number
+  pageGeneration: number
+  routeFullPath: string
+}
 const orderIntentStoreV2Key = 'aikayun-order-intents-v2'
+const pageGeneration = ref(0)
+const activeSubmissionGeneration = ref<number | null>(null)
+const submitting = computed(() => activeSubmissionGeneration.value === pageGeneration.value)
+const quoteGeneration = ref<number | null>(null)
 
 useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 
@@ -98,10 +110,9 @@ function parseRequestedItems(): CheckoutSelection | null {
 onMounted(() => { clientReady.value = true })
 
 const requestedSelection = computed(() => {
-  void sharedIntentRevision.value
   return parseRequestedItems()
 })
-const requestedItems = computed(() => requestedSelection.value?.items ?? null)
+const requestedSelectionFingerprint = computed(() => selectionFingerprint(requestedSelection.value))
 const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id))
 const loginRedirect = computed(() => `/login?redirect=${encodeURIComponent(route.fullPath)}`)
 const purchaseLoginRequired = computed(() => !isCustomer.value
@@ -130,23 +141,75 @@ function statusLabel(item: CheckoutQuoteItem): string {
   }
 }
 
-async function loadQuote(items = requestedItems.value) {
+function cloneSelection(selection: CheckoutSelection | null): CheckoutSelection | null {
+  if (!selection) return null
+  return selection.version === 2
+    ? { version: 2, items: selection.items.map(item => ({ ...item })) }
+    : { version: 1, items: selection.items.map(item => ({ ...item })) }
+}
+
+function selectionFingerprint(selection: CheckoutSelection | null): string | null {
+  if (!selection) return null
+  const items = selection.version === 2
+    ? [...selection.items].sort((left, right) => left.lineId.localeCompare(right.lineId))
+    : selection.items
+  return `${selection.version}:${JSON.stringify(items)}`
+}
+
+function routeSelectionId(): string | null {
+  return typeof route.query.intent === 'string' && isUuid(route.query.intent) ? route.query.intent : null
+}
+
+function captureOperationContext(
+  selection: CheckoutSelection | null = requestedSelection.value,
+  generation = pageGeneration.value,
+  quoteToken: string | null = null,
+): CheckoutOperationContext {
+  const snapshot = cloneSelection(selection)
+  return {
+    selectionId: routeSelectionId(), requestVersion: snapshot?.version ?? null,
+    selection: snapshot, selectionFingerprint: selectionFingerprint(snapshot), quoteToken,
+    identityVersion: customerApi.identityVersion.value, pageGeneration: generation, routeFullPath: route.fullPath,
+  }
+}
+
+function pageContextIsCurrent(context: CheckoutOperationContext): boolean {
+  return context.pageGeneration === pageGeneration.value
+    && route.path === '/checkout'
+    && route.fullPath === context.routeFullPath
+    && routeSelectionId() === context.selectionId
+    && selectionFingerprint(requestedSelection.value) === context.selectionFingerprint
+    && customerApi.identityVersion.value === context.identityVersion
+}
+
+function identityContextIsCurrent(context: CheckoutOperationContext): boolean {
+  return context.identityVersion === customerApi.identityVersion.value
+}
+
+async function loadQuote(context = captureOperationContext()) {
+  if (!pageContextIsCurrent(context)) return
   const sequence = ++requestSequence
   errorMessage.value = ''
   quote.value = null
-  if (!items) {
+  quoteGeneration.value = null
+  if (!context.selection) {
     busy.value = false
     errorMessage.value = '报价链接无效，请返回购物车重新选择商品。'
     return
   }
   busy.value = true
   try {
-    const result = await shoppingCart.quote(items)
-    if (sequence === requestSequence) quote.value = result
+    const result = await shoppingCart.quote(context.selection.items)
+    if (sequence === requestSequence && pageContextIsCurrent(context)) {
+      quote.value = result
+      quoteGeneration.value = context.pageGeneration
+    }
   } catch (error) {
-    if (sequence === requestSequence) errorMessage.value = error instanceof Error ? error.message : '报价暂时无法加载，请重试。'
+    if (sequence === requestSequence && pageContextIsCurrent(context)) {
+      errorMessage.value = error instanceof Error ? error.message : '报价暂时无法加载，请重试。'
+    }
   } finally {
-    if (sequence === requestSequence) busy.value = false
+    if (sequence === requestSequence && pageContextIsCurrent(context)) busy.value = false
   }
 }
 
@@ -197,10 +260,6 @@ function removeOrderIntent(items: CartSkuQuantity[], ownerId: string, idempotenc
   } catch { /* The completed order remains available through order history. */ }
 }
 
-function routeSelectionId(): string | null {
-  return typeof route.query.intent === 'string' && isUuid(route.query.intent) ? route.query.intent : null
-}
-
 function guestOrderHeaders(ownerId: string): Record<string, string> | undefined {
   return ownerId.startsWith('guest:') ? { 'x-aikayun-guest-session-id': ownerId.slice('guest:'.length) } : undefined
 }
@@ -225,73 +284,80 @@ async function submitPendingV2(intent: PendingOrderIntentV2, request: CheckoutRe
   return result.order.id
 }
 
-async function processV2Intent(
-  selection: CheckoutSelection | null, identityAtStart: number,
-  quoteToken: string | null,
-): Promise<string | null> {
+async function processV2Intent(context: CheckoutOperationContext): Promise<string | null> {
   return withOrderSubmissionLock(() => customerApi.withCheckoutIdentity(async (request) => {
-    if (identityAtStart !== customerApi.identityVersion.value) return null
+    if (!identityContextIsCurrent(context)) return null
     const ownerId = await currentOrderOwnerId(request)
-    if (identityAtStart !== customerApi.identityVersion.value) return null
+    if (!identityContextIsCurrent(context)) return null
+    const selection = context.selection
     let intent: OrderIntentV2 | null
-    if (quoteToken && selection?.version === 2) {
-      intent = await prepareOrderIntentV2(selection.items, ownerId, quoteToken, routeSelectionId())
+    if (context.quoteToken && selection?.version === 2) {
+      intent = await prepareOrderIntentV2(selection.items, ownerId, context.quoteToken, context.selectionId)
     } else if (selection?.version === 2) {
-      intent = await findOrderIntentV2(selection.items, ownerId, routeSelectionId())
+      intent = await findOrderIntentV2(selection.items, ownerId, context.selectionId)
     } else {
-      const selectionId = routeSelectionId()
-      intent = selectionId ? await findOrderIntentBySelectionId(selectionId, ownerId) : null
+      intent = context.selectionId ? await findOrderIntentBySelectionId(context.selectionId, ownerId) : null
     }
     if (!intent || intent.state === 'rejected') return null
     if (intent.state === 'completed') return intent.orderId
-    if (identityAtStart !== customerApi.identityVersion.value) return null
+    if (!identityContextIsCurrent(context)) return null
     return submitPendingV2(intent, request)
   }))
 }
 
-async function showCompletedOrder(orderId: string, identityAtStart: number): Promise<void> {
-  if (identityAtStart !== customerApi.identityVersion.value) return
+async function showCompletedOrder(orderId: string, context: CheckoutOperationContext): Promise<void> {
+  if (!pageContextIsCurrent(context)) return
   await navigateTo(`/orders/${orderId}`)
 }
 
 async function createOrder() {
-  const selection = requestedSelection.value
-  const items = requestedItems.value
+  const pageContext = captureOperationContext()
   const currentQuote = quote.value
-  if (submitting.value || !selection || !items || !currentQuote?.canContinue || !currentQuote.quoteToken) return
-  const identityAtStart = customerApi.identityVersion.value
-  const identityIsCurrent = () => identityAtStart === customerApi.identityVersion.value
-  submitting.value = true
+  if (submitting.value || !pageContext.selection || !currentQuote?.canContinue
+    || quoteGeneration.value !== pageContext.pageGeneration || !currentQuote.quoteToken) return
+  const context: CheckoutOperationContext = { ...pageContext, quoteToken: currentQuote.quoteToken }
+  activeSubmissionGeneration.value = context.pageGeneration
   submitError.value = ''
   try {
-    if (selection.version === 2) {
-      const orderId = await processV2Intent(selection, identityAtStart, currentQuote.quoteToken)
-      if (orderId) await showCompletedOrder(orderId, identityAtStart)
+    if (context.requestVersion === 2) {
+      const orderId = await processV2Intent(context)
+      if (orderId) await showCompletedOrder(orderId, context)
     } else {
+      const selection = context.selection
+      if (selection?.version !== 1 || !context.quoteToken) return
       const completed = await withOrderSubmissionLock(() => customerApi.withCheckoutIdentity(async (request) => {
-        if (!identityIsCurrent()) return null
+        if (!identityContextIsCurrent(context)) return null
         const actualOwnerId = await currentOrderOwnerId(request)
-        if (!identityIsCurrent()) return null
+        if (!identityContextIsCurrent(context)) return null
         // Keep the historical v1 storage key; new guest keys have a separate
         // owner receipt so an unknown result cannot cross a later guest session.
         const ownerId = actualOwnerId.startsWith('guest:') ? 'guest' : actualOwnerId
         const idempotencyKey = orderIntentKey(selection.items, ownerId, actualOwnerId)
         const result = await request<CreateOrderResult>('/api/v1/checkout/orders', {
           method: 'POST', headers: guestOrderHeaders(actualOwnerId),
-          body: { idempotencyKey, quoteToken: currentQuote.quoteToken, items },
+          body: { idempotencyKey, quoteToken: context.quoteToken, items: selection.items },
         })
         return { result, ownerId, idempotencyKey }
       }))
-      if (!completed || !identityIsCurrent()) return
+      if (!completed || !identityContextIsCurrent(context)) return
+      if (!pageContextIsCurrent(context)) {
+        // The v1 response confirms completion and its historical key is only
+        // a temporary retry record; remove it without taking over a new page.
+        removeOrderIntent(selection.items, completed.ownerId, completed.idempotencyKey)
+        return
+      }
       const orderPath = `/orders/${completed.result.order.id}`
       await navigateTo(orderPath)
-      if (identityIsCurrent() && route.path === orderPath) removeOrderIntent(selection.items, completed.ownerId, completed.idempotencyKey)
+      if (identityContextIsCurrent(context) && route.path === orderPath) {
+        removeOrderIntent(selection.items, completed.ownerId, completed.idempotencyKey)
+      }
     }
   } catch (error) {
-    if (!identityIsCurrent()) return
+    if (!identityContextIsCurrent(context) || !pageContextIsCurrent(context)) return
     if (error instanceof PendingOwnerConflictError || (error instanceof CustomerApiError && error.code === 'GUEST_SESSION_CHANGED')) pendingOwnerBlocked.value = true
     if (error instanceof CheckoutConflictError) {
       quote.value = error.currentQuote
+      quoteGeneration.value = context.pageGeneration
       submitError.value = `${error.message} 已显示最新报价，请再次确认后重新提交。`
     } else {
       submitError.value = error instanceof CustomerApiError || error instanceof Error
@@ -299,23 +365,24 @@ async function createOrder() {
         : '订单暂时未能创建。请稍后重试，重复提交会返回同一订单。'
     }
   } finally {
-    submitting.value = false
+    if (activeSubmissionGeneration.value === context.pageGeneration) activeSubmissionGeneration.value = null
   }
 }
 
-async function replayPendingV2(selection: CheckoutSelection | null): Promise<void> {
-  if (!import.meta.client || selection?.version === 1 || submitting.value || !customerApi.sessionResolved.value) return
-  const identityAtStart = customerApi.identityVersion.value
+async function replayPendingV2(context: CheckoutOperationContext): Promise<void> {
+  if (!import.meta.client || context.selection?.version === 1 || submitting.value
+    || !customerApi.sessionResolved.value || !pageContextIsCurrent(context)) return
   try {
-    if (!hasOrderIntentV2(selection?.version === 2 ? selection.items : null, routeSelectionId())) return
-    submitting.value = true
-    const orderId = await processV2Intent(selection, identityAtStart, null)
-    if (orderId) await showCompletedOrder(orderId, identityAtStart)
+    if (!hasOrderIntentV2(context.selection?.version === 2 ? context.selection.items : null, context.selectionId)) return
+    activeSubmissionGeneration.value = context.pageGeneration
+    const orderId = await processV2Intent(context)
+    if (orderId) await showCompletedOrder(orderId, context)
   } catch (error) {
-    if (identityAtStart !== customerApi.identityVersion.value) return
+    if (!identityContextIsCurrent(context) || !pageContextIsCurrent(context)) return
     if (error instanceof PendingOwnerConflictError || (error instanceof CustomerApiError && error.code === 'GUEST_SESSION_CHANGED')) pendingOwnerBlocked.value = true
     if (error instanceof CheckoutConflictError) {
       quote.value = error.currentQuote
+      quoteGeneration.value = context.pageGeneration
       submitError.value = `${error.message} 已显示最新报价，请再次确认。`
     } else if (error instanceof PendingOwnerConflictError || (error instanceof CustomerApiError && error.code === 'GUEST_SESSION_CHANGED')) {
       submitError.value = error.message
@@ -323,35 +390,56 @@ async function replayPendingV2(selection: CheckoutSelection | null): Promise<voi
       submitError.value = '上次提交结果尚未确认。保留原请求标识，继续重试会先核对原订单。'
     }
   } finally {
-    submitting.value = false
+    if (activeSubmissionGeneration.value === context.pageGeneration) activeSubmissionGeneration.value = null
   }
 }
 
 watch(
-  [requestedSelection, () => customerApi.identityVersion.value, () => customerApi.sessionResolved.value, clientReady],
-  ([selection]) => {
-    if (!import.meta.client) return
-    if (typeof route.query.intent === 'string' && !clientReady.value) return
+  [() => route.fullPath, requestedSelectionFingerprint, () => customerApi.identityVersion.value,
+    clientReady],
+  () => {
+    const generation = pageGeneration.value + 1
+    pageGeneration.value = generation
+    const context = captureOperationContext(requestedSelection.value, generation)
+    // Invalidate prior quote work before replay can await a lock or network.
+    requestSequence += 1
+    quote.value = null
+    quoteGeneration.value = null
+    busy.value = false
+    errorMessage.value = ''
+    submitError.value = ''
     pendingOwnerBlocked.value = false
+    if (!import.meta.client || route.path !== '/checkout') return
+    if (typeof route.query.intent === 'string' && !clientReady.value) return
     void (async () => {
-      await replayPendingV2(selection)
-      if (route.path === '/checkout') await loadQuote(selection?.items ?? null)
+      await replayPendingV2(context)
+      if (pageContextIsCurrent(context)) await loadQuote(context)
     })()
   },
   { immediate: true, flush: 'sync' },
 )
 
+watch(
+  () => customerApi.sessionResolved.value,
+  () => {
+    const context = captureOperationContext()
+    if (!import.meta.client || !clientReady.value || route.path !== '/checkout') return
+    void (async () => {
+      await replayPendingV2(context)
+      if (pageContextIsCurrent(context)) await loadQuote(context)
+    })()
+  },
+  { flush: 'sync' },
+)
+
 function onSharedIntentChange(event: StorageEvent): void {
-  if (event.key === orderIntentStoreV2Key) sharedIntentRevision.value += 1
+  if (event.key !== orderIntentStoreV2Key || !import.meta.client || route.path !== '/checkout') return
+  const context = captureOperationContext()
+  if (context.selection?.version === 2 && context.selectionId) void replayPendingV2(context)
 }
 
 onMounted(() => window.addEventListener('storage', onSharedIntentChange))
 onBeforeUnmount(() => window.removeEventListener('storage', onSharedIntentChange))
-
-watch(() => customerApi.identityVersion.value, () => {
-  submitError.value = ''
-  pendingOwnerBlocked.value = false
-}, { flush: 'sync' })
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
