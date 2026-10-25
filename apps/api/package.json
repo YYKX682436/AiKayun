@@ -16,7 +16,9 @@
     "private-files:check": "tsx src/media/private-file-reconcile-cli.ts --check",
     "private-files:repair": "tsx src/media/private-file-reconcile-cli.ts --repair",
     "purchase-drafts:check": "tsx src/media/purchase-draft-reconcile-cli.ts --check",
-    "purchase-drafts:repair": "tsx src/media/purchase-draft-reconcile-cli.ts --repair"
+    "purchase-drafts:repair": "tsx src/media/purchase-draft-reconcile-cli.ts --repair",
+    "purchase-order-attachments:check": "tsx src/media/purchase-order-attachment-reconcile-cli.ts --check",
+    "purchase-order-attachments:repair": "tsx src/media/purchase-order-attachment-reconcile-cli.ts --repair"
   },
   "dependencies": {
     "@aikayun/contracts": "workspace:*",

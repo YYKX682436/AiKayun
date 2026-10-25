@@ -906,19 +906,78 @@ export const CartSkuQuantitySchema = Type.Object({
   quantity: Type.Integer({ minimum: 1, maximum: 99 }),
 }, { additionalProperties: false })
 
-export const CustomerCartAddBodySchema = CartSkuQuantitySchema
+const PurchaseLineIdSchema = Type.String({ format: 'uuid' })
+const PurchaseLineQuantitySchema = Type.Integer({ minimum: 1, maximum: 99 })
+const PurchaseLineDraftRevisionSchema = Type.Integer({ minimum: 1 })
+
+// Version 2 keeps the request's line reference separate from the server-only
+// content identity. A draft reference and its revision are always paired.
+export const CheckoutRequestLineV2Schema = Type.Union([
+  Type.Object({
+    lineId: PurchaseLineIdSchema,
+    skuId: Type.String({ format: 'uuid' }),
+    quantity: PurchaseLineQuantitySchema,
+  }, { additionalProperties: false }),
+  Type.Object({
+    lineId: PurchaseLineIdSchema,
+    skuId: Type.String({ format: 'uuid' }),
+    quantity: PurchaseLineQuantitySchema,
+    draftId: Type.Null(),
+    draftRevision: Type.Null(),
+  }, { additionalProperties: false }),
+  Type.Object({
+    lineId: PurchaseLineIdSchema,
+    skuId: Type.String({ format: 'uuid' }),
+    quantity: PurchaseLineQuantitySchema,
+    draftId: Type.String({ format: 'uuid' }),
+    draftRevision: PurchaseLineDraftRevisionSchema,
+  }, { additionalProperties: false }),
+])
+
+export const CustomerCartAddBodySchema = Type.Union([
+  CartSkuQuantitySchema,
+  Type.Object({
+    version: Type.Literal(2),
+    skuId: Type.String({ format: 'uuid' }),
+    quantity: PurchaseLineQuantitySchema,
+    draftId: Type.String({ format: 'uuid' }),
+    draftRevision: PurchaseLineDraftRevisionSchema,
+  }, { additionalProperties: false }),
+])
 export const CustomerCartUpdateBodySchema = Type.Object({
   quantity: Type.Integer({ minimum: 1, maximum: 99 }),
 }, { additionalProperties: false })
 
-export const CustomerCartMergeBodySchema = Type.Object({
+export const CustomerCartLineParamsSchema = Type.Object({ lineId: PurchaseLineIdSchema }, { additionalProperties: false })
+export const CustomerCartLineQuantityBodySchema = Type.Object({
+  quantity: PurchaseLineQuantitySchema,
+  expectedLineRevision: Type.Integer({ minimum: 1 }),
+}, { additionalProperties: false })
+export const CustomerCartLinePurchaseFormBodySchema = Type.Object({
+  expectedLineRevision: Type.Integer({ minimum: 1 }),
+  expectedDraftRevision: PurchaseLineDraftRevisionSchema,
+  values: Type.Record(Type.String({ format: 'uuid' }), Type.Unknown()),
+}, { additionalProperties: false })
+
+export const CustomerCartMergeBodyV1Schema = Type.Object({
   mergeId: Type.String({ format: 'uuid' }),
   items: Type.Array(CartSkuQuantitySchema, { minItems: 1, maxItems: 50 }),
 }, { additionalProperties: false })
+export const CustomerCartMergeBodyV2Schema = Type.Object({
+  version: Type.Literal(2),
+  mergeId: Type.String({ format: 'uuid' }),
+  items: Type.Array(CheckoutRequestLineV2Schema, { minItems: 1, maxItems: 50 }),
+}, { additionalProperties: false })
+export const CustomerCartMergeBodySchema = Type.Union([CustomerCartMergeBodyV1Schema, CustomerCartMergeBodyV2Schema])
 
-export const CheckoutQuoteBodySchema = Type.Object({
+export const CheckoutQuoteBodyV1Schema = Type.Object({
   items: Type.Array(CartSkuQuantitySchema, { minItems: 1, maxItems: 50 }),
 }, { additionalProperties: false })
+export const CheckoutQuoteBodyV2Schema = Type.Object({
+  version: Type.Literal(2),
+  items: Type.Array(CheckoutRequestLineV2Schema, { minItems: 1, maxItems: 50 }),
+}, { additionalProperties: false })
+export const CheckoutQuoteBodySchema = Type.Union([CheckoutQuoteBodyV1Schema, CheckoutQuoteBodyV2Schema])
 
 export const CartOptionSchema = Type.Object({
   groupId: Type.String({ format: 'uuid' }),
@@ -943,9 +1002,20 @@ export const CheckoutQuoteReasonSchema = Type.Union([
   Type.Literal('guest_free_claim_disabled'),
   Type.Literal('purchase_limit_exceeded'),
   Type.Literal('login_required_for_purchase_limit'),
+  Type.Literal('purchase_form_invalid'),
+  Type.Literal('purchase_form_version_changed'),
+  Type.Literal('purchase_form_required'),
 ])
 
 export const CheckoutQuoteItemSchema = Type.Object({
+  lineId: Type.Union([PurchaseLineIdSchema, Type.Null()]),
+  sourceLineIds: Type.Array(PurchaseLineIdSchema, { maxItems: 50 }),
+  lineRevision: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+  draftId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  draftRevision: Type.Union([PurchaseLineDraftRevisionSchema, Type.Null()]),
+  templateVersionId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
+  normalizationVersion: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+  contentIdentity: Type.Union([Type.String({ pattern: '^[a-f0-9]{64}$' }), Type.Null()]),
   skuId: Type.String({ format: 'uuid' }),
   productId: Type.Union([Type.String({ format: 'uuid' }), Type.Null()]),
   productName: Type.Union([Type.String({ minLength: 1, maxLength: 200 }), Type.Null()]),
@@ -984,11 +1054,18 @@ export const CheckoutQuoteSchema = Type.Object({
   ]), { maxItems: 2 }),
 }, { additionalProperties: false })
 
-export const CreateOrderBodySchema = Type.Object({
+export const CreateOrderBodyV1Schema = Type.Object({
   idempotencyKey: Type.String({ format: 'uuid' }),
   quoteToken: Type.String({ pattern: '^[0-9a-f]{64}$' }),
   items: Type.Array(CartSkuQuantitySchema, { minItems: 1, maxItems: 50 }),
 }, { additionalProperties: false })
+export const CreateOrderBodyV2Schema = Type.Object({
+  version: Type.Literal(2),
+  idempotencyKey: Type.String({ format: 'uuid' }),
+  quoteToken: Type.String({ pattern: '^[0-9a-f]{64}$' }),
+  items: Type.Array(CheckoutRequestLineV2Schema, { minItems: 1, maxItems: 50 }),
+}, { additionalProperties: false })
+export const CreateOrderBodySchema = Type.Union([CreateOrderBodyV1Schema, CreateOrderBodyV2Schema])
 
 export const OrderStatusSchema = Type.Union([
   Type.Literal('pending_payment'), Type.Literal('processing'),
@@ -1552,6 +1629,7 @@ export const OrderFulfillmentAttemptSchema = Type.Object({
 }, { additionalProperties: false })
 export const OrderItemSchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
+  lineId: Type.Union([PurchaseLineIdSchema, Type.Null()]),
   productId: Type.String({ format: 'uuid' }),
   skuId: Type.String({ format: 'uuid' }),
   productName: Type.String({ minLength: 1, maxLength: 200 }),
@@ -2194,6 +2272,7 @@ export const PrivateFileDownloadParamsSchema = Type.Object({
   deliveryId: Type.String({ format: 'uuid' }),
 }, { additionalProperties: false })
 export const GuestOrderSessionSchema = Type.Object({
+  sessionId: Type.String({ format: 'uuid' }),
   expiresAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
 export const ManualFulfillmentDeliveryBodySchema = Type.Object({
@@ -2338,6 +2417,7 @@ export const CustomerCartSchema = Type.Object({
 export const CustomerCartMutationSchema = Type.Object({
   changed: Type.Boolean(),
   merged: Type.Boolean(),
+  retainedLineId: Type.Union([PurchaseLineIdSchema, Type.Null()]),
   skippedSkuIds: Type.Array(Type.String({ format: 'uuid' }), { maxItems: 50 }),
   cart: CustomerCartSchema,
 }, { additionalProperties: false })
@@ -2773,13 +2853,23 @@ export type PublicInventorySummary = Static<typeof PublicInventorySummarySchema>
 export type PublicProductOptionGroup = Static<typeof PublicProductOptionGroupSchema>
 export type PublicProductVariant = Static<typeof PublicProductVariantSchema>
 export type CartSkuQuantity = Static<typeof CartSkuQuantitySchema>
+export type CheckoutRequestLineV2 = Static<typeof CheckoutRequestLineV2Schema>
 export type CustomerCartAddBody = Static<typeof CustomerCartAddBodySchema>
 export type CustomerCartUpdateBody = Static<typeof CustomerCartUpdateBodySchema>
+export type CustomerCartLineParams = Static<typeof CustomerCartLineParamsSchema>
+export type CustomerCartLineQuantityBody = Static<typeof CustomerCartLineQuantityBodySchema>
+export type CustomerCartLinePurchaseFormBody = Static<typeof CustomerCartLinePurchaseFormBodySchema>
+export type CustomerCartMergeBodyV1 = Static<typeof CustomerCartMergeBodyV1Schema>
+export type CustomerCartMergeBodyV2 = Static<typeof CustomerCartMergeBodyV2Schema>
 export type CustomerCartMergeBody = Static<typeof CustomerCartMergeBodySchema>
+export type CheckoutQuoteBodyV1 = Static<typeof CheckoutQuoteBodyV1Schema>
+export type CheckoutQuoteBodyV2 = Static<typeof CheckoutQuoteBodyV2Schema>
 export type CheckoutQuoteBody = Static<typeof CheckoutQuoteBodySchema>
 export type CheckoutQuoteReason = Static<typeof CheckoutQuoteReasonSchema>
 export type CheckoutQuoteItem = Static<typeof CheckoutQuoteItemSchema>
 export type CheckoutQuote = Static<typeof CheckoutQuoteSchema>
+export type CreateOrderBodyV1 = Static<typeof CreateOrderBodyV1Schema>
+export type CreateOrderBodyV2 = Static<typeof CreateOrderBodyV2Schema>
 export type CreateOrderBody = Static<typeof CreateOrderBodySchema>
 export type ExternalPaymentMethod = Static<typeof ExternalPaymentMethodSchema>
 export type PaymentProviderType = Static<typeof PaymentProviderTypeSchema>

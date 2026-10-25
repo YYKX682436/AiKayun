@@ -51,7 +51,16 @@ import {
   verifyDoubleSubmitCsrf,
 } from '../auth/security.js'
 import type { Database, FulfillmentMethod, OrderStatus as DbOrderStatus } from '../db/types.js'
-import { CheckoutQuoteError, checkoutRequestHash, normalizeCheckoutItems, quoteCheckoutItems } from './checkout-quote.js'
+import { CheckoutQuoteError, checkoutRequestHash, normalizeCheckoutItems,
+  quoteCheckoutItems, quoteCheckoutPurchaseLines } from './checkout-quote.js'
+import { normalizePurchaseLineRequests, purchaseLineContentIdentity,
+  purchaseLineRequestHash, PurchaseLineError, type ResolvedPurchaseLine } from './purchase-lines.js'
+import { PurchaseDraftServiceError, type PurchaseDraftOwner } from './purchase-forms.js'
+import { PurchaseAttachmentError, PurchaseAttachmentStorage } from '../media/purchase-attachment-storage.js'
+import { PurchaseOrderAttachmentStorage } from '../media/purchase-order-attachment-storage.js'
+import { PurchaseOrderDecryptionError, PurchaseOrderKeyUnavailableError } from './purchase-form-crypto.js'
+import { preparePurchaseOrderAttachments, persistOrderPurchaseSnapshotInTransaction,
+  type PreparedPurchaseOrderAttachment } from './purchase-order-attachments.js'
 import { CodePoolDecryptionError, CodePoolKeyUnavailableError, decryptCodePoolContent } from './code-pool-crypto.js'
 import {
   decryptFixedDeliveryPayload,
@@ -117,7 +126,14 @@ function handleOrderError(error: unknown, reply: FastifyReply, requestId: string
   if (error instanceof FixedDeliveryDecryptionError) {
     return reply.code(503).send(failure('FIXED_DELIVERY_DECRYPTION_FAILED', '此订单的数字交付内容完整性校验失败，已记录请求编号供排查。', requestId))
   }
-  if (error instanceof OrderError || error instanceof CheckoutQuoteError) {
+  if (error instanceof PurchaseOrderKeyUnavailableError || error instanceof PurchaseOrderDecryptionError) {
+    return reply.code(503).send(failure('PURCHASE_ORDER_SNAPSHOT_UNAVAILABLE', '成交资料暂时无法读取。', requestId))
+  }
+  if (error instanceof PurchaseAttachmentError) {
+    return reply.code(503).send(failure(error.code, error.message, requestId))
+  }
+  if (error instanceof OrderError || error instanceof CheckoutQuoteError
+    || error instanceof PurchaseLineError || error instanceof PurchaseDraftServiceError) {
     return reply.code(error.status).send(failure(error.code, error.message, requestId))
   }
   const constraint = postgresConstraint(error)
@@ -192,7 +208,7 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
     .select([
       'id', 'product_id', 'product_variant_id', 'product_name_snapshot', 'product_type_snapshot',
       'sku_code_snapshot', 'sku_snapshot', 'inventory_mode_snapshot', 'fulfillment_method_snapshot',
-      'fulfillment_content_version_id',
+      'fulfillment_content_version_id', 'purchase_line_id',
       'unit_price', 'quantity', 'line_amount', 'fulfillment_status', 'fulfilled_quantity',
       'fulfillment_reserved_quantity',
     ])
@@ -375,6 +391,7 @@ export async function loadOrderDetail(db: Db, id: string, config?: AppConfig): P
     itemsSealed: true,
     items: itemRows.map(item => ({
       id: item.id,
+      lineId: item.purchase_line_id,
       productId: item.product_id,
       skuId: item.product_variant_id,
       productName: item.product_name_snapshot,
@@ -424,17 +441,18 @@ export async function assertCustomerSession(
   if (!session) throw new OrderError(401, 'UNAUTHORIZED', '顾客登录状态已失效，请重新登录。')
 }
 
-export async function assertGuestSession(trx: Transaction<Database>, token: string | undefined): Promise<string> {
+export async function assertGuestSession(
+  trx: Transaction<Database>, token: string | undefined, purchaseLock = false,
+): Promise<string> {
   if (!token || !/^[A-Za-z0-9_-]{43}$/u.test(token)) {
     throw new OrderError(401, 'GUEST_SESSION_REQUIRED', '请刷新页面后继续，系统会自动恢复游客订单会话。')
   }
-  const session = await trx.selectFrom('guest_order_sessions')
+  const query = trx.selectFrom('guest_order_sessions')
     .select('id')
     .where('token_hash', '=', hashToken(token))
     .where('revoked_at', 'is', null)
     .where('expires_at', '>', new Date())
-    .forShare()
-    .executeTakeFirst()
+  const session = await (purchaseLock ? query.forUpdate() : query.forShare()).executeTakeFirst()
   if (!session) throw new OrderError(401, 'GUEST_SESSION_REQUIRED', '游客订单会话已过期，请刷新页面后继续。')
   return session.id
 }
@@ -502,9 +520,12 @@ async function createOrderTransaction(
   customer: AuthenticatedCustomer | null,
   guestToken: string | undefined,
   config: AppConfig,
+  preparedByLine: ReadonlyMap<string, PreparedPurchaseOrderAttachment[]>,
 ): Promise<{ created: boolean; order: OrderDetail }> {
-  const items = normalizeCheckoutItems(body.items)
-  const requestHash = checkoutRequestHash(items)
+  const v2 = 'version' in body && body.version === 2
+  const legacyItems = v2 ? null : normalizeCheckoutItems(body.items)
+  const requestedLines = v2 ? normalizePurchaseLineRequests(body.items) : null
+  const requestHash = v2 ? purchaseLineRequestHash(body.items) : checkoutRequestHash(legacyItems!)
   let ownerType: 'customer' | 'guest'
   let ownerId: string
   if (customer) {
@@ -514,7 +535,7 @@ async function createOrderTransaction(
     ownerType = 'customer'
     ownerId = customer.id
   } else {
-    ownerId = await assertGuestSession(trx, guestToken)
+    ownerId = await assertGuestSession(trx, guestToken, v2)
     ownerType = 'guest'
   }
 
@@ -524,8 +545,13 @@ async function createOrderTransaction(
 
   await trx.selectFrom('storefront_customer_policy').select('singleton')
     .where('singleton', '=', true).forShare().executeTakeFirstOrThrow()
-  await lockCheckoutCatalog(trx, items.map(item => item.skuId))
-  const currentQuote = await quoteCheckoutItems(trx, items, customer?.id ?? null, config)
+  await lockCheckoutCatalog(trx, (v2 ? requestedLines! : legacyItems!).map(item => item.skuId))
+  const owner: PurchaseDraftOwner = customer
+    ? { kind: 'customer', customer }
+    : { kind: 'guest', guestSessionToken: guestToken ?? '' }
+  const purchaseQuote = v2 ? await quoteCheckoutPurchaseLines(trx, body.items, owner, config) : null
+  const currentQuote = purchaseQuote?.quote
+    ?? await quoteCheckoutItems(trx, legacyItems!, customer?.id ?? null, config)
   if (currentQuote.quoteToken !== body.quoteToken) {
     throw new CheckoutConflict('CHECKOUT_QUOTE_CHANGED', '价格、商品状态、库存、限购规则或可购额度已变化，请核对最新报价后重新提交。', currentQuote)
   }
@@ -552,8 +578,11 @@ async function createOrderTransaction(
     history_hidden_reason: null,
   }).execute()
 
+  const resolvedLines = new Map<string, ResolvedPurchaseLine>(purchaseQuote?.lines.map(line => [line.lineId, line]) ?? [])
   const orderItems = [...currentQuote.items].sort((left, right) =>
-    (left.productId ?? '').localeCompare(right.productId ?? '') || left.skuId.localeCompare(right.skuId))
+    (left.productId ?? '').localeCompare(right.productId ?? '')
+    || left.skuId.localeCompare(right.skuId)
+    || (left.lineId ?? '').localeCompare(right.lineId ?? ''))
   for (const item of orderItems) {
     const inventoryMode = item.inventoryMode
     if (!item.productId || !item.productName || !item.productType || !item.skuCode || !item.unitPrice || !item.lineTotal
@@ -562,8 +591,10 @@ async function createOrderTransaction(
       throw new Error('Eligible checkout item is missing required transaction snapshot fields')
     }
     const orderItemId = randomUUID()
+    const lineId = item.lineId ?? randomUUID()
     await trx.insertInto('order_items').values({
       id: orderItemId,
+      purchase_line_id: lineId,
       order_id: orderId,
       product_id: item.productId,
       product_variant_id: item.skuId,
@@ -578,6 +609,14 @@ async function createOrderTransaction(
       quantity: item.quantity,
       line_amount: item.lineTotal,
     }).execute()
+    const resolved = item.lineId ? resolvedLines.get(item.lineId) : null
+    if (v2 && !resolved) throw new Error('Version 2 quote is missing its resolved purchase line')
+    await persistOrderPurchaseSnapshotInTransaction(trx, config, {
+      orderItemId,
+      contentIdentity: resolved?.contentIdentity ?? purchaseLineContentIdentity(item.skuId, null, null, null),
+      draft: resolved?.validatedDraft ?? null,
+      preparedAttachments: item.lineId ? (preparedByLine.get(item.lineId) ?? []) : [],
+    })
     if (inventoryMode === 'quantity') {
       await trx.insertInto('order_inventory_reservations').values({
         id: randomUUID(),
@@ -601,10 +640,55 @@ async function createOrderWithRetry(
   guestToken: string | undefined,
   config: AppConfig,
 ): Promise<{ created: boolean; order: OrderDetail }> {
+  const preparedByLine = new Map<string, PreparedPurchaseOrderAttachment[]>()
+  if ('version' in body && body.version === 2) {
+    const requestHash = purchaseLineRequestHash(body.items)
+    const preflight = await db.transaction().execute(async (trx) => {
+      let ownerType: 'customer' | 'guest'
+      let ownerId: string
+      if (customer) {
+        await assertCustomerSession(trx, customer, true)
+        ownerType = 'customer'
+        ownerId = customer.id
+      } else {
+        ownerId = await assertGuestSession(trx, guestToken, true)
+        ownerType = 'guest'
+      }
+      await lockIdempotencyKey(trx, ownerType, ownerId, body.idempotencyKey)
+      const existing = await existingIdempotentOrder(trx, ownerType, ownerId,
+        body.idempotencyKey, requestHash, config)
+      if (existing) return { existing, lines: [] as ResolvedPurchaseLine[] }
+      const owner: PurchaseDraftOwner = customer
+        ? { kind: 'customer', customer }
+        : { kind: 'guest', guestSessionToken: guestToken ?? '' }
+      const purchaseQuote = await quoteCheckoutPurchaseLines(trx, body.items, owner, config)
+      if (purchaseQuote.quote.quoteToken !== body.quoteToken) {
+        throw new CheckoutConflict('CHECKOUT_QUOTE_CHANGED',
+          '填写资料、价格、库存或购买资格已变化，请核对最新报价后重新提交。', purchaseQuote.quote)
+      }
+      if (!purchaseQuote.quote.canContinue || purchaseQuote.quote.totalAmount === null) {
+        const limitExceeded = purchaseQuote.quote.items.some(item => item.purchaseLimits.requiresLogin
+          || item.purchaseLimits.product.exceeded || item.purchaseLimits.sku.exceeded)
+        throw new CheckoutConflict(limitExceeded ? 'PURCHASE_LIMIT_EXCEEDED' : 'ORDER_NOT_ELIGIBLE',
+          '所选购买行当前不满足下单条件，请核对最新报价后重新提交。', purchaseQuote.quote)
+      }
+      return { existing: null, lines: purchaseQuote.lines }
+    })
+    if (preflight.existing) return { created: false, order: preflight.existing }
+    const draftStorage = new PurchaseAttachmentStorage(config.privateFileRoot)
+    const orderStorage = new PurchaseOrderAttachmentStorage(config.privateFileRoot)
+    for (const line of preflight.lines) {
+      if (!line.validatedDraft || line.validatedDraft.attachments.length === 0) continue
+      const prepared = await preparePurchaseOrderAttachments(db, draftStorage, orderStorage,
+        line.validatedDraft)
+      preparedByLine.set(line.lineId, prepared)
+    }
+  }
   const maxAttempts = 3
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      return await db.transaction().execute(trx => createOrderTransaction(trx, body, customer, guestToken, config))
+      return await db.transaction().execute(trx => createOrderTransaction(trx, body, customer,
+        guestToken, config, preparedByLine))
     } catch (error) {
       if (!retryableSqlStates.has(postgresCode(error) ?? '') || attempt === maxAttempts) {
         if (retryableSqlStates.has(postgresCode(error) ?? '')) {
@@ -1119,24 +1203,25 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
       if (request.customer) throw new OrderError(409, 'CUSTOMER_SESSION_ACTIVE', '登录顾客请使用自己的订单账户。')
       const currentToken = request.cookies[guestSessionCookie]
       if (currentToken && /^[A-Za-z0-9_-]{43}$/u.test(currentToken)) {
-        const existing = await db.selectFrom('guest_order_sessions').select('expires_at')
+        const existing = await db.selectFrom('guest_order_sessions').select(['id', 'expires_at'])
           .where('token_hash', '=', hashToken(currentToken))
           .where('revoked_at', 'is', null)
           .where('expires_at', '>', new Date())
           .executeTakeFirst()
         if (existing) {
           reply.header('cache-control', 'no-store')
-          return success({ expiresAt: existing.expires_at.toISOString() }, request.id)
+          return success({ sessionId: existing.id, expiresAt: existing.expires_at.toISOString() }, request.id)
         }
       }
       const token = createOpaqueToken()
+      const sessionId = randomUUID()
       const expiresAt = new Date(Date.now() + guestSessionTtlSeconds * 1000)
       await db.insertInto('guest_order_sessions').values({
-        id: randomUUID(), token_hash: hashToken(token), expires_at: expiresAt, revoked_at: null,
+        id: sessionId, token_hash: hashToken(token), expires_at: expiresAt, revoked_at: null,
       }).execute()
       setGuestSessionCookie(reply, token, config)
       reply.header('cache-control', 'no-store')
-      return reply.code(201).send(success({ expiresAt: expiresAt.toISOString() }, request.id))
+      return reply.code(201).send(success({ sessionId, expiresAt: expiresAt.toISOString() }, request.id))
     } catch (error) {
       return handleOrderError(error, reply, request.id)
     }

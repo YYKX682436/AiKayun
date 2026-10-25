@@ -13,6 +13,7 @@ import type { Database } from '../src/db/types.js'
 import { createZpaySignature } from '../src/payments/zpay-epay.js'
 import { expireDueUnpaidOrders } from '../src/commerce/orders.js'
 import { startZpayHttpFixture } from './fixtures/zpay-http-server.js'
+import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
   ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
@@ -176,11 +177,12 @@ async function createOrder(
       history_hidden_at: null, history_hidden_by_admin_id: null, history_hidden_reason: null,
     }).execute()
     await trx.insertInto('order_items').values({
-      id: itemId, order_id: orderId, product_id: productId, product_variant_id: variantId,
+      id: itemId, order_id: orderId, purchase_line_id: randomUUID(), product_id: productId, product_variant_id: variantId,
       product_name_snapshot: name, product_type_snapshot: 'digital', sku_code_snapshot: `PAY-${variantId.slice(0, 8)}`,
       sku_snapshot: JSON.stringify([]), inventory_mode_snapshot: inventoryMode, fulfillment_method_snapshot: 'manual',
       unit_price: amount, quantity: 1, line_amount: amount,
     }).execute()
+    await insertNoFormPurchaseSnapshot(trx, itemId, variantId)
     if (options.quantityStock !== undefined) {
       await trx.insertInto('order_inventory_reservations').values({
         id: randomUUID(), order_item_id: itemId, product_id: productId,

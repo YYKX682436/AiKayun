@@ -14,6 +14,7 @@ import { AppMigrationProvider } from '../src/db/migration-provider.js'
 import { createDatabase } from '../src/db/pool.js'
 import type { Database } from '../src/db/types.js'
 import { startZpayHttpFixture } from './fixtures/zpay-http-server.js'
+import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
   ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
@@ -197,11 +198,12 @@ async function createOrder(customer: Session, amount: string): Promise<string> {
       history_hidden_by_admin_id: null, history_hidden_reason: null,
     }).execute()
     await trx.insertInto('order_items').values({
-      id: itemId, order_id: orderId, product_id: productId, product_variant_id: variantId,
+      id: itemId, order_id: orderId, purchase_line_id: randomUUID(), product_id: productId, product_variant_id: variantId,
       product_name_snapshot: name, product_type_snapshot: 'digital', sku_code_snapshot: `WDR-${variantId.slice(0, 8)}`,
       sku_snapshot: JSON.stringify([]), inventory_mode_snapshot: 'unlimited', fulfillment_method_snapshot: 'manual',
       unit_price: amount, quantity: 1, line_amount: amount,
     }).execute()
+    await insertNoFormPurchaseSnapshot(trx, itemId, variantId)
     await trx.updateTable('orders').set({ items_sealed: true }).where('id', '=', orderId).execute()
   })
   return orderId

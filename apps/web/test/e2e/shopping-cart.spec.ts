@@ -268,7 +268,7 @@ async function addProductFromDetailInApp(page: Page, product: Product, quantity:
 }
 
 test('guest cart persists locally, merges safely into accounts, and stays private across sessions', async ({ page }) => {
-  test.setTimeout(120_000)
+  test.setTimeout(180_000)
   captureBrowserDiagnostics(page)
   const browserErrors: string[] = []
   page.on('pageerror', error => browserErrors.push(error.message))
@@ -371,8 +371,31 @@ test('guest cart persists locally, merges safely into accounts, and stays privat
     await expect(page.getByRole('heading', { name: productAName })).toBeVisible()
     await expect(page.getByRole('heading', { name: productBName })).toBeVisible()
 
+    // Signed-in checkout carries only an opaque selection ID in the URL;
+    // the exact line references survive refresh in same-tab session storage.
+    await page.getByRole('checkbox', { name: `选择${productBName}` }).uncheck()
+    await page.getByRole('link', { name: '查看结算报价' }).click()
+    await expect(page).toHaveURL(/\/checkout\?intent=[0-9a-f-]{36}$/u)
+    expect(new URL(page.url()).searchParams.has('items')).toBe(false)
+    const selectionKeys = await page.evaluate(() => Object.keys(sessionStorage)
+      .filter(key => key.startsWith('aikayun-checkout-selections-v2')))
+    expect(selectionKeys).toEqual(['aikayun-checkout-selections-v2'])
+    await page.reload()
+    await expect(page.getByRole('heading', { name: '确认订单' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: productAName })).toBeVisible()
+    await page.getByRole('link', { name: '返回购物车', exact: true }).click()
+
+    const cartBeforeLineMutation = await page.request.get('/api/v1/customer/cart')
+    expect(cartBeforeLineMutation.status()).toBe(200)
+    const cartLines = (await cartBeforeLineMutation.json()).data as { items: Array<{ lineId: string; skuId: string }> }
+    const productALineId = cartLines.items.find(item => item.skuId === productA.variants[0]!.id)?.lineId
+    expect(productALineId).toMatch(/^[0-9a-f-]{36}$/u)
+
     const quantityControl = page.locator(`[aria-label="${productAName}购买数量"]`)
+    const linePatch = page.waitForRequest(request => request.method() === 'PATCH'
+      && new URL(request.url()).pathname === `/api/v1/customer/cart/lines/${productALineId}`)
     await page.getByRole('button', { name: `增加${productAName}数量` }).click()
+    expect((await linePatch).postDataJSON()).toMatchObject({ quantity: 4, expectedLineRevision: expect.any(Number) })
     await expect(quantityControl).toContainText('4')
     await page.getByRole('button', { name: `减少${productAName}数量` }).click()
     await expect(quantityControl).toContainText('3')
@@ -887,6 +910,395 @@ test('guest cart add, quantity changes, removal, and clear persist only unclaime
   }
   finally {
     if (!page.isClosed() && product) await deleteProduct(page, product)
+  }
+})
+
+test('guest v3 quote folds equal-content lines without changing old pending batches', async ({ page }) => {
+  test.setTimeout(120_000)
+  const productName = `Cart分行折叠-${randomUUID().slice(0, 8)}`
+  let product: Product | undefined
+  try {
+    await attachBrowserAdmin(page)
+    product = await createProduct(page, productName, '4.00')
+    const skuId = product.variants[0]!.id
+    const firstLineId = randomUUID()
+    const secondLineId = randomUUID()
+    const legacyPending = {
+      ownerId: randomUUID(), mergeId: randomUUID(), items: [{ skuId, quantity: 1 }],
+    }
+    await page.goto('/cart')
+    await page.evaluate(({ key, store }) => localStorage.setItem(key, JSON.stringify(store)), {
+      key: guestCartKey,
+      store: {
+        version: 3,
+        unclaimedItems: [
+          { lineId: firstLineId, skuId, quantity: 1 },
+          { lineId: secondLineId, skuId, quantity: 2 },
+        ],
+        pendingBatches: [legacyPending],
+      },
+    })
+    await page.reload()
+    await expect(page.getByRole('heading', { name: productName })).toHaveCount(1)
+    const quantityControl = page.locator(`[aria-label="${productName}购买数量"]`)
+    await expect(quantityControl).toContainText('3')
+    await expect.poll(async () => {
+      const raw = await page.evaluate(key => localStorage.getItem(key), guestCartKey)
+      const stored = JSON.parse(raw ?? 'null') as { unclaimedItems: Array<{ lineId: string; quantity: number }> }
+      return stored.unclaimedItems.length
+    }).toBe(1)
+    const folded = JSON.parse(await page.evaluate(key => localStorage.getItem(key), guestCartKey) ?? 'null') as {
+      version: number
+      unclaimedItems: Array<{ lineId: string; skuId: string; quantity: number }>
+      pendingBatches: unknown[]
+    }
+    expect(folded.version).toBe(3)
+    expect(folded.unclaimedItems).toEqual([{
+      lineId: [firstLineId, secondLineId].sort()[0], skuId, quantity: 3,
+    }])
+    expect(folded.pendingBatches).toEqual([legacyPending])
+
+    await page.getByRole('button', { name: `增加${productName}数量` }).click()
+    await expect(quantityControl).toContainText('4')
+    await page.getByRole('listitem').filter({ hasText: productName }).getByRole('button', { name: '移除' }).click()
+    await expect(page.getByRole('heading', { name: '购物车还是空的' })).toBeVisible()
+    const afterRemove = JSON.parse(await page.evaluate(key => localStorage.getItem(key), guestCartKey) ?? 'null') as {
+      unclaimedItems: unknown[]; pendingBatches: unknown[]
+    }
+    expect(afterRemove.unclaimedItems).toEqual([])
+    expect(afterRemove.pendingBatches).toEqual([legacyPending])
+  } finally {
+    if (product) await deleteProduct(page, product)
+  }
+})
+
+test('v2 checkout never reuses an unresolved intent across account or guest-session changes', async ({ page }) => {
+  test.setTimeout(120_000)
+  const productName = `Cart未决归属-${randomUUID().slice(0, 8)}`
+  let product: Product | undefined
+  let orderPosts = 0
+  try {
+    await attachBrowserAdmin(page)
+    product = await createProduct(page, productName, '4.00')
+    const line = { lineId: randomUUID(), skuId: product.variants[0]!.id, quantity: 1 }
+    const selectionId = randomUUID()
+    const fingerprint = JSON.stringify([line])
+    await page.goto('/cart')
+    await page.route('**/api/v1/checkout/orders', async (route) => {
+      if (route.request().method() === 'POST') orderPosts += 1
+      await route.continue()
+    })
+    await page.evaluate(({ selectionId, fingerprint, line }) => {
+      sessionStorage.setItem('aikayun-checkout-selections-v2', JSON.stringify([{
+        id: selectionId, fingerprint, items: [line],
+      }]))
+      // A tab-local v2 request from the previous build migrates without
+      // changing its key, quote token, or request body.
+      sessionStorage.setItem('aikayun-order-intents-v2', JSON.stringify([{
+        ownerId: crypto.randomUUID(), fingerprint, idempotencyKey: crypto.randomUUID(),
+        quoteToken: '0'.repeat(64), items: [line],
+      }]))
+    }, { selectionId, fingerprint, line })
+    await page.goto(`/checkout?intent=${selectionId}`)
+    await expect(page.getByRole('alert').filter({ hasText: '已有其他账户或游客会话的未确认订单' })).toBeVisible()
+    expect(orderPosts).toBe(0)
+    const migrated = await page.evaluate(() => ({
+      local: JSON.parse(localStorage.getItem('aikayun-order-intents-v2') ?? 'null'),
+      old: sessionStorage.getItem('aikayun-order-intents-v2'),
+    })) as { local: Array<{ state: string; idempotencyKey: string }>; old: string | null }
+    expect(migrated.local).toHaveLength(1)
+    expect(migrated.local[0]?.state).toBe('pending')
+    expect(migrated.old).toBeNull()
+
+    await page.evaluate((fingerprint) => {
+      localStorage.setItem('aikayun-order-intents-v2', JSON.stringify([{
+        state: 'pending', ownerId: `guest:${crypto.randomUUID()}`, fingerprint,
+        selectionId: null, idempotencyKey: crypto.randomUUID(),
+        quoteToken: '0'.repeat(64), items: JSON.parse(sessionStorage.getItem('aikayun-checkout-selections-v2')!)[0].items,
+      }]))
+    }, fingerprint)
+    await page.reload()
+    await expect(page.getByRole('alert').filter({ hasText: '已有其他账户或游客会话的未确认订单' })).toBeVisible()
+    expect(orderPosts).toBe(0)
+  } finally {
+    await page.unroute('**/api/v1/checkout/orders')
+    if (product) await deleteProduct(page, product)
+  }
+})
+
+test('v2 lost order acknowledgment replays the same key after closing its tab and retains the completed receipt', async ({ page }) => {
+  test.setTimeout(150_000)
+  const productName = `Cart订单恢复-${randomUUID().slice(0, 8)}`
+  let product: Product | undefined
+  let originalPolicy: CustomerPolicy | undefined
+  const selectionId = randomUUID()
+  const firstCommitted = deferred()
+  const postKeys: string[] = []
+  let committedOrderId: string | null = null
+  let secondPage: Page | undefined
+  let thirdPage: Page | undefined
+  try {
+    await attachBrowserAdmin(page)
+    originalPolicy = await setGuestCheckout(page, true)
+    product = await createProduct(page, productName, '4.00')
+    await makeProductPurchasable(page, product)
+    const line = { lineId: randomUUID(), skuId: product.variants[0]!.id, quantity: 1 }
+    const fingerprint = JSON.stringify([line])
+    await page.goto('/cart')
+    await page.evaluate(({ selectionId, fingerprint, line }) => {
+      sessionStorage.setItem('aikayun-checkout-selections-v2', JSON.stringify([{
+        id: selectionId, fingerprint, items: [line],
+      }]))
+    }, { selectionId, fingerprint, line })
+    const checkoutUrl = `/checkout?intent=${selectionId}`
+    await page.goto(checkoutUrl)
+    await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
+    await page.route('**/api/v1/checkout/orders', async (route) => {
+      if (route.request().method() !== 'POST') return route.continue()
+      postKeys.push((route.request().postDataJSON() as { idempotencyKey: string }).idempotencyKey)
+      const response = await route.fetch()
+      expect([200, 201]).toContain(response.status())
+      committedOrderId = ((await response.json()) as { data: { order: { id: string } } }).data.order.id
+      firstCommitted.resolve()
+      await route.abort('failed')
+    })
+    await page.getByRole('button', { name: '提交订单' }).click()
+    await firstCommitted.promise
+    await expect(page.getByRole('alert').filter({ hasText: '服务暂时无法处理此请求' })).toBeVisible()
+    const pending = JSON.parse(await page.evaluate(() => localStorage.getItem('aikayun-order-intents-v2')) ?? 'null') as Array<{
+      state: string; ownerId: string; idempotencyKey: string; items: unknown[]; selectionId: string
+    }>
+    expect(pending).toHaveLength(1)
+    expect(pending[0]).toMatchObject({ state: 'pending', selectionId, items: [line] })
+    expect(pending[0]?.ownerId).toMatch(/^guest:[0-9a-f-]{36}$/u)
+    expect(JSON.stringify(pending)).not.toContain(productName)
+    expect(postKeys).toEqual([pending[0]!.idempotencyKey])
+
+    await page.close()
+    secondPage = await page.context().newPage()
+    const secondSelectionId = randomUUID()
+    await secondPage.route('**/api/v1/checkout/orders', async (route) => {
+      if (route.request().method() === 'POST') postKeys.push((route.request().postDataJSON() as { idempotencyKey: string }).idempotencyKey)
+      await route.continue()
+    })
+    await secondPage.goto('/cart')
+    await secondPage.evaluate(({ secondSelectionId, line }) => {
+      sessionStorage.setItem('aikayun-checkout-selections-v2', JSON.stringify([{
+        id: secondSelectionId, fingerprint: JSON.stringify([line]), items: [line],
+      }]))
+    }, { secondSelectionId, line })
+    await secondPage.goto(`/checkout?intent=${secondSelectionId}`)
+    await expect(secondPage).toHaveURL(new RegExp(`/orders/${committedOrderId}$`, 'u'))
+    expect(postKeys).toEqual([pending[0]!.idempotencyKey, pending[0]!.idempotencyKey])
+    const completed = JSON.parse(await secondPage.evaluate(() => localStorage.getItem('aikayun-order-intents-v2')) ?? 'null') as Array<{
+      state: string; orderId: string; idempotencyKey: string; items?: unknown; quoteToken?: unknown
+    }>
+    expect(completed).toEqual([expect.objectContaining({
+      state: 'completed', orderId: committedOrderId, idempotencyKey: pending[0]!.idempotencyKey,
+    })])
+    expect(completed[0]).not.toHaveProperty('items')
+    expect(completed[0]).not.toHaveProperty('quoteToken')
+
+    await secondPage.goto(`/checkout?intent=${secondSelectionId}`)
+    await expect(secondPage).toHaveURL(new RegExp(`/orders/${committedOrderId}$`, 'u'))
+    expect(postKeys).toHaveLength(2)
+
+    // The first tab's session selection has disappeared; its original URL
+    // still resolves the receipt and cannot create a new key.
+    thirdPage = await page.context().newPage()
+    await thirdPage.route('**/api/v1/checkout/orders', async (route) => {
+      if (route.request().method() === 'POST') postKeys.push((route.request().postDataJSON() as { idempotencyKey: string }).idempotencyKey)
+      await route.continue()
+    })
+    await thirdPage.goto(checkoutUrl)
+    await expect(thirdPage).toHaveURL(new RegExp(`/orders/${committedOrderId}$`, 'u'))
+    expect(postKeys).toHaveLength(2)
+  } finally {
+    const cleanupPage = thirdPage ?? secondPage ?? page
+    // A real order now references this product; the isolated E2E database is
+    // reset on the next run and removed after this focused verification.
+    if (originalPolicy) await restoreCustomerPolicy(cleanupPage, originalPolicy)
+    await secondPage?.close()
+    await thirdPage?.close()
+  }
+})
+
+test('a stale checkout tab follows another tab’s completed v2 receipt without a new order key', async ({ page }) => {
+  test.setTimeout(150_000)
+  const productName = `Cart完成回执-${randomUUID().slice(0, 8)}`
+  let product: Product | undefined
+  let originalPolicy: CustomerPolicy | undefined
+  let confirmingPage: Page | undefined
+  const postKeys: string[] = []
+  try {
+    await attachBrowserAdmin(page)
+    originalPolicy = await setGuestCheckout(page, true)
+    product = await createProduct(page, productName, '4.00')
+    await makeProductPurchasable(page, product)
+    const line = { lineId: randomUUID(), skuId: product.variants[0]!.id, quantity: 1 }
+    const selectionId = randomUUID()
+    const checkoutUrl = `/checkout?intent=${selectionId}`
+    await page.goto('/cart')
+    await page.evaluate(({ selectionId, line }) => sessionStorage.setItem('aikayun-checkout-selections-v2', JSON.stringify([{
+      id: selectionId, fingerprint: JSON.stringify([line]), items: [line],
+    }])), { selectionId, line })
+    await page.goto(checkoutUrl)
+    await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
+    await page.route('**/api/v1/checkout/orders', async (route) => {
+      if (route.request().method() !== 'POST') return route.continue()
+      postKeys.push((route.request().postDataJSON() as { idempotencyKey: string }).idempotencyKey)
+      const response = await route.fetch()
+      expect([200, 201]).toContain(response.status())
+      await route.abort('failed')
+    })
+    await page.getByRole('button', { name: '提交订单' }).click()
+    await expect(page.getByRole('alert').filter({ hasText: '服务暂时无法处理此请求' })).toBeVisible()
+    expect(postKeys).toHaveLength(1)
+
+    confirmingPage = await page.context().newPage()
+    await confirmingPage.route('**/api/v1/checkout/orders', async (route) => {
+      if (route.request().method() === 'POST') postKeys.push((route.request().postDataJSON() as { idempotencyKey: string }).idempotencyKey)
+      await route.continue()
+    })
+    await confirmingPage.goto(checkoutUrl)
+    await expect(confirmingPage).toHaveURL(/\/orders\/[0-9a-f-]{36}$/u)
+    const originalOrderUrl = new URL(confirmingPage.url()).pathname
+    await expect(page).toHaveURL(new RegExp(`${originalOrderUrl}$`, 'u'))
+    expect(postKeys).toEqual([postKeys[0], postKeys[0]])
+
+    await page.goto(checkoutUrl)
+    await expect(page).toHaveURL(new RegExp(`${originalOrderUrl}$`, 'u'))
+    expect(postKeys).toHaveLength(2)
+  } finally {
+    if (originalPolicy) await restoreCustomerPolicy(confirmingPage ?? page, originalPolicy)
+    await confirmingPage?.close()
+  }
+})
+
+test('a fresh cart checkout can buy the same line again while older selection URLs stay bound to their orders', async ({ page }) => {
+  test.setTimeout(150_000)
+  const productName = `Cart正常复购-${randomUUID().slice(0, 8)}`
+  let product: Product | undefined
+  let originalPolicy: CustomerPolicy | undefined
+  const orderKeys: string[] = []
+  try {
+    await attachBrowserAdmin(page)
+    originalPolicy = await setGuestCheckout(page, true)
+    product = await createProduct(page, productName, '4.00')
+    await makeProductPurchasable(page, product)
+    const line = { lineId: randomUUID(), skuId: product.variants[0]!.id, quantity: 1 }
+    await page.goto('/cart')
+    await page.evaluate(({ guestCartKey, line }) => localStorage.setItem(guestCartKey, JSON.stringify({
+      version: 3, unclaimedItems: [line], pendingBatches: [],
+    })), { guestCartKey, line })
+    await page.route('**/api/v1/checkout/orders', async (route) => {
+      if (route.request().method() === 'POST') {
+        orderKeys.push((route.request().postDataJSON() as { idempotencyKey: string }).idempotencyKey)
+      }
+      await route.continue()
+    })
+    await page.reload()
+    await expect(page.getByRole('heading', { name: productName })).toBeVisible()
+    await page.getByRole('link', { name: '查看结算报价' }).click()
+    await expect(page).toHaveURL(/\/checkout\?intent=[0-9a-f-]{36}$/u)
+    const firstCheckoutUrl = page.url()
+    await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
+    await page.getByRole('button', { name: '提交订单' }).click()
+    await expect(page).toHaveURL(/\/orders\/[0-9a-f-]{36}$/u)
+    const firstOrderUrl = page.url()
+
+    await page.goto('/cart')
+    await expect(page.getByRole('heading', { name: productName })).toBeVisible()
+    await page.getByRole('link', { name: '查看结算报价' }).click()
+    await expect(page).toHaveURL(/\/checkout\?intent=[0-9a-f-]{36}$/u)
+    const secondCheckoutUrl = page.url()
+    expect(secondCheckoutUrl).not.toBe(firstCheckoutUrl)
+    await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
+    await page.getByRole('button', { name: '提交订单' }).click()
+    await expect(page).toHaveURL(/\/orders\/[0-9a-f-]{36}$/u)
+    expect(page.url()).not.toBe(firstOrderUrl)
+    expect(orderKeys).toHaveLength(2)
+    expect(orderKeys[1]).not.toBe(orderKeys[0])
+
+    await page.goto(firstCheckoutUrl)
+    await expect(page).toHaveURL(firstOrderUrl)
+    expect(orderKeys).toHaveLength(2)
+
+    // Terminal receipts from the previous guest session do not block a new
+    // guest's explicit cart checkout for the same stable purchase line.
+    await page.context().clearCookies({ name: 'aikayun_guest_order_session' })
+    await page.goto('/cart')
+    await page.getByRole('link', { name: '查看结算报价' }).click()
+    await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
+    await page.getByRole('button', { name: '提交订单' }).click()
+    await expect(page).toHaveURL(/\/orders\/[0-9a-f-]{36}$/u)
+    expect(orderKeys).toHaveLength(3)
+    expect(new Set(orderKeys).size).toBe(3)
+
+    await page.evaluate(() => {
+      const key = 'aikayun-order-intents-v2'
+      const receipts = JSON.parse(localStorage.getItem(key) ?? '[]') as Array<{ fingerprint: string }>
+      const fingerprint = receipts[0]!.fingerprint
+      localStorage.setItem(key, JSON.stringify([...receipts, {
+        state: 'rejected', ownerId: `guest:${crypto.randomUUID()}`, fingerprint,
+        selectionId: crypto.randomUUID(), idempotencyKey: crypto.randomUUID(),
+        quoteToken: '0'.repeat(64), items: JSON.parse(fingerprint),
+      }]))
+    })
+    await page.goto('/cart')
+    await page.getByRole('link', { name: '查看结算报价' }).click()
+    await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
+    await page.getByRole('button', { name: '提交订单' }).click()
+    await expect(page).toHaveURL(/\/orders\/[0-9a-f-]{36}$/u)
+    expect(orderKeys).toHaveLength(4)
+    expect(new Set(orderKeys).size).toBe(4)
+  } finally {
+    if (originalPolicy) await restoreCustomerPolicy(page, originalPolicy)
+  }
+})
+
+test('old guest cart rows upgrade before checkout while claimed v1 batches retain their original request', async ({ page }) => {
+  test.setTimeout(150_000)
+  const productName = `Cart旧版结算-${randomUUID().slice(0, 8)}`
+  let product: Product | undefined
+  let originalPolicy: CustomerPolicy | undefined
+  let submittedBody: unknown = null
+  try {
+    await attachBrowserAdmin(page)
+    originalPolicy = await setGuestCheckout(page, true)
+    product = await createProduct(page, productName, '4.00')
+    await makeProductPurchasable(page, product)
+    const originalBatch = {
+      ownerId: randomUUID(), mergeId: randomUUID(), items: [{ skuId: randomUUID(), quantity: 2 }],
+    }
+    await page.goto('/cart')
+    await page.evaluate(({ guestCartKey, skuId, originalBatch }) => localStorage.setItem(guestCartKey, JSON.stringify({
+      version: 2, unclaimedItems: [{ skuId, quantity: 1 }], pendingBatches: [originalBatch],
+    })), { guestCartKey, skuId: product.variants[0]!.id, originalBatch })
+    await page.route('**/api/v1/checkout/orders', async (route) => {
+      if (route.request().method() === 'POST') submittedBody = route.request().postDataJSON()
+      await route.continue()
+    })
+    await page.reload()
+    await expect(page.getByRole('heading', { name: productName })).toBeVisible()
+    await page.getByRole('link', { name: '查看结算报价' }).click()
+    await expect(page).toHaveURL(/\/checkout\?intent=[0-9a-f-]{36}$/u)
+    expect(new URL(page.url()).searchParams.has('items')).toBe(false)
+    const upgraded = JSON.parse(await page.evaluate(key => localStorage.getItem(key), guestCartKey) ?? 'null') as {
+      version: number; unclaimedItems: Array<{ lineId: string; skuId: string; quantity: number }>
+      pendingBatches: unknown[]
+    }
+    expect(upgraded.version).toBe(3)
+    expect(upgraded.unclaimedItems).toEqual([{
+      lineId: expect.stringMatching(/^[0-9a-f-]{36}$/u), skuId: product.variants[0]!.id, quantity: 1,
+    }])
+    expect(upgraded.pendingBatches).toEqual([originalBatch])
+    await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
+    await page.getByRole('button', { name: '提交订单' }).click()
+    await expect(page).toHaveURL(/\/orders\/[0-9a-f-]{36}$/u)
+    expect(submittedBody).toMatchObject({ version: 2, items: upgraded.unclaimedItems })
+  } finally {
+    if (originalPolicy) await restoreCustomerPolicy(page, originalPolicy)
   }
 })
 

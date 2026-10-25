@@ -21,6 +21,7 @@ import { productRichContentToSafeHtml } from '@aikayun/contracts'
 import type { CreateProductBody, ProductDetail } from '@aikayun/contracts'
 import { MediaStorage } from '../src/media/storage.js'
 import { reconcileProductMedia } from '../src/media/reconcile.js'
+import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const testEmail = 'admin@example.com'
@@ -265,11 +266,12 @@ async function createReservedOrderForTest(
       history_hidden_by_admin_id: null, history_hidden_reason: null,
     }).execute()
     await trx.insertInto('order_items').values({
-      id: itemId, order_id: orderId, product_id: productId, product_variant_id: variantId,
+      id: itemId, order_id: orderId, purchase_line_id: randomUUID(), product_id: productId, product_variant_id: variantId,
       product_name_snapshot: current.name, product_type_snapshot: current.productType,
       sku_code_snapshot: sku.skuCode, sku_snapshot: '[]', inventory_mode_snapshot: 'quantity',
       fulfillment_method_snapshot: 'manual', unit_price: unitPrice, quantity, line_amount: lineAmount,
     }).execute()
+    await insertNoFormPurchaseSnapshot(trx, itemId, variantId)
     await trx.insertInto('order_inventory_reservations').values({
       id: randomUUID(), order_item_id: itemId, product_id: productId, product_variant_id: variantId, quantity,
     }).execute()
@@ -928,7 +930,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       'customer_cart_merge_requests', 'customer_management_audit',
       'customer_sessions', 'customers', 'guest_order_sessions',
       'order_inventory_events', 'order_inventory_reservations', 'order_item_fulfillment_attempts',
-      'order_item_fulfillment_deliveries', 'order_items',
+      'order_item_fulfillment_deliveries', 'order_item_purchase_attachments', 'order_item_purchase_snapshots', 'order_items',
       'order_refund_allocations', 'order_refund_audit_events', 'order_refund_manual_attempts',
       'order_refunds', 'order_status_events', 'orders',
       'payment_attempt_provider_state', 'payment_attempt_secrets', 'payment_attempts',
@@ -943,6 +945,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       'product_variant_quantity_inventory', 'product_variants', 'products',
       'purchase_draft_attachment_references', 'purchase_draft_attachments', 'purchase_drafts',
       'purchase_form_audit_events', 'purchase_form_template_identities', 'purchase_form_template_versions', 'purchase_form_templates',
+      'purchase_order_attachment_objects',
       'sku_purchase_form_overrides',
       'storefront_customer_policy', 'supplier_api_delivery_events', 'supplier_api_delivery_operations',
       'supplier_api_operations_admin_audit', 'supplier_connection_audit_events', 'supplier_connection_credentials', 'supplier_connection_tests',

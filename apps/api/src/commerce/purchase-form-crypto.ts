@@ -88,3 +88,71 @@ export function purchaseFormContentIdentity(templateVersionId: string, normalize
     }), 'utf8')
     .digest('hex')
 }
+
+export class PurchaseOrderKeyUnavailableError extends Error {
+  constructor() {
+    super('Purchase order content encryption is unavailable')
+    this.name = 'PurchaseOrderKeyUnavailableError'
+  }
+}
+
+export class PurchaseOrderDecryptionError extends Error {
+  constructor() {
+    super('Purchase order content failed integrity verification')
+    this.name = 'PurchaseOrderDecryptionError'
+  }
+}
+
+function orderPurposeKey(config: AppConfig, keyId: string): Buffer {
+  try {
+    const rootKey = requiredPaymentKeyRing(config).keys[keyId]
+    if (!rootKey) throw new PurchaseOrderKeyUnavailableError()
+    return createHmac('sha256', rootKey).update('aikayun:purchase-order:encryption:v1', 'utf8').digest()
+  } catch {
+    throw new PurchaseOrderKeyUnavailableError()
+  }
+}
+
+export function purchaseOrderContentContext(orderItemId: string): string {
+  return `aikayun:purchase-order:item-content:v1:${orderItemId}`
+}
+
+export function encryptPurchaseOrderValues(
+  config: AppConfig,
+  orderItemId: string,
+  normalizedValues: Record<string, unknown>,
+): EncryptedPurchaseDraft {
+  let keyId: string
+  try { keyId = requiredPaymentKeyRing(config).activeKeyId } catch {
+    throw new PurchaseOrderKeyUnavailableError()
+  }
+  const key = orderPurposeKey(config, keyId)
+  const nonce = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', key, nonce)
+  cipher.setAAD(Buffer.from(purchaseOrderContentContext(orderItemId), 'utf8'))
+  const ciphertext = Buffer.concat([
+    cipher.update(canonicalPurchaseFormJson(normalizedValues), 'utf8'),
+    cipher.final(),
+  ])
+  return { keyId, nonce, ciphertext, authTag: cipher.getAuthTag() }
+}
+
+export function decryptPurchaseOrderValues(
+  config: AppConfig,
+  orderItemId: string,
+  envelope: EncryptedPurchaseDraft,
+): Record<string, unknown> {
+  const key = orderPurposeKey(config, envelope.keyId)
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', key, envelope.nonce)
+    decipher.setAAD(Buffer.from(purchaseOrderContentContext(orderItemId), 'utf8'))
+    decipher.setAuthTag(envelope.authTag)
+    const plaintext = Buffer.concat([decipher.update(envelope.ciphertext), decipher.final()])
+    const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plaintext))
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new PurchaseOrderDecryptionError()
+    return parsed as Record<string, unknown>
+  } catch (error) {
+    if (error instanceof PurchaseOrderKeyUnavailableError) throw error
+    throw new PurchaseOrderDecryptionError()
+  }
+}

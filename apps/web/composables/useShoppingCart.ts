@@ -1,11 +1,14 @@
 import type {
   CartSkuQuantity,
+  CheckoutRequestLineV2,
   CheckoutQuote,
   CustomerCart,
+  CustomerCartLinePurchaseFormBody,
   CustomerCartMergeBody,
   CustomerCartMutation,
 } from '@aikayun/contracts'
 import { CustomerApiError, useCustomerApi } from './useCustomerApi'
+import { saveCheckoutSelection } from '~/utils/checkoutSelection'
 
 const storageKey = 'aikayun-guest-cart-v2'
 const storageLockName = 'aikayun:guest-cart:v2'
@@ -13,17 +16,35 @@ const maxLineQuantity = 99
 const maxCartLines = 50
 const maxPendingBatches = 50
 
-type GuestCartBatch = {
+type GuestCartBatchV1 = {
   ownerId: string
   mergeId: string
   items: CartSkuQuantity[]
 }
 
-type GuestCartStore = {
+type GuestCartBatchV2 = {
+  version: 2
+  ownerId: string
+  mergeId: string
+  items: CheckoutRequestLineV2[]
+}
+
+type GuestCartBatch = GuestCartBatchV1 | GuestCartBatchV2
+type CartRequestItems = CartSkuQuantity[] | CheckoutRequestLineV2[]
+
+type GuestCartStoreV2 = {
   version: 2
   unclaimedItems: CartSkuQuantity[]
+  pendingBatches: GuestCartBatchV1[]
+}
+
+type GuestCartStoreV3 = {
+  version: 3
+  unclaimedItems: CheckoutRequestLineV2[]
   pendingBatches: GuestCartBatch[]
 }
+
+type GuestCartStore = GuestCartStoreV2 | GuestCartStoreV3
 
 type StoredGuestCart = {
   ok: boolean
@@ -32,7 +53,7 @@ type StoredGuestCart = {
 }
 
 type GuestCartSnapshot = {
-  items: CartSkuQuantity[]
+  items: CartRequestItems
   raw: string | null
   revision: number
   storageOk: boolean
@@ -59,7 +80,7 @@ function emptyGuestCartStore(): GuestCartStore {
   return { version: 2, unclaimedItems: [], pendingBatches: [] }
 }
 
-function parseItems(value: unknown): CartSkuQuantity[] | null {
+function parseLegacyItems(value: unknown): CartSkuQuantity[] | null {
   if (!Array.isArray(value) || value.length > maxCartLines) return null
   const seen = new Set<string>()
   const items: CartSkuQuantity[] = []
@@ -74,44 +95,99 @@ function parseItems(value: unknown): CartSkuQuantity[] | null {
   return items
 }
 
+function parseLineItems(value: unknown): CheckoutRequestLineV2[] | null {
+  if (!Array.isArray(value) || value.length > maxCartLines) return null
+  const seen = new Set<string>()
+  const skuTotals = new Map<string, number>()
+  const items: CheckoutRequestLineV2[] = []
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== 'object' || !isUuid(candidate.lineId) || !isUuid(candidate.skuId)
+      || seen.has(candidate.lineId) || !Number.isSafeInteger(candidate.quantity)
+      || candidate.quantity < 1 || candidate.quantity > maxLineQuantity) return null
+    const hasDraftId = Object.hasOwn(candidate, 'draftId')
+    const hasDraftRevision = Object.hasOwn(candidate, 'draftRevision')
+    if (hasDraftId !== hasDraftRevision) return null
+    if (hasDraftId && (candidate.draftId !== null || candidate.draftRevision !== null)
+      && (!isUuid(candidate.draftId) || !Number.isSafeInteger(candidate.draftRevision) || candidate.draftRevision < 1)) return null
+    if (Object.keys(candidate).some(key => !['lineId', 'skuId', 'quantity', 'draftId', 'draftRevision'].includes(key))) return null
+    const total = (skuTotals.get(candidate.skuId) ?? 0) + candidate.quantity
+    if (total > maxLineQuantity) return null
+    seen.add(candidate.lineId)
+    skuTotals.set(candidate.skuId, total)
+    items.push({ ...candidate } as CheckoutRequestLineV2)
+  }
+  return items
+}
+
 function parseGuestCartStore(raw: string | null): GuestCartStore | null {
   if (!raw) return emptyGuestCartStore()
   try {
     const value = JSON.parse(raw) as Partial<GuestCartStore>
-    if (value.version !== 2 || !Array.isArray(value.pendingBatches) || value.pendingBatches.length > maxPendingBatches) return null
-    const unclaimedItems = parseItems(value.unclaimedItems)
+    if ((value.version !== 2 && value.version !== 3)
+      || !Array.isArray(value.pendingBatches) || value.pendingBatches.length > maxPendingBatches) return null
+    const unclaimedItems = value.version === 2
+      ? parseLegacyItems(value.unclaimedItems)
+      : parseLineItems(value.unclaimedItems)
     if (!unclaimedItems) return null
     const pendingBatches: GuestCartBatch[] = []
     for (const candidate of value.pendingBatches) {
       if (!candidate || !isUuid(candidate.ownerId) || !isUuid(candidate.mergeId)) return null
-      const items = parseItems(candidate.items)
+      const items = 'version' in candidate && candidate.version === 2
+        ? parseLineItems(candidate.items)
+        : parseLegacyItems(candidate.items)
       if (!items?.length) return null
-      pendingBatches.push({ ownerId: candidate.ownerId, mergeId: candidate.mergeId, items })
+      if ('version' in candidate && candidate.version === 2) {
+        if (value.version !== 3) return null
+        pendingBatches.push({ version: 2, ownerId: candidate.ownerId, mergeId: candidate.mergeId, items: items as CheckoutRequestLineV2[] })
+      } else {
+        // Do not upgrade an already-claimed batch: its original request body
+        // and SHA-256 must remain replayable after a local v3 transition.
+        pendingBatches.push({ ownerId: candidate.ownerId, mergeId: candidate.mergeId, items: items as CartSkuQuantity[] })
+      }
     }
-    return { version: 2, unclaimedItems, pendingBatches }
+    return value.version === 2
+      ? { version: 2, unclaimedItems: unclaimedItems as CartSkuQuantity[], pendingBatches: pendingBatches as GuestCartBatchV1[] }
+      : { version: 3, unclaimedItems: unclaimedItems as CheckoutRequestLineV2[], pendingBatches }
   }
   catch {
     return null
   }
 }
 
-function cloneItems(items: CartSkuQuantity[]): CartSkuQuantity[] {
-  return items.map(item => ({ skuId: item.skuId, quantity: item.quantity }))
+function cloneItems<T extends CartSkuQuantity | CheckoutRequestLineV2>(items: T[]): T[] {
+  return items.map(item => ({ ...item }))
 }
 
-function sameItems(left: CartSkuQuantity[], right: CartSkuQuantity[]): boolean {
+function sameItems(left: CartRequestItems, right: CartRequestItems): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
 function sameBatch(left: GuestCartBatch, right: GuestCartBatch): boolean {
   return left.ownerId === right.ownerId
     && left.mergeId === right.mergeId
+    && ('version' in left ? left.version : 1) === ('version' in right ? right.version : 1)
     && sameItems(left.items, right.items)
+}
+
+function isLineItems(items: CartRequestItems): items is CheckoutRequestLineV2[] {
+  return items.every(item => 'lineId' in item)
+}
+
+function upgradeGuestStore(store: GuestCartStoreV2): GuestCartStoreV3 {
+  return {
+    version: 3,
+    unclaimedItems: store.unclaimedItems.map(item => ({ lineId: newId(), ...item })),
+    pendingBatches: store.pendingBatches.map(batch => ({
+      ownerId: batch.ownerId,
+      mergeId: batch.mergeId,
+      items: cloneItems(batch.items),
+    })),
+  }
 }
 
 export function useShoppingCart() {
   const customerApi = useCustomerApi()
-  const guestItems = useState<CartSkuQuantity[]>('storefront-guest-cart-items', () => [])
+  const guestItems = useState<CartRequestItems>('storefront-guest-cart-items', () => [])
   const customerCart = useState<CustomerCart | null>('storefront-customer-cart', () => null)
   const guestQuote = useState<CheckoutQuote | null>('storefront-guest-cart-quote', () => null)
   const ownerId = useState<string | null>('storefront-cart-owner-id', () => null)
@@ -129,6 +205,7 @@ export function useShoppingCart() {
   const guestRevision = useState('storefront-cart-guest-revision', () => 0)
   const guestStoreRaw = useState<string | null>('storefront-cart-storage-raw', () => null)
   const guestStorageError = useState<string | null>('storefront-cart-storage-error', () => null)
+  const mergedGuestLineTargets = useState<Record<string, string>>('storefront-merged-guest-line-targets', () => ({}))
   const nuxtApp = useNuxtApp() as ReturnType<typeof useNuxtApp> & {
     _shoppingCartStorageListener?: (event: StorageEvent) => void
   }
@@ -250,6 +327,7 @@ export function useShoppingCart() {
     readyState.value = false
     customerCart.value = null
     guestQuote.value = null
+    mergedGuestLineTargets.value = {}
     errorState.value = null
     noticeState.value = null
     busyState.value = false
@@ -264,6 +342,55 @@ export function useShoppingCart() {
 
   function readError(error: unknown, fallback: string): string {
     return error instanceof CustomerApiError ? error.message : error instanceof Error ? error.message : fallback
+  }
+
+  async function reconcileGuestQuoteLines(
+    scope: CartScope, snapshot: GuestCartSnapshot, quote: CheckoutQuote,
+  ): Promise<GuestCartSnapshot | null> {
+    if (!isLineItems(snapshot.items) || !quote.items.some(item => item.sourceLineIds.length > 1)) return null
+    const originals = new Map(snapshot.items.map(item => [item.lineId.toLowerCase(), item]))
+    const used = new Set<string>()
+    const nextItems: CheckoutRequestLineV2[] = []
+    for (const quoted of quote.items) {
+      if (!quoted.lineId || !quoted.sourceLineIds.length) throw new Error('购买行报价缺少来源身份，请刷新后重试。')
+      const sourceIds = quoted.sourceLineIds.map(id => id.toLowerCase())
+      if (!sourceIds.includes(quoted.lineId.toLowerCase())) throw new Error('购买行报价身份不一致，请刷新后重试。')
+      const sources = sourceIds.map((id) => {
+        if (used.has(id)) throw new Error('购买行报价来源重复，请刷新后重试。')
+        used.add(id)
+        return originals.get(id)
+      })
+      if (sources.some(item => !item || item.skuId.toLowerCase() !== quoted.skuId.toLowerCase())
+        || sources.reduce((total, item) => total + (item?.quantity ?? 0), 0) !== quoted.quantity) {
+        throw new Error('购买行报价数量不一致，请刷新后重试。')
+      }
+      const retained = originals.get(quoted.lineId.toLowerCase())!
+      if ((('draftId' in retained ? retained.draftId : null) ?? null) !== quoted.draftId
+        || (('draftRevision' in retained ? retained.draftRevision : null) ?? null) !== quoted.draftRevision) {
+        throw new Error('购买行报价资料引用不一致，请刷新后重试。')
+      }
+      nextItems.push({ ...retained, lineId: quoted.lineId, quantity: quoted.quantity })
+    }
+    if (used.size !== originals.size) throw new Error('购买行报价未覆盖全部来源，请刷新后重试。')
+    return withGuestStorageLock(() => {
+      if (!scopeIsActive(scope) || guestRevision.value !== snapshot.revision) return null
+      const stored = readStoredGuestCart()
+      if (!stored.ok || stored.raw !== snapshot.raw || stored.store.version !== 3) return null
+      const next = { ...stored.store, unclaimedItems: nextItems }
+      writeGuestStore(next)
+      const redirects = { ...mergedGuestLineTargets.value }
+      for (const quoted of quote.items) {
+        if (!quoted.lineId) continue
+        for (const sourceId of quoted.sourceLineIds) redirects[sourceId] = quoted.lineId
+      }
+      mergedGuestLineTargets.value = redirects
+      return {
+        items: cloneItems(nextItems),
+        raw: JSON.stringify(next),
+        revision: guestRevision.value,
+        storageOk: true,
+      }
+    }, true)
   }
 
   async function refreshGuestQuote(scope: CartScope, snapshot = readGuestSnapshot()): Promise<boolean> {
@@ -281,9 +408,16 @@ export function useShoppingCart() {
     try {
       const quote = await customerApi.request<CheckoutQuote>('/api/v1/checkout/quote', {
         method: 'POST',
-        body: { items: snapshot.items },
+        body: isLineItems(snapshot.items)
+          ? { version: 2, items: snapshot.items }
+          : { items: snapshot.items },
       })
       if (!snapshotIsCurrent(scope, snapshot)) return false
+      if (isLineItems(snapshot.items) && quote.items.some(item => item.sourceLineIds.length > 1)) {
+        const merged = await reconcileGuestQuoteLines(scope, snapshot, quote)
+        if (!merged) return false
+        return refreshGuestQuote(scope, merged)
+      }
       guestQuote.value = quote
       errorState.value = null
       return true
@@ -304,15 +438,21 @@ export function useShoppingCart() {
       let store = stored.store
       if (store.unclaimedItems.length) {
         if (store.pendingBatches.length >= maxPendingBatches) throw new Error('本机有过多待确认购物车批次，请先登录原账户完成同步。')
-        const batch: GuestCartBatch = {
-          ownerId: claimingCustomerId,
-          mergeId: newId(),
-          items: cloneItems(store.unclaimedItems),
-        }
-        store = {
-          version: 2,
-          unclaimedItems: [],
-          pendingBatches: [...store.pendingBatches, batch],
+        if (store.version === 2) {
+          const batch: GuestCartBatchV1 = {
+            ownerId: claimingCustomerId,
+            mergeId: newId(),
+            items: cloneItems(store.unclaimedItems),
+          }
+          store = { ...store, unclaimedItems: [], pendingBatches: [...store.pendingBatches, batch] }
+        } else {
+          const batch: GuestCartBatchV2 = {
+            version: 2,
+            ownerId: claimingCustomerId,
+            mergeId: newId(),
+            items: cloneItems(store.unclaimedItems),
+          }
+          store = { ...store, unclaimedItems: [], pendingBatches: [...store.pendingBatches, batch] }
         }
         writeGuestStore(store)
       }
@@ -320,11 +460,11 @@ export function useShoppingCart() {
         applyStoredGuestCart(stored)
       }
       return {
-        batches: store.pendingBatches.filter(batch => batch.ownerId === claimingCustomerId).map(batch => ({
-          ownerId: batch.ownerId,
-          mergeId: batch.mergeId,
-          items: cloneItems(batch.items),
-        })),
+        batches: store.pendingBatches.filter(batch => batch.ownerId === claimingCustomerId).map(batch => (
+          'version' in batch
+            ? { version: 2, ownerId: batch.ownerId, mergeId: batch.mergeId, items: cloneItems(batch.items) }
+            : { ownerId: batch.ownerId, mergeId: batch.mergeId, items: cloneItems(batch.items) }
+        )),
         hasOtherOwners: store.pendingBatches.some(batch => batch.ownerId !== claimingCustomerId),
       }
     }, true)
@@ -348,10 +488,9 @@ export function useShoppingCart() {
 
   async function mergeGuestBatch(scope: CartScope, batch: GuestCartBatch): Promise<MergeResult> {
     if (!scopeIsCurrent(scope)) return 'stale'
-    const mergeBody: CustomerCartMergeBody = {
-      mergeId: batch.mergeId,
-      items: cloneItems(batch.items),
-    }
+    const mergeBody: CustomerCartMergeBody = 'version' in batch
+      ? { version: 2, mergeId: batch.mergeId, items: cloneItems(batch.items) }
+      : { mergeId: batch.mergeId, items: cloneItems(batch.items) }
     try {
       const merged = await customerApi.request<CustomerCartMutation>('/api/v1/customer/cart/merge', {
         method: 'POST',
@@ -571,13 +710,24 @@ export function useShoppingCart() {
       }
       else {
         const snapshot = await mutateGuestCart(scope, operationVersion, (store) => {
-          const current = store.unclaimedItems.find(item => item.skuId === skuId)?.quantity ?? 0
-          const next = current + quantity
-          if (next > maxLineQuantity) throw new Error(`同一规格数量不能超过 ${maxLineQuantity}。`)
-          if (!current && store.unclaimedItems.length >= maxCartLines) throw new Error(`购物车最多包含 ${maxCartLines} 个规格。`)
-          const unclaimedItems = current
-            ? store.unclaimedItems.map(item => item.skuId === skuId ? { skuId, quantity: next } : item)
-            : [...store.unclaimedItems, { skuId, quantity }]
+          if (store.version === 2) {
+            const current = store.unclaimedItems.find(item => item.skuId === skuId)?.quantity ?? 0
+            const next = current + quantity
+            if (next > maxLineQuantity) throw new Error(`同一规格数量不能超过 ${maxLineQuantity}。`)
+            if (!current && store.unclaimedItems.length >= maxCartLines) throw new Error(`购物车最多包含 ${maxCartLines} 个购买行。`)
+            const unclaimedItems = current
+              ? store.unclaimedItems.map(item => item.skuId === skuId ? { skuId, quantity: next } : item)
+              : [...store.unclaimedItems, { skuId, quantity }]
+            return { ...store, unclaimedItems }
+          }
+          const skuTotal = store.unclaimedItems.filter(item => item.skuId === skuId)
+            .reduce((total, item) => total + item.quantity, 0)
+          if (skuTotal + quantity > maxLineQuantity) throw new Error(`同一规格跨行数量不能超过 ${maxLineQuantity}。`)
+          const existing = store.unclaimedItems.find(item => item.skuId === skuId && (!('draftId' in item) || item.draftId === null))
+          if (!existing && store.unclaimedItems.length >= maxCartLines) throw new Error(`购物车最多包含 ${maxCartLines} 个购买行。`)
+          const unclaimedItems = existing
+            ? store.unclaimedItems.map(item => item.lineId === existing.lineId ? { ...item, quantity: item.quantity + quantity } : item)
+            : [...store.unclaimedItems, { lineId: newId(), skuId, quantity }]
           return { ...store, unclaimedItems }
         })
         if (snapshot && scopeIsActive(scope)) await refreshGuestQuote(scope, snapshot)
@@ -592,23 +742,119 @@ export function useShoppingCart() {
     }
   }
 
-  async function setQuantity(skuId: string, quantity: number): Promise<void> {
+  // This is a line-level primitive for the later ⑥-2C entry flow. No form
+  // editor or upload action is exposed by the current storefront.
+  async function addWithDraft(skuId: string, quantity: number, draftId: string, draftRevision: number): Promise<string | null> {
+    const scope = currentScope()
+    if (!isUuid(skuId) || !isUuid(draftId) || !Number.isSafeInteger(quantity)
+      || quantity < 1 || quantity > maxLineQuantity || !Number.isSafeInteger(draftRevision) || draftRevision < 1) {
+      if (scopeIsActive(scope)) errorState.value = '购买行或资料版本无效，请重新确认。'
+      return null
+    }
+    const operationVersion = beginOperation(scope)
+    if (operationVersion === null) return null
+    const normalizedSkuId = skuId.toLowerCase()
+    const normalizedDraftId = draftId.toLowerCase()
+    try {
+      if (scope.customerId) {
+        const result = await customerApi.request<CustomerCartMutation>('/api/v1/customer/cart/items', {
+          method: 'POST', body: { version: 2, skuId: normalizedSkuId, quantity, draftId: normalizedDraftId, draftRevision },
+        })
+        if (operationIsCurrent(scope, operationVersion)) customerCart.value = result.cart
+        return result.retainedLineId
+      }
+      let retainedLineId = newId()
+      const snapshot = await mutateGuestCart(scope, operationVersion, (currentStore) => {
+        const store = currentStore.version === 2 ? upgradeGuestStore(currentStore) : currentStore
+        const existingDraftLine = store.unclaimedItems.find(item => 'draftId' in item
+          && item.draftId?.toLowerCase() === normalizedDraftId)
+        if (existingDraftLine && (existingDraftLine.skuId.toLowerCase() !== normalizedSkuId
+          || !('draftRevision' in existingDraftLine) || existingDraftLine.draftRevision !== draftRevision)) {
+          throw new Error('同一填写草稿已绑定不同规格或修订，请先重新确认原购买行。')
+        }
+        const skuTotal = store.unclaimedItems.filter(item => item.skuId.toLowerCase() === normalizedSkuId)
+          .reduce((total, item) => total + item.quantity, 0)
+        if (skuTotal + quantity > maxLineQuantity) throw new Error(`同一规格跨行数量不能超过 ${maxLineQuantity}。`)
+        if (existingDraftLine) {
+          retainedLineId = existingDraftLine.lineId
+          return {
+            ...store,
+            unclaimedItems: store.unclaimedItems.map(item => item.lineId === retainedLineId
+              ? { ...item, quantity: item.quantity + quantity } : item),
+          }
+        }
+        if (store.unclaimedItems.length >= maxCartLines) throw new Error(`购物车最多包含 ${maxCartLines} 个购买行。`)
+        return {
+          ...store,
+          unclaimedItems: [...store.unclaimedItems, {
+            lineId: retainedLineId, skuId: normalizedSkuId, quantity,
+            draftId: normalizedDraftId, draftRevision,
+          }],
+        }
+      })
+      if (snapshot && scopeIsActive(scope)) await refreshGuestQuote(scope, snapshot)
+      return snapshot ? retainedLineId : null
+    } catch (error) {
+      if (operationIsCurrent(scope, operationVersion)) errorState.value = readError(error, '购买行暂时无法保存，请重试。')
+      return null
+    } finally {
+      finishOperation(scope, operationVersion)
+    }
+  }
+
+  async function editPurchaseFormLine(lineId: string, body: CustomerCartLinePurchaseFormBody): Promise<string | null> {
+    const scope = currentScope()
+    if (!scope.customerId || !isUuid(lineId)) return null
+    const operationVersion = beginOperation(scope)
+    if (operationVersion === null) return null
+    try {
+      const result = await customerApi.request<CustomerCartMutation>(`/api/v1/customer/cart/lines/${encodeURIComponent(lineId)}/purchase-form`, {
+        method: 'PATCH', body,
+      })
+      if (operationIsCurrent(scope, operationVersion)) customerCart.value = result.cart
+      return result.retainedLineId
+    } catch (error) {
+      if (operationIsCurrent(scope, operationVersion)) errorState.value = readError(error, '购买资料更新失败，请重新核对资料与报价。')
+      return null
+    } finally {
+      finishOperation(scope, operationVersion)
+    }
+  }
+
+  async function setQuantity(lineIdOrSkuId: string, quantity: number): Promise<void> {
     if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > maxLineQuantity) return
     const scope = currentScope()
     const operationVersion = beginOperation(scope)
     if (operationVersion === null) return
     try {
       if (scope.customerId) {
-        const result = await customerApi.request<CustomerCartMutation>(`/api/v1/customer/cart/items/${encodeURIComponent(skuId)}`, {
-          method: 'PATCH', body: { quantity },
-        })
+        const line = customerCart.value?.items.find(item => item.lineId === lineIdOrSkuId)
+        if (line && line.lineRevision === null) throw new Error('购买行版本不可用，请刷新购物车后重试。')
+        const result = line
+          ? await customerApi.request<CustomerCartMutation>(`/api/v1/customer/cart/lines/${encodeURIComponent(lineIdOrSkuId)}`, {
+            method: 'PATCH', body: { quantity, expectedLineRevision: line.lineRevision },
+          })
+          : await customerApi.request<CustomerCartMutation>(`/api/v1/customer/cart/items/${encodeURIComponent(lineIdOrSkuId)}`, {
+            method: 'PATCH', body: { quantity },
+          })
         if (operationIsCurrent(scope, operationVersion)) customerCart.value = result.cart
       }
       else {
-        const snapshot = await mutateGuestCart(scope, operationVersion, store => ({
-          ...store,
-          unclaimedItems: store.unclaimedItems.map(item => item.skuId === skuId ? { skuId, quantity } : item),
-        }))
+        const snapshot = await mutateGuestCart(scope, operationVersion, (store) => {
+          if (store.version === 2) return {
+            ...store,
+            unclaimedItems: store.unclaimedItems.map(item => item.skuId === lineIdOrSkuId ? { ...item, quantity } : item),
+          }
+          const line = store.unclaimedItems.find(item => item.lineId === lineIdOrSkuId)
+          if (!line) return store
+          const otherQuantity = store.unclaimedItems.filter(item => item.skuId === line.skuId && item.lineId !== line.lineId)
+            .reduce((total, item) => total + item.quantity, 0)
+          if (otherQuantity + quantity > maxLineQuantity) throw new Error(`同一规格跨行数量不能超过 ${maxLineQuantity}。`)
+          return {
+            ...store,
+            unclaimedItems: store.unclaimedItems.map(item => item.lineId === lineIdOrSkuId ? { ...item, quantity } : item),
+          }
+        })
         if (snapshot && scopeIsActive(scope)) await refreshGuestQuote(scope, snapshot)
       }
     }
@@ -620,20 +866,23 @@ export function useShoppingCart() {
     }
   }
 
-  async function remove(skuId: string): Promise<void> {
+  async function remove(lineIdOrSkuId: string): Promise<void> {
     const scope = currentScope()
     const operationVersion = beginOperation(scope)
     if (operationVersion === null) return
     try {
       if (scope.customerId) {
-        const result = await customerApi.request<CustomerCartMutation>(`/api/v1/customer/cart/items/${encodeURIComponent(skuId)}`, { method: 'DELETE' })
+        const line = customerCart.value?.items.find(item => item.lineId === lineIdOrSkuId)
+        const path = line
+          ? `/api/v1/customer/cart/lines/${encodeURIComponent(lineIdOrSkuId)}`
+          : `/api/v1/customer/cart/items/${encodeURIComponent(lineIdOrSkuId)}`
+        const result = await customerApi.request<CustomerCartMutation>(path, { method: 'DELETE' })
         if (operationIsCurrent(scope, operationVersion)) customerCart.value = result.cart
       }
       else {
-        const snapshot = await mutateGuestCart(scope, operationVersion, store => ({
-          ...store,
-          unclaimedItems: store.unclaimedItems.filter(item => item.skuId !== skuId),
-        }))
+        const snapshot = await mutateGuestCart(scope, operationVersion, store => store.version === 2
+          ? { ...store, unclaimedItems: store.unclaimedItems.filter(item => item.skuId !== lineIdOrSkuId) }
+          : { ...store, unclaimedItems: store.unclaimedItems.filter(item => item.lineId !== lineIdOrSkuId) })
         if (snapshot && scopeIsActive(scope)) await refreshGuestQuote(scope, snapshot)
       }
     }
@@ -667,17 +916,107 @@ export function useShoppingCart() {
     }
   }
 
-  async function quote(items: CartSkuQuantity[]): Promise<CheckoutQuote> {
+  async function quote(items: CartRequestItems): Promise<CheckoutQuote> {
     const scope = currentScope()
     const result = await customerApi.request<CheckoutQuote>('/api/v1/checkout/quote', {
-      method: 'POST', body: { items },
+      method: 'POST', body: isLineItems(items) ? { version: 2, items } : { items },
     })
     if (!scopeIsCurrent(scope)) throw new CustomerApiError(0, 'STALE_IDENTITY', '登录状态已变化，请重新获取报价。')
     return result
   }
 
-  function checkoutPath(items: CartSkuQuantity[]): string {
+  function checkoutPath(items: CartRequestItems): string {
+    if (isLineItems(items)) {
+      try {
+        return saveCheckoutSelection(items)
+      } catch {
+        errorState.value = '浏览器暂时无法保存结算选择，请启用会话存储后重试。'
+        return '/cart'
+      }
+    }
+    // Existing legacy links remain replayable without rewriting their body.
     return `/checkout?items=${encodeURIComponent(JSON.stringify(items))}`
+  }
+
+  async function prepareCheckoutPath(items: CartRequestItems): Promise<string> {
+    if (!items.length) throw new Error('请先选择要结算的购买行。')
+    const scope = currentScope()
+    if (!scopeIsActive(scope)) throw new Error('购物车身份已变化，请刷新后重新选择。')
+    if (scope.customerId || isLineItems(items)) return checkoutPath(items)
+
+    // Only a deliberate cart checkout upgrades old unclaimed guest rows. Old
+    // claimed merge batches retain their owner, merge ID, and exact v1 items.
+    const operationVersion = beginOperation(scope)
+    if (operationVersion === null) throw new Error('购物车正在更新，请稍后重新结算。')
+    try {
+      const snapshot = readGuestSnapshot()
+      if (!snapshot.storageOk || isLineItems(snapshot.items)) {
+        throw new Error('游客购物车已变化，请重新选择购买行。')
+      }
+      const selected = new Map<string, number>()
+      for (const item of items) {
+        if (!isUuid(item.skuId) || !Number.isSafeInteger(item.quantity)
+          || item.quantity < 1 || item.quantity > maxLineQuantity || selected.has(item.skuId)) {
+          throw new Error('所选商品数量或身份无效，请重新选择。')
+        }
+        selected.set(item.skuId, item.quantity)
+      }
+      const upgraded = await withGuestStorageLock(() => {
+        if (!operationIsCurrent(scope, operationVersion) || scope.customerId
+          || guestRevision.value !== snapshot.revision) {
+          throw new Error('购物车身份已变化，请重新选择购买行。')
+        }
+        const stored = readStoredGuestCart()
+        if (!stored.ok || stored.raw !== snapshot.raw || stored.store.version !== 2) {
+          throw new Error('游客购物车已变化，请重新选择购买行。')
+        }
+        const selectedRows = [...selected].map(([skuId, quantity]) => {
+          const row = stored.store.unclaimedItems.find(item => item.skuId === skuId)
+          if (!row || row.quantity !== quantity) throw new Error('所选购买行已变化，请重新选择。')
+          return row
+        })
+        const next = upgradeGuestStore(stored.store)
+        const upgradedRows = selectedRows.map(row => next.unclaimedItems.find(item => item.skuId === row.skuId)!)
+        try {
+          if (localStorage.getItem(storageKey) !== stored.raw) throw new Error('changed')
+        } catch {
+          throw new Error('本机购物车已变化，请重新选择购买行。')
+        }
+        writeGuestStore(next)
+        const redirects = { ...mergedGuestLineTargets.value }
+        for (const row of stored.store.unclaimedItems) {
+          const line = next.unclaimedItems.find(item => item.skuId === row.skuId)!
+          redirects[`legacy:${row.skuId}`] = line.lineId
+        }
+        mergedGuestLineTargets.value = redirects
+        return {
+          selectedItems: cloneItems(upgradedRows),
+          snapshot: {
+            items: cloneItems(next.unclaimedItems), raw: JSON.stringify(next),
+            revision: guestRevision.value, storageOk: true,
+          } satisfies GuestCartSnapshot,
+        }
+      }, true)
+      if (!operationIsCurrent(scope, operationVersion)) throw new Error('购物车身份已变化，请重新选择购买行。')
+      const path = checkoutPath(upgraded.selectedItems)
+      if (path === '/cart') throw new Error(errorState.value ?? '浏览器无法保存结算选择，请重试。')
+      const refreshed = await refreshGuestQuote(scope, upgraded.snapshot)
+      if (!refreshed || !operationIsCurrent(scope, operationVersion)) {
+        throw new Error('购物车报价已变化，请重新选择购买行。')
+      }
+      return path
+    } catch (error) {
+      if (operationIsCurrent(scope, operationVersion)) {
+        errorState.value = readError(error, '无法安全准备结算，请重试。')
+      }
+      throw error
+    } finally {
+      finishOperation(scope, operationVersion)
+    }
+  }
+
+  function resolveLineKey(key: string): string {
+    return mergedGuestLineTargets.value[key] ?? key
   }
 
   return {
@@ -694,10 +1033,14 @@ export function useShoppingCart() {
     syncSession,
     refresh,
     add,
+    addWithDraft,
+    editPurchaseFormLine,
     setQuantity,
     remove,
     clear,
     quote,
     checkoutPath,
+    prepareCheckoutPath,
+    resolveLineKey,
   }
 }

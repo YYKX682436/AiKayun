@@ -227,6 +227,47 @@ export const PurchaseDraftSaveBodySchema = Type.Object({
   values: Type.Record(Type.String({ format: 'uuid' }), Type.Unknown()),
 }, { additionalProperties: false })
 
+export const OrderPurchaseAttachmentSchema = Type.Object({
+  attachmentId: IdentitySchema,
+  fieldId: IdentitySchema,
+  byteSize: Type.Integer({ minimum: 1, maximum: PURCHASE_FORM_LIMITS.attachmentBytes }),
+  sha256: Type.String({ pattern: '^[a-f0-9]{64}$' }),
+}, { additionalProperties: false })
+
+const OrderPurchaseSnapshotBase = {
+  orderItemId: IdentitySchema,
+}
+
+export const OrderPurchaseSnapshotSchema = Type.Union([
+  Type.Object({
+    ...OrderPurchaseSnapshotBase,
+    state: Type.Literal('legacy'),
+    templateVersionId: Type.Null(),
+    normalizationVersion: Type.Null(),
+    contentIdentity: Type.Null(),
+    values: Type.Null(),
+    attachments: Type.Array(OrderPurchaseAttachmentSchema, { maxItems: 0 }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    ...OrderPurchaseSnapshotBase,
+    state: Type.Literal('none'),
+    templateVersionId: Type.Null(),
+    normalizationVersion: Type.Null(),
+    contentIdentity: Type.String({ pattern: '^[a-f0-9]{64}$' }),
+    values: Type.Null(),
+    attachments: Type.Array(OrderPurchaseAttachmentSchema, { maxItems: 0 }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    ...OrderPurchaseSnapshotBase,
+    state: Type.Literal('filled'),
+    templateVersionId: IdentitySchema,
+    normalizationVersion: Type.Integer({ minimum: 1 }),
+    contentIdentity: Type.String({ pattern: '^[a-f0-9]{64}$' }),
+    values: Type.Record(Type.String({ format: 'uuid' }), Type.Unknown()),
+    attachments: Type.Array(OrderPurchaseAttachmentSchema, { maxItems: PURCHASE_FORM_LIMITS.attachmentsPerDraft }),
+  }, { additionalProperties: false }),
+])
+
 export interface PurchaseFormLeafFieldBase {
   id: string
   meaningKey: string
@@ -261,6 +302,8 @@ export type PurchaseTemplateVersionsQuery = Static<typeof PurchaseTemplateVersio
 export type ProductPurchaseFormAssignmentBody = Static<typeof ProductPurchaseFormAssignmentBodySchema>
 export type SkuPurchaseFormAssignmentBody = Static<typeof SkuPurchaseFormAssignmentBodySchema>
 export type PurchaseDraftSaveBody = Static<typeof PurchaseDraftSaveBodySchema>
+export type OrderPurchaseAttachment = Static<typeof OrderPurchaseAttachmentSchema>
+export type OrderPurchaseSnapshot = Static<typeof OrderPurchaseSnapshotSchema>
 
 export type PurchaseFormIssue = { fieldId: string | null; code: string }
 export type PurchaseFormValidationResult<T> =

@@ -14,6 +14,7 @@ import { startUnpaidOrderExpiryWorker } from '../src/commerce/unpaid-order-expir
 import { startCodePoolDeliveryWorker } from '../src/commerce/code-pool-delivery-worker.js'
 import type { AppConfig } from '../src/config.js'
 import { codePoolFingerprint, decryptCodePoolContent } from '../src/commerce/code-pool-crypto.js'
+import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const testOrigin = 'http://localhost:3000'
@@ -302,6 +303,8 @@ async function insertDirectPurchaseOrder(
   catalog: Catalog,
   orderId: string,
 ) {
+  const itemId = randomUUID()
+  const lineId = randomUUID()
   await trx.insertInto('orders').values({
     id: orderId, customer_id: customerId, guest_order_session_id: null,
     idempotency_key: randomUUID(), request_sha256: digest, total_amount: catalog.price,
@@ -310,11 +313,11 @@ async function insertDirectPurchaseOrder(
   }).execute()
   await sql`
     INSERT INTO order_items (
-      id, order_id, product_id, product_variant_id, product_name_snapshot, product_type_snapshot,
+      id, order_id, purchase_line_id, product_id, product_variant_id, product_name_snapshot, product_type_snapshot,
       sku_code_snapshot, sku_snapshot, inventory_mode_snapshot, fulfillment_method_snapshot,
       unit_price, quantity, line_amount
     )
-    SELECT gen_random_uuid(), ${orderId}::uuid, product.id, variant.id, product.name,
+    SELECT ${itemId}::uuid, ${orderId}::uuid, ${lineId}::uuid, product.id, variant.id, product.name,
       product.product_type, variant.sku_code,
       COALESCE((
         SELECT jsonb_agg(jsonb_build_object(
@@ -336,6 +339,7 @@ async function insertDirectPurchaseOrder(
     JOIN product_variant_fulfillment AS fulfillment ON fulfillment.product_variant_id = variant.id
     WHERE product.id = ${catalog.productId}::uuid AND variant.id = ${catalog.skuId}::uuid
   `.execute(trx)
+  await insertNoFormPurchaseSnapshot(trx, itemId, catalog.skuId)
   await trx.updateTable('orders').set({ items_sealed: true }).where('id', '=', orderId).execute()
 }
 

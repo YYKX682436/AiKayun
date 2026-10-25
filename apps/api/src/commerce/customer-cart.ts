@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import { sql, type Kysely, type Transaction } from 'kysely'
 import {
@@ -7,6 +7,9 @@ import {
   CheckoutQuoteBodySchema,
   CheckoutQuoteSchema,
   CustomerCartAddBodySchema,
+  CustomerCartLineParamsSchema,
+  CustomerCartLinePurchaseFormBodySchema,
+  CustomerCartLineQuantityBodySchema,
   CustomerCartMergeBodySchema,
   CustomerCartMutationSchema,
   CustomerCartSchema,
@@ -17,15 +20,23 @@ import {
 } from '@aikayun/contracts'
 import type {
   CartSkuQuantity,
+  CheckoutQuoteBody,
+  CustomerCartAddBody,
   CustomerCart,
   CustomerCartMergeBody,
   CustomerCartMutation,
 } from '@aikayun/contracts'
+import { multiplyUnitAmount, settleAmount } from '@aikayun/money'
 import type { AppConfig } from '../config.js'
 import type { Database } from '../db/types.js'
 import { optionalCustomer, requireCustomer, type AuthenticatedCustomer, CUSTOMER_CSRF_COOKIE } from '../auth/customer.js'
-import { verifyDoubleSubmitCsrf } from '../auth/security.js'
-import { quoteCheckoutItems, normalizeCheckoutItems, CheckoutQuoteError } from './checkout-quote.js'
+import { hashToken, verifyDoubleSubmitCsrf } from '../auth/security.js'
+import { quoteCheckoutItems, quoteCheckoutPurchaseLines, normalizeCheckoutItems, CheckoutQuoteError } from './checkout-quote.js'
+import { assertGuestSession, guestSessionCookie } from './orders.js'
+import { PurchaseDraftServiceError, claimGuestPurchaseDraftsInTransaction,
+  savePurchaseDraftInTransaction, validatePurchaseDraftForPurchaseInTransaction } from './purchase-forms.js'
+import { normalizePurchaseLineRequests, preparedPurchaseFormVersion, purchaseLineContentIdentity,
+  purchaseLineRequestHash, PurchaseLineError } from './purchase-lines.js'
 
 const maxCartLines = 50
 const maxLineQuantity = 99
@@ -60,26 +71,77 @@ function emptyCart(): CustomerCart {
 
 async function cartSnapshot(db: Db, customerId: string, config: AppConfig): Promise<CustomerCart> {
   const saved = await db.selectFrom('customer_cart_items')
-    .select(['sku_id', 'quantity'])
+    .select(['line_id', 'sku_id', 'quantity', 'revision', 'draft_id', 'draft_revision',
+      'template_version_id', 'normalization_version', 'content_identity'])
     .where('customer_id', '=', customerId)
     .orderBy('updated_at', 'desc')
     .orderBy('sku_id')
     .execute()
   if (!saved.length) return emptyCart()
 
-  const quote = await quoteCheckoutItems(db, saved.map(row => ({ skuId: row.sku_id, quantity: row.quantity })), customerId, config)
+  const quantities = new Map<string, number>()
+  for (const row of saved) quantities.set(row.sku_id, (quantities.get(row.sku_id) ?? 0) + row.quantity)
+  const quote = await quoteCheckoutItems(db, [...quantities].map(([skuId, quantity]) => ({ skuId, quantity })),
+    customerId, config, { skipPurchaseFormRequirement: true })
+  const policy = await db.selectFrom('storefront_customer_policy').select('purchase_forms_enabled')
+    .where('singleton', '=', true).executeTakeFirstOrThrow()
+  const formVersions = new Map<string, string | null>()
+  if (policy.purchase_forms_enabled) {
+    for (const skuId of quantities.keys()) formVersions.set(skuId, await preparedPurchaseFormVersion(db, skuId))
+  }
+  const bySku = new Map(quote.items.map(item => [item.skuId, item]))
+  const draftIds = saved.flatMap(row => row.draft_id ? [row.draft_id] : [])
+  const draftRows = draftIds.length ? await db.selectFrom('purchase_drafts')
+    .select(['id', 'revision', 'status', 'expires_at', 'template_version_id'])
+    .where('id', 'in', draftIds).execute() : []
+  const drafts = new Map(draftRows.map(row => [row.id, row]))
+  const items = saved.map((row) => {
+    const base = bySku.get(row.sku_id)
+    if (!base) throw new Error('Saved cart SKU is missing from its quote')
+    const draft = row.draft_id ? drafts.get(row.draft_id) : null
+    const invalidDraft = row.draft_id !== null && (!draft || draft.status !== 'active'
+      || draft.expires_at <= new Date() || draft.revision !== row.draft_revision
+      || draft.template_version_id !== row.template_version_id)
+    const requiredVersion = formVersions.get(row.sku_id) ?? null
+    const formRequired = policy.purchase_forms_enabled && requiredVersion !== null
+      && (!row.draft_id || row.template_version_id !== requiredVersion)
+    return {
+      ...base,
+      lineId: row.line_id,
+      lineRevision: row.revision,
+      draftId: row.draft_id,
+      draftRevision: row.draft_revision,
+      templateVersionId: row.template_version_id,
+      normalizationVersion: row.normalization_version,
+      contentIdentity: row.content_identity,
+      quantity: row.quantity,
+      lineTotal: base.unitPrice === null ? null : settleAmount(multiplyUnitAmount(base.unitPrice, row.quantity)),
+      canPurchase: base.canPurchase && !invalidDraft && !formRequired,
+      reason: invalidDraft ? 'purchase_form_invalid' as const
+        : formRequired ? 'purchase_form_required' as const : base.reason,
+    }
+  })
   return {
-    items: quote.items,
+    items,
     itemCount: saved.length,
     totalQuantity: saved.reduce((total, row) => total + row.quantity, 0),
     pricedSubtotal: quote.pricedSubtotal,
     totalAmount: quote.totalAmount,
     totalComplete: quote.totalComplete,
-    canContinue: quote.canContinue,
+    canContinue: quote.canContinue && items.every(item => item.canPurchase),
     policyReasons: quote.policyReasons,
     quotedAt: quote.quotedAt,
     currency: quote.currency,
   }
+}
+
+async function authenticatedCartSnapshot(
+  db: Kysely<Database>, customer: AuthenticatedCustomer, config: AppConfig,
+): Promise<CustomerCart> {
+  return db.transaction().execute(async (trx) => {
+    await lockCustomer(trx, customer, false)
+    return cartSnapshot(trx, customer.id, config)
+  })
 }
 
 async function lockCustomer(
@@ -123,8 +185,68 @@ function mergeDigest(items: CartSkuQuantity[]): string {
   return createHash('sha256').update(JSON.stringify(items)).digest('hex')
 }
 
+type CartLineContent = {
+  skuId: string
+  quantity: number
+  contentIdentity: string
+  draftId: string | null
+  draftRevision: number | null
+  templateVersionId: string | null
+  normalizationVersion: number | null
+}
+
+async function addCartLineInTransaction(
+  trx: Transaction<Database>, customerId: string, line: CartLineContent,
+): Promise<{ retainedLineId: string; changed: boolean }> {
+  const currentRows = await trx.selectFrom('customer_cart_items')
+    .select(['line_id', 'sku_id', 'quantity', 'content_identity', 'draft_id', 'draft_revision', 'template_version_id'])
+    .where('customer_id', '=', customerId).orderBy('line_id').execute()
+  const skuTotal = currentRows.filter(row => row.sku_id === line.skuId)
+    .reduce((total, row) => total + row.quantity, 0)
+  if (skuTotal + line.quantity > maxLineQuantity) {
+    throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
+  }
+  const existing = currentRows.find(row => row.sku_id === line.skuId && row.content_identity === line.contentIdentity)
+  if (existing) {
+    let replacement: Partial<Pick<Database['customer_cart_items'], 'draft_id' | 'draft_revision'
+      | 'template_version_id' | 'normalization_version'>> = {}
+    if (existing.draft_id) {
+      const bound = await trx.selectFrom('purchase_drafts')
+        .select(['revision', 'status', 'expires_at', 'template_version_id'])
+        .where('id', '=', existing.draft_id).executeTakeFirst()
+      const stale = !bound || bound.status !== 'active' || bound.expires_at <= new Date()
+        || bound.revision !== existing.draft_revision || bound.template_version_id !== existing.template_version_id
+      if (stale) {
+        if (!line.draftId) throw new CartError(409, 'PURCHASE_DRAFT_INVALID', '原购物车填写资料已失效，请重新确认。')
+        replacement = {
+          draft_id: line.draftId, draft_revision: line.draftRevision,
+          template_version_id: line.templateVersionId, normalization_version: line.normalizationVersion,
+        }
+      }
+    }
+    await trx.updateTable('customer_cart_items').set({ quantity: existing.quantity + line.quantity, ...replacement })
+      .where('line_id', '=', existing.line_id).execute()
+    return { retainedLineId: existing.line_id, changed: true }
+  }
+  if (currentRows.length >= maxCartLines) {
+    throw new CartError(409, 'CART_ITEM_LIMIT', `购物车最多包含 ${maxCartLines} 个购买行。`)
+  }
+  if (line.draftId && currentRows.some(row => row.draft_id === line.draftId)) {
+    throw new CartError(409, 'PURCHASE_DRAFT_ALREADY_BOUND', '这份填写草稿已绑定另一购买行，请为新行另存草稿。')
+  }
+  const lineId = randomUUID()
+  await trx.insertInto('customer_cart_items').values({
+    line_id: lineId, customer_id: customerId, sku_id: line.skuId, quantity: line.quantity,
+    content_identity: line.contentIdentity, draft_id: line.draftId,
+    draft_revision: line.draftRevision, template_version_id: line.templateVersionId,
+    normalization_version: line.normalizationVersion,
+  }).execute()
+  return { retainedLineId: lineId, changed: true }
+}
+
 function mapError(error: unknown, reply: FastifyReply, requestId: string) {
-  if (error instanceof CartError || error instanceof CheckoutQuoteError) {
+  if (error instanceof CartError || error instanceof CheckoutQuoteError
+    || error instanceof PurchaseDraftServiceError || error instanceof PurchaseLineError) {
     return reply.code(error.status).send(failure(error.code, error.message, requestId))
   }
   if (error instanceof RangeError || error instanceof TypeError) {
@@ -172,45 +294,37 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
     },
   }, async (request, reply) => {
     try {
-      const body = request.body as CartSkuQuantity
-      const cart = await db.transaction().execute(async (trx) => {
+      const body = request.body as CustomerCartAddBody
+      const added = await db.transaction().execute(async (trx) => {
         const customer = request.customer!
         await lockCustomer(trx, customer, true)
         const found = await lockExistingSkus(trx, [body.skuId])
         if (!found.has(body.skuId)) throw new CartError(404, 'SKU_NOT_FOUND', '所选商品规格已不存在。')
-
-        const current = await trx.selectFrom('customer_cart_items')
-          .select(['quantity'])
-          .where('customer_id', '=', customer.id)
-          .where('sku_id', '=', body.skuId)
-          .executeTakeFirst()
-        const nextQuantity = (current?.quantity ?? 0) + body.quantity
-        if (nextQuantity > maxLineQuantity) {
-          throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
-        }
-        if (!current) {
-          const lineCount = await trx.selectFrom('customer_cart_items')
-            .select(eb => eb.fn.countAll<number>().as('total'))
-            .where('customer_id', '=', customer.id)
-            .executeTakeFirstOrThrow()
-          if (lineCount.total >= maxCartLines) {
-            throw new CartError(409, 'CART_ITEM_LIMIT', `购物车最多包含 ${maxCartLines} 个 SKU。`)
+        if ('version' in body) {
+          const draft = await validatePurchaseDraftForPurchaseInTransaction(trx, config,
+            { kind: 'customer', customer }, { draftId: body.draftId, expectedRevision: body.draftRevision })
+          const preparedVersion = await preparedPurchaseFormVersion(trx, body.skuId)
+          if (draft.templateVersionId !== preparedVersion) {
+            throw new CartError(409, 'PURCHASE_FORM_VERSION_CHANGED', '商品填写模板绑定已变化，请重新确认购买资料。')
           }
+          return addCartLineInTransaction(trx, customer.id, {
+            skuId: body.skuId, quantity: body.quantity,
+            contentIdentity: purchaseLineContentIdentity(body.skuId, draft.templateVersionId,
+              draft.normalizationVersion, draft.normalizedValues),
+            draftId: draft.id, draftRevision: draft.revision,
+            templateVersionId: draft.templateVersionId, normalizationVersion: draft.normalizationVersion,
+          })
         }
-
-        await trx.insertInto('customer_cart_items').values({
-          customer_id: customer.id,
-          sku_id: body.skuId,
-          quantity: nextQuantity,
-          updated_at: new Date(),
-        }).onConflict(oc => oc.columns(['customer_id', 'sku_id']).doUpdateSet({
-          quantity: nextQuantity,
-          updated_at: new Date(),
-        })).execute()
-        return cartSnapshot(trx, customer.id, config)
+        return addCartLineInTransaction(trx, customer.id, {
+          skuId: body.skuId, quantity: body.quantity,
+          contentIdentity: purchaseLineContentIdentity(body.skuId, null, null, null),
+          draftId: null, draftRevision: null, templateVersionId: null, normalizationVersion: null,
+        })
       })
+      const cart = await authenticatedCartSnapshot(db, request.customer!, config)
       reply.header('cache-control', 'no-store')
-      const result: CustomerCartMutation = { changed: true, merged: false, skippedSkuIds: [], cart }
+      const result: CustomerCartMutation = { changed: added.changed, merged: false,
+        skippedSkuIds: [], retainedLineId: added.retainedLineId, cart }
       return success(result, request.id)
     } catch (error) {
       return mapError(error, reply, request.id)
@@ -232,20 +346,30 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
     try {
       const { id: skuId } = request.params as { id: string }
       const { quantity } = request.body as { quantity: number }
-      const cart = await db.transaction().execute(async (trx) => {
+      const retainedLineId = await db.transaction().execute(async (trx) => {
         const customer = request.customer!
         await lockCustomer(trx, customer, true)
+        const noFormIdentity = purchaseLineContentIdentity(skuId, null, null, null)
+        const other = await trx.selectFrom('customer_cart_items')
+          .select(['line_id', 'quantity'])
+          .where('customer_id', '=', customer.id).where('sku_id', '=', skuId)
+          .where('content_identity', '!=', noFormIdentity).execute()
+        if (other.reduce((total, row) => total + row.quantity, 0) + quantity > maxLineQuantity) {
+          throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
+        }
         const updated = await trx.updateTable('customer_cart_items')
-          .set({ quantity, updated_at: new Date() })
+          .set({ quantity })
           .where('customer_id', '=', customer.id)
           .where('sku_id', '=', skuId)
-          .returning('sku_id')
+          .where('content_identity', '=', noFormIdentity)
+          .returning('line_id')
           .executeTakeFirst()
         if (!updated) throw new CartError(404, 'CART_ITEM_NOT_FOUND', '购物车中没有该商品规格。')
-        return cartSnapshot(trx, customer.id, config)
+        return updated.line_id
       })
+      const cart = await authenticatedCartSnapshot(db, request.customer!, config)
       reply.header('cache-control', 'no-store')
-      return success({ changed: true, merged: false, skippedSkuIds: [], cart } satisfies CustomerCartMutation, request.id)
+      return success({ changed: true, merged: false, skippedSkuIds: [], retainedLineId, cart } satisfies CustomerCartMutation, request.id)
     } catch (error) {
       return mapError(error, reply, request.id)
     }
@@ -265,17 +389,19 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
   }, async (request, reply) => {
     try {
       const { id: skuId } = request.params as { id: string }
-      const cart = await db.transaction().execute(async (trx) => {
+      const changed = await db.transaction().execute(async (trx) => {
         const customer = request.customer!
         await lockCustomer(trx, customer, true)
         const deleted = await trx.deleteFrom('customer_cart_items')
           .where('customer_id', '=', customer.id)
           .where('sku_id', '=', skuId)
+          .where('content_identity', '=', purchaseLineContentIdentity(skuId, null, null, null))
           .executeTakeFirst()
-        return { cart: await cartSnapshot(trx, customer.id, config), changed: deleted.numDeletedRows > 0n }
+        return deleted.numDeletedRows > 0n
       })
+      const cart = await authenticatedCartSnapshot(db, request.customer!, config)
       reply.header('cache-control', 'no-store')
-      return success({ ...cart, merged: false, skippedSkuIds: [] } satisfies CustomerCartMutation, request.id)
+      return success({ cart, changed, merged: false, skippedSkuIds: [], retainedLineId: null } satisfies CustomerCartMutation, request.id)
     } catch (error) {
       return mapError(error, reply, request.id)
     }
@@ -298,13 +424,134 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
         await lockCustomer(trx, customer, true)
         const deleted = await trx.deleteFrom('customer_cart_items')
           .where('customer_id', '=', customer.id).executeTakeFirst()
-        return { changed: deleted.numDeletedRows > 0n, cart: await cartSnapshot(trx, customer.id, config) }
+        return deleted.numDeletedRows > 0n
       })
+      const cart = await authenticatedCartSnapshot(db, request.customer!, config)
       reply.header('cache-control', 'no-store')
-      return success({ ...result, merged: false, skippedSkuIds: [] } satisfies CustomerCartMutation, request.id)
+      return success({ changed: result, cart, merged: false, skippedSkuIds: [], retainedLineId: null } satisfies CustomerCartMutation, request.id)
     } catch (error) {
       return mapError(error, reply, request.id)
     }
+  })
+
+  app.patch('/api/v1/customer/cart/lines/:lineId', {
+    preHandler: [authenticateCustomer, csrfCheck],
+    config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
+    schema: {
+      tags: ['customer'], summary: 'Set quantity for one stable cart line',
+      params: CustomerCartLineParamsSchema, body: CustomerCartLineQuantityBodySchema,
+      response: { 200: ApiSuccessSchemaOf(CustomerCartMutationSchema), 401: ApiErrorSchema,
+        403: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const { lineId } = request.params as { lineId: string }
+      const body = request.body as { quantity: number; expectedLineRevision: number }
+      await db.transaction().execute(async (trx) => {
+        const customer = request.customer!
+        await lockCustomer(trx, customer, true)
+        const line = await trx.selectFrom('customer_cart_items').selectAll()
+          .where('customer_id', '=', customer.id).where('line_id', '=', lineId)
+          .forUpdate().executeTakeFirst()
+        if (!line) throw new CartError(404, 'CART_ITEM_NOT_FOUND', '购物车中没有该购买行。')
+        if (line.revision !== body.expectedLineRevision) {
+          throw new CartError(409, 'CART_LINE_REVISION_CONFLICT', '购买行已被其他操作修改，请刷新购物车。')
+        }
+        const other = await trx.selectFrom('customer_cart_items').select('quantity')
+          .where('customer_id', '=', customer.id).where('sku_id', '=', line.sku_id)
+          .where('line_id', '!=', lineId).execute()
+        if (other.reduce((sum, row) => sum + row.quantity, body.quantity) > maxLineQuantity) {
+          throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
+        }
+        await trx.updateTable('customer_cart_items').set({ quantity: body.quantity })
+          .where('line_id', '=', lineId).execute()
+      })
+      const cart = await authenticatedCartSnapshot(db, request.customer!, config)
+      reply.header('cache-control', 'no-store')
+      return success({ changed: true, merged: false, skippedSkuIds: [], retainedLineId: lineId, cart } satisfies CustomerCartMutation, request.id)
+    } catch (error) { return mapError(error, reply, request.id) }
+  })
+
+  app.patch('/api/v1/customer/cart/lines/:lineId/purchase-form', {
+    preHandler: [authenticateCustomer, csrfCheck],
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    schema: {
+      tags: ['customer'], summary: 'Atomically edit a bound draft and its cart line',
+      params: CustomerCartLineParamsSchema, body: CustomerCartLinePurchaseFormBodySchema,
+      response: { 200: ApiSuccessSchemaOf(CustomerCartMutationSchema), 400: ApiErrorSchema,
+        401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const { lineId } = request.params as { lineId: string }
+      const body = request.body as { expectedLineRevision: number; expectedDraftRevision: number; values: Record<string, unknown> }
+      const retainedLineId = await db.transaction().execute(async (trx) => {
+        const customer = request.customer!
+        await lockCustomer(trx, customer, true)
+        const line = await trx.selectFrom('customer_cart_items').selectAll()
+          .where('customer_id', '=', customer.id).where('line_id', '=', lineId)
+          .forUpdate().executeTakeFirst()
+        if (!line || !line.draft_id) throw new CartError(404, 'CART_ITEM_NOT_FOUND', '购物车中没有可编辑的填写购买行。')
+        if (line.revision !== body.expectedLineRevision || line.draft_revision !== body.expectedDraftRevision) {
+          throw new CartError(409, 'CART_LINE_REVISION_CONFLICT', '购买行或填写资料已变化，请刷新后再编辑。')
+        }
+        await lockExistingSkus(trx, [line.sku_id])
+        const saved = await savePurchaseDraftInTransaction(trx, config, { kind: 'customer', customer }, {
+          draftId: line.draft_id, expectedRevision: body.expectedDraftRevision, values: body.values,
+        }, { coordinatedCartEdit: true })
+        if (!saved.complete) throw new CartError(409, 'PURCHASE_DRAFT_INCOMPLETE', '请完成所有必填填写资料。')
+        const prepared = await preparedPurchaseFormVersion(trx, line.sku_id)
+        if (prepared !== line.template_version_id) {
+          throw new CartError(409, 'PURCHASE_FORM_VERSION_CHANGED', '商品填写模板绑定已变化，请重新确认购买资料。')
+        }
+        const contentIdentity = purchaseLineContentIdentity(line.sku_id, line.template_version_id,
+          line.normalization_version, saved.normalizedValues)
+        const collision = await trx.selectFrom('customer_cart_items').select(['line_id', 'quantity'])
+          .where('customer_id', '=', customer.id).where('sku_id', '=', line.sku_id)
+          .where('content_identity', '=', contentIdentity).where('line_id', '!=', lineId)
+          .forUpdate().executeTakeFirst()
+        if (collision) {
+          if (collision.quantity + line.quantity > maxLineQuantity) {
+            throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
+          }
+          await trx.deleteFrom('customer_cart_items').where('line_id', '=', lineId).execute()
+          await trx.updateTable('customer_cart_items').set({ quantity: collision.quantity + line.quantity })
+            .where('line_id', '=', collision.line_id).execute()
+          return collision.line_id
+        }
+        await trx.updateTable('customer_cart_items').set({
+          draft_revision: saved.revision, content_identity: contentIdentity,
+        }).where('line_id', '=', lineId).execute()
+        return lineId
+      })
+      const cart = await authenticatedCartSnapshot(db, request.customer!, config)
+      reply.header('cache-control', 'no-store')
+      return success({ changed: true, merged: false, skippedSkuIds: [], retainedLineId, cart } satisfies CustomerCartMutation, request.id)
+    } catch (error) { return mapError(error, reply, request.id) }
+  })
+
+  app.delete('/api/v1/customer/cart/lines/:lineId', {
+    preHandler: [authenticateCustomer, csrfCheck],
+    config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
+    schema: {
+      tags: ['customer'], summary: 'Remove one stable cart line', params: CustomerCartLineParamsSchema,
+      response: { 200: ApiSuccessSchemaOf(CustomerCartMutationSchema), 401: ApiErrorSchema,
+        403: ApiErrorSchema, 404: ApiErrorSchema },
+    },
+  }, async (request, reply) => {
+    try {
+      const { lineId } = request.params as { lineId: string }
+      const changed = await db.transaction().execute(async (trx) => {
+        const customer = request.customer!
+        await lockCustomer(trx, customer, true)
+        const result = await trx.deleteFrom('customer_cart_items')
+          .where('customer_id', '=', customer.id).where('line_id', '=', lineId).executeTakeFirst()
+        return result.numDeletedRows > 0n
+      })
+      const cart = await authenticatedCartSnapshot(db, request.customer!, config)
+      reply.header('cache-control', 'no-store')
+      return success({ changed, merged: false, skippedSkuIds: [], retainedLineId: null, cart } satisfies CustomerCartMutation, request.id)
+    } catch (error) { return mapError(error, reply, request.id) }
   })
 
   app.post('/api/v1/customer/cart/merge', {
@@ -321,8 +568,10 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
   }, async (request, reply) => {
     try {
       const body = request.body as CustomerCartMergeBody
-      const normalized = normalizeCheckoutItems(body.items)
-      const digest = mergeDigest(normalized)
+      const v2 = 'version' in body && body.version === 2
+      const legacyItems = v2 ? null : normalizeCheckoutItems(body.items as CartSkuQuantity[])
+      const lineItems = v2 ? normalizePurchaseLineRequests(body.items) : null
+      const digest = v2 ? purchaseLineRequestHash(body.items) : mergeDigest(legacyItems!)
       const result = await db.transaction().execute(async (trx) => {
         const customer = request.customer!
         await lockCustomer(trx, customer, true)
@@ -337,59 +586,80 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           if (previous.request_sha256 !== digest) {
             throw new CartError(409, 'CART_MERGE_ID_REUSED', '购物车合并请求标识已用于不同内容，请刷新后重试。')
           }
-          return {
-            changed: false,
-            skippedSkuIds: previous.skipped_sku_ids,
-            cart: await cartSnapshot(trx, customer.id, config),
+          return { changed: false, skippedSkuIds: previous.skipped_sku_ids }
+        }
+        if (v2 && lineItems!.some(item => item.draftId)) {
+          const guestToken = request.cookies[guestSessionCookie]
+          if (!guestToken || !/^[A-Za-z0-9_-]{43}$/u.test(guestToken)) {
+            throw new CartError(401, 'GUEST_SESSION_REQUIRED', '原游客会话已不可用，请重新登录后处理此批次。')
+          }
+          const source = await trx.selectFrom('guest_order_sessions').select('id')
+            .where('token_hash', '=', hashToken(guestToken)).where('revoked_at', 'is', null)
+            .where('expires_at', '>', new Date()).forUpdate().executeTakeFirst()
+          if (!source) throw new CartError(401, 'GUEST_SESSION_REQUIRED', '原游客会话已过期。')
+        }
+        const incoming = v2 ? lineItems! : legacyItems!
+        const existingSkuIds = await lockExistingSkus(trx, incoming.map(item => item.skuId))
+        const skippedSkuIds = [...new Set(incoming.filter(item => !existingSkuIds.has(item.skuId))
+          .map(item => item.skuId))].sort()
+        const accepted = incoming.filter(item => existingSkuIds.has(item.skuId))
+        if (v2) {
+          const acceptedV2 = lineItems!.filter(item => existingSkuIds.has(item.skuId))
+          const drafted = acceptedV2.filter(item => item.draftId)
+          let claimedRevisions: Record<string, number> = {}
+          if (drafted.length) {
+            const guestToken = request.cookies[guestSessionCookie]
+            if (!guestToken) throw new CartError(401, 'GUEST_SESSION_REQUIRED', '原游客会话已不可用，请重新登录后处理此批次。')
+            const claimed = await claimGuestPurchaseDraftsInTransaction(trx, customer, guestToken,
+              drafted.map(item => ({ draftId: item.draftId!, expectedRevision: item.draftRevision! })))
+            claimedRevisions = claimed.revisions
+          }
+          for (const item of acceptedV2) {
+            if (!item.draftId) {
+              await addCartLineInTransaction(trx, customer.id, {
+                skuId: item.skuId, quantity: item.quantity,
+                contentIdentity: purchaseLineContentIdentity(item.skuId, null, null, null),
+                draftId: null, draftRevision: null, templateVersionId: null, normalizationVersion: null,
+              })
+              continue
+            }
+            const claimedRevision = claimedRevisions[item.draftId]
+            if (!claimedRevision) throw new CartError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '原游客填写资料已变化，请重新确认。')
+            const draft = await validatePurchaseDraftForPurchaseInTransaction(trx, config,
+              { kind: 'customer', customer }, { draftId: item.draftId, expectedRevision: claimedRevision })
+            if (draft.revision !== claimedRevision) {
+              throw new CartError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '原游客填写资料已变化，请重新确认。')
+            }
+            const prepared = await preparedPurchaseFormVersion(trx, item.skuId)
+            if (prepared !== draft.templateVersionId) {
+              throw new CartError(409, 'PURCHASE_FORM_VERSION_CHANGED', '商品填写模板绑定已变化，请重新确认购买资料。')
+            }
+            await addCartLineInTransaction(trx, customer.id, {
+              skuId: item.skuId, quantity: item.quantity,
+              contentIdentity: purchaseLineContentIdentity(item.skuId, draft.templateVersionId,
+                draft.normalizationVersion, draft.normalizedValues),
+              draftId: draft.id, draftRevision: draft.revision,
+              templateVersionId: draft.templateVersionId, normalizationVersion: draft.normalizationVersion,
+            })
+          }
+        } else {
+          for (const item of accepted) {
+            await addCartLineInTransaction(trx, customer.id, {
+              skuId: item.skuId, quantity: item.quantity,
+              contentIdentity: purchaseLineContentIdentity(item.skuId, null, null, null),
+              draftId: null, draftRevision: null, templateVersionId: null, normalizationVersion: null,
+            })
           }
         }
-
         await trx.insertInto('customer_cart_merge_requests').values({
-          customer_id: customer.id,
-          merge_id: body.mergeId,
-          request_sha256: digest,
-          skipped_sku_ids: [],
+          customer_id: customer.id, merge_id: body.mergeId, request_sha256: digest,
+          skipped_sku_ids: skippedSkuIds,
         }).execute()
-
-        const existingSkuIds = await lockExistingSkus(trx, normalized.map(item => item.skuId))
-        const skippedSkuIds = normalized.filter(item => !existingSkuIds.has(item.skuId)).map(item => item.skuId)
-        const accepted = normalized.filter(item => existingSkuIds.has(item.skuId))
-        const currentRows = await trx.selectFrom('customer_cart_items')
-          .select(['sku_id', 'quantity'])
-          .where('customer_id', '=', customer.id)
-          .execute()
-        const current = new Map(currentRows.map(row => [row.sku_id, row.quantity]))
-        const newLineCount = accepted.filter(item => !current.has(item.skuId)).length
-        if (current.size + newLineCount > maxCartLines) {
-          throw new CartError(409, 'CART_ITEM_LIMIT', `购物车最多包含 ${maxCartLines} 个 SKU，请先移除部分商品。`)
-        }
-
-        for (const item of accepted) {
-          const quantity = (current.get(item.skuId) ?? 0) + item.quantity
-          if (quantity > maxLineQuantity) {
-            throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}，请先调整数量。`)
-          }
-          await trx.insertInto('customer_cart_items').values({
-            customer_id: customer.id,
-            sku_id: item.skuId,
-            quantity,
-            updated_at: new Date(),
-          }).onConflict(oc => oc.columns(['customer_id', 'sku_id']).doUpdateSet({
-            quantity,
-            updated_at: new Date(),
-          })).execute()
-          current.set(item.skuId, quantity)
-        }
-        await trx.updateTable('customer_cart_merge_requests')
-          .set({ skipped_sku_ids: skippedSkuIds })
-          .where('customer_id', '=', customer.id)
-          .where('merge_id', '=', body.mergeId)
-          .execute()
-        return { changed: accepted.length > 0, skippedSkuIds, cart: await cartSnapshot(trx, customer.id, config) }
+        return { changed: accepted.length > 0, skippedSkuIds }
       })
-
+      const cart = await authenticatedCartSnapshot(db, request.customer!, config)
       reply.header('cache-control', 'no-store')
-      return success({ ...result, merged: true } satisfies CustomerCartMutation, request.id)
+      return success({ ...result, cart, merged: true, retainedLineId: null } satisfies CustomerCartMutation, request.id)
     } catch (error) {
       return mapError(error, reply, request.id)
     }
@@ -408,10 +678,23 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
     },
   }, async (request, reply) => {
     try {
-      const items = (request.body as { items: CartSkuQuantity[] }).items
+      const body = request.body as CheckoutQuoteBody
       const quote = await db.transaction().execute(async (trx) => {
-        if (request.customer) await lockCustomer(trx, request.customer, false)
-        return quoteCheckoutItems(trx, items, request.customer?.id ?? null, config)
+        // The draft validator takes the customer UPDATE lock. Acquire it first
+        // for v2 so concurrent quotes never upgrade two SHARE locks in reverse.
+        if (request.customer) await lockCustomer(trx, request.customer,
+          'version' in body && body.version === 2)
+        if (!request.customer && 'version' in body && body.version === 2
+          && body.items.some(item => 'draftId' in item && item.draftId)) {
+          await assertGuestSession(trx, request.cookies[guestSessionCookie], true)
+        }
+        if ('version' in body && body.version === 2) {
+          const owner = request.customer
+            ? { kind: 'customer' as const, customer: request.customer }
+            : { kind: 'guest' as const, guestSessionToken: request.cookies[guestSessionCookie] ?? '' }
+          return (await quoteCheckoutPurchaseLines(trx, body.items, owner, config)).quote
+        }
+        return quoteCheckoutItems(trx, body.items, request.customer?.id ?? null, config)
       })
       reply.header('cache-control', 'no-store')
       return success(quote, request.id)

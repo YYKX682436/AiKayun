@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import type { CartSkuQuantity, CheckoutQuote, CheckoutQuoteItem } from '@aikayun/contracts'
+import type { CartSkuQuantity, CheckoutQuote, CheckoutQuoteItem, CheckoutRequestLineV2 } from '@aikayun/contracts'
 
 const customerApi = useCustomerApi()
 const shoppingCart = useShoppingCart()
-const selectedSkuIds = ref<string[]>([])
+const selectedLineKeys = ref<string[]>([])
 const selectedQuote = ref<CheckoutQuote | null>(null)
 const quoteError = ref('')
+const checkoutError = ref('')
 const quoteBusy = ref(false)
+const checkoutPreparing = ref(false)
 let quoteSequence = 0
 let selectionInitialized = false
 
@@ -15,10 +17,27 @@ useSeoMeta({ title: '购物车', description: '查看购物车商品和当前结
 const items = computed(() => shoppingCart.cartView.value?.items ?? [])
 const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id))
 const isEmpty = computed(() => shoppingCart.ready.value && items.value.length === 0)
-const selectedItems = computed(() => items.value.filter(item => selectedSkuIds.value.includes(item.skuId)))
+function lineKey(item: CheckoutQuoteItem): string {
+  return item.lineId ?? `legacy:${item.skuId}`
+}
+
+const selectedItems = computed(() => items.value.filter(item => selectedLineKeys.value.includes(lineKey(item))))
 const selectedCount = computed(() => selectedItems.value.reduce((total, item) => total + item.quantity, 0))
-const selectedQuoteItems = computed<CartSkuQuantity[]>(() => selectedItems.value.map(item => ({ skuId: item.skuId, quantity: item.quantity })))
-const checkoutPath = computed(() => selectedQuoteItems.value.length
+const selectedQuoteItems = computed<CartSkuQuantity[] | CheckoutRequestLineV2[] | null>(() => {
+  if (!selectedItems.value.length) return []
+  if (selectedItems.value.every(item => item.lineId === null)) {
+    return selectedItems.value.map(item => ({ skuId: item.skuId, quantity: item.quantity }))
+  }
+  if (selectedItems.value.some(item => !item.lineId || (item.draftId === null) !== (item.draftRevision === null))) return null
+  return selectedItems.value.map(item => ({
+    lineId: item.lineId!, skuId: item.skuId, quantity: item.quantity,
+    draftId: item.draftId, draftRevision: item.draftRevision,
+  }))
+})
+// Legacy guest rows require a Web Lock migration before entering v2 checkout.
+// Their fallback link stays on the cart; ordinary clicks use openCheckout.
+const checkoutPath = computed(() => selectedQuoteItems.value?.length
+  && selectedQuoteItems.value.every(item => 'lineId' in item)
   ? shoppingCart.checkoutPath(selectedQuoteItems.value)
   : '/cart')
 const purchaseLoginRedirect = computed(() => `/login?redirect=${encodeURIComponent(checkoutPath.value)}`)
@@ -41,25 +60,50 @@ function statusLabel(item: CheckoutQuoteItem): string {
     case 'guest_free_claim_disabled': return '游客领取免费商品未开放，请登录'
     case 'purchase_limit_exceeded': return '超过商品或规格限购额度'
     case 'login_required_for_purchase_limit': return '该商品需要登录后购买'
+    case 'purchase_form_invalid': return '购买资料已失效，请重新确认'
+    case 'purchase_form_version_changed': return '填写模板已变化，请重新确认'
+    case 'purchase_form_required': return '此商品需要填写购买资料'
     default: return item.canPurchase ? '可继续报价' : '暂不可购买'
   }
 }
 
-function selectionChanged(skuId: string, checked: boolean): void {
-  selectedSkuIds.value = checked
-    ? [...new Set([...selectedSkuIds.value, skuId])]
-    : selectedSkuIds.value.filter(id => id !== skuId)
+function selectionChanged(key: string, checked: boolean): void {
+  selectedLineKeys.value = checked
+    ? [...new Set([...selectedLineKeys.value, key])]
+    : selectedLineKeys.value.filter(id => id !== key)
 }
 
 function selectAll(checked: boolean): void {
-  selectedSkuIds.value = checked ? items.value.map(item => item.skuId) : []
+  selectedLineKeys.value = checked ? items.value.map(lineKey) : []
+}
+
+async function openCheckout(loginFirst = false): Promise<void> {
+  const selection = selectedQuoteItems.value
+  if (checkoutPreparing.value || !selection?.length) return
+  const identityAtStart = customerApi.identityVersion.value
+  checkoutPreparing.value = true
+  checkoutError.value = ''
+  try {
+    const path = await shoppingCart.prepareCheckoutPath(selection)
+    if (identityAtStart !== customerApi.identityVersion.value) return
+    if (path === '/cart') throw new Error('结算选择未能安全保存，请重试。')
+    await navigateTo(loginFirst ? `/login?redirect=${encodeURIComponent(path)}` : path)
+  } catch (error) {
+    if (identityAtStart === customerApi.identityVersion.value) {
+      checkoutError.value = error instanceof Error ? error.message : '无法安全准备结算，请重试。'
+    }
+  } finally {
+    checkoutPreparing.value = false
+  }
 }
 
 watch(items, (value) => {
-  const currentIds = new Set(value.map(item => item.skuId))
-  selectedSkuIds.value = selectedSkuIds.value.filter(id => currentIds.has(id))
+  if (!value.length && shoppingCart.guestItems.value.length && !isCustomer.value) return
+  const currentIds = new Set(value.map(lineKey))
+  selectedLineKeys.value = [...new Set(selectedLineKeys.value.map(shoppingCart.resolveLineKey))]
+    .filter(id => currentIds.has(id))
   if (!selectionInitialized && value.length) {
-    selectedSkuIds.value = value.map(item => item.skuId)
+    selectedLineKeys.value = value.map(lineKey)
     selectionInitialized = true
   }
 }, { immediate: true })
@@ -67,9 +111,11 @@ watch(items, (value) => {
 watch(selectedQuoteItems, async (value) => {
   const sequence = ++quoteSequence
   quoteError.value = ''
-  if (!value.length) {
+  checkoutError.value = ''
+  if (!value?.length) {
     selectedQuote.value = null
     quoteBusy.value = false
+    if (value === null) quoteError.value = '所选购买行身份已失效，请刷新购物车。'
     return
   }
   quoteBusy.value = true
@@ -90,6 +136,7 @@ watch(() => customerApi.identityVersion.value, () => {
   quoteSequence += 1
   selectedQuote.value = null
   quoteError.value = ''
+  checkoutError.value = ''
   quoteBusy.value = false
 }, { flush: 'sync' })
 
@@ -210,8 +257,8 @@ onMounted(() => {
               <input
                 type="checkbox"
                 class="size-4 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-                :checked="items.length > 0 && selectedSkuIds.length === items.length"
-                :indeterminate="selectedSkuIds.length > 0 && selectedSkuIds.length < items.length"
+                :checked="items.length > 0 && selectedLineKeys.length === items.length"
+                :indeterminate="selectedLineKeys.length > 0 && selectedLineKeys.length < items.length"
                 aria-label="全选购物车商品"
                 @change="selectAll(($event.target as HTMLInputElement).checked)"
               >
@@ -230,21 +277,24 @@ onMounted(() => {
 
           <ul class="space-y-3">
             <li
-              v-for="item in items"
-              :key="item.skuId"
+              v-for="(item, index) in items"
+              :key="lineKey(item)"
               class="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-3 rounded-xl border border-default bg-elevated p-4 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:gap-4 sm:p-5"
             >
               <input
                 type="checkbox"
                 class="mt-1 size-4 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-                :checked="selectedSkuIds.includes(item.skuId)"
+                :checked="selectedLineKeys.includes(lineKey(item))"
                 :aria-label="`选择${item.productName ?? '不可用商品'}`"
-                @change="selectionChanged(item.skuId, ($event.target as HTMLInputElement).checked)"
+                @change="selectionChanged(lineKey(item), ($event.target as HTMLInputElement).checked)"
               >
               <div class="min-w-0">
                 <h2 class="break-words font-medium text-highlighted">
                   {{ item.productName ?? '商品信息暂不可用' }}
                 </h2>
+                <p class="mt-1 text-xs text-muted">
+                  购买行 {{ index + 1 }}<span v-if="item.draftId"> · 已绑定填写资料</span>
+                </p>
                 <p
                   v-if="item.skuCode"
                   class="mt-1 break-all text-xs text-muted"
@@ -298,7 +348,7 @@ onMounted(() => {
                     :aria-label="`减少${item.productName ?? '商品'}数量`"
                     class="min-h-10 min-w-10 justify-center"
                     :disabled="item.quantity <= 1 || shoppingCart.busy.value"
-                    @click="shoppingCart.setQuantity(item.skuId, item.quantity - 1)"
+                    @click="shoppingCart.setQuantity(item.lineId ?? item.skuId, item.quantity - 1)"
                   />
                   <span
                     class="min-w-9 px-1 text-center text-sm tabular-nums text-highlighted"
@@ -312,7 +362,7 @@ onMounted(() => {
                     :aria-label="`增加${item.productName ?? '商品'}数量`"
                     class="min-h-10 min-w-10 justify-center"
                     :disabled="item.quantity >= 99 || shoppingCart.busy.value"
-                    @click="shoppingCart.setQuantity(item.skuId, item.quantity + 1)"
+                    @click="shoppingCart.setQuantity(item.lineId ?? item.skuId, item.quantity + 1)"
                   />
                 </div>
                 <UButton
@@ -320,7 +370,7 @@ onMounted(() => {
                   variant="link"
                   icon="i-lucide-x"
                   :disabled="shoppingCart.busy.value"
-                  @click="shoppingCart.remove(item.skuId)"
+                  @click="shoppingCart.remove(item.lineId ?? item.skuId)"
                 >
                   移除
                 </UButton>
@@ -369,6 +419,13 @@ onMounted(() => {
             {{ quoteError }}
           </p>
           <p
+            v-if="checkoutError"
+            class="mt-3 text-sm text-error"
+            role="alert"
+          >
+            {{ checkoutError }}
+          </p>
+          <p
             v-if="!isCustomer"
             class="mt-3 text-sm leading-6 text-muted"
           >
@@ -382,7 +439,9 @@ onMounted(() => {
             color="primary"
             block
             class="mt-5 min-h-11"
-            :disabled="selectedQuoteItems.length === 0 || quoteBusy || Boolean(quoteError) || (selectedQuote !== null && !selectedQuote.canContinue)"
+            :loading="checkoutPreparing"
+            :disabled="!selectedQuoteItems?.length || checkoutPreparing || quoteBusy || Boolean(quoteError) || (selectedQuote !== null && !selectedQuote.canContinue)"
+            @click.prevent="openCheckout()"
           >
             查看结算报价
           </UButton>
@@ -393,6 +452,9 @@ onMounted(() => {
             variant="outline"
             block
             class="mt-2 min-h-11"
+            :loading="checkoutPreparing"
+            :disabled="checkoutPreparing"
+            @click.prevent="openCheckout(true)"
           >
             该商品需要登录后购买
           </UButton>

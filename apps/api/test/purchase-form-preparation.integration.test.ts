@@ -1,11 +1,13 @@
 import { randomBytes, randomUUID, createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { cp, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { sql } from 'kysely'
-import type { Kysely, KyselyPlugin, Transaction } from 'kysely'
+import { Kysely, PostgresDialect, type KyselyPlugin, type Transaction } from 'kysely'
+import { Pool } from 'pg'
 import type { FastifyInstance } from 'fastify'
 import { Migrator } from 'kysely/migration'
 import sharp from 'sharp'
@@ -30,8 +32,18 @@ import {
   savePurchaseDraft,
   uploadPurchaseDraftAttachment,
   validatePurchaseDraftForPurchase,
+  validatePurchaseDraftForPurchaseInTransaction,
 } from '../src/commerce/purchase-forms.js'
 import { PurchaseAttachmentStorage } from '../src/media/purchase-attachment-storage.js'
+import { PurchaseOrderAttachmentStorage } from '../src/media/purchase-order-attachment-storage.js'
+import {
+  getOwnedOrderPurchaseSnapshot,
+  persistOrderPurchaseSnapshotInTransaction,
+  preparePurchaseOrderAttachments,
+  readOwnedOrderPurchaseAttachment,
+  reconcilePurchaseOrderAttachments,
+} from '../src/commerce/purchase-order-attachments.js'
+import { purchaseLineContentIdentity } from '../src/commerce/purchase-lines.js'
 import { PrivateFileStorage } from '../src/media/private-file-storage.js'
 import { reconcilePrivateFiles } from '../src/media/private-file-reconcile.js'
 import type { PurchaseFormDefinition } from '@aikayun/contracts'
@@ -293,6 +305,378 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
       .rejects.toMatchObject({ code: '23514', constraint: 'purchase_form_history_immutable' })
     expect((await db.selectFrom('product_purchase_form_settings').select('template_version_id')
       .where('product_id', '=', catalog.productId).executeTakeFirstOrThrow()).template_version_id).toBe(fixture.versionId)
+  }, 45_000)
+
+  it('keeps a prepared order image when cleanup races an in-flight order bind', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const catalog = await createCatalog()
+    const customer = await makeCustomer()
+    const owner = customerOwner(customer)
+    const draftStorage = new PurchaseAttachmentStorage(privateRoot)
+    const orderStorage = new PurchaseOrderAttachmentStorage(privateRoot)
+    const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const png = await sharp({ create: { width: 8, height: 8, channels: 4, background: '#332255' } }).png().toBuffer()
+    const image = await uploadPurchaseDraftAttachment(db, configA, draftStorage, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    const saved = await savePurchaseDraft(db, configA, owner, { draftId: draft.id,
+      expectedRevision: draft.revision, values: {
+        [fixture.ids.accountId]: '0008', [fixture.ids.selectId]: fixture.options.planA,
+        [fixture.ids.cascadeId]: { path: [fixture.ids.regionId, fixture.ids.serverId],
+          expanded: { [fixture.ids.playerId]: 'Race' } },
+        [fixture.ids.imageId]: [image.attachmentId],
+      } })
+    const validated = await db.transaction().execute(trx => validatePurchaseDraftForPurchaseInTransaction(
+      trx, configA, owner, { draftId: draft.id, expectedRevision: saved.revision },
+    ))
+    const prepared = await preparePurchaseOrderAttachments(db, draftStorage, orderStorage, validated)
+    const orderId = randomUUID()
+    const orderItemId = randomUUID()
+    let signalBound!: () => void
+    let releaseBind!: () => void
+    const bound = new Promise<void>(resolve => { signalBound = resolve })
+    const release = new Promise<void>(resolve => { releaseBind = resolve })
+    const commit = db.transaction().execute(async trx => {
+      await trx.insertInto('orders').values({
+        id: orderId, customer_id: customer.id, guest_order_session_id: null,
+        idempotency_key: randomUUID(), request_sha256: 'c'.repeat(64),
+        status: 'pending_payment', total_amount: '12.50', currency: 'CNY',
+        unpaid_expires_at: new Date(Date.now() + 30 * 60_000),
+        history_hidden_at: null, history_hidden_by_admin_id: null, history_hidden_reason: null,
+      }).execute()
+      await trx.insertInto('order_items').values({
+        id: orderItemId, order_id: orderId, purchase_line_id: randomUUID(),
+        product_id: catalog.productId, product_variant_id: catalog.skuId,
+        product_name_snapshot: `准备关联隔离商品-${catalog.productId.slice(0, 8)}`,
+        product_type_snapshot: 'digital', sku_code_snapshot: `PREP-${catalog.skuId.slice(0, 8)}`,
+        sku_snapshot: JSON.stringify([]), inventory_mode_snapshot: 'unlimited',
+        fulfillment_method_snapshot: 'manual', fulfillment_content_version_id: null,
+        unit_price: '12.50', quantity: 1, line_amount: '12.50',
+      }).execute()
+      await persistOrderPurchaseSnapshotInTransaction(trx, configA, {
+        orderItemId,
+        contentIdentity: purchaseLineContentIdentity(catalog.skuId, validated.templateVersionId,
+          validated.normalizationVersion, validated.normalizedValues),
+        draft: validated, preparedAttachments: prepared,
+      })
+      signalBound()
+      await release
+      await trx.updateTable('orders').set({ items_sealed: true }).where('id', '=', orderId).execute()
+    })
+    try {
+      await bound
+      const cleaned = await reconcilePurchaseOrderAttachments(db, orderStorage, {
+        repair: true, now: new Date(Date.now() + 25 * 60 * 60_000), graceHours: 24,
+      })
+      expect(cleaned.removedFiles).toBe(0)
+    } finally {
+      releaseBind()
+    }
+    await commit
+    expect((await db.selectFrom('purchase_order_attachment_objects').select('status')
+      .where('id', '=', prepared[0]!.objectId).executeTakeFirstOrThrow()).status).toBe('retained')
+    expect(createHash('sha256').update((await readOwnedOrderPurchaseAttachment(
+      db, orderStorage, owner, orderItemId, image.attachmentId,
+    )).bytes).digest('hex')).toBe(image.sha256)
+  }, 45_000)
+
+  it('persists a verified prepared order archive independently and reaps only an unbound failed preparation', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const catalog = await createCatalog()
+    const customer = await makeCustomer()
+    const owner = customerOwner(customer)
+    const draftStorage = new PurchaseAttachmentStorage(privateRoot)
+    const orderStorage = new PurchaseOrderAttachmentStorage(privateRoot)
+    const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const png = await sharp({ create: { width: 9, height: 6, channels: 4, background: '#6b317d' } }).png().toBuffer()
+    const attachment = await uploadPurchaseDraftAttachment(db, configA, draftStorage, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    const saved = await savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, values: {
+        [fixture.ids.accountId]: '00041',
+        [fixture.ids.selectId]: fixture.options.planA,
+        [fixture.ids.cascadeId]: {
+          path: [fixture.ids.regionId, fixture.ids.serverId],
+          expanded: { [fixture.ids.playerId]: 'Exact Player' },
+        },
+        [fixture.ids.imageId]: [attachment.attachmentId],
+      },
+    })
+    const validated = await db.transaction().execute(trx => validatePurchaseDraftForPurchaseInTransaction(
+      trx, configA, owner, { draftId: draft.id, expectedRevision: saved.revision },
+    ))
+    const prepared = await preparePurchaseOrderAttachments(db, draftStorage, orderStorage, validated)
+    expect(prepared).toHaveLength(1)
+    const object = await db.selectFrom('purchase_order_attachment_objects').selectAll()
+      .where('id', '=', prepared[0]!.objectId).executeTakeFirstOrThrow()
+    expect(object).toMatchObject({
+      status: 'prepared', source_draft_id: draft.id, source_attachment_id: attachment.attachmentId,
+      sha256: attachment.sha256,
+    })
+    expect(createHash('sha256').update(await orderStorage.readVerified(
+      object.id, object.storage_key, object.byte_size, object.sha256,
+    )).digest('hex')).toBe(attachment.sha256)
+
+    const failedOrderId = randomUUID()
+    const failedItemId = randomUUID()
+    await expect(db.transaction().execute(async trx => {
+      await trx.insertInto('orders').values({
+        id: failedOrderId, customer_id: customer.id, guest_order_session_id: null,
+        idempotency_key: randomUUID(), request_sha256: 'b'.repeat(64),
+        status: 'pending_payment', total_amount: '12.50', currency: 'CNY',
+        unpaid_expires_at: new Date(Date.now() + 30 * 60_000),
+        history_hidden_at: null, history_hidden_by_admin_id: null, history_hidden_reason: null,
+      }).execute()
+      await trx.insertInto('order_items').values({
+        id: failedItemId, order_id: failedOrderId, purchase_line_id: randomUUID(),
+        product_id: catalog.productId, product_variant_id: catalog.skuId,
+        product_name_snapshot: `准备关联隔离商品-${catalog.productId.slice(0, 8)}`,
+        product_type_snapshot: 'digital', sku_code_snapshot: `PREP-${catalog.skuId.slice(0, 8)}`,
+        sku_snapshot: JSON.stringify([]), inventory_mode_snapshot: 'unlimited',
+        fulfillment_method_snapshot: 'manual', fulfillment_content_version_id: null,
+        unit_price: '12.50', quantity: 1, line_amount: '12.50',
+      }).execute()
+      await persistOrderPurchaseSnapshotInTransaction(trx, configA, {
+        orderItemId: failedItemId,
+        contentIdentity: purchaseLineContentIdentity(catalog.skuId, validated.templateVersionId,
+          validated.normalizationVersion, validated.normalizedValues),
+        draft: validated, preparedAttachments: prepared,
+      })
+      throw new Error('injected order transaction failure after archive bind')
+    })).rejects.toThrow('injected order transaction failure after archive bind')
+    expect(await db.selectFrom('orders').select('id').where('id', '=', failedOrderId).execute()).toHaveLength(0)
+    expect(await db.selectFrom('order_item_purchase_attachments').select('order_item_id')
+      .where('archive_object_id', '=', object.id).execute()).toHaveLength(0)
+    expect((await db.selectFrom('purchase_order_attachment_objects').select('status')
+      .where('id', '=', object.id).executeTakeFirstOrThrow()).status).toBe('prepared')
+    expect(createHash('sha256').update(await orderStorage.readVerified(
+      object.id, object.storage_key, object.byte_size, object.sha256,
+    )).digest('hex')).toBe(attachment.sha256)
+
+    await requestPurchaseDraftDeletion(db, owner, draft.id, saved.revision)
+    await reconcilePurchaseDrafts(db, draftStorage, { repair: true })
+    expect((await draftStorage.scanFiles()).some(file => file.id === attachment.attachmentId)).toBe(false)
+    expect((await orderStorage.scanFiles()).some(file => file.id === object.id)).toBe(true)
+    const future = new Date(Date.now() + 25 * 60 * 60_000)
+    const cleaned = await reconcilePurchaseOrderAttachments(db, orderStorage, {
+      repair: true, now: future, graceHours: 24,
+    })
+    expect(cleaned.removedFiles).toBeGreaterThanOrEqual(1)
+    expect(await db.selectFrom('purchase_order_attachment_objects').select('id').where('id', '=', object.id).execute())
+      .toHaveLength(0)
+    expect((await orderStorage.scanFiles()).some(file => file.id === object.id)).toBe(false)
+  }, 45_000)
+
+  it('replays an image order after its response is lost without reading the deleted source or preparing another archive', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const catalog = await createCatalog()
+    const product = await db.selectFrom('products').select('revision')
+      .where('id', '=', catalog.productId).executeTakeFirstOrThrow()
+    const assigned = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/purchase-form`, headers: adminHeaders(),
+      payload: { expectedRevision: product.revision, mode: 'template', templateVersionId: fixture.versionId },
+    })
+    expect(assigned.statusCode, JSON.stringify(assigned.json())).toBe(200)
+
+    const customer = await makeCustomer()
+    const owner = customerOwner(customer)
+    const draftStorage = new PurchaseAttachmentStorage(privateRoot)
+    const orderStorage = new PurchaseOrderAttachmentStorage(privateRoot)
+    const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const png = await sharp({ create: { width: 7, height: 9, channels: 4, background: '#704a2b' } }).png().toBuffer()
+    const image = await uploadPurchaseDraftAttachment(db, configA, draftStorage, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    const saved = await savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, values: {
+        [fixture.ids.accountId]: '00092', [fixture.ids.selectId]: fixture.options.planA,
+        [fixture.ids.cascadeId]: { path: [fixture.ids.regionId, fixture.ids.serverId],
+          expanded: { [fixture.ids.playerId]: 'Replay' } },
+        [fixture.ids.imageId]: [image.attachmentId],
+      },
+    })
+    const csrfResponse = await inject({ method: 'GET', url: '/api/v1/customer/auth/csrf' })
+    expect(csrfResponse.statusCode).toBe(200)
+    const headers = {
+      origin,
+      cookie: `aikayun_customer_session=${customer.token}; ${cookieFrom(csrfResponse, 'aikayun_customer_csrf')}`,
+      'x-csrf-token': csrfResponse.json().data.csrfToken as string,
+    }
+    const items = [{ lineId: randomUUID(), skuId: catalog.skuId, quantity: 1,
+      draftId: draft.id, draftRevision: saved.revision }]
+    const quote = await inject({ method: 'POST', url: '/api/v1/checkout/quote', headers,
+      payload: { version: 2, items } })
+    expect(quote.statusCode, JSON.stringify(quote.json())).toBe(200)
+    expect(quote.json().data.canContinue).toBe(true)
+    const body = { version: 2, items, idempotencyKey: randomUUID(),
+      quoteToken: quote.json().data.quoteToken as string }
+    const first = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: body })
+    expect(first.statusCode, JSON.stringify(first.json())).toBe(201)
+    const firstOrder = first.json().data.order as { id: string; items: Array<{ id: string }> }
+    expect(firstOrder.items).toHaveLength(1)
+    const archivedBefore = await db.selectFrom('purchase_order_attachment_objects').selectAll()
+      .where('source_draft_id', '=', draft.id).execute()
+    expect(archivedBefore).toHaveLength(1)
+    expect(archivedBefore[0]?.status).toBe('retained')
+
+    await requestPurchaseDraftDeletion(db, owner, draft.id, saved.revision)
+    await reconcilePurchaseDrafts(db, draftStorage, { repair: true })
+    expect((await draftStorage.scanFiles()).some(file => file.id === image.attachmentId)).toBe(false)
+    // The client does not need the lost 201 response: the original request body alone recovers the order.
+    const replay = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: body })
+    expect(replay.statusCode, JSON.stringify(replay.json())).toBe(200)
+    expect(replay.json().data.order.id).toBe(firstOrder.id)
+    const archivedAfter = await db.selectFrom('purchase_order_attachment_objects').selectAll()
+      .where('source_draft_id', '=', draft.id).execute()
+    expect(archivedAfter).toEqual(archivedBefore)
+    expect(createHash('sha256').update((await readOwnedOrderPurchaseAttachment(
+      db, orderStorage, owner, firstOrder.items[0]!.id, image.attachmentId,
+    )).bytes).digest('hex')).toBe(image.sha256)
+  }, 45_000)
+
+  it('retains immutable order values and a private image after draft cleanup with ownership and historical-key checks', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const catalog = await createCatalog()
+    const customer = await makeCustomer()
+    const stranger = await makeCustomer()
+    const owner = customerOwner(customer)
+    const draftStorage = new PurchaseAttachmentStorage(privateRoot)
+    const orderStorage = new PurchaseOrderAttachmentStorage(privateRoot)
+    const draft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const png = await sharp({ create: { width: 11, height: 7, channels: 4, background: '#27396b' } }).png().toBuffer()
+    const image = await uploadPurchaseDraftAttachment(db, configA, draftStorage, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    const saved = await savePurchaseDraft(db, configA, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, values: {
+        [fixture.ids.accountId]: '0000007',
+        [fixture.ids.selectId]: fixture.options.planB,
+        [fixture.ids.cascadeId]: {
+          path: [fixture.ids.regionId, fixture.ids.serverId],
+          expanded: { [fixture.ids.playerId]: 'Preserve Case ' },
+        },
+        [fixture.ids.imageId]: [image.attachmentId],
+      },
+    })
+    const validated = await db.transaction().execute(trx => validatePurchaseDraftForPurchaseInTransaction(
+      trx, configA, owner, { draftId: draft.id, expectedRevision: saved.revision },
+    ))
+    const prepared = await preparePurchaseOrderAttachments(db, draftStorage, orderStorage, validated)
+    const orderId = randomUUID()
+    const orderItemId = randomUUID()
+    await db.transaction().execute(async trx => {
+      await trx.insertInto('orders').values({
+        id: orderId, customer_id: customer.id, guest_order_session_id: null,
+        idempotency_key: randomUUID(), request_sha256: 'b'.repeat(64),
+        status: 'pending_payment', total_amount: '12.50', currency: 'CNY',
+        unpaid_expires_at: new Date(Date.now() + 30 * 60_000),
+        history_hidden_at: null, history_hidden_by_admin_id: null, history_hidden_reason: null,
+      }).execute()
+      await trx.insertInto('order_items').values({
+        id: orderItemId, order_id: orderId, purchase_line_id: randomUUID(),
+        product_id: catalog.productId, product_variant_id: catalog.skuId,
+        product_name_snapshot: `准备关联隔离商品-${catalog.productId.slice(0, 8)}`,
+        product_type_snapshot: 'digital', sku_code_snapshot: `PREP-${catalog.skuId.slice(0, 8)}`,
+        sku_snapshot: JSON.stringify([]), inventory_mode_snapshot: 'unlimited',
+        fulfillment_method_snapshot: 'manual', fulfillment_content_version_id: null,
+        unit_price: '12.50', quantity: 1, line_amount: '12.50',
+      }).execute()
+      await persistOrderPurchaseSnapshotInTransaction(trx, configA, {
+        orderItemId,
+        contentIdentity: purchaseLineContentIdentity(
+          catalog.skuId, fixture.versionId, validated.normalizationVersion, validated.normalizedValues,
+        ),
+        draft: validated,
+        preparedAttachments: prepared,
+      })
+      await trx.updateTable('orders').set({ items_sealed: true }).where('id', '=', orderId).execute()
+    })
+    const retained = await db.selectFrom('purchase_order_attachment_objects').select('status')
+      .where('id', '=', prepared[0]!.objectId).executeTakeFirstOrThrow()
+    expect(retained.status).toBe('retained')
+    await requestPurchaseDraftDeletion(db, owner, draft.id, saved.revision)
+    await reconcilePurchaseDrafts(db, draftStorage, { repair: true })
+    expect((await draftStorage.scanFiles()).some(file => file.id === image.attachmentId)).toBe(false)
+    const snapshot = await getOwnedOrderPurchaseSnapshot(db, configRotated, owner, orderItemId)
+    expect(snapshot).toMatchObject({
+      state: 'filled', templateVersionId: fixture.versionId,
+      normalizationVersion: 1, attachments: [{ attachmentId: image.attachmentId, sha256: image.sha256 }],
+    })
+    expect(snapshot.values?.[fixture.ids.accountId]).toBe('0000007')
+    expect(createHash('sha256').update((await readOwnedOrderPurchaseAttachment(
+      db, orderStorage, owner, orderItemId, image.attachmentId,
+    )).bytes).digest('hex')).toBe(image.sha256)
+    await expect(getOwnedOrderPurchaseSnapshot(db, configRotated, customerOwner(stranger), orderItemId))
+      .rejects.toMatchObject({ status: 404 })
+    await expect(readOwnedOrderPurchaseAttachment(
+      db, orderStorage, customerOwner(stranger), orderItemId, image.attachmentId,
+    )).rejects.toMatchObject({ status: 404 })
+    const missingHistoricalKey: AppConfig = {
+      ...configA, paymentCredentialKeyRing: { activeKeyId: 'draft-b', keys: { 'draft-b': keyB } },
+    }
+    await expect(getOwnedOrderPurchaseSnapshot(db, missingHistoricalKey, owner, orderItemId))
+      .rejects.toThrow('Purchase order content encryption is unavailable')
+    const later = await reconcilePurchaseOrderAttachments(db, orderStorage, {
+      repair: true, now: new Date(Date.now() + 25 * 60 * 60_000),
+    })
+    expect(later.missingRetained).toBe(0)
+    expect((await orderStorage.scanFiles()).some(file => file.id === prepared[0]!.objectId)).toBe(true)
+    await expect(sql`UPDATE order_item_purchase_snapshots SET content_identity = ${'c'.repeat(64)}
+      WHERE order_item_id = ${orderItemId}`.execute(db))
+      .rejects.toMatchObject({ code: '23514' })
+
+    if (process.env.PURCHASE_ORDER_RESTORE_ACCEPTANCE === '1') {
+      if (!testDatabaseUrl) throw new Error('A dedicated source TEST_DATABASE_URL is required')
+      const sourceName = new URL(testDatabaseUrl).pathname.slice(1)
+      if (!sourceName.endsWith('_test')) throw new Error('Restore source must be a dedicated _test database')
+      const restoredName = `aikayun_purchase_restore_${randomUUID().replaceAll('-', '').slice(0, 12)}_test`
+      const container = process.env.PURCHASE_ORDER_RESTORE_CONTAINER ?? 'aikayun-db-1'
+      const copyBase = await mkdtemp(join(tmpdir(), 'aikayun-purchase-order-restore-'))
+      const copiedPrivateRoot = join(copyBase, 'private-volume')
+      const docker = (args: string[], input?: Buffer) => {
+        const result = spawnSync('docker', ['exec', ...(input ? ['-i'] : []), container, ...args], {
+          input, maxBuffer: 128 * 1024 * 1024,
+        })
+        if (result.error || result.status !== 0) {
+          throw new Error(`Isolated restore command failed: ${args[0]}: ${result.error?.message ?? result.stderr.toString('utf8')}`)
+        }
+        return result.stdout
+      }
+      let created = false
+      let restoredDb: Kysely<Database> | undefined
+      try {
+        await cp(privateRoot, copiedPrivateRoot, { recursive: true })
+        const dump = docker(['pg_dump', '-U', 'aikayun', '-Fc', '-d', sourceName])
+        docker(['createdb', '-U', 'aikayun', restoredName])
+        created = true
+        docker(['pg_restore', '-U', 'aikayun', '--no-owner', '--no-privileges', '-d', restoredName], dump)
+        const restoredUrl = new URL(testDatabaseUrl)
+        restoredUrl.pathname = `/${restoredName}`
+        restoredDb = new Kysely<Database>({
+          dialect: new PostgresDialect({ pool: new Pool({ connectionString: restoredUrl.href }) }),
+        })
+        const restoredSnapshot = await getOwnedOrderPurchaseSnapshot(restoredDb, configRotated, owner, orderItemId)
+        expect(restoredSnapshot).toEqual(snapshot)
+        expect((await restoredDb.selectFrom('purchase_order_attachment_objects').select('status')
+          .where('id', '=', prepared[0]!.objectId).executeTakeFirstOrThrow()).status).toBe('retained')
+        const restoredFile = await readOwnedOrderPurchaseAttachment(
+          restoredDb, new PurchaseOrderAttachmentStorage(copiedPrivateRoot), owner, orderItemId, image.attachmentId,
+        )
+        expect(restoredFile.sha256).toBe(image.sha256)
+        expect(createHash('sha256').update(restoredFile.bytes).digest('hex')).toBe(image.sha256)
+        await expect(getOwnedOrderPurchaseSnapshot(restoredDb, configRotated, customerOwner(stranger), orderItemId))
+          .rejects.toMatchObject({ status: 404 })
+      } finally {
+        if (restoredDb) await restoredDb.destroy()
+        if (created) docker(['dropdb', '-U', 'aikayun', '--if-exists', restoredName])
+        await rm(copyBase, { recursive: true, force: true })
+      }
+    }
   }, 45_000)
 
   it('rejects malformed nested expanded fields on create and revision without partial writes', async () => {

@@ -51,6 +51,26 @@ export interface PurchaseDraftWriteResult {
   normalizedContentHash: string
 }
 
+export interface ValidatedPurchaseDraft extends PurchaseDraftWriteResult {
+  templateVersionId: string
+  normalizationVersion: number
+  attachments: Array<{
+    id: string
+    fieldId: string
+    storageKey: string
+    byteSize: number
+    width: number
+    height: number
+    sha256: string
+  }>
+}
+
+export interface PurchaseDraftReference {
+  draftId: string
+  expectedRevision?: number
+  expectedTemplateVersionId?: string
+}
+
 type OwnerIdentity = { kind: 'customer'; customerId: string } | { kind: 'guest'; guestSessionId: string }
 type DraftRow = Selectable<PurchaseDraftsTable>
 type DraftAttachmentRow = Selectable<PurchaseDraftAttachmentsTable>
@@ -75,7 +95,7 @@ function assertTemplateDefinition(value: unknown): PurchaseFormDefinition {
   return result.value
 }
 
-async function validateAndLockOwner(
+export async function validateAndLockPurchaseDraftOwner(
   trx: Transaction<Database>,
   owner: PurchaseDraftOwner,
   lock: 'share' | 'update' = 'share',
@@ -119,6 +139,16 @@ async function lockOwnedDraft(
   if (locked.status !== 'active') throw draftNotFound()
   if (locked.expires_at <= new Date()) throw expiredDraft()
   return locked
+}
+
+async function assertDraftNotBoundToCart(trx: Transaction<Database>, draftId: string): Promise<void> {
+  const binding = await trx.selectFrom('customer_cart_items').select('line_id')
+    .where('draft_id', '=', draftId).executeTakeFirst()
+  if (binding) {
+    throw new PurchaseDraftServiceError(
+      409, 'PURCHASE_DRAFT_CART_BOUND', '此填写草稿已绑定购物车购买行，请在购物车中编辑。',
+    )
+  }
 }
 
 async function loadDraftTemplate(trx: Transaction<Database>, versionId: string): Promise<PurchaseFormDefinition> {
@@ -274,7 +304,7 @@ export async function createPurchaseDraft(
 ): Promise<{ id: string; revision: number; expiresAt: string }> {
   if (!uuidPattern.test(templateVersionId)) throw new PurchaseDraftServiceError(400, 'PURCHASE_TEMPLATE_VERSION_INVALID', '填写模板版本无效。')
   return db.transaction().execute(async (trx) => {
-    const identity = await validateAndLockOwner(trx, owner, 'update')
+    const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
     await loadDraftTemplate(trx, templateVersionId)
     let countQuery = trx.selectFrom('purchase_drafts').select(db.fn.countAll<number>().as('count'))
       .where('status', '=', 'active').where('expires_at', '>', now)
@@ -312,7 +342,7 @@ export async function getPurchaseDraft(
   draftId: string,
 ): Promise<PurchaseDraftView> {
   return db.transaction().execute(async (trx) => {
-    const identity = await validateAndLockOwner(trx, owner)
+    const identity = await validateAndLockPurchaseDraftOwner(trx, owner)
     const draft = await lockOwnedDraft(trx, identity, draftId, 'share')
     const definition = await loadDraftTemplate(trx, draft.template_version_id)
     const attachments = await listDraftAttachments(trx, draft.id, false)
@@ -335,58 +365,123 @@ export async function getPurchaseDraft(
   })
 }
 
+export async function savePurchaseDraftInTransaction(
+  trx: Transaction<Database>,
+  config: AppConfig,
+  owner: PurchaseDraftOwner,
+  input: { draftId: string; expectedRevision: number; values: unknown },
+  options: { coordinatedCartEdit?: boolean } = {},
+): Promise<PurchaseDraftWriteResult> {
+  const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
+  const draft = await lockOwnedDraft(trx, identity, input.draftId, 'update')
+  if (!options.coordinatedCartEdit) await assertDraftNotBoundToCart(trx, draft.id)
+  if (!Number.isSafeInteger(input.expectedRevision) || draft.revision !== input.expectedRevision) {
+    throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已被其他操作修改，请重新读取。')
+  }
+  const definition = await loadDraftTemplate(trx, draft.template_version_id)
+  const attachments = await listDraftAttachments(trx, draft.id, true)
+  assertAttachmentCapacity(attachments)
+  const normalized = normalizeForDraft(definition, input.values, attachments)
+  const refs = collectImageReferences(definition, normalized.value)
+  const attachmentById = new Map(attachments.map(attachment => [attachment.id, attachment]))
+  if (refs.some(reference => attachmentById.get(reference.attachmentId)?.field_id !== reference.fieldId
+    || attachmentById.get(reference.attachmentId)?.status !== 'ready')) {
+    throw validationError(refs.map(reference => ({ fieldId: reference.fieldId, code: 'ATTACHMENT_NOT_OWNED' })))
+  }
+  const complete = normalizeForDraft(definition, input.values, attachments, true)
+  const payload = Buffer.from(canonicalPurchaseFormJson(normalized.value), 'utf8')
+  if (payload.length > PURCHASE_FORM_LIMITS.requestBytes - 16 * 1024) {
+    throw new PurchaseDraftServiceError(413, 'PURCHASE_DRAFT_TOO_LARGE', '填写资料超过保存容量上限。')
+  }
+  const encrypted = encryptPurchaseDraft(config, draft.id, normalized.value)
+  await trx.deleteFrom('purchase_draft_attachment_references').where('draft_id', '=', draft.id).execute()
+  for (const reference of refs) {
+    await trx.insertInto('purchase_draft_attachment_references').values({
+      draft_id: draft.id,
+      attachment_id: reference.attachmentId,
+      field_id: reference.fieldId,
+    }).execute()
+  }
+  const updated = await trx.updateTable('purchase_drafts').set({
+    encrypted_payload: encrypted.ciphertext,
+    payload_nonce: encrypted.nonce,
+    payload_auth_tag: encrypted.authTag,
+    encryption_key_id: encrypted.keyId,
+  }).where('id', '=', draft.id).returning(['revision', 'expires_at']).executeTakeFirstOrThrow()
+  return {
+    id: draft.id,
+    revision: updated.revision,
+    expiresAt: updated.expires_at.toISOString(),
+    complete: complete.incompleteFieldIds.length === 0,
+    incompleteFieldIds: complete.incompleteFieldIds,
+    normalizedValues: normalized.value,
+    normalizedContentHash: purchaseFormContentIdentity(draft.template_version_id, normalized.value),
+  }
+}
+
 export async function savePurchaseDraft(
   db: Kysely<Database>,
   config: AppConfig,
   owner: PurchaseDraftOwner,
   input: { draftId: string; expectedRevision: number; values: unknown },
 ): Promise<PurchaseDraftWriteResult> {
-  return db.transaction().execute(async (trx) => {
-    const identity = await validateAndLockOwner(trx, owner)
-    const draft = await lockOwnedDraft(trx, identity, input.draftId, 'update')
-    if (!Number.isSafeInteger(input.expectedRevision) || draft.revision !== input.expectedRevision) {
-      throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已被其他操作修改，请重新读取。')
+  return db.transaction().execute(trx => savePurchaseDraftInTransaction(trx, config, owner, input))
+}
+
+export async function validatePurchaseDraftForPurchaseInTransaction(
+  trx: Transaction<Database>,
+  config: AppConfig,
+  owner: PurchaseDraftOwner,
+  reference: PurchaseDraftReference,
+  mode: 'share' | 'update' = 'share',
+): Promise<ValidatedPurchaseDraft> {
+  const identity = await validateAndLockPurchaseDraftOwner(trx, owner, owner.kind === 'customer' ? 'update' : mode)
+  const draft = await lockOwnedDraft(trx, identity, reference.draftId, mode)
+  if (reference.expectedRevision !== undefined
+    && (!Number.isSafeInteger(reference.expectedRevision) || draft.revision !== reference.expectedRevision)) {
+    throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已变化，请重新确认并报价。')
+  }
+  if (reference.expectedTemplateVersionId && draft.template_version_id !== reference.expectedTemplateVersionId) {
+    throw new PurchaseDraftServiceError(409, 'PURCHASE_TEMPLATE_VERSION_CONFLICT', '填写模板版本已变化，请重新确认并报价。')
+  }
+  const definition = await loadDraftTemplate(trx, draft.template_version_id)
+  const attachments = await listDraftAttachments(trx, draft.id, mode === 'update')
+  const values = decryptPurchaseDraft(config, draft.id, envelope(draft))
+  const complete = normalizeForDraft(definition, values, attachments, true)
+  if (complete.incompleteFieldIds.length) {
+    throw new PurchaseDraftServiceError(400, 'PURCHASE_DRAFT_INCOMPLETE', '请完成所有必填字段和级联选择。', complete.incompleteFieldIds)
+  }
+  const refs = collectImageReferences(definition, complete.value)
+  const byId = new Map(attachments.map(attachment => [attachment.id.toLowerCase(), attachment]))
+  const imageAttachments = refs.map(reference => {
+    const attachment = byId.get(reference.attachmentId.toLowerCase())
+    if (!attachment || attachment.status !== 'ready' || attachment.field_id.toLowerCase() !== reference.fieldId
+      || attachment.byte_size === null || attachment.width === null || attachment.height === null
+      || attachment.sha256 === null) {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_UNAVAILABLE', '填写图片已变化，请重新确认并报价。')
     }
-    const definition = await loadDraftTemplate(trx, draft.template_version_id)
-    const attachments = await listDraftAttachments(trx, draft.id, true)
-    assertAttachmentCapacity(attachments)
-    const normalized = normalizeForDraft(definition, input.values, attachments)
-    const refs = collectImageReferences(definition, normalized.value)
-    const attachmentById = new Map(attachments.map(attachment => [attachment.id, attachment]))
-    if (refs.some(reference => attachmentById.get(reference.attachmentId)?.field_id !== reference.fieldId
-      || attachmentById.get(reference.attachmentId)?.status !== 'ready')) {
-      throw validationError(refs.map(reference => ({ fieldId: reference.fieldId, code: 'ATTACHMENT_NOT_OWNED' })))
-    }
-    const complete = normalizeForDraft(definition, input.values, attachments, true)
-    const payload = Buffer.from(canonicalPurchaseFormJson(normalized.value), 'utf8')
-    if (payload.length > PURCHASE_FORM_LIMITS.requestBytes - 16 * 1024) {
-      throw new PurchaseDraftServiceError(413, 'PURCHASE_DRAFT_TOO_LARGE', '填写资料超过保存容量上限。')
-    }
-    const encrypted = encryptPurchaseDraft(config, draft.id, normalized.value)
-    await trx.deleteFrom('purchase_draft_attachment_references').where('draft_id', '=', draft.id).execute()
-    for (const reference of refs) {
-      await trx.insertInto('purchase_draft_attachment_references').values({
-        draft_id: draft.id,
-        attachment_id: reference.attachmentId,
-        field_id: reference.fieldId,
-      }).execute()
-    }
-    const updated = await trx.updateTable('purchase_drafts').set({
-      encrypted_payload: encrypted.ciphertext,
-      payload_nonce: encrypted.nonce,
-      payload_auth_tag: encrypted.authTag,
-      encryption_key_id: encrypted.keyId,
-    }).where('id', '=', draft.id).returning(['revision', 'expires_at']).executeTakeFirstOrThrow()
     return {
-      id: draft.id,
-      revision: updated.revision,
-      expiresAt: updated.expires_at.toISOString(),
-      complete: complete.incompleteFieldIds.length === 0,
-      incompleteFieldIds: complete.incompleteFieldIds,
-      normalizedValues: normalized.value,
-      normalizedContentHash: purchaseFormContentIdentity(draft.template_version_id, normalized.value),
+      id: attachment.id,
+      fieldId: attachment.field_id,
+      storageKey: attachment.storage_key,
+      byteSize: attachment.byte_size,
+      width: attachment.width,
+      height: attachment.height,
+      sha256: attachment.sha256,
     }
   })
+  return {
+    id: draft.id,
+    revision: draft.revision,
+    expiresAt: draft.expires_at.toISOString(),
+    templateVersionId: draft.template_version_id,
+    normalizationVersion: draft.normalization_version,
+    complete: true,
+    incompleteFieldIds: [],
+    normalizedValues: complete.value,
+    normalizedContentHash: purchaseFormContentIdentity(draft.template_version_id, complete.value),
+    attachments: imageAttachments,
+  }
 }
 
 export async function validatePurchaseDraftForPurchase(
@@ -395,26 +490,9 @@ export async function validatePurchaseDraftForPurchase(
   owner: PurchaseDraftOwner,
   draftId: string,
 ): Promise<PurchaseDraftWriteResult> {
-  return db.transaction().execute(async (trx) => {
-    const identity = await validateAndLockOwner(trx, owner)
-    const draft = await lockOwnedDraft(trx, identity, draftId, 'share')
-    const definition = await loadDraftTemplate(trx, draft.template_version_id)
-    const attachments = await listDraftAttachments(trx, draft.id, false)
-    const values = decryptPurchaseDraft(config, draft.id, envelope(draft))
-    const complete = normalizeForDraft(definition, values, attachments, true)
-    if (complete.incompleteFieldIds.length) {
-      throw new PurchaseDraftServiceError(400, 'PURCHASE_DRAFT_INCOMPLETE', '请完成所有必填字段和级联选择。', complete.incompleteFieldIds)
-    }
-    return {
-      id: draft.id,
-      revision: draft.revision,
-      expiresAt: draft.expires_at.toISOString(),
-      complete: true,
-      incompleteFieldIds: [],
-      normalizedValues: complete.value,
-      normalizedContentHash: purchaseFormContentIdentity(draft.template_version_id, complete.value),
-    }
-  })
+  return db.transaction().execute(trx => validatePurchaseDraftForPurchaseInTransaction(
+    trx, config, owner, { draftId },
+  ))
 }
 
 export async function renewPurchaseDraft(
@@ -425,8 +503,9 @@ export async function renewPurchaseDraft(
   now = new Date(),
 ): Promise<{ revision: number; expiresAt: string }> {
   return db.transaction().execute(async (trx) => {
-    const identity = await validateAndLockOwner(trx, owner)
+    const identity = await validateAndLockPurchaseDraftOwner(trx, owner)
     const draft = await lockOwnedDraft(trx, identity, draftId, 'update')
+    await assertDraftNotBoundToCart(trx, draft.id)
     if (draft.revision !== expectedRevision) throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已被其他操作修改，请重新读取。')
     const expiresAt = new Date(now.getTime() + PURCHASE_DRAFT_TTL_DAYS * 24 * 60 * 60 * 1000)
     const updated = await trx.updateTable('purchase_drafts').set({ expires_at: expiresAt })
@@ -442,8 +521,9 @@ export async function requestPurchaseDraftDeletion(
   expectedRevision: number,
 ): Promise<void> {
   await db.transaction().execute(async (trx) => {
-    const identity = await validateAndLockOwner(trx, owner)
+    const identity = await validateAndLockPurchaseDraftOwner(trx, owner)
     const draft = await lockOwnedDraft(trx, identity, draftId, 'update')
+    await assertDraftNotBoundToCart(trx, draft.id)
     if (draft.revision !== expectedRevision) throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已被其他操作修改，请重新读取。')
     await trx.updateTable('purchase_drafts').set({ status: 'deleting' }).where('id', '=', draft.id).execute()
     await trx.deleteFrom('purchase_draft_attachment_references').where('draft_id', '=', draft.id).execute()
@@ -460,8 +540,9 @@ export async function requestPurchaseDraftAttachmentDeletion(
   expectedRevision: number,
 ): Promise<{ revision: number }> {
   return db.transaction().execute(async (trx) => {
-    const identity = await validateAndLockOwner(trx, owner)
+    const identity = await validateAndLockPurchaseDraftOwner(trx, owner)
     const draft = await lockOwnedDraft(trx, identity, draftId, 'update')
+    await assertDraftNotBoundToCart(trx, draft.id)
     if (draft.revision !== expectedRevision) throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已被其他操作修改，请重新读取。')
     if (!uuidPattern.test(attachmentId)) throw draftNotFound()
     const attachment = await trx.selectFrom('purchase_draft_attachments').selectAll()
@@ -484,6 +565,80 @@ export async function requestPurchaseDraftAttachmentDeletion(
   })
 }
 
+export async function claimGuestPurchaseDraftsInTransaction(
+  trx: Transaction<Database>,
+  currentCustomer: Pick<AuthenticatedCustomer, 'id' | 'sessionId'>,
+  originalGuestSessionToken: string,
+  requestedDrafts: Array<string | { draftId: string; expectedRevision: number }>,
+  now = new Date(),
+): Promise<{ claimedCount: number; alreadyClaimedCount: number; revisions: Record<string, number> }> {
+  const draftIds = requestedDrafts.map(draft => typeof draft === 'string' ? draft : draft.draftId)
+  const expectedRevisions = new Map(requestedDrafts
+    .filter((draft): draft is { draftId: string; expectedRevision: number } => typeof draft !== 'string')
+    .map(draft => [draft.draftId.toLowerCase(), draft.expectedRevision]))
+  if (!guestSessionTokenPattern.test(originalGuestSessionToken) || draftIds.length < 1 || draftIds.length > 50
+    || draftIds.some(id => !uuidPattern.test(id)) || new Set(draftIds.map(id => id.toLowerCase())).size !== draftIds.length
+    || [...expectedRevisions.values()].some(revision => !Number.isSafeInteger(revision) || revision < 1)) {
+    throw new PurchaseDraftServiceError(400, 'PURCHASE_DRAFT_CLAIM_INVALID', '指定的填写草稿无法认领。')
+  }
+  const customerOwner = await validateAndLockPurchaseDraftOwner(trx, { kind: 'customer', customer: currentCustomer }, 'update')
+  if (customerOwner.kind !== 'customer') throw new PurchaseDraftServiceError(401, 'UNAUTHORIZED', '顾客登录状态已失效，请重新登录。')
+  const guestSession = await trx.selectFrom('guest_order_sessions').select('id')
+    .where('token_hash', '=', hashToken(originalGuestSessionToken))
+    .where('revoked_at', 'is', null).where('expires_at', '>', now)
+    .forUpdate().executeTakeFirst()
+  if (!guestSession) throw new PurchaseDraftServiceError(401, 'GUEST_SESSION_REQUIRED', '原游客会话无效或已过期。')
+
+  const drafts = await trx.selectFrom('purchase_drafts').selectAll().where('id', 'in', draftIds)
+    .orderBy('id').forUpdate().execute()
+  if (drafts.length !== draftIds.length) throw draftNotFound()
+  const toClaim: DraftRow[] = []
+  const revisions: Record<string, number> = {}
+  let claimedCount = 0
+  let alreadyClaimedCount = 0
+  for (const draft of drafts) {
+    if (draft.status !== 'active' || draft.expires_at <= now) throw draftNotFound()
+    const expectedRevision = expectedRevisions.get(draft.id.toLowerCase())
+    if (expectedRevision !== undefined && draft.revision !== expectedRevision) {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '指定填写草稿已变化，请重新确认并合并购物车。')
+    }
+    if (draft.customer_id === customerOwner.customerId && draft.guest_order_session_id === null
+      && draft.claimed_from_guest_order_session_id === guestSession.id) {
+      alreadyClaimedCount += 1
+      revisions[draft.id] = draft.revision
+      continue
+    }
+    if (draft.customer_id !== null || draft.guest_order_session_id !== guestSession.id
+      || draft.claimed_from_guest_order_session_id !== null) throw draftNotFound()
+    toClaim.push(draft)
+  }
+  if (toClaim.length) {
+    const activeCustomerDrafts = await trx.selectFrom('purchase_drafts')
+      .select(trx.fn.countAll<number>().as('count'))
+      .where('customer_id', '=', customerOwner.customerId)
+      .where('guest_order_session_id', 'is', null)
+      .where('status', '=', 'active').where('expires_at', '>', now)
+      .executeTakeFirstOrThrow()
+    if (Number(activeCustomerDrafts.count) + toClaim.length > PURCHASE_DRAFT_MAX_PER_OWNER) {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_LIMIT', '可保存的填写草稿数量已达到上限。')
+    }
+    const transferredAttachments = await trx.selectFrom('purchase_draft_attachments').select(['byte_size', 'reserved_bytes'])
+      .where('draft_id', 'in', toClaim.map(draft => draft.id)).where('status', 'in', ['uploading', 'ready', 'failed']).execute()
+    const transferredBytes = transferredAttachments.reduce((total, attachment) => total + (attachment.byte_size ?? attachment.reserved_bytes), 0)
+    await assertOwnerAttachmentCapacity(trx, customerOwner, transferredBytes, undefined, transferredAttachments.length)
+  }
+  for (const draft of toClaim) {
+    const updated = await trx.updateTable('purchase_drafts').set({
+      customer_id: customerOwner.customerId,
+      guest_order_session_id: null,
+      claimed_from_guest_order_session_id: guestSession.id,
+    }).where('id', '=', draft.id).returning('revision').executeTakeFirstOrThrow()
+    revisions[draft.id] = updated.revision
+    claimedCount += 1
+  }
+  return { claimedCount, alreadyClaimedCount, revisions }
+}
+
 export async function claimGuestPurchaseDrafts(
   db: Kysely<Database>,
   currentCustomer: Pick<AuthenticatedCustomer, 'id' | 'sessionId'>,
@@ -491,61 +646,10 @@ export async function claimGuestPurchaseDrafts(
   draftIds: string[],
   now = new Date(),
 ): Promise<{ claimedCount: number; alreadyClaimedCount: number }> {
-  if (!guestSessionTokenPattern.test(originalGuestSessionToken) || draftIds.length < 1 || draftIds.length > 50
-    || draftIds.some(id => !uuidPattern.test(id)) || new Set(draftIds.map(id => id.toLowerCase())).size !== draftIds.length) {
-    throw new PurchaseDraftServiceError(400, 'PURCHASE_DRAFT_CLAIM_INVALID', '指定的填写草稿无法认领。')
-  }
-  return db.transaction().execute(async (trx) => {
-    const customerOwner = await validateAndLockOwner(trx, { kind: 'customer', customer: currentCustomer }, 'update')
-    if (customerOwner.kind !== 'customer') throw new PurchaseDraftServiceError(401, 'UNAUTHORIZED', '顾客登录状态已失效，请重新登录。')
-    const guestSession = await trx.selectFrom('guest_order_sessions').select('id')
-      .where('token_hash', '=', hashToken(originalGuestSessionToken))
-      .where('revoked_at', 'is', null).where('expires_at', '>', now)
-      .forUpdate().executeTakeFirst()
-    if (!guestSession) throw new PurchaseDraftServiceError(401, 'GUEST_SESSION_REQUIRED', '原游客会话无效或已过期。')
-
-    const drafts = await trx.selectFrom('purchase_drafts').selectAll().where('id', 'in', draftIds)
-      .orderBy('id').forUpdate().execute()
-    if (drafts.length !== draftIds.length) throw draftNotFound()
-    const toClaim: DraftRow[] = []
-    let claimedCount = 0
-    let alreadyClaimedCount = 0
-    for (const draft of drafts) {
-      if (draft.status !== 'active' || draft.expires_at <= now) throw draftNotFound()
-      if (draft.customer_id === customerOwner.customerId && draft.guest_order_session_id === null
-        && draft.claimed_from_guest_order_session_id === guestSession.id) {
-        alreadyClaimedCount += 1
-        continue
-      }
-      if (draft.customer_id !== null || draft.guest_order_session_id !== guestSession.id
-        || draft.claimed_from_guest_order_session_id !== null) throw draftNotFound()
-      toClaim.push(draft)
-    }
-    if (toClaim.length) {
-      const activeCustomerDrafts = await trx.selectFrom('purchase_drafts')
-        .select(db.fn.countAll<number>().as('count'))
-        .where('customer_id', '=', customerOwner.customerId)
-        .where('guest_order_session_id', 'is', null)
-        .where('status', '=', 'active').where('expires_at', '>', now)
-        .executeTakeFirstOrThrow()
-      if (Number(activeCustomerDrafts.count) + toClaim.length > PURCHASE_DRAFT_MAX_PER_OWNER) {
-        throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_LIMIT', '可保存的填写草稿数量已达到上限。')
-      }
-      const transferredAttachments = await trx.selectFrom('purchase_draft_attachments').select(['byte_size', 'reserved_bytes'])
-        .where('draft_id', 'in', toClaim.map(draft => draft.id)).where('status', 'in', ['uploading', 'ready', 'failed']).execute()
-      const transferredBytes = transferredAttachments.reduce((total, attachment) => total + (attachment.byte_size ?? attachment.reserved_bytes), 0)
-      await assertOwnerAttachmentCapacity(trx, customerOwner, transferredBytes, undefined, transferredAttachments.length)
-    }
-    for (const draft of toClaim) {
-      await trx.updateTable('purchase_drafts').set({
-        customer_id: customerOwner.customerId,
-        guest_order_session_id: null,
-        claimed_from_guest_order_session_id: guestSession.id,
-      }).where('id', '=', draft.id).execute()
-      claimedCount += 1
-    }
-    return { claimedCount, alreadyClaimedCount }
-  })
+  const result = await db.transaction().execute(trx => claimGuestPurchaseDraftsInTransaction(
+    trx, currentCustomer, originalGuestSessionToken, draftIds, now,
+  ))
+  return { claimedCount: result.claimedCount, alreadyClaimedCount: result.alreadyClaimedCount }
 }
 
 async function releaseUncommittedPurchaseDraftUpload(
@@ -607,7 +711,7 @@ export async function uploadPurchaseDraftAttachment(
   const attachmentId = randomUUID()
   const storageKey = storage.storageKey(attachmentId)
   await db.transaction().execute(async (trx) => {
-    const identity = await validateAndLockOwner(trx, owner, 'update')
+    const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
     const draft = await lockOwnedDraft(trx, identity, input.draftId, 'update')
     if (draft.revision !== input.expectedRevision) throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已被其他操作修改，请重新读取。')
     const definition = await loadDraftTemplate(trx, draft.template_version_id)
@@ -643,7 +747,7 @@ export async function uploadPurchaseDraftAttachment(
     const prepared = await processPurchaseImageUpload(input.stream, input.claimedMimeType)
     const createdKey = await storage.store(attachmentId, prepared.bytes)
     const finalized = await db.transaction().execute(async (trx) => {
-      const identity = await validateAndLockOwner(trx, owner, 'update')
+      const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
       const draft = await lockOwnedDraft(trx, identity, input.draftId, 'update')
       if (draft.revision !== input.expectedRevision) throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '填写草稿已被其他操作修改，请重新读取。')
       const definition = await loadDraftTemplate(trx, draft.template_version_id)
@@ -701,7 +805,7 @@ export async function readPurchaseDraftAttachment(
   attachmentId: string,
 ): Promise<{ bytes: Buffer; mimeType: 'image/webp'; byteSize: number; sha256: string }> {
   return db.transaction().execute(async (trx) => {
-    const identity = await validateAndLockOwner(trx, owner, 'update')
+    const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
     const draft = await lockOwnedDraft(trx, identity, draftId, 'share')
     if (!uuidPattern.test(attachmentId)) throw draftNotFound()
     const attachmentQuery = trx.selectFrom('purchase_draft_attachments').selectAll()

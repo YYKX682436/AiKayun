@@ -21,9 +21,12 @@ import type { PurchaseFormDefinition } from '@aikayun/contracts'
 import type { AppConfig } from '../src/config.js'
 import {
   decryptPurchaseDraft,
+  decryptPurchaseOrderValues,
   encryptPurchaseDraft,
+  encryptPurchaseOrderValues,
   purchaseFormContentIdentity,
 } from '../src/commerce/purchase-form-crypto.js'
+import { PurchaseOrderAttachmentStorage } from '../src/media/purchase-order-attachment-storage.js'
 
 const generatedRoots: string[] = []
 afterEach(async () => {
@@ -228,6 +231,41 @@ describe('⑥-2A encrypted draft and private image primitives', () => {
     expect(decryptPurchaseDraft(rotated, '11ef68d0-379a-48d0-906b-0cc65c1e6503', encrypted)).toEqual(values)
     expect(() => decryptPurchaseDraft(rotated, randomUUID(), encrypted)).toThrow('Purchase draft ciphertext failed integrity verification')
     expect(() => decryptPurchaseDraft(config('b', { b: keyB }), '11ef68d0-379a-48d0-906b-0cc65c1e6503', encrypted)).toThrow('Purchase draft encryption is unavailable')
+  })
+
+  it('keeps order values under an independent purpose and order-item AAD', () => {
+    const draftId = randomUUID()
+    const orderItemId = randomUUID()
+    const values = { account: '00123', player: 'Case Sensitive' }
+    const draft = encryptPurchaseDraft(config('a', { a: keyA }), draftId, values)
+    const order = encryptPurchaseOrderValues(config('a', { a: keyA }), orderItemId, values)
+    expect(order.ciphertext.includes(Buffer.from('Case Sensitive'))).toBe(false)
+    expect(decryptPurchaseOrderValues(config('b', { a: keyA, b: keyB }), orderItemId, order)).toEqual(values)
+    expect(() => decryptPurchaseOrderValues(config('a', { a: keyA }), randomUUID(), order)).toThrow()
+    expect(() => decryptPurchaseOrderValues(config('a', { a: keyA }), orderItemId, draft)).toThrow()
+    expect(() => decryptPurchaseDraft(config('a', { a: keyA }), draftId, order)).toThrow()
+    expect(() => decryptPurchaseOrderValues(config('b', { b: keyB }), orderItemId, order))
+      .toThrow('Purchase order content encryption is unavailable')
+  })
+
+  it('keeps a verified order archive readable after removing the draft object', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aikayun-purchase-order-archive-unit-'))
+    generatedRoots.push(root)
+    const draftStorage = new PurchaseAttachmentStorage(root)
+    const orderStorage = new PurchaseOrderAttachmentStorage(root)
+    const bytes = await sharp({ create: { width: 4, height: 3, channels: 4, background: '#276e8f' } }).webp().toBuffer()
+    const sha256 = (await import('node:crypto')).createHash('sha256').update(bytes).digest('hex')
+    const draftId = randomUUID()
+    const orderObjectId = randomUUID()
+    const draftKey = await draftStorage.store(draftId, bytes)
+    const copied = await draftStorage.readVerified(draftId, draftKey, bytes.length, sha256)
+    const orderKey = await orderStorage.store(orderObjectId, copied, sha256)
+    expect(orderKey).not.toBe(draftKey)
+    await draftStorage.remove(draftId, draftKey)
+    expect(await orderStorage.readVerified(orderObjectId, orderKey, bytes.length, sha256)).toEqual(bytes)
+    await expect(orderStorage.readVerified(orderObjectId, orderKey, bytes.length, '0'.repeat(64)))
+      .rejects.toMatchObject({ code: 'PURCHASE_ORDER_ATTACHMENT_UNAVAILABLE' })
+    expect((await orderStorage.scanFiles()).filter(file => file.location === 'object')).toHaveLength(1)
   })
 
   it('decodes actual JPEG, PNG and WebP bytes, rejects MIME mismatch, corruption and size overflow', async () => {

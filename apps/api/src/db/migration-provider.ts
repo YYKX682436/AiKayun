@@ -30,6 +30,7 @@ import { digitalFulfillmentAcceptanceMigration } from './migrations/202610230002
 import { kayixinReadonlyMigration } from './migrations/202610240001_kayixin_readonly.js'
 import { purchaseFormsDraftsMigration } from './migrations/202610240002_purchase_forms_drafts.js'
 import { purchaseFormAuditProductIdentityMigration } from './migrations/202610240003_purchase_form_audit_product_identity.js'
+import { purchaseLinesMigration } from './migrations/202610250001_purchase_lines.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -64,6 +65,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610240001_kayixin_readonly': kayixinReadonlyMigration,
       '202610240002_purchase_forms_drafts': purchaseFormsDraftsMigration,
       '202610240003_purchase_form_audit_product_identity': purchaseFormAuditProductIdentityMigration,
+      '202610250001_purchase_lines': purchaseLinesMigration,
     }
   }
 }

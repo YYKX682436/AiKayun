@@ -82,6 +82,7 @@ export interface StorefrontCustomerPolicyTable {
   require_phone: Generated<boolean>
   guest_checkout_enabled: Generated<boolean>
   guest_free_claim_enabled: Generated<boolean>
+  purchase_forms_enabled: Generated<boolean>
   unpaid_order_timeout_minutes: Generated<number>
   wallet_top_up_enabled: Generated<boolean>
   wallet_top_up_min_amount: ColumnType<string, string | undefined, string>
@@ -130,9 +131,16 @@ export interface CustomerManagementAuditTable {
 }
 
 export interface CustomerCartItemsTable {
+  line_id: Generated<string>
   customer_id: string
   sku_id: string
   quantity: number
+  revision: Generated<number>
+  content_identity: string
+  draft_id: string | null
+  draft_revision: number | null
+  template_version_id: string | null
+  normalization_version: number | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }
@@ -391,6 +399,7 @@ export interface OrdersTable {
   total_amount: ColumnType<string, string, string>
   currency: Generated<'CNY'>
   items_sealed: Generated<boolean>
+  purchase_snapshot_version: Generated<number>
   created_at: Generated<Date>
   unpaid_expires_at: Date | null
   history_hidden_at: Date | null
@@ -410,6 +419,7 @@ export interface OrderSkuOptionSnapshot {
 export interface OrderItemsTable {
   id: string
   order_id: string
+  purchase_line_id: string | null
   product_id: string
   product_variant_id: string
   product_name_snapshot: string
@@ -425,6 +435,47 @@ export interface OrderItemsTable {
   fulfillment_status: Generated<OrderFulfillmentStatus>
   fulfilled_quantity: Generated<number>
   fulfillment_reserved_quantity: Generated<number>
+  created_at: Generated<Date>
+}
+
+export interface OrderItemPurchaseSnapshotsTable {
+  order_item_id: string
+  template_version_id: string | null
+  normalization_version: number | null
+  content_identity: string
+  encrypted_values: Buffer | null
+  values_nonce: Buffer | null
+  values_auth_tag: Buffer | null
+  encryption_key_id: string | null
+  attachment_ids: ColumnType<string[], string[] | undefined, string[]>
+  created_at: Generated<Date>
+}
+
+export type PurchaseOrderAttachmentObjectStatus = 'prepared' | 'retained' | 'deleting'
+
+export interface PurchaseOrderAttachmentObjectsTable {
+  id: string
+  source_draft_id: string
+  source_attachment_id: string
+  storage_key: string
+  mime_type: Generated<'image/webp'>
+  byte_size: number
+  width: number
+  height: number
+  sha256: string
+  status: Generated<PurchaseOrderAttachmentObjectStatus>
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
+
+export interface OrderItemPurchaseAttachmentsTable {
+  order_item_id: string
+  source_attachment_id: string
+  archive_object_id: string
+  field_id: string
+  ordinal: number
+  sha256: string
+  byte_size: number
   created_at: Generated<Date>
 }
 
@@ -1127,6 +1178,9 @@ export interface Database {
   private_file_objects: PrivateFileObjectsTable
   orders: OrdersTable
   order_items: OrderItemsTable
+  order_item_purchase_snapshots: OrderItemPurchaseSnapshotsTable
+  purchase_order_attachment_objects: PurchaseOrderAttachmentObjectsTable
+  order_item_purchase_attachments: OrderItemPurchaseAttachmentsTable
   order_inventory_reservations: OrderInventoryReservationsTable
   order_inventory_events: OrderInventoryEventsTable
   code_pool_batches: CodePoolBatchesTable

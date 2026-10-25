@@ -7,6 +7,7 @@ import { createDatabase } from '../src/db/pool.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
 import type { Database, FulfillmentMethod, OrderSkuOptionSnapshot, ProductInventoryMode, ProductType } from '../src/db/types.js'
 import { recordWalletOrderPayment } from '../src/finance/wallet.js'
+import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const digest = 'a'.repeat(64)
@@ -164,6 +165,7 @@ async function createOrder(options: {
     await trx.insertInto('order_items').values({
       id: itemId,
       order_id: id,
+      purchase_line_id: randomUUID(),
       product_id: catalog.productId,
       product_variant_id: catalog.variantId,
       product_name_snapshot: catalog.productName,
@@ -176,6 +178,7 @@ async function createOrder(options: {
       quantity,
       line_amount: totalAmount,
     }).execute()
+    await insertNoFormPurchaseSnapshot(trx, itemId, catalog.variantId)
     if (catalog.inventoryMode === 'quantity') {
       await trx.insertInto('order_inventory_reservations').values({
         id: randomUUID(),
@@ -1265,6 +1268,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
       delete prePaymentMigrations['202610240001_kayixin_readonly']
       delete prePaymentMigrations['202610240002_purchase_forms_drafts']
       delete prePaymentMigrations['202610240003_purchase_form_audit_product_identity']
+      delete prePaymentMigrations['202610250001_purchase_lines']
       const prePaymentProvider = { getMigrations: async () => prePaymentMigrations }
       const currentMigrator = new Migrator({ db, provider: prePaymentProvider })
       const upgradeResult = await currentMigrator.migrateToLatest()

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { sql, type Kysely, type Transaction } from 'kysely'
 import {
   type CartSkuQuantity,
+  type CheckoutRequestLineV2,
   type CheckoutQuote,
   type CheckoutQuoteItem,
   type CheckoutQuoteReason,
@@ -16,6 +17,9 @@ import type { AppConfig } from '../config.js'
 import type { Database, ProductInventoryMode, ProductStatus, ProductType } from '../db/types.js'
 import { PrivateFileError, PrivateFileStorage } from '../media/private-file-storage.js'
 import { variantOptionCombinationValid } from '../catalog/public-products.js'
+import type { PurchaseDraftOwner } from './purchase-forms.js'
+import { normalizePurchaseLineRequests, resolvePurchaseLinesInTransaction,
+  type ResolvedPurchaseLine } from './purchase-lines.js'
 
 const maxCartLines = 50
 const maxLineQuantity = 99
@@ -69,6 +73,8 @@ type QuoteSkuRow = {
   sku_24h_purchased: number | null
   guest_checkout_enabled: boolean
   guest_free_claim_enabled: boolean
+  purchase_forms_enabled: boolean
+  required_purchase_form_version_id: string | null
 }
 
 export function normalizeCheckoutItems(items: CartSkuQuantity[]): CartSkuQuantity[] {
@@ -167,6 +173,7 @@ export async function quoteCheckoutItems(
   inputItems: CartSkuQuantity[],
   customerId: string | null,
   config: AppConfig,
+  options: { skipPurchaseFormRequirement?: boolean } = {},
 ): Promise<CheckoutQuote> {
   const customerAuthenticated = customerId !== null
   const items = normalizeCheckoutItems(inputItems)
@@ -274,10 +281,16 @@ export async function quoteCheckoutItems(
       sku_purchase_counts.lifetime_purchased AS sku_lifetime_purchased,
       sku_purchase_counts.recent_purchased AS sku_24h_purchased,
       policy.guest_checkout_enabled,
-      policy.guest_free_claim_enabled
+      policy.guest_free_claim_enabled,
+      policy.purchase_forms_enabled,
+      CASE WHEN sku_form.product_variant_id IS NOT NULL
+        THEN sku_form.template_version_id ELSE product_form.template_version_id
+      END AS required_purchase_form_version_id
     FROM requested
     LEFT JOIN product_variants AS variant ON variant.id = requested.sku_id
     LEFT JOIN products AS product ON product.id = variant.product_id
+    LEFT JOIN product_purchase_form_settings AS product_form ON product_form.product_id = product.id
+    LEFT JOIN sku_purchase_form_overrides AS sku_form ON sku_form.product_variant_id = variant.id
     LEFT JOIN product_variant_quantity_inventory AS inventory
       ON inventory.product_id = variant.product_id AND inventory.product_variant_id = variant.id
     LEFT JOIN product_variant_fulfillment AS fulfillment ON fulfillment.product_variant_id = variant.id
@@ -397,6 +410,14 @@ export async function quoteCheckoutItems(
       },
       canPurchase: false,
       reason: null,
+      lineId: null,
+      lineRevision: null,
+      draftId: null,
+      draftRevision: null,
+      templateVersionId: null,
+      normalizationVersion: null,
+      contentIdentity: null,
+      sourceLineIds: [],
     }
     let reason = reasonForSku(row)
     if (!customerAuthenticated && unitPrice !== null) {
@@ -410,6 +431,8 @@ export async function quoteCheckoutItems(
     }
     if (requiresLogin) reason ??= 'login_required_for_purchase_limit'
     else if (productLimits.exceeded || skuLimits.exceeded) reason ??= 'purchase_limit_exceeded'
+    if (!options.skipPurchaseFormRequirement && row.purchase_forms_enabled
+      && row.required_purchase_form_version_id) reason ??= 'purchase_form_required'
     item.reason = reason
     item.canPurchase = reason === null
     return item
@@ -430,10 +453,70 @@ export async function quoteCheckoutItems(
     guestFreeClaimEnabled,
     policyReasons: [...policyReasons].sort(),
   }
-  const quoteToken = createHash('sha256').update(JSON.stringify(stableQuote)).digest('hex')
+  // Keep the historical v1 token byte-for-byte compatible. The response now
+  // includes nullable line fields, but old submitted quote tokens must replay.
+  const legacyItems = quoteLines.map(({ lineId: _lineId, lineRevision: _lineRevision,
+    draftId: _draftId, draftRevision: _draftRevision, templateVersionId: _templateVersionId,
+    normalizationVersion: _normalizationVersion, contentIdentity: _contentIdentity,
+    sourceLineIds: _sourceLineIds, ...legacy }) => legacy)
+  const quoteToken = createHash('sha256').update(JSON.stringify({ ...stableQuote, items: legacyItems })).digest('hex')
   return {
     quotedAt: new Date().toISOString(),
     quoteToken,
     ...stableQuote,
   }
+}
+
+export async function quoteCheckoutPurchaseLines(
+  trx: Transaction<Database>,
+  inputItems: CheckoutRequestLineV2[],
+  owner: PurchaseDraftOwner,
+  config: AppConfig,
+  lock: 'share' | 'update' = 'share',
+): Promise<{ quote: CheckoutQuote; lines: ResolvedPurchaseLine[] }> {
+  const requested = normalizePurchaseLineRequests(inputItems)
+  const quantities = new Map<string, number>()
+  for (const line of requested) quantities.set(line.skuId, (quantities.get(line.skuId) ?? 0) + line.quantity)
+  const base = await quoteCheckoutItems(trx, [...quantities].map(([skuId, quantity]) => ({ skuId, quantity })),
+    owner.kind === 'customer' ? owner.customer.id : null, config,
+    { skipPurchaseFormRequirement: true })
+  const lines = await resolvePurchaseLinesInTransaction(trx, config, owner, inputItems, lock)
+  const policy = await trx.selectFrom('storefront_customer_policy').select('purchase_forms_enabled')
+    .where('singleton', '=', true).executeTakeFirstOrThrow()
+  const bySku = new Map(base.items.map(item => [item.skuId, item]))
+  const quoteLines: CheckoutQuoteItem[] = lines.map((line) => {
+    const item = bySku.get(line.skuId)
+    if (!item) throw new Error('Resolved purchase line is missing its SKU quote')
+    const formRequired = policy.purchase_forms_enabled && line.preparationVersionId !== null && !line.draftId
+    return {
+      ...item,
+      lineId: line.lineId,
+      lineRevision: null,
+      draftId: line.draftId,
+      draftRevision: line.draftRevision,
+      templateVersionId: line.templateVersionId,
+      normalizationVersion: line.normalizationVersion,
+      contentIdentity: line.contentIdentity,
+      sourceLineIds: line.sourceLineIds,
+      quantity: line.quantity,
+      lineTotal: item.unitPrice === null ? null : settleAmount(multiplyUnitAmount(item.unitPrice, line.quantity)),
+      canPurchase: item.canPurchase && !formRequired,
+      reason: formRequired ? 'purchase_form_required' : item.reason,
+    }
+  })
+  const stable = {
+    currency: base.currency,
+    items: quoteLines,
+    pricedSubtotal: base.pricedSubtotal,
+    totalAmount: base.totalAmount,
+    totalComplete: base.totalComplete,
+    canContinue: base.totalComplete && quoteLines.length > 0 && quoteLines.every(item => item.canPurchase),
+    customerAuthenticated: base.customerAuthenticated,
+    guestCheckoutEnabled: base.guestCheckoutEnabled,
+    guestFreeClaimEnabled: base.guestFreeClaimEnabled,
+    policyReasons: base.policyReasons,
+    preparationBindings: lines.map(line => ({ lineId: line.lineId, versionId: line.preparationVersionId })),
+  }
+  const quoteToken = createHash('sha256').update(JSON.stringify(stable)).digest('hex')
+  return { quote: { ...base, items: quoteLines, canContinue: stable.canContinue, quoteToken }, lines }
 }

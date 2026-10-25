@@ -1,7 +1,15 @@
 <script setup lang="ts">
-import type { CartSkuQuantity, CheckoutQuote, CheckoutQuoteItem } from '@aikayun/contracts'
+import type { CartSkuQuantity, CheckoutQuote, CheckoutQuoteItem, CheckoutRequestLineV2, GuestOrderSession } from '@aikayun/contracts'
 import type { CreateOrderResult } from '@aikayun/contracts'
 import { CheckoutConflictError, CustomerApiError } from '~/composables/useCustomerApi'
+import { loadCheckoutSelection } from '~/utils/checkoutSelection'
+import {
+  completeOrderIntentV2, findOrderIntentBySelectionId, findOrderIntentV2, hasOrderIntentV2,
+  PendingOwnerConflictError, prepareOrderIntentV2, rejectOrderIntentV2,
+  withOrderSubmissionLock,
+} from '~/utils/checkoutOrderIntent'
+import type { PendingOrderIntentV2 } from '~/utils/checkoutOrderIntent'
+import type { OrderIntentV2 } from '~/utils/checkoutOrderIntent'
 
 const route = useRoute()
 const customerApi = useCustomerApi()
@@ -11,34 +19,87 @@ const busy = ref(false)
 const submitting = ref(false)
 const errorMessage = ref('')
 const submitError = ref('')
+const pendingOwnerBlocked = ref(false)
+const sharedIntentRevision = ref(0)
 let requestSequence = 0
+const clientReady = ref(false)
+type CheckoutSelection =
+  | { version: 1; items: CartSkuQuantity[] }
+  | { version: 2; items: CheckoutRequestLineV2[] }
+const orderIntentStoreV2Key = 'aikayun-order-intents-v2'
 
 useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 
 useSeoMeta({ title: '结算报价预览', description: '查看所选商品的当前结算报价。', robots: 'noindex, nofollow' })
 
-function parseRequestedItems(): CartSkuQuantity[] | null {
-  const raw = route.query.items
-  if (typeof raw !== 'string' || raw.length > 6000) return null
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
+}
+
+function parseRequestedItems(): CheckoutSelection | null {
+  const intentId = route.query.intent
+  let raw = route.query.items
+  if (typeof intentId === 'string') {
+    if (!clientReady.value) return null
+    try {
+      const saved = loadCheckoutSelection(intentId)
+      raw = saved ? JSON.stringify(saved) : null
+    } catch {
+      return null
+    }
+  }
+  if (typeof raw !== 'string' || raw.length > 16000) return null
   try {
     const parsed = JSON.parse(raw) as unknown
     if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 50) return null
-    const items: CartSkuQuantity[] = []
+    const legacyItems: CartSkuQuantity[] = []
+    const lineItems: CheckoutRequestLineV2[] = []
+    const seenLineIds = new Set<string>()
+    let requestVersion: 1 | 2 | null = null
+    const skuTotals = new Map<string, number>()
     for (const item of parsed) {
       if (!item || typeof item !== 'object' || !('skuId' in item) || !('quantity' in item)) return null
       const skuId = String(item.skuId)
       const quantity = item.quantity
-      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(skuId)
+      if (!isUuid(skuId)
         || !Number.isSafeInteger(quantity) || (quantity as number) < 1 || (quantity as number) > 99) return null
-      items.push({ skuId, quantity: quantity as number })
+      const total = (skuTotals.get(skuId) ?? 0) + (quantity as number)
+      if (total > 99) return null
+      skuTotals.set(skuId, total)
+      if ('lineId' in item) {
+        if (requestVersion === 1 || !isUuid(item.lineId) || seenLineIds.has(item.lineId)) return null
+        requestVersion = 2
+        seenLineIds.add(item.lineId)
+        const hasDraftId = Object.hasOwn(item, 'draftId')
+        const hasDraftRevision = Object.hasOwn(item, 'draftRevision')
+        if (hasDraftId !== hasDraftRevision) return null
+        if (hasDraftId && (item.draftId !== null || item.draftRevision !== null)
+          && (!isUuid(item.draftId) || !Number.isSafeInteger(item.draftRevision) || (item.draftRevision as number) < 1)) return null
+        if (Object.keys(item).some(key => !['lineId', 'skuId', 'quantity', 'draftId', 'draftRevision'].includes(key))) return null
+        lineItems.push({ ...item } as CheckoutRequestLineV2)
+      } else {
+        if (requestVersion === 2 || Object.keys(item).some(key => !['skuId', 'quantity'].includes(key))) return null
+        requestVersion = 1
+        legacyItems.push({ skuId, quantity: quantity as number })
+      }
     }
-    return items
+    // V2 requests need an opaque selection URL so a completed receipt can
+    // remain bound to that exact operation across tabs and browser restarts.
+    if (requestVersion === 2 && typeof intentId !== 'string') return null
+    return requestVersion === 2 ? { version: 2, items: lineItems } : { version: 1, items: legacyItems }
   } catch {
     return null
   }
 }
 
-const requestedItems = computed(() => parseRequestedItems())
+onMounted(() => { clientReady.value = true })
+
+const requestedSelection = computed(() => {
+  void sharedIntentRevision.value
+  return parseRequestedItems()
+})
+const requestedItems = computed(() => requestedSelection.value?.items ?? null)
 const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id))
 const loginRedirect = computed(() => `/login?redirect=${encodeURIComponent(route.fullPath)}`)
 const purchaseLoginRequired = computed(() => !isCustomer.value
@@ -59,6 +120,9 @@ function statusLabel(item: CheckoutQuoteItem): string {
     case 'guest_free_claim_disabled': return '游客免费领取已关闭'
     case 'purchase_limit_exceeded': return '超过商品或规格限购额度'
     case 'login_required_for_purchase_limit': return '该商品需要登录后购买'
+    case 'purchase_form_invalid': return '购买资料已失效，请重新确认'
+    case 'purchase_form_version_changed': return '填写模板已变化，请重新确认'
+    case 'purchase_form_required': return '此商品需要填写购买资料'
     case 'product_not_found': return '商品已删除或无法读取'
     default: return item.canPurchase ? '可继续报价' : '暂不可购买'
   }
@@ -90,6 +154,14 @@ function canonicalItems(items: CartSkuQuantity[]): CartSkuQuantity[] {
   return [...counts].sort(([left], [right]) => left.localeCompare(right)).map(([skuId, quantity]) => ({ skuId, quantity }))
 }
 
+async function currentOrderOwnerId(): Promise<string> {
+  const customerId = customerApi.session.value?.customer.id
+  if (customerId) return customerId
+  const session = await customerApi.request<GuestOrderSession>('/api/v1/guest/session', { method: 'POST' })
+  if (!isUuid(session.sessionId)) throw new Error('游客会话无法确认，请稍后重试。')
+  return `guest:${session.sessionId}`
+}
+
 function orderIntentKey(items: CartSkuQuantity[], ownerId: string): string {
   if (!import.meta.client) throw new Error('请在浏览器中继续创建订单。')
   const fingerprint = JSON.stringify(canonicalItems(items))
@@ -115,29 +187,90 @@ function removeOrderIntent(items: CartSkuQuantity[], ownerId: string): void {
   try { sessionStorage.removeItem(storageKey) } catch { /* The completed order remains available through order history. */ }
 }
 
+function routeSelectionId(): string | null {
+  return typeof route.query.intent === 'string' && isUuid(route.query.intent) ? route.query.intent : null
+}
+
+async function submitPendingV2(intent: PendingOrderIntentV2): Promise<string> {
+  let result: CreateOrderResult
+  try {
+    result = await customerApi.request<CreateOrderResult>('/api/v1/checkout/orders', {
+      method: 'POST',
+      body: { version: 2, idempotencyKey: intent.idempotencyKey, quoteToken: intent.quoteToken, items: intent.items },
+    })
+  } catch (error) {
+    if (error instanceof CheckoutConflictError) {
+      const completed = await rejectOrderIntentV2(intent)
+      if (completed) return completed.orderId
+    }
+    throw error
+  }
+  // The original pending request stays replayable if this local receipt write fails.
+  await completeOrderIntentV2(intent, result.order.id)
+  return result.order.id
+}
+
+async function processV2Intent(
+  selection: CheckoutSelection | null, ownerId: string, identityAtStart: number,
+  quoteToken: string | null,
+): Promise<string | null> {
+  return withOrderSubmissionLock(async () => {
+    if (identityAtStart !== customerApi.identityVersion.value) return null
+    let intent: OrderIntentV2 | null
+    if (quoteToken && selection?.version === 2) {
+      intent = await prepareOrderIntentV2(selection.items, ownerId, quoteToken, routeSelectionId())
+    } else if (selection?.version === 2) {
+      intent = await findOrderIntentV2(selection.items, ownerId, routeSelectionId())
+    } else {
+      const selectionId = routeSelectionId()
+      intent = selectionId ? await findOrderIntentBySelectionId(selectionId, ownerId) : null
+    }
+    if (!intent || intent.state === 'rejected') return null
+    if (intent.state === 'completed') return intent.orderId
+    if (identityAtStart !== customerApi.identityVersion.value) return null
+    return submitPendingV2(intent)
+  })
+}
+
+async function showCompletedOrder(orderId: string, identityAtStart: number): Promise<void> {
+  if (identityAtStart !== customerApi.identityVersion.value) return
+  await navigateTo(`/orders/${orderId}`)
+}
+
 async function createOrder() {
+  const selection = requestedSelection.value
   const items = requestedItems.value
   const currentQuote = quote.value
-  if (submitting.value || !items || !currentQuote?.canContinue || !currentQuote.quoteToken) return
+  if (submitting.value || !selection || !items || !currentQuote?.canContinue || !currentQuote.quoteToken) return
   const identityAtStart = customerApi.identityVersion.value
-  const ownerId = customerApi.session.value?.customer.id ?? 'guest'
   const identityIsCurrent = () => identityAtStart === customerApi.identityVersion.value
   submitting.value = true
   submitError.value = ''
   try {
-    if (ownerId === 'guest') await customerApi.request<{ expiresAt: string }>('/api/v1/guest/session', { method: 'POST' })
+    let ownerId: string
+    if (selection.version === 2) ownerId = await currentOrderOwnerId()
+    else if (customerApi.session.value?.customer.id) ownerId = customerApi.session.value.customer.id
+    else {
+      await customerApi.request<GuestOrderSession>('/api/v1/guest/session', { method: 'POST' })
+      ownerId = 'guest'
+    }
     if (!identityIsCurrent()) return
-    const idempotencyKey = orderIntentKey(items, ownerId)
-    const result = await customerApi.request<CreateOrderResult>('/api/v1/checkout/orders', {
-      method: 'POST',
-      body: { idempotencyKey, quoteToken: currentQuote.quoteToken, items },
-    })
-    if (!identityIsCurrent()) return
-    const orderPath = `/orders/${result.order.id}`
-    await navigateTo(orderPath)
-    if (identityIsCurrent() && route.path === orderPath) removeOrderIntent(items, ownerId)
+    if (selection.version === 2) {
+      const orderId = await processV2Intent(selection, ownerId, identityAtStart, currentQuote.quoteToken)
+      if (orderId) await showCompletedOrder(orderId, identityAtStart)
+    } else {
+      const idempotencyKey = orderIntentKey(selection.items, ownerId)
+      const result = await customerApi.request<CreateOrderResult>('/api/v1/checkout/orders', {
+        method: 'POST', body: { idempotencyKey, quoteToken: currentQuote.quoteToken, items },
+      })
+      if (!identityIsCurrent()) return
+      const orderPath = `/orders/${result.order.id}`
+      await navigateTo(orderPath)
+      if (identityIsCurrent() && route.path === orderPath) removeOrderIntent(selection.items, ownerId)
+    }
   } catch (error) {
     if (!identityIsCurrent()) return
+    if (error instanceof PendingOwnerConflictError) pendingOwnerBlocked.value = true
     if (error instanceof CheckoutConflictError) {
       quote.value = error.currentQuote
       submitError.value = `${error.message} 已显示最新报价，请再次确认后重新提交。`
@@ -151,14 +284,56 @@ async function createOrder() {
   }
 }
 
+async function replayPendingV2(selection: CheckoutSelection | null): Promise<void> {
+  if (!import.meta.client || selection?.version === 1 || submitting.value || !customerApi.sessionResolved.value) return
+  const identityAtStart = customerApi.identityVersion.value
+  try {
+    if (!hasOrderIntentV2(selection?.version === 2 ? selection.items : null, routeSelectionId())) return
+    const ownerId = await currentOrderOwnerId()
+    if (identityAtStart !== customerApi.identityVersion.value) return
+    submitting.value = true
+    const orderId = await processV2Intent(selection, ownerId, identityAtStart, null)
+    if (orderId) await showCompletedOrder(orderId, identityAtStart)
+  } catch (error) {
+    if (identityAtStart !== customerApi.identityVersion.value) return
+    if (error instanceof PendingOwnerConflictError) pendingOwnerBlocked.value = true
+    if (error instanceof CheckoutConflictError) {
+      quote.value = error.currentQuote
+      submitError.value = `${error.message} 已显示最新报价，请再次确认。`
+    } else if (error instanceof PendingOwnerConflictError) {
+      submitError.value = error.message
+    } else {
+      submitError.value = '上次提交结果尚未确认。保留原请求标识，继续重试会先核对原订单。'
+    }
+  } finally {
+    submitting.value = false
+  }
+}
+
 watch(
-  [requestedItems, () => customerApi.identityVersion.value],
-  ([items]) => { if (import.meta.client) void loadQuote(items) },
+  [requestedSelection, () => customerApi.identityVersion.value, () => customerApi.sessionResolved.value, clientReady],
+  ([selection]) => {
+    if (!import.meta.client) return
+    if (typeof route.query.intent === 'string' && !clientReady.value) return
+    pendingOwnerBlocked.value = false
+    void (async () => {
+      await replayPendingV2(selection)
+      if (route.path === '/checkout') await loadQuote(selection?.items ?? null)
+    })()
+  },
   { immediate: true, flush: 'sync' },
 )
 
+function onSharedIntentChange(event: StorageEvent): void {
+  if (event.key === orderIntentStoreV2Key) sharedIntentRevision.value += 1
+}
+
+onMounted(() => window.addEventListener('storage', onSharedIntentChange))
+onBeforeUnmount(() => window.removeEventListener('storage', onSharedIntentChange))
+
 watch(() => customerApi.identityVersion.value, () => {
   submitError.value = ''
+  pendingOwnerBlocked.value = false
 }, { flush: 'sync' })
 
 function formatDate(value: string): string {
@@ -265,6 +440,16 @@ function formatDate(value: string): string {
         </template>
       </UAlert>
 
+      <UAlert
+        v-if="submitError"
+        class="mt-4"
+        color="error"
+        variant="soft"
+        :title="submitError"
+        role="alert"
+        aria-live="assertive"
+      />
+
       <div
         v-if="busy && !quote"
         class="mt-6 space-y-3"
@@ -275,16 +460,6 @@ function formatDate(value: string): string {
           v-for="index in 2"
           :key="index"
           class="h-24 animate-pulse rounded-xl border border-default bg-elevated motion-reduce:animate-none"
-        />
-
-        <UAlert
-          v-if="submitError"
-          class="mt-4"
-          color="error"
-          variant="soft"
-          :title="submitError"
-          role="alert"
-          aria-live="assertive"
         />
       </div>
 
@@ -297,14 +472,17 @@ function formatDate(value: string): string {
           aria-label="报价商品"
         >
           <li
-            v-for="item in quote.items"
-            :key="item.skuId"
+            v-for="(item, index) in quote.items"
+            :key="item.lineId ?? `legacy:${item.skuId}`"
             class="grid min-w-0 gap-3 rounded-xl border border-default bg-elevated p-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:p-5"
           >
             <div class="min-w-0">
               <h2 class="break-words font-medium text-highlighted">
                 {{ item.productName ?? '商品信息暂不可用' }}
               </h2>
+              <p class="mt-1 text-xs text-muted">
+                购买行 {{ index + 1 }}<span v-if="item.draftId"> · 已绑定填写资料</span>
+              </p>
               <p
                 v-if="item.options.length"
                 class="mt-1 text-sm text-muted"
@@ -400,7 +578,7 @@ function formatDate(value: string): string {
             color="primary"
             icon="i-lucide-lock-keyhole"
             :loading="submitting"
-            :disabled="submitting || busy"
+            :disabled="submitting || busy || pendingOwnerBlocked"
             @click="createOrder"
           >
             {{ submitting ? '正在安全创建订单' : '提交订单' }}

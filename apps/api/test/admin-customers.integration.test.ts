@@ -11,6 +11,7 @@ import { hashToken } from '../src/auth/security.js'
 import { createDatabase } from '../src/db/pool.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
 import type { Database } from '../src/db/types.js'
+import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const origin = 'http://localhost:3000'
@@ -113,11 +114,12 @@ async function insertOrder(trx: Kysely<Database>, customerId: string, catalog: A
     history_hidden_at: null, history_hidden_by_admin_id: null, history_hidden_reason: null,
   }).execute()
   await trx.insertInto('order_items').values({
-    id: itemId, order_id: id, product_id: catalog.productId, product_variant_id: catalog.variantId,
+    id: itemId, order_id: id, purchase_line_id: randomUUID(), product_id: catalog.productId, product_variant_id: catalog.variantId,
     product_name_snapshot: catalog.productName, product_type_snapshot: 'digital', sku_code_snapshot: catalog.skuCode,
     sku_snapshot: JSON.stringify([]), inventory_mode_snapshot: 'unlimited', fulfillment_method_snapshot: 'manual',
     unit_price: '10.00', quantity: 1, line_amount: '10.00',
   }).execute()
+  await insertNoFormPurchaseSnapshot(trx, itemId, catalog.variantId)
   await trx.updateTable('orders').set({ items_sealed: true }).where('id', '=', id).execute()
   return { id, itemId }
 }

@@ -58,6 +58,7 @@ beforeAll(async () => {
     '202610240001_kayixin_readonly',
     '202610240002_purchase_forms_drafts',
     '202610240003_purchase_form_audit_product_identity',
+    '202610250001_purchase_lines',
   ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])
