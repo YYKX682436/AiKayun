@@ -135,4 +135,4 @@ fixture隔离修复后，以 `PLAYWRIGHT_USE_PRODUCTION_SERVER=true` 连跑新�
 
 最终本地完整 `pnpm verify` 退出码0：lint 0错误（既有52条后台页面警告）、API/Web 类型检查、金额 12/12、API/PostgreSQL 21文件364/364、生产构建及所有浏览器门禁通过。主生产浏览器73/73、0跳过；其中 R1 游客/别名/身份锁7项和 R2上下文3项已包含在73中，不重复累计。分开的品牌替代1/1、SSR错误3/3、开发预览1/1、生产品牌运行时1/1，均0跳过；构建及专项服务器因 Google 字体元数据连接超时使用既有 fallback。一次中间 API 验证因隔离库处于空 schema 而失败；仅重建 `_test` 隔离库并重跑后，API 全套及最终 `pnpm verify` 均通过。该中间错误不计入最终通过。
 
-真实新订单资料归档 SIGKILL、在线生产库/卷一致性备份、真实供应商采购及幂等/查单语义继续为 `NOT_VERIFIED`。本轮未运行本机 Compose 栈，避免触碰既有业务容器/卷；Compose 浏览器与 CI 的最终执行数量在对应提交的 GitHub Actions 结果确认后补记。⑥-2C正式填写/上传/附件展示/启用入口未开放，未部署生产。
+真实新订单资料归档 SIGKILL、在线生产库/卷一致性备份、真实供应商采购及幂等/查单语义继续为 `NOT_VERIFIED`。本轮未运行本机 Compose 栈，避免触碰既有业务容器/卷。提交 `80913b348ec15e59a21340c25c903fd3e0fc9996` 的 [GitHub Actions run 40174820587](https://github.com/YYKX682436/AiKayun/actions/runs/40174820587) 实际完成并成功：API/PostgreSQL 21文件364/364；主浏览器73/73；替代品牌1/1、SSR错误3/3、开发预览1/1、生产品牌运行时1/1，均0跳过。Compose 浏览器实际运行73项，65通过、8跳过；跳过项为不含隔离 Kayixin/供应商 fixture 的 Compose 环境不能运行的6个 Kayixin R1、1个 Kayixin只读和1个外部供应商测试。Compose 数据重建持久化门禁也通过。CI 中已有数字交付 SIGKILL/恢复步骤通过，但它不验证本阶段新订单资料归档，故后者仍为 `NOT_VERIFIED`。⑥-2C正式填写/上传/附件展示/启用入口未开放，未部署生产。
