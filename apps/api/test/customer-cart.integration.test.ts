@@ -1412,6 +1412,53 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
       payload: { mergeId, items: [{ skuId: deletedSku!.skuId, quantity: 1 }] },
     })).statusCode).toBe(200)
     const administrator = await createAdminSession()
+    const [formSku] = await createCatalog({ mode: 'unlimited', fulfillmentMethod: 'manual' })
+    const fieldId = randomUUID()
+    const createdTemplate = await app.inject({
+      method: 'POST', url: '/api/v1/admin/purchase-form-templates',
+      headers: { origin: testOrigin, cookie: administrator.cookie, 'x-csrf-token': administrator.csrf },
+      payload: { name: '顾客删除回收模板', definition: { fields: [{
+        id: fieldId, meaningKey: 'account', type: 'text', label: '账号', required: true, maxLength: 80,
+      }] } },
+    })
+    expect(createdTemplate.statusCode, JSON.stringify(createdTemplate.json())).toBe(201)
+    const frozen = await app.inject({
+      method: 'POST', url: `/api/v1/admin/purchase-form-templates/${createdTemplate.json().data.template.id}/versions`,
+      headers: { origin: testOrigin, cookie: administrator.cookie, 'x-csrf-token': administrator.csrf },
+      payload: { expectedRevision: createdTemplate.json().data.template.revision },
+    })
+    expect(frozen.statusCode, JSON.stringify(frozen.json())).toBe(201)
+    const versionId = frozen.json().data.id as string
+    await db.insertInto('product_purchase_form_settings').values({
+      product_id: formSku!.productId, mode: 'template', template_version_id: versionId,
+      applied_mode: 'template', applied_template_version_id: versionId,
+      updated_by_admin_id: administrator.id,
+    }).execute()
+    const lifecycle = await app.inject({ method: 'GET', url: '/api/v1/admin/storefront/purchase-forms',
+      headers: { origin: testOrigin, cookie: administrator.cookie, 'x-csrf-token': administrator.csrf } })
+    const activated = await app.inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
+      headers: { origin: testOrigin, cookie: administrator.cookie, 'x-csrf-token': administrator.csrf },
+      payload: { expectedStatus: 'preparing', nextStatus: 'active', expectedImpactHash: lifecycle.json().data.impactHash } })
+    expect(activated.statusCode, JSON.stringify(activated.json())).toBe(200)
+    const session = await db.selectFrom('customer_sessions').select('id')
+      .where('customer_id', '=', deleted.id).executeTakeFirstOrThrow()
+    const owner = { kind: 'customer' as const, customer: { id: deleted.id, sessionId: session.id } }
+    const draft = await createPurchaseDraft(db, config, owner, versionId)
+    const saved = await savePurchaseDraft(db, config, owner, {
+      draftId: draft.id, expectedRevision: draft.revision, values: { [fieldId]: 'delete-owner' },
+    })
+    const addedForm = await app.inject({ method: 'POST', url: '/api/v1/customer/cart/items',
+      headers: customerHeaders(deleted), payload: { version: 2, skuId: formSku!.skuId,
+        quantity: 1, draftId: saved.id, draftRevision: saved.revision } })
+    expect(addedForm.statusCode, JSON.stringify(addedForm.json())).toBe(200)
+    const line = await db.selectFrom('customer_cart_items').select(['line_id', 'revision', 'draft_revision'])
+      .where('customer_id', '=', deleted.id).where('sku_id', '=', formSku!.skuId).executeTakeFirstOrThrow()
+    const edit = await app.inject({ method: 'POST',
+      url: `/api/v1/customer/cart/lines/${line.line_id}/purchase-form/replacement-draft`,
+      headers: customerHeaders(deleted), payload: { expectedLineRevision: line.revision,
+        expectedDraftRevision: line.draft_revision } })
+    expect(edit.statusCode, JSON.stringify(edit.json())).toBe(201)
+    const replacementId = edit.json().data.replacementDraftId as string
     const anonymized = await app.inject({
       method: 'DELETE', url: `/api/v1/admin/customers/${deleted.id}`,
       headers: { origin: testOrigin, cookie: administrator.cookie, 'x-csrf-token': administrator.csrf },
@@ -1420,5 +1467,9 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     expect((await app.inject({ method: 'GET', url: '/api/v1/customer/cart', headers: { cookie: deleted.sessionCookie } })).statusCode).toBe(401)
     expect(await db.selectFrom('customer_cart_items').select('sku_id').where('customer_id', '=', deleted.id).execute()).toEqual([])
     expect(await db.selectFrom('customer_cart_merge_requests').select('merge_id').where('customer_id', '=', deleted.id).execute()).toEqual([])
+    expect(await db.selectFrom('customer_cart_line_replacement_drafts').select('line_id')
+      .where('line_id', '=', line.line_id).execute()).toEqual([])
+    expect(await db.selectFrom('purchase_drafts').select('status').where('id', '=', replacementId)
+      .executeTakeFirstOrThrow()).toEqual({ status: 'deleting' })
   })
 })

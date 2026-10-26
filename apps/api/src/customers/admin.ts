@@ -36,6 +36,7 @@ import type { AppConfig } from '../config.js'
 import type { Database } from '../db/types.js'
 import { hashPassword } from '../auth/password.js'
 import { requireAdmin, verifyCsrf } from '../auth/admin.js'
+import { discardCartLineReplacementDraftsInTransaction } from '../commerce/purchase-forms.js'
 
 class CustomerManagementError extends Error {
   constructor(
@@ -681,6 +682,9 @@ export function registerAdminCustomerRoutes(
           throw new CustomerManagementError(409, 'CUSTOMER_HAS_UNRESOLVED_FULFILLMENT', '账户存在尚未完成的履约义务，不能删除。')
         }
 
+        const cartLines = await trx.selectFrom('customer_cart_items').select('line_id')
+          .where('customer_id', '=', id).orderBy('line_id').forUpdate().execute()
+        await discardCartLineReplacementDraftsInTransaction(trx, cartLines.map(line => line.line_id))
         await trx.deleteFrom('customer_cart_items').where('customer_id', '=', id).execute()
         await trx.deleteFrom('customer_cart_merge_requests').where('customer_id', '=', id).execute()
         const revokedSessionCount = await revokeCustomerSessions(trx, id)
