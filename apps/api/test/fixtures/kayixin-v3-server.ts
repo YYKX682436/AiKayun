@@ -34,6 +34,7 @@ export function fixtureProduct(goodsId = 201001) {
           expand: [{ type: 14, title: '扩展验证编号', required: 1,
             placeholder: '请输入扩展号码 <b>提示</b>', regex: '^[A-Z]{6}$ <script>window.KAYIXIN_EXPAND_XSS=true</script>',
             options: [{ name: '身份证后六位', value: '1', expand: [{ type: 15, title: '更深扩展字段',
+              ...(goodsId === 201002 ? { required: 0 } : {}),
               placeholder: '更深提示 <img src=x onerror=alert(1)>', regex: '^深层.*$', options: [] }] }] },
           { type: 0, title: '扩展备注', required: 0, placeholder: '可选备注', regex: '', options: [] }] },
       ] },
@@ -49,7 +50,7 @@ export async function startKayixinV3Fixture(options: { port?: number; credential
   const requests: Array<{ path: string; method: string; body: Buffer; headers: Record<string, string | string[] | undefined> }> = []
   let mode: FixtureMode = 'ok'
   let override: ((path: string, body: Record<string, unknown>) => unknown) | undefined
-  let barrier: { arrived: () => void; wait: Promise<void> } | undefined
+  let barrier: { path: string; arrived: () => void; wait: Promise<void> } | undefined
   const sockets = new Set<import('node:net').Socket>()
   const server = createServer(async (request, response) => {
     if (request.url === '/__fixture/health') { response.end('ok'); return }
@@ -76,7 +77,7 @@ export async function startKayixinV3Fixture(options: { port?: number; credential
       || signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected)) || mode === 'auth') {
       response.end(encode({ code: 1001, msg: `签名错误 ${credentials[0]!.appSecret}` })); return
     }
-    if (barrier && path === '/api/v3/user/getAccount') {
+    if (barrier && path === barrier.path) {
       const pending = barrier; barrier = undefined; pending.arrived(); await pending.wait
     }
     if (mode === 'timeout') { await new Promise(resolve => setTimeout(resolve, 8500)); if (response.destroyed) return }
@@ -90,24 +91,31 @@ export async function startKayixinV3Fixture(options: { port?: number; credential
     let data: unknown
     if (override) data = override(path, body)
     else if (path.endsWith('/getAccount')) data = { balance: '1234.123456789012345678' }
-    else if (path.endsWith('/getList')) data = { allCount: 2, allPage: 2, items: Number(body.page) <= 2 ? [fixtureProduct(Number(body.page) === 2 ? 201002 : 201001)] : [] }
+    else if (path.endsWith('/getList')) {
+      const page = Number(body.page)
+      const keyWord = typeof body.keyWord === 'string' ? body.keyWord : ''
+      const goodsId = keyWord.includes('201002') || page === 2 ? 201002 : 201001
+      data = { allCount: 2, allPage: 2, items: page <= 2 ? [fixtureProduct(goodsId)] : [] }
+    }
     else data = fixtureProduct(Number(body.goodsId))
     response.end(encode({ code: 1000, msg: 'success', data }))
   })
   server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)) })
   await new Promise<void>(resolve => server.listen(options.port ?? 0, '127.0.0.1', resolve))
   const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+  const pauseNext = (path: string) => {
+    let arrived!: () => void; let release!: () => void
+    const received = new Promise<void>(resolve => { arrived = resolve })
+    const wait = new Promise<void>(resolve => { release = resolve })
+    barrier = { path, arrived, wait }
+    return { received, release }
+  }
   return {
     baseUrl, requests,
     setMode(value: FixtureMode) { mode = value },
     setData(value?: typeof override) { override = value },
-    pauseNextAccount() {
-      let arrived!: () => void; let release!: () => void
-      const received = new Promise<void>(resolve => { arrived = resolve })
-      const wait = new Promise<void>(resolve => { release = resolve })
-      barrier = { arrived, wait }
-      return { received, release }
-    },
+    pauseNextAccount() { return pauseNext('/api/v3/user/getAccount') },
+    pauseNextGoodDetail() { return pauseNext('/api/v3/goods/getDetail') },
     async close() { for (const socket of sockets) socket.destroy(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) },
   }
 }

@@ -38,6 +38,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     to: '/admin/supplier-connections',
   },
   {
+    label: '供应商商品映射',
+    icon: 'i-lucide-git-compare-arrows',
+    to: '/admin/supplier-product-mappings',
+  },
+  {
     label: '钱包与充值',
     icon: 'i-lucide-wallet',
     to: '/admin/wallets',

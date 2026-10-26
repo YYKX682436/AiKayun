@@ -380,6 +380,96 @@ export interface SupplierConnectionAuditEventsTable {
   created_at: Generated<Date>
 }
 
+export interface SupplierProductMappingHeadsTable {
+  id: string
+  product_id: string
+  product_variant_id: string
+  revision: Generated<number>
+  status: 'draft' | 'reviewed' | 'stale'
+  supplier_connection_id: string
+  supplier_connection_version_id: string
+  provider_type: Generated<'kayixin_customer_v3'>
+  upstream_product_id: string
+  upstream_product_name: string
+  upstream_sku_type: 0 | 1 | 2
+  upstream_sku_code: string | null
+  upstream_combination: ColumnType<Array<{ title: string; value: string }>, string, string>
+  upstream_structure_snapshot: ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>
+  upstream_structure_sha256: string
+  upstream_observed_at: Date
+  template_id: string
+  template_version_id: string
+  template_sha256: string
+  normalization_version: number
+  rules_version: Generated<number>
+  rules: ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>
+  rules_sha256: string
+  latest_review_version_id: string | null
+  latest_version_number: Generated<number>
+  created_by_admin_id: string
+  updated_by_admin_id: string
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
+
+export interface SupplierProductMappingObservationsTable {
+  id: string
+  administrator_id: string
+  supplier_connection_id: string
+  supplier_connection_version_id: string
+  provider_type: Generated<'kayixin_customer_v3'>
+  upstream_product_id: string
+  upstream_product_name: string
+  upstream_sku_type: 0 | 1 | 2
+  upstream_sku_code: string | null
+  upstream_combination: ColumnType<Array<{ title: string; value: string }>, string, string>
+  upstream_structure_snapshot: ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>
+  upstream_structure_sha256: string
+  upstream_observed_at: Date
+  expires_at: Date
+}
+
+export interface SupplierProductMappingVersionsTable {
+  id: string
+  mapping_id: string
+  version_number: number
+  product_id: string
+  product_variant_id: string
+  supplier_connection_id: string
+  supplier_connection_version_id: string
+  provider_type: Generated<'kayixin_customer_v3'>
+  upstream_product_id: string
+  upstream_product_name: string
+  upstream_sku_type: 0 | 1 | 2
+  upstream_sku_code: string | null
+  upstream_combination: ColumnType<Array<{ title: string; value: string }>, string, string>
+  upstream_structure_snapshot: ColumnType<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>>
+  upstream_structure_sha256: string
+  upstream_observed_at: Date
+  template_id: string
+  template_version_id: string
+  template_sha256: string
+  normalization_version: number
+  rules_version: Generated<number>
+  rules: ColumnType<Record<string, unknown>, Record<string, unknown>, never>
+  rules_sha256: string
+  administrator_id: string
+  reviewed_at: Generated<Date>
+}
+
+export interface SupplierProductMappingAuditEventsTable {
+  id: string
+  mapping_id: string
+  product_id: string
+  product_variant_id: string
+  administrator_id: string
+  operation: 'created' | 'draft_saved' | 'reviewed' | 'marked_stale' | 'restored'
+  mapping_version_id: string | null
+  revision: number
+  summary: ColumnType<Record<string, unknown>, Record<string, unknown>, never>
+  created_at: Generated<Date>
+}
+
 export interface ApiFulfillmentAuditEventsTable {
   id: string
   product_variant_id: string | null
@@ -1194,6 +1284,10 @@ export interface Database {
   supplier_connection_credentials: SupplierConnectionCredentialsTable
   supplier_connection_versions: SupplierConnectionVersionsTable
   supplier_connection_audit_events: SupplierConnectionAuditEventsTable
+  supplier_product_mapping_heads: SupplierProductMappingHeadsTable
+  supplier_product_mapping_observations: SupplierProductMappingObservationsTable
+  supplier_product_mapping_versions: SupplierProductMappingVersionsTable
+  supplier_product_mapping_audit_events: SupplierProductMappingAuditEventsTable
   api_fulfillment_audit_events: ApiFulfillmentAuditEventsTable
   private_file_objects: PrivateFileObjectsTable
   orders: OrdersTable

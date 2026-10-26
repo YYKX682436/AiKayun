@@ -42,7 +42,7 @@ import {
 } from '../commerce/http-json-v1.js'
 import { validateKayixinBaseUrl, KayixinV3Error, readKayixinAccount, readKayixinGoods, readKayixinGoodDetail, type KayixinV3Source } from '../commerce/kayixin-customer-v3.js'
 
-class SupplierAdminError extends Error {
+export class SupplierAdminError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
     super(message)
     this.name = 'SupplierAdminError'
@@ -187,6 +187,35 @@ async function credentialForVersion(
 
 function readIdentity(version: SupplierVersionRow): KayixinV3Source {
   return { connectionId: version.supplier_connection_id, configurationVersionId: version.id, configurationVersionNumber: version.version_number }
+}
+
+/**
+ * Reuse the fixed Kayixin V3 detail operation for mapping preparation. The
+ * caller cannot select a path, method, payload, or supplier URL.
+ */
+export async function readCurrentKayixinGoodDetail(
+  db: Kysely<Database>, config: AppConfig, connectionId: string, goodsId: number,
+  expectedVersionId?: string,
+): Promise<Awaited<ReturnType<typeof readKayixinGoodDetail>>> {
+  const loaded = await currentSupplier(db, connectionId)
+  if (!loaded) throw new SupplierAdminError(404, 'SUPPLIER_CONNECTION_NOT_FOUND', '卡易信只读连接不存在。')
+  if (loaded.connection.providerType !== 'kayixin_customer_v3') {
+    throw new SupplierAdminError(400, 'SUPPLIER_PROTOCOL_NOT_SUPPORTED', '商品映射仅支持卡易信 V3 只读连接。')
+  }
+  if (expectedVersionId && loaded.versionRow.id !== expectedVersionId) {
+    throw new SupplierAdminError(409, 'SUPPLIER_VERSION_CHANGED', '读取期间供应商配置发生变化，请重新读取当前版本。')
+  }
+  const credentials = await credentialForVersion(db, config, loaded.versionRow)
+  if (credentials.providerType !== 'kayixin_customer_v3') throw new SupplierCredentialKeyUnavailableError()
+  const result = await readKayixinGoodDetail(config, {
+    baseUrl: loaded.versionRow.base_url, appId: credentials.appId, appSecret: credentials.appSecret,
+  }, readIdentity(loaded.versionRow), goodsId)
+  const current = await db.selectFrom('supplier_connections').select('current_version_id')
+    .where('id', '=', connectionId).executeTakeFirst()
+  if (current?.current_version_id !== loaded.versionRow.id) {
+    throw new SupplierAdminError(409, 'SUPPLIER_VERSION_CHANGED', '读取期间供应商配置发生变化，请重新读取当前版本。')
+  }
+  return result
 }
 
 export function registerAdminSupplierConnectionRoutes(

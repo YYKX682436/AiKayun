@@ -950,6 +950,8 @@ describe('Fastify API with PostgreSQL 18', () => {
       'storefront_customer_policy', 'supplier_api_delivery_events', 'supplier_api_delivery_operations',
       'supplier_api_operations_admin_audit', 'supplier_connection_audit_events', 'supplier_connection_credentials', 'supplier_connection_tests',
       'supplier_connection_versions', 'supplier_connections',
+      'supplier_product_mapping_audit_events', 'supplier_product_mapping_heads',
+      'supplier_product_mapping_observations', 'supplier_product_mapping_versions',
       'wallet_accounts', 'wallet_ledger_entries', 'wallet_operations',
       'withdrawal_audit_events', 'withdrawal_payout_attempts', 'withdrawal_payout_results',
       'withdrawal_private_files', 'withdrawal_settings_audit_events', 'withdrawals',

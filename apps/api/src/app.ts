@@ -38,6 +38,7 @@ import { registerAdminCodePoolRoutes } from './catalog/admin-code-pool.js'
 import { registerAdminFixedDeliveryRoutes } from './catalog/admin-fixed-delivery.js'
 import { registerAdminPrivateFileDeliveryRoutes } from './catalog/admin-private-file-delivery.js'
 import { registerAdminSupplierConnectionRoutes } from './catalog/admin-supplier-connections.js'
+import { registerAdminSupplierProductMappingRoutes } from './catalog/admin-supplier-product-mappings.js'
 import { registerAdminApiFulfillmentRoutes } from './catalog/admin-api-fulfillment.js'
 import { registerProductMediaRoutes } from './media/admin.js'
 import { registerPublicProductRoutes } from './catalog/public-products.js'
@@ -209,6 +210,7 @@ export async function createApp(options: {
   registerAdminCodePoolRoutes(app, db, config)
   registerAdminFixedDeliveryRoutes(app, db, config)
   registerAdminSupplierConnectionRoutes(app, db, config)
+  registerAdminSupplierProductMappingRoutes(app, db, config)
   registerAdminApiFulfillmentRoutes(app, db, config)
   await registerAdminPrivateFileDeliveryRoutes(app, db, config)
   await registerProductMediaRoutes(app, db, config)
