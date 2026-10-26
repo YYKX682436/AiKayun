@@ -89,6 +89,11 @@ export const SupplierProductMappingRestoreBodySchema = Type.Object({
   versionId: Uuid,
 }, { additionalProperties: false })
 export const SupplierProductMappingIdParamsSchema = Type.Object({ id: Uuid }, { additionalProperties: false })
+export const SupplierReferenceQuoteObserveBodySchema = Type.Object({
+  expectedProductRevision: Type.Integer({ minimum: 1 }),
+  expectedSkuRevision: Type.Integer({ minimum: 1 }),
+  expectedMappingRevision: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+}, { additionalProperties: false })
 export const SupplierProductMappingHistoryQuerySchema = Type.Object({
   page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
   pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
@@ -136,6 +141,7 @@ export const SupplierMappingCatalogSkuSchema = Type.Object({
   productStatus: Type.String(),
   productRevision: Type.Integer({ minimum: 1 }),
   skuId: Uuid,
+  skuRevision: Type.Integer({ minimum: 1 }),
   skuCode: Type.String(),
   skuEnabled: Type.Boolean(),
   skuRetiredAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
@@ -278,6 +284,65 @@ export const SupplierProductMappingRefreshOutcomeSchema = Type.Object({
   identityChanged: Type.Boolean(),
 }, { additionalProperties: false })
 
+const SupplierQuoteObservationOutcomeSchema = Type.Union([
+  Type.Literal('observed'), Type.Literal('quote_missing'), Type.Literal('mapping_missing'),
+  Type.Literal('mapping_not_reviewed'), Type.Literal('mapping_stale'), Type.Literal('configuration_changed'),
+  Type.Literal('identity_changed'), Type.Literal('structure_changed'), Type.Literal('read_failed'),
+  Type.Literal('mapping_changed'), Type.Literal('sku_changed'),
+])
+const SupplierQuoteComparisonReasonSchema = Type.Union([
+  Type.Literal('comparable_same_source_and_structure'), Type.Literal('first_observation'),
+  Type.Literal('previous_observation_unusable'), Type.Literal('different_connection'),
+  Type.Literal('different_configuration'), Type.Literal('different_product'),
+  Type.Literal('different_sku'), Type.Literal('different_quote_scope'),
+  Type.Literal('structure_changed'), Type.Literal('quote_missing'),
+])
+
+export const SupplierReferenceQuoteObservationSchema = Type.Object({
+  id: Uuid,
+  productId: Uuid,
+  skuId: Uuid,
+  mappingId: Type.Union([Uuid, Type.Null()]),
+  mappingVersionId: Type.Union([Uuid, Type.Null()]),
+  mappingRevision: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+  mappingStatus: Type.Union([MappingStatus, Type.Literal('none')]),
+  source: Type.Union([Type.Object({
+    connectionId: Uuid,
+    configurationVersionId: Uuid,
+    configurationVersionNumber: Type.Integer({ minimum: 1 }),
+    protocol: Type.Literal('kayixin_customer_v3'),
+  }, { additionalProperties: false }), Type.Null()]),
+  upstreamProductId: Type.Union([UpstreamProductId, Type.Null()]),
+  upstreamSkuType: Type.Union([Type.Literal(0), Type.Literal(1), Type.Literal(2), Type.Null()]),
+  upstreamSkuCode: UpstreamSkuCode,
+  upstreamCombination: Type.Array(Type.Object({ title: Type.String({ maxLength: 200 }), value: Type.String({ maxLength: 200 }) }, { additionalProperties: false }), { maxItems: 30 }),
+  quoteScope: Type.Union([Type.Literal('product'), Type.Literal('variant'), Type.Null()]),
+  quoteAmount: Type.Union([Type.String({ maxLength: 64, pattern: '^(0|[1-9][0-9]{0,23})(\\.[0-9]{1,18})?$' }), Type.Null()]),
+  quoteCurrency: Type.Null(),
+  currencyStatus: Type.Literal('unspecified'),
+  quoteBasis: Type.Union([Type.Literal('upstream_account_reference'), Type.Null()]),
+  quoteUnitStatus: Type.Literal('unverified'),
+  actualDebitVerified: Type.Literal(false),
+  outcome: SupplierQuoteObservationOutcomeSchema,
+  observedAt: Type.String({ format: 'date-time' }),
+  sourceReadAt: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+  structureFingerprint: Type.Union([Fingerprint, Type.Null()]),
+  failureCode: Type.Union([Type.String({ maxLength: 80 }), Type.Null()]),
+  comparison: Type.Object({
+    comparable: Type.Boolean(),
+    reason: SupplierQuoteComparisonReasonSchema,
+    previousObservationId: Type.Union([Uuid, Type.Null()]),
+    previousAmount: Type.Union([Type.String({ maxLength: 64, pattern: '^(0|[1-9][0-9]{0,23})(\\.[0-9]{1,18})?$' }), Type.Null()]),
+    rawReferenceDelta: Type.Union([Type.String({ maxLength: 64, pattern: '^-?(?:0|[1-9][0-9]{0,24})(?:\\.[0-9]{1,18})?$' }), Type.Null()]),
+  }, { additionalProperties: false }),
+}, { additionalProperties: false })
+
+export const SupplierReferenceQuoteObservationPageSchema = Type.Object({
+  productId: Uuid,
+  skuId: Uuid,
+  items: Type.Array(SupplierReferenceQuoteObservationSchema, { maxItems: 50 }),
+}, { additionalProperties: false })
+
 export const SupplierProductMappingPreviewSchema = Type.Object({
   kind: Type.Literal('internal_mapping_preview'),
   executedUpstreamCode: Type.Literal(false),
@@ -309,6 +374,7 @@ export type SupplierProductMappingObserveBody = Static<typeof SupplierProductMap
 export type SupplierProductMappingObservation = Static<typeof SupplierProductMappingObservationSchema>
 export type SupplierProductMappingRefreshObservation = Static<typeof SupplierProductMappingRefreshObservationSchema>
 export type SupplierProductMappingRevisionBody = Static<typeof SupplierProductMappingRevisionBodySchema>
+export type SupplierReferenceQuoteObserveBody = Static<typeof SupplierReferenceQuoteObserveBodySchema>
 export type SupplierProductMappingRestoreBody = Static<typeof SupplierProductMappingRestoreBodySchema>
 export type SupplierMappingCatalogSku = Static<typeof SupplierMappingCatalogSkuSchema>
 export type SupplierProductMapping = Static<typeof SupplierProductMappingSchema>
@@ -319,6 +385,8 @@ export type SupplierProductMappingHistory = Static<typeof SupplierProductMapping
 export type SupplierProductMappingList = Static<typeof SupplierProductMappingListSchema>
 export type SupplierProductMappingReviewOutcome = Static<typeof SupplierProductMappingReviewOutcomeSchema>
 export type SupplierProductMappingRefreshOutcome = Static<typeof SupplierProductMappingRefreshOutcomeSchema>
+export type SupplierReferenceQuoteObservation = Static<typeof SupplierReferenceQuoteObservationSchema>
+export type SupplierReferenceQuoteObservationPage = Static<typeof SupplierReferenceQuoteObservationPageSchema>
 export type SupplierProductMappingStructureSnapshot = Static<typeof StructureSnapshotSchema>
 
 type MappingUpstreamOption = { name: string; value: string; children: MappingUpstreamOption[]; expand: MappingUpstreamField[] }

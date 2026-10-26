@@ -36,6 +36,7 @@ import { purchaseFormActivationStateMigration } from './migrations/202610250003_
 import { cartReplacementDraftsMigration } from './migrations/202610250004_cart_replacement_drafts.js'
 import { supplierProductMappingsMigration } from './migrations/202610260001_supplier_product_mappings.js'
 import { productPricingRulesMigration } from './migrations/202610260002_product_pricing_rules.js'
+import { supplierQuoteObservationsMigration } from './migrations/202610270001_supplier_quote_observations.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -76,6 +77,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610250004_cart_replacement_drafts': cartReplacementDraftsMigration,
       '202610260001_supplier_product_mappings': supplierProductMappingsMigration,
       '202610260002_product_pricing_rules': productPricingRulesMigration,
+      '202610270001_supplier_quote_observations': supplierQuoteObservationsMigration,
     }
   }
 }

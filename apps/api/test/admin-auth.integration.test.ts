@@ -199,11 +199,61 @@ async function patchSkuPrices(
   skuId: string,
   body: Record<string, unknown>,
 ) {
-  return app.inject({
-    method: 'PATCH',
-    url: `/api/v1/admin/products/${productId}/variants/${skuId}/prices`,
+  const directPatch = (payload: Record<string, unknown>) => app.inject({
+    method: 'PATCH', url: `/api/v1/admin/products/${productId}/variants/${skuId}/prices`,
+    headers: productHeaders(auth), payload,
+  })
+  if (!Object.hasOwn(body, 'costPrice')) return directPatch(body)
+
+  const { costPrice, ...nonCostFields } = body
+  let expectedRevision = Number(body.expectedRevision)
+  let expectedSkuRevision = Number(body.expectedSkuRevision)
+  const hasOtherPriceChanges = Object.hasOwn(nonCostFields, 'salePrice') || Object.hasOwn(nonCostFields, 'compareAtPrice')
+  if (hasOtherPriceChanges) {
+    const savedOtherPrices = await directPatch(nonCostFields)
+    if (savedOtherPrices.statusCode !== 200) return savedOtherPrices
+    const saved = savedOtherPrices.json<{ data: { productRevision: number; skuRevision: number } }>().data
+    expectedRevision = saved.productRevision
+    expectedSkuRevision = saved.skuRevision
+  }
+  const preview = await app.inject({
+    method: 'POST', url: `/api/v1/admin/products/${productId}/cost-preview`,
     headers: productHeaders(auth),
-    payload: body,
+    payload: { expectedRevision, updates: [{ skuId, expectedSkuRevision, costPrice }] },
+  })
+  if (preview.statusCode !== 200) return preview
+  const previewItem = preview.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number; newCostPrice: string | null; inputDigest: string }> } }>().data.items[0]!
+  const confirmed = await app.inject({
+    method: 'PATCH', url: `/api/v1/admin/products/${productId}/prices/batch`, headers: productHeaders(auth),
+    payload: { expectedRevision: preview.json<{ data: { productRevision: number } }>().data.productRevision, updates: [{
+      skuId: previewItem.skuId, expectedSkuRevision: previewItem.skuRevision,
+      costPrice: previewItem.newCostPrice, costPreviewDigest: previewItem.inputDigest,
+    }] },
+  })
+  if (confirmed.statusCode !== 200) return confirmed
+  return app.inject({ method: 'GET', url: `/api/v1/admin/products/${productId}/variants/${skuId}/prices`, headers: { cookie: auth.sessionCookie } })
+}
+
+async function confirmCostChanges(
+  auth: Awaited<ReturnType<typeof loginAdmin>>,
+  productId: string,
+  expectedRevision: number,
+  updates: Array<{ skuId: string; expectedSkuRevision: number; costPrice: string | null }>,
+) {
+  const preview = await app.inject({
+    method: 'POST', url: `/api/v1/admin/products/${productId}/cost-preview`, headers: productHeaders(auth),
+    payload: { expectedRevision, updates },
+  })
+  if (preview.statusCode !== 200) return preview
+  const data = preview.json<{ data: { productRevision: number; items: Array<{
+    skuId: string; skuRevision: number; newCostPrice: string | null; inputDigest: string;
+  }> } }>().data
+  return app.inject({
+    method: 'PATCH', url: `/api/v1/admin/products/${productId}/prices/batch`, headers: productHeaders(auth),
+    payload: { expectedRevision: data.productRevision, updates: data.items.map(item => ({
+      skuId: item.skuId, expectedSkuRevision: item.skuRevision,
+      costPrice: item.newCostPrice, costPreviewDigest: item.inputDigest,
+    })) },
   })
 }
 
@@ -986,6 +1036,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       'supplier_connection_versions', 'supplier_connections',
       'supplier_product_mapping_audit_events', 'supplier_product_mapping_heads',
       'supplier_product_mapping_observations', 'supplier_product_mapping_versions',
+      'supplier_reference_quote_observations',
       'wallet_accounts', 'wallet_ledger_entries', 'wallet_operations',
       'withdrawal_audit_events', 'withdrawal_payout_attempts', 'withdrawal_payout_results',
       'withdrawal_private_files', 'withdrawal_settings_audit_events', 'withdrawals',
@@ -4598,12 +4649,19 @@ describe('D6 product management API additions', () => {
         updates: prices.map((price, index) => ({
           skuId: price.skuId,
           expectedSkuRevision: price.skuRevision,
-          ...(index === 0 ? { salePrice: '18.80', compareAtPrice: '28.80' } : { salePrice: '38.80', costPrice: '1.23456' }),
+          ...(index === 0 ? { salePrice: '18.80', compareAtPrice: '28.80' } : { salePrice: '38.80' }),
         })),
       },
     })
     expect(batch.statusCode).toBe(200)
-    const batchData = batch.json<{ data: { productRevision: number; items: Array<{ skuId: string; salePrice: string; compareAtPrice: string | null; costPrice: string | null }> } }>().data
+    const savedSaleData = batch.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> } }>().data
+    const costSku = savedSaleData.items.find(item => item.skuId !== prices[0]!.skuId)!
+    const savedCost = await confirmCostChanges(auth, product.id, savedSaleData.productRevision, [
+      { skuId: costSku.skuId, expectedSkuRevision: costSku.skuRevision, costPrice: '1.23456' },
+    ])
+    expect(savedCost.statusCode, savedCost.body).toBe(200)
+    const finalPricePage = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=50`, headers: { cookie: auth.sessionCookie } })
+    const batchData = finalPricePage.json<{ data: { productRevision: number; items: Array<{ skuId: string; salePrice: string; compareAtPrice: string | null; costPrice: string | null; skuRevision: number }> } }>().data
     const saved = batchData.items
     expect(saved.map(item => item.salePrice).sort()).toEqual(['18.80', '38.80'])
     expect(saved.find(item => item.salePrice === '18.80')).toMatchObject({ compareAtPrice: '28.80', costPrice: null })
@@ -4628,6 +4686,173 @@ describe('D6 product management API additions', () => {
     })
     expect(afterConflict.json<{ data: { items: Array<{ salePrice: string }> } }>().data.items.map(item => item.salePrice).sort())
       .toEqual(['18.80', '38.80'])
+  })
+
+  it('previews confirmed CNY costs against the sole price source and rejects stale or duplicate batch confirmation', async () => {
+    const auth = await loginAdmin()
+    const created = await createTestProduct(auth, '⑥-3B 成本预览与并发确认')
+    const values = [randomUUID(), randomUUID(), randomUUID()]
+    const matrix = await saveMatrix(auth, created.id, {
+      expectedRevision: created.revision, mode: 'selected', groups: [optionGroup('成本测试', randomUUID(), [
+        { id: values[0]!, name: '固定利润' }, { id: values[1]!, name: '比例加价' }, { id: values[2]!, name: '手动售价' },
+      ])],
+      combinations: [
+        { optionValueIds: [values[0]!], salePrice: '20.00', enabled: true },
+        { optionValueIds: [values[1]!], salePrice: '30.00', enabled: true },
+        { optionValueIds: [values[2]!], salePrice: '15.00', enabled: true },
+      ],
+      retireSkuIds: created.variants.map(variant => variant.id),
+    })
+    expect(matrix.statusCode, matrix.body).toBe(200)
+    const product = matrix.json<{ data: { product: ProductDetail } }>().data.product
+    const fixedSku = product.variants.find(variant => variant.options[0]?.valueId === values[0])!
+    const markupSku = product.variants.find(variant => variant.options[0]?.valueId === values[1])!
+    const manualSku = product.variants.find(variant => variant.options[0]?.valueId === values[2])!
+
+    const pricePage = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=50`, headers: { cookie: auth.sessionCookie } })
+    const initial = pricePage.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> } }>().data
+    const compareSave = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/prices/batch`, headers: productHeaders(auth),
+      payload: { expectedRevision: initial.productRevision, updates: [
+        { skuId: fixedSku.id, expectedSkuRevision: initial.items.find(row => row.skuId === fixedSku.id)!.skuRevision, compareAtPrice: '50.00' },
+        { skuId: markupSku.id, expectedSkuRevision: initial.items.find(row => row.skuId === markupSku.id)!.skuRevision, compareAtPrice: '60.00' },
+        { skuId: manualSku.id, expectedSkuRevision: initial.items.find(row => row.skuId === manualSku.id)!.skuRevision, compareAtPrice: '40.00' },
+      ] },
+    })
+    expect(compareSave.statusCode, compareSave.body).toBe(200)
+    const withCompare = compareSave.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> } }>().data
+    const firstCostPreview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/cost-preview`, headers: productHeaders(auth),
+      payload: { expectedRevision: withCompare.productRevision, updates: [
+        { skuId: fixedSku.id, expectedSkuRevision: withCompare.items.find(row => row.skuId === fixedSku.id)!.skuRevision, costPrice: '10.00000' },
+      ] },
+    })
+    expect(firstCostPreview.statusCode, firstCostPreview.body).toBe(200)
+    expect(firstCostPreview.json().data.items[0]).toMatchObject({ currentCostPrice: null, newCostPrice: '10.00000',
+      costDelta: null, currentGrossProfit: null, currentGrossMarginRate: null, afterCostGrossProfit: '10.00000',
+      suggestedSalePrice: null, risks: expect.arrayContaining(['COST_MISSING', 'MANUAL_MODE']) })
+    const seedCosts = await confirmCostChanges(auth, product.id, withCompare.productRevision, [
+      ...[fixedSku, markupSku, manualSku].map((sku, index) => ({ skuId: sku.id,
+        expectedSkuRevision: withCompare.items.find(row => row.skuId === sku.id)!.skuRevision,
+        costPrice: ['10.00000', '10.00000', '10.00000'][index]! })),
+    ])
+    expect(seedCosts.statusCode, seedCosts.body).toBe(200)
+    const seeded = seedCosts.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> } }>().data
+    const ruleSave = await app.inject({
+      method: 'PUT', url: `/api/v1/admin/products/${product.id}/pricing-rules/batch`, headers: productHeaders(auth),
+      payload: { expectedRevision: seeded.productRevision, updates: [
+        { skuId: fixedSku.id, expectedSkuRevision: seeded.items.find(row => row.skuId === fixedSku.id)!.skuRevision,
+          expectedRuleRevision: 0, mode: 'fixed_profit', fixedProfit: '5.00000' },
+        { skuId: markupSku.id, expectedSkuRevision: seeded.items.find(row => row.skuId === markupSku.id)!.skuRevision,
+          expectedRuleRevision: 0, mode: 'percentage_markup', markupRate: '25' },
+      ] },
+    })
+    expect(ruleSave.statusCode, ruleSave.body).toBe(200)
+    const rules = ruleSave.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> } }>().data
+    const noChangePreview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/cost-preview`, headers: productHeaders(auth),
+      payload: { expectedRevision: rules.productRevision, updates: [
+        { skuId: fixedSku.id, expectedSkuRevision: rules.items.find(row => row.skuId === fixedSku.id)!.skuRevision, costPrice: '10.00000' },
+      ] },
+    })
+    expect(noChangePreview.json().data.items[0]).toMatchObject({ currentCostPrice: '10.00000', newCostPrice: '10.00000', costDelta: '0.00000' })
+    const zeroCostPreview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/cost-preview`, headers: productHeaders(auth),
+      payload: { expectedRevision: rules.productRevision, updates: [
+        { skuId: fixedSku.id, expectedSkuRevision: rules.items.find(row => row.skuId === fixedSku.id)!.skuRevision, costPrice: '0.00000' },
+      ] },
+    })
+    expect(zeroCostPreview.json().data.items[0].risks).toContain('ZERO_COST')
+    const preview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/cost-preview`, headers: productHeaders(auth),
+      payload: { expectedRevision: rules.productRevision, updates: [
+        { skuId: fixedSku.id, expectedSkuRevision: rules.items.find(row => row.skuId === fixedSku.id)!.skuRevision, costPrice: '12.00000' },
+        { skuId: markupSku.id, expectedSkuRevision: rules.items.find(row => row.skuId === markupSku.id)!.skuRevision, costPrice: '8.00000' },
+        { skuId: manualSku.id, expectedSkuRevision: seeded.items.find(row => row.skuId === manualSku.id)!.skuRevision, costPrice: '20.00000' },
+      ] },
+    })
+    expect(preview.statusCode, preview.body).toBe(200)
+    const previewData = preview.json<{ data: { productId: string; productRevision: number; items: Array<{
+      skuId: string; skuRevision: number; inputDigest: string; currentCostPrice: string | null; newCostPrice: string | null;
+      costDelta: string | null; salePrice: string; compareAtPrice: string | null; currentGrossProfit: string | null;
+      currentGrossMarginRate: string | null; afterCostGrossProfit: string | null; afterCostGrossMarginRate: string | null;
+      suggestedSalePrice: string | null; suggestedGrossProfit: string | null; suggestedGrossMarginRate: string | null;
+      fixedProfit: string | null; markupRate: string | null; risks: string[];
+    }> } }>().data
+    const fixed = previewData.items.find(item => item.skuId === fixedSku.id)!
+    const markup = previewData.items.find(item => item.skuId === markupSku.id)!
+    const manual = previewData.items.find(item => item.skuId === manualSku.id)!
+    expect(fixed).toMatchObject({ currentCostPrice: '10.00000', newCostPrice: '12.00000', costDelta: '2.00000',
+      salePrice: '20.00', compareAtPrice: '50.00', currentGrossProfit: '10.00000', currentGrossMarginRate: '50.0000',
+      afterCostGrossProfit: '8.00000', afterCostGrossMarginRate: '40.0000', fixedProfit: '5.00000',
+      suggestedSalePrice: '17.00', suggestedGrossProfit: '5.00000' })
+    expect(markup).toMatchObject({ costDelta: '-2.00000', salePrice: '30.00', currentGrossProfit: '20.00000',
+      afterCostGrossProfit: '22.00000', afterCostGrossMarginRate: '73.3333', markupRate: '25.0000',
+      suggestedSalePrice: '10.00', suggestedGrossProfit: '2.00000', suggestedGrossMarginRate: '20.0000' })
+    expect(manual).toMatchObject({ costDelta: '10.00000', afterCostGrossProfit: '-5.00000', suggestedSalePrice: null,
+      suggestedGrossProfit: null, risks: expect.arrayContaining(['MANUAL_MODE', 'NEGATIVE_PROFIT']) })
+    const unchanged = await db.selectFrom('product_variants').select(['id', 'sale_price', 'compare_at_price', 'cost_price'])
+      .where('id', 'in', [fixedSku.id, markupSku.id, manualSku.id]).execute()
+    expect(unchanged.every(row => row.cost_price === '10.00000')).toBe(true)
+    expect(unchanged.find(row => row.id === fixedSku.id)).toMatchObject({ sale_price: '20.00000', compare_at_price: '50.00000' })
+
+    const directCostWithoutPreview = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${fixedSku.id}/prices`, headers: productHeaders(auth),
+      payload: { expectedRevision: previewData.productRevision, expectedSkuRevision: fixed.skuRevision, costPrice: '12.00000' },
+    })
+    expect(directCostWithoutPreview.statusCode).toBe(409)
+    expect(directCostWithoutPreview.json().error.code).toBe('COST_PREVIEW_STALE')
+
+    const confirmPayload = { expectedRevision: previewData.productRevision, updates: previewData.items.map(item => ({
+      skuId: item.skuId, expectedSkuRevision: item.skuRevision, costPrice: item.newCostPrice, costPreviewDigest: item.inputDigest,
+    })) }
+    const wrongBatch = structuredClone(confirmPayload)
+    wrongBatch.updates[1]!.costPreviewDigest = '0'.repeat(64)
+    const rejected = await app.inject({ method: 'PATCH', url: `/api/v1/admin/products/${product.id}/prices/batch`,
+      headers: productHeaders(auth), payload: wrongBatch })
+    expect(rejected.statusCode).toBe(409)
+    const unchangedAfterRollback = await db.selectFrom('product_variants').select(['id', 'cost_price'])
+      .where('id', 'in', [fixedSku.id, markupSku.id, manualSku.id]).execute()
+    expect(unchangedAfterRollback.every(row => row.cost_price === '10.00000')).toBe(true)
+
+    const auditCountBefore = await db.selectFrom('product_management_audit_events').select('id').where('product_id', '=', product.id)
+      .where('operation', '=', 'price_updated').execute()
+    const attempts = await Promise.all([1, 2].map(() => app.inject({ method: 'PATCH', url: `/api/v1/admin/products/${product.id}/prices/batch`,
+      headers: productHeaders(auth), payload: confirmPayload })))
+    expect(attempts.map(response => response.statusCode).sort()).toEqual([200, 409])
+    const finalRows = await db.selectFrom('product_variants').select(['id', 'sale_price', 'compare_at_price', 'cost_price', 'pricing_rule_status'])
+      .where('id', 'in', [fixedSku.id, markupSku.id, manualSku.id]).execute()
+    expect(finalRows.find(row => row.id === fixedSku.id)).toMatchObject({ sale_price: '20.00000', compare_at_price: '50.00000', cost_price: '12.00000', pricing_rule_status: 'stale' })
+    expect(finalRows.find(row => row.id === markupSku.id)).toMatchObject({ sale_price: '30.00000', compare_at_price: '60.00000', cost_price: '8.00000', pricing_rule_status: 'stale' })
+    expect(finalRows.find(row => row.id === manualSku.id)).toMatchObject({ sale_price: '15.00000', compare_at_price: '40.00000', cost_price: '20.00000', pricing_rule_status: 'manual' })
+    const auditCountAfter = await db.selectFrom('product_management_audit_events').select('id').where('product_id', '=', product.id)
+      .where('operation', '=', 'price_updated').execute()
+    expect(auditCountAfter).toHaveLength(auditCountBefore.length + 3)
+
+    const rulePreview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`, headers: productHeaders(auth),
+      payload: { skuIds: [fixedSku.id, markupSku.id] },
+    })
+    expect(rulePreview.statusCode, rulePreview.body).toBe(200)
+    const rulePreviewData = rulePreview.json<{ data: { productRevision: number; items: Array<{
+      skuId: string; skuRevision: number; ruleRevision: number; inputDigest: string; suggestedSalePrice: string; ruleStatus: string;
+    }> } }>().data
+    expect(rulePreviewData.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ skuId: fixedSku.id, suggestedSalePrice: '17.00', ruleStatus: 'stale' }),
+      expect.objectContaining({ skuId: markupSku.id, suggestedSalePrice: '10.00', ruleStatus: 'stale' }),
+    ]))
+    const applyRules = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/apply`, headers: productHeaders(auth),
+      payload: { expectedRevision: rulePreviewData.productRevision, confirmLossAndFreePrice: false,
+        items: rulePreviewData.items.map(item => ({ skuId: item.skuId, expectedSkuRevision: item.skuRevision,
+          expectedRuleRevision: item.ruleRevision, inputDigest: item.inputDigest })) },
+    })
+    expect(applyRules.statusCode, applyRules.body).toBe(200)
+    expect(applyRules.json<{ data: { items: Array<{ skuId: string; salePrice: string; costPrice: string | null; compareAtPrice: string | null }> } }>().data.items)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ skuId: fixedSku.id, salePrice: '17.00', costPrice: '12.00000', compareAtPrice: '50.00' }),
+        expect.objectContaining({ skuId: markupSku.id, salePrice: '10.00', costPrice: '8.00000', compareAtPrice: '60.00' }),
+      ]))
   })
 
   it('lists reusable media, exposes the gallery cover, and filters inventory history by operation ID', async () => {
@@ -5266,16 +5491,22 @@ describe('D8 cross-module PostgreSQL concurrency acceptance', () => {
     expect(product.variants).toHaveLength(2)
     const fixedSku = product.variants.find(variant => variant.options.some(option => option.valueName === '固定利润 SKU'))
     const markupSku = product.variants.find(variant => variant.options.some(option => option.valueName === '成本加价 SKU'))
-    const seedCosts = await app.inject({
+    const seedCompareAt = await app.inject({
       method: 'PATCH', url: `/api/v1/admin/products/${product.id}/prices/batch`, headers: productHeaders(auth),
       payload: {
         expectedRevision: product.revision,
         updates: [
-          { skuId: fixedSku!.id, expectedSkuRevision: fixedSku!.revision, costPrice: '10.12345', compareAtPrice: '15.00' },
-          { skuId: markupSku!.id, expectedSkuRevision: markupSku!.revision, costPrice: '10.00001', compareAtPrice: '30.00' },
+          { skuId: fixedSku!.id, expectedSkuRevision: fixedSku!.revision, compareAtPrice: '15.00' },
+          { skuId: markupSku!.id, expectedSkuRevision: markupSku!.revision, compareAtPrice: '30.00' },
         ],
       },
     })
+    expect(seedCompareAt.statusCode, seedCompareAt.body).toBe(200)
+    const compareData = seedCompareAt.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> } }>().data
+    const seedCosts = await confirmCostChanges(auth, product.id, compareData.productRevision, [
+      { skuId: fixedSku!.id, expectedSkuRevision: compareData.items.find(item => item.skuId === fixedSku!.id)!.skuRevision, costPrice: '10.12345' },
+      { skuId: markupSku!.id, expectedSkuRevision: compareData.items.find(item => item.skuId === markupSku!.id)!.skuRevision, costPrice: '10.00001' },
+    ])
     expect(seedCosts.statusCode, seedCosts.body).toBe(200)
 
     const getRules = async () => {
@@ -5401,9 +5632,14 @@ describe('D8 cross-module PostgreSQL concurrency acceptance', () => {
     const directPrice = await app.inject({
       method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${fixedSku!.id}/prices`, headers: productHeaders(auth),
       payload: { expectedRevision: firstCurrentPrice.productRevision, expectedSkuRevision: firstCurrentPrice.skuRevision,
-        salePrice: '12.00', costPrice: '11.00000' },
+        salePrice: '12.00' },
     })
     expect(directPrice.statusCode, directPrice.body).toBe(200)
+    const directPriceData = directPrice.json<{ data: { productRevision: number; skuRevision: number } }>().data
+    const changedCost = await confirmCostChanges(auth, product.id, directPriceData.productRevision, [
+      { skuId: fixedSku!.id, expectedSkuRevision: directPriceData.skuRevision, costPrice: '11.00000' },
+    ])
+    expect(changedCost.statusCode, changedCost.body).toBe(200)
     const staleApply = await app.inject({
       method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/apply`, headers: productHeaders(auth),
       payload: { expectedRevision: freshPreview.productRevision, confirmLossAndFreePrice: false,
@@ -5454,10 +5690,9 @@ describe('D8 cross-module PostgreSQL concurrency acceptance', () => {
     let latestPrices = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=50`, headers: { cookie: auth.sessionCookie } })
     let pricePage = latestPrices.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> } }>().data
     const markupCurrentPrice = pricePage.items.find(item => item.skuId === markupSku!.id)!
-    const clearCost = await app.inject({
-      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${markupSku!.id}/prices`, headers: productHeaders(auth),
-      payload: { expectedRevision: pricePage.productRevision, expectedSkuRevision: markupCurrentPrice.skuRevision, costPrice: null },
-    })
+    const clearCost = await confirmCostChanges(auth, product.id, pricePage.productRevision, [
+      { skuId: markupSku!.id, expectedSkuRevision: markupCurrentPrice.skuRevision, costPrice: null },
+    ])
     expect(clearCost.statusCode).toBe(200)
     const missingCost = await app.inject({
       method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`, headers: productHeaders(auth),
@@ -5469,10 +5704,9 @@ describe('D8 cross-module PostgreSQL concurrency acceptance', () => {
     latestPrices = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=50`, headers: { cookie: auth.sessionCookie } })
     pricePage = latestPrices.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> } }>().data
     const zeroCostSku = pricePage.items.find(item => item.skuId === markupSku!.id)!
-    const setZeroCost = await app.inject({
-      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${markupSku!.id}/prices`, headers: productHeaders(auth),
-      payload: { expectedRevision: pricePage.productRevision, expectedSkuRevision: zeroCostSku.skuRevision, costPrice: '0.00000' },
-    })
+    const setZeroCost = await confirmCostChanges(auth, product.id, pricePage.productRevision, [
+      { skuId: markupSku!.id, expectedSkuRevision: zeroCostSku.skuRevision, costPrice: '0.00000' },
+    ])
     expect(setZeroCost.statusCode).toBe(200)
     const freePreview = await app.inject({
       method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`, headers: productHeaders(auth),
@@ -5508,11 +5742,9 @@ describe('D8 cross-module PostgreSQL concurrency acceptance', () => {
 
     const ruleRowsBeforeOverflow = await getRules()
     const overflowSku = ruleRowsBeforeOverflow.items.find(item => item.skuId === markupSku!.id)!
-    const setMaxCost = await app.inject({
-      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${markupSku!.id}/prices`, headers: productHeaders(auth),
-      payload: { expectedRevision: ruleRowsBeforeOverflow.productRevision, expectedSkuRevision: overflowSku.skuRevision,
-        costPrice: '9999999999999.99999' },
-    })
+    const setMaxCost = await confirmCostChanges(auth, product.id, ruleRowsBeforeOverflow.productRevision, [
+      { skuId: markupSku!.id, expectedSkuRevision: overflowSku.skuRevision, costPrice: '9999999999999.99999' },
+    ])
     expect(setMaxCost.statusCode).toBe(200)
     const overflowPreview = await app.inject({
       method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`, headers: productHeaders(auth),

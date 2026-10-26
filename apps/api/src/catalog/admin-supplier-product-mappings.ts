@@ -19,6 +19,10 @@ import {
   SupplierProductMappingReviewOutcomeSchema,
   SupplierProductMappingSchema,
   SupplierProductMappingUpdateBodySchema,
+  SupplierReferenceQuoteObserveBodySchema,
+  SupplierReferenceQuoteObservationPageSchema,
+  SupplierReferenceQuoteObservationSchema,
+  ProductVariantIdParamsSchema,
   canonicalSupplierMappingJson,
   failure,
   success,
@@ -35,16 +39,19 @@ import type {
   SupplierProductMappingObserveBody,
   SupplierProductMappingRestoreBody,
   SupplierProductMappingUpdateBody,
+  SupplierReferenceQuoteObserveBody,
+  SupplierReferenceQuoteObservation,
   SupplierProductMappingVersion,
   SupplierMappingRules,
 } from '@aikayun/contracts'
 import type { AppConfig } from '../config.js'
 import { requireAdmin, verifyCsrf } from '../auth/admin.js'
-import type { Database, SupplierProductMappingHeadsTable, SupplierProductMappingObservationsTable, SupplierProductMappingVersionsTable } from '../db/types.js'
+import type { Database, SupplierProductMappingHeadsTable, SupplierProductMappingObservationsTable, SupplierProductMappingVersionsTable, SupplierReferenceQuoteObservationsTable } from '../db/types.js'
 import { KayixinV3Error } from '../commerce/kayixin-customer-v3.js'
 import { SupplierCredentialKeyUnavailableError } from '../commerce/supplier-api-crypto.js'
 import { effectivePurchaseFormForSku } from '../commerce/purchase-form-config.js'
 import { readCurrentKayixinGoodDetail, SupplierAdminError } from './admin-supplier-connections.js'
+import { preserveSupplierReferenceAmount, subtractSupplierReferenceAmounts } from '@aikayun/money'
 
 const pageSizeDefault = 50
 const observationTtlMs = 30 * 60 * 1000
@@ -60,6 +67,7 @@ type MappingDb = Kysely<Database> | Transaction<Database>
 type MappingHeadRow = Selectable<SupplierProductMappingHeadsTable>
 type MappingObservationRow = Selectable<SupplierProductMappingObservationsTable>
 type MappingVersionRow = Selectable<SupplierProductMappingVersionsTable>
+type QuoteObservationRow = Selectable<SupplierReferenceQuoteObservationsTable>
 type LocalTemplate = {
   id: string
   templateId: string
@@ -347,6 +355,127 @@ async function markMappingStale(db: Kysely<Database>, id: string, expectedRevisi
   return loadMapping(db, id)
 }
 
+type QuoteAttempt = {
+  mapping: SupplierProductMapping | null
+  outcome: SupplierReferenceQuoteObservation['outcome']
+  sourceReadAt: Date | null
+  structureFingerprint: string | null
+  quoteScope: 'product' | 'variant' | null
+  quoteAmount: string | null
+  quoteBasis: 'upstream_account_reference' | null
+  upstreamProductId: string | null
+  upstreamSkuType: 0 | 1 | 2 | null
+  upstreamSkuCode: string | null
+  upstreamCombination: Array<{ title: string; value: string }>
+  failureCode: string | null
+}
+
+function quoteObservationFromRow(row: QuoteObservationRow): SupplierReferenceQuoteObservation {
+  return {
+    id: row.id, productId: row.product_id, skuId: row.product_variant_id,
+    mappingId: row.mapping_id, mappingVersionId: row.mapping_version_id,
+    mappingRevision: row.mapping_revision, mappingStatus: row.mapping_status,
+    source: row.supplier_connection_id && row.supplier_connection_version_id && row.configuration_version_number
+      ? { connectionId: row.supplier_connection_id, configurationVersionId: row.supplier_connection_version_id,
+          configurationVersionNumber: row.configuration_version_number, protocol: 'kayixin_customer_v3' }
+      : null,
+    upstreamProductId: row.upstream_product_id, upstreamSkuType: row.upstream_sku_type,
+    upstreamSkuCode: row.upstream_sku_code, upstreamCombination: row.upstream_combination,
+    quoteScope: row.quote_scope, quoteAmount: row.quote_amount, quoteCurrency: null,
+    currencyStatus: 'unspecified', quoteBasis: row.quote_basis,
+    quoteUnitStatus: 'unverified', actualDebitVerified: false, outcome: row.outcome,
+    observedAt: row.observed_at.toISOString(), sourceReadAt: row.source_read_at?.toISOString() ?? null,
+    structureFingerprint: row.structure_fingerprint, failureCode: row.failure_code,
+    comparison: {
+      comparable: row.comparable_to_previous, reason: row.comparison_reason,
+      previousObservationId: row.previous_observation_id, previousAmount: row.previous_amount,
+      rawReferenceDelta: row.raw_reference_delta,
+    },
+  }
+}
+
+async function insertQuoteObservation(db: MappingDb, administratorId: string, productId: string, skuId: string,
+  attempt: QuoteAttempt): Promise<SupplierReferenceQuoteObservation> {
+  const previous = await db.selectFrom('supplier_reference_quote_observations').selectAll()
+    .where('product_id', '=', productId).where('product_variant_id', '=', skuId)
+    .orderBy('observed_at', 'desc').orderBy('id', 'desc').limit(1).executeTakeFirst()
+  let comparisonReason: SupplierReferenceQuoteObservation['comparison']['reason']
+  let comparable = false
+  const previousAmount: string | null = previous?.quote_amount ?? null
+  let rawReferenceDelta: string | null = null
+  if (attempt.outcome === 'quote_missing') comparisonReason = 'quote_missing'
+  else if (attempt.outcome !== 'observed') comparisonReason = previous ? 'previous_observation_unusable' : 'first_observation'
+  else if (!previous) comparisonReason = 'first_observation'
+  else if (previous.outcome !== 'observed' || previous.quote_amount === null) comparisonReason = 'previous_observation_unusable'
+  else if (previous.supplier_connection_id !== (attempt.mapping?.connectionId ?? null)) comparisonReason = 'different_connection'
+  else if (previous.supplier_connection_version_id !== (attempt.mapping?.configurationVersionId ?? null)) comparisonReason = 'different_configuration'
+  else if (previous.upstream_product_id !== attempt.upstreamProductId) comparisonReason = 'different_product'
+  else if (previous.upstream_sku_type !== attempt.upstreamSkuType
+    || previous.upstream_sku_code !== attempt.upstreamSkuCode
+    || digest(previous.upstream_combination) !== digest(attempt.upstreamCombination)) comparisonReason = 'different_sku'
+  else if (previous.quote_scope !== attempt.quoteScope) comparisonReason = 'different_quote_scope'
+  else if (previous.structure_fingerprint !== attempt.structureFingerprint) comparisonReason = 'structure_changed'
+  else if (attempt.quoteAmount === null) comparisonReason = 'quote_missing'
+  else {
+    comparisonReason = 'comparable_same_source_and_structure'
+    comparable = true
+    rawReferenceDelta = subtractSupplierReferenceAmounts(attempt.quoteAmount, previous.quote_amount)
+  }
+
+  const id = randomUUID()
+  const observedAt = new Date()
+  const mapping = attempt.mapping
+  const row = await db.insertInto('supplier_reference_quote_observations').values({
+    id, administrator_id: administratorId, product_id: productId, product_variant_id: skuId,
+    mapping_id: mapping?.id ?? null, mapping_version_id: mapping?.reviewedVersionId ?? null,
+    mapping_revision: mapping?.revision ?? null, mapping_status: mapping?.status ?? 'none',
+    supplier_connection_id: mapping?.connectionId ?? null,
+    supplier_connection_version_id: mapping?.configurationVersionId ?? null,
+    configuration_version_number: mapping?.configurationVersionNumber ?? null,
+    upstream_product_id: attempt.upstreamProductId, upstream_sku_type: attempt.upstreamSkuType,
+    upstream_sku_code: attempt.upstreamSkuCode,
+    upstream_combination: JSON.stringify(attempt.upstreamCombination),
+    quote_scope: attempt.quoteScope, quote_amount: attempt.quoteAmount, quote_currency: null,
+    currency_status: 'unspecified', quote_basis: attempt.quoteBasis, quote_unit_status: 'unverified',
+    actual_debit_verified: false, outcome: attempt.outcome, observed_at: observedAt,
+    source_read_at: attempt.sourceReadAt, structure_fingerprint: attempt.structureFingerprint,
+    failure_code: attempt.failureCode, comparable_to_previous: comparable,
+    comparison_reason: comparisonReason, previous_observation_id: previous?.id ?? null,
+    previous_amount: previousAmount, raw_reference_delta: rawReferenceDelta,
+  }).returningAll().executeTakeFirstOrThrow() as QuoteObservationRow
+
+  await sql`
+    DELETE FROM supplier_reference_quote_observations
+    WHERE product_id = ${productId}::uuid AND product_variant_id = ${skuId}::uuid
+      AND id NOT IN (
+        SELECT id FROM supplier_reference_quote_observations
+        WHERE product_id = ${productId}::uuid AND product_variant_id = ${skuId}::uuid
+        ORDER BY observed_at DESC, id DESC LIMIT 50
+      )
+  `.execute(db)
+  return quoteObservationFromRow(row)
+}
+
+function failedQuoteAttempt(mapping: SupplierProductMapping | null, outcome: QuoteAttempt['outcome'], failureCode: string | null): QuoteAttempt {
+  return {
+    mapping, outcome, sourceReadAt: null, structureFingerprint: mapping?.structureFingerprint ?? null,
+    quoteScope: null, quoteAmount: null, quoteBasis: null,
+    upstreamProductId: mapping?.upstreamProductId ?? null,
+    upstreamSkuType: mapping?.upstreamSkuType ?? null,
+    upstreamSkuCode: mapping?.upstreamSkuCode ?? null,
+    upstreamCombination: mapping?.upstreamCombination ?? [], failureCode,
+  }
+}
+
+async function markQuoteMappingStale(db: Kysely<Database>, mapping: SupplierProductMapping,
+  administratorId: string, issueCode: string): Promise<SupplierProductMapping> {
+  try { return await markMappingStale(db, mapping.id, mapping.revision, administratorId, issueCode) }
+  catch (error) {
+    if (error instanceof MappingAdminError && error.code === 'SUPPLIER_MAPPING_REVISION_CONFLICT') return loadMapping(db, mapping.id)
+    throw error
+  }
+}
+
 async function getObservationForBody(db: Kysely<Database>, administratorId: string, observationId: string) {
   const row = await db.selectFrom('supplier_product_mapping_observations').selectAll()
     .where('id', '=', observationId).where('administrator_id', '=', administratorId)
@@ -509,6 +638,175 @@ export function registerAdminSupplierProductMappingRoutes(app: FastifyInstance, 
     throw error
   }
 
+  app.get('/api/v1/admin/products/:id/variants/:variantId/reference-quotes', {
+    preHandler: authenticate,
+    schema: { tags: ['admin', 'catalog'], summary: 'Read bounded administrator-only upstream reference quote history',
+      params: ProductVariantIdParamsSchema,
+      response: { 200: ApiSuccessSchemaOf(SupplierReferenceQuoteObservationPageSchema), 401: ApiErrorSchema, 404: ApiErrorSchema } },
+  }, async (request, reply) => {
+    const { id: productId, variantId: skuId } = request.params as { id: string; variantId: string }
+    try {
+      const target = await db.selectFrom('product_variants').select('id')
+        .where('product_id', '=', productId).where('id', '=', skuId).executeTakeFirst()
+      if (!target) throw new MappingAdminError(404, 'LOCAL_SKU_NOT_FOUND', '本地商品或 SKU 不存在。')
+      const rows = await db.selectFrom('supplier_reference_quote_observations').selectAll()
+        .where('product_id', '=', productId).where('product_variant_id', '=', skuId)
+        .orderBy('observed_at', 'desc').orderBy('id', 'desc').limit(50).execute()
+      return reply.send(success({ productId, skuId, items: rows.map(row => quoteObservationFromRow(row)) }, request.id))
+    } catch (error) { return sendError(reply, error, request.id) }
+  })
+
+  app.post('/api/v1/admin/products/:id/variants/:variantId/reference-quotes/observe', {
+    preHandler: protectedWrite,
+    schema: { tags: ['admin', 'catalog'], summary: 'Explicitly read and record one mapped Kayixin V3 reference quote',
+      params: ProductVariantIdParamsSchema, body: SupplierReferenceQuoteObserveBodySchema,
+      response: { 200: ApiSuccessSchemaOf(SupplierReferenceQuoteObservationSchema), ...errorSchemas } },
+  }, async (request, reply) => {
+    const { id: productId, variantId: skuId } = request.params as { id: string; variantId: string }
+    const body = request.body as SupplierReferenceQuoteObserveBody
+    let mapping: SupplierProductMapping | null = null
+    let attempt: QuoteAttempt
+    try {
+      const target = await db.selectFrom('products as product')
+        .innerJoin('product_variants as sku', 'sku.product_id', 'product.id')
+        .select(['product.revision as product_revision', 'product.status as product_status', 'sku.revision as sku_revision'])
+        .where('product.id', '=', productId).where('sku.id', '=', skuId).executeTakeFirst()
+      if (!target) throw new MappingAdminError(404, 'LOCAL_SKU_NOT_FOUND', '本地商品或 SKU 不存在。')
+      if (target.product_revision !== body.expectedProductRevision || target.sku_revision !== body.expectedSkuRevision) {
+        throw new MappingAdminError(409, 'QUOTE_OBSERVATION_TARGET_CHANGED', '商品或 SKU 已变化，请重新读取后再观察报价。')
+      }
+      const head = await db.selectFrom('supplier_product_mapping_heads').select(['id', 'revision', 'status'])
+        .where('product_id', '=', productId).where('product_variant_id', '=', skuId).executeTakeFirst()
+      if ((head?.revision ?? null) !== body.expectedMappingRevision) {
+        throw new MappingAdminError(409, 'QUOTE_OBSERVATION_MAPPING_CHANGED', '供应商映射已变化，请重新读取后再观察报价。')
+      }
+      mapping = head ? await loadMapping(db, head.id) : null
+      if (!mapping) {
+        attempt = failedQuoteAttempt(null, 'mapping_missing', 'SUPPLIER_MAPPING_MISSING')
+      } else if (mapping.status === 'stale') {
+        const configurationChanged = mapping.issues.some(issue => issue.code === 'SUPPLIER_CONFIGURATION_VERSION_CHANGED')
+        attempt = failedQuoteAttempt(mapping, configurationChanged ? 'configuration_changed' : 'mapping_stale',
+          configurationChanged ? 'SUPPLIER_VERSION_CHANGED' : 'SUPPLIER_MAPPING_STALE')
+        if (head?.status !== 'stale') mapping = await markQuoteMappingStale(db, mapping, request.admin!.id, attempt.failureCode!)
+        attempt.mapping = mapping
+      } else if (mapping.status !== 'reviewed') {
+        attempt = failedQuoteAttempt(mapping, 'mapping_not_reviewed', 'SUPPLIER_MAPPING_NOT_REVIEWED')
+      } else {
+        let upstream: Awaited<ReturnType<typeof readCurrentKayixinGoodDetail>> | null = null
+        try {
+          upstream = await readCurrentKayixinGoodDetail(db, config, mapping.connectionId,
+            Number(mapping.upstreamProductId), mapping.configurationVersionId)
+        } catch (error) {
+          if (error instanceof SupplierAdminError && error.code === 'SUPPLIER_VERSION_CHANGED') {
+            mapping = await markQuoteMappingStale(db, mapping, request.admin!.id, error.code)
+            attempt = failedQuoteAttempt(mapping, 'configuration_changed', error.code)
+          } else if (error instanceof KayixinV3Error) {
+            attempt = failedQuoteAttempt(mapping, 'read_failed', 'KAYIXIN_READ_FAILED')
+          } else if (error instanceof SupplierCredentialKeyUnavailableError) {
+            attempt = failedQuoteAttempt(mapping, 'read_failed', 'SUPPLIER_CREDENTIAL_KEY_UNAVAILABLE')
+          } else throw error
+        }
+        if (upstream) {
+          let identity: SelectedUpstreamSku | null = null
+          try { identity = selectedUpstreamSku(upstream, mapping.upstreamSkuType, mapping.upstreamSkuCode) }
+          catch (error) {
+            if (!(error instanceof MappingAdminError) || !error.code.startsWith('UPSTREAM_SKU_')) throw error
+            mapping = await markQuoteMappingStale(db, mapping, request.admin!.id, error.code)
+            attempt = failedQuoteAttempt(mapping, 'identity_changed', error.code)
+          }
+          if (identity) {
+            const identityChanged = upstream.upstreamProductId !== mapping.upstreamProductId
+              || identity.skuType !== mapping.upstreamSkuType || identity.skuCode !== mapping.upstreamSkuCode
+              || digest(identity.combination) !== digest(mapping.upstreamCombination)
+            if (identityChanged) {
+              mapping = await markQuoteMappingStale(db, mapping, request.admin!.id, 'UPSTREAM_QUOTE_IDENTITY_CHANGED')
+              attempt = failedQuoteAttempt(mapping, 'identity_changed', 'UPSTREAM_QUOTE_IDENTITY_CHANGED')
+            } else {
+              const snapshot = supplierProductStructureSnapshot(upstream, identity.skuCode)
+              const fingerprint = digest(snapshot)
+              if (fingerprint !== mapping.structureFingerprint) {
+                mapping = await markQuoteMappingStale(db, mapping, request.admin!.id, 'UPSTREAM_QUOTE_STRUCTURE_CHANGED')
+                attempt = failedQuoteAttempt(mapping, 'structure_changed', 'UPSTREAM_QUOTE_STRUCTURE_CHANGED')
+              } else {
+                const quote = identity.skuType === 0
+                  ? upstream.quote
+                  : upstream.variants.find(item => item.upstreamSku === identity!.skuCode)!.quote
+                const quoteAmount = quote.amount === null ? null : preserveSupplierReferenceAmount(quote.amount)
+                attempt = {
+                  mapping, outcome: quoteAmount === null ? 'quote_missing' : 'observed',
+                  sourceReadAt: new Date(upstream.source.readAt), structureFingerprint: fingerprint,
+                  quoteScope: identity.skuType === 0 ? 'product' : 'variant', quoteAmount,
+                  quoteBasis: quote.basis, upstreamProductId: upstream.upstreamProductId,
+                  upstreamSkuType: identity.skuType, upstreamSkuCode: identity.skuCode,
+                  upstreamCombination: identity.combination, failureCode: quoteAmount === null ? 'UPSTREAM_QUOTE_MISSING' : null,
+                }
+              }
+            }
+          }
+        }
+      }
+
+      const observation = await db.transaction().execute(async trx => {
+        const lockedProduct = await trx.selectFrom('products').select(['revision', 'status'])
+          .where('id', '=', productId).forUpdate().executeTakeFirst()
+        const lockedSku = await trx.selectFrom('product_variants').select(['revision'])
+          .where('product_id', '=', productId).where('id', '=', skuId).forUpdate().executeTakeFirst()
+        if (!lockedProduct || !lockedSku) throw new MappingAdminError(409, 'QUOTE_OBSERVATION_TARGET_CHANGED', '本地商品或 SKU 已变化，无法保存此次观察。')
+        if (lockedSku.revision !== body.expectedSkuRevision) {
+          attempt.outcome = 'sku_changed'
+          attempt.failureCode = 'LOCAL_SKU_REVISION_CHANGED'
+        } else if (lockedProduct.revision !== body.expectedProductRevision) {
+          attempt.outcome = 'mapping_changed'
+          attempt.failureCode = 'LOCAL_PRODUCT_REVISION_CHANGED'
+        }
+
+        const currentHead = await trx.selectFrom('supplier_product_mapping_heads').select(['id', 'revision', 'status'])
+          .where('product_id', '=', productId).where('product_variant_id', '=', skuId).executeTakeFirst()
+        if (!mapping && currentHead) {
+          mapping = await loadMapping(trx, currentHead.id)
+          attempt = failedQuoteAttempt(mapping, 'mapping_changed', 'SUPPLIER_MAPPING_CREATED_DURING_OBSERVATION')
+        } else if (mapping && (!currentHead || currentHead.id !== mapping.id)) {
+          attempt.outcome = 'mapping_changed'
+          attempt.failureCode = 'SUPPLIER_MAPPING_CHANGED_DURING_OBSERVATION'
+        } else if (mapping && currentHead && currentHead.revision !== mapping.revision) {
+          if (attempt.outcome === 'observed' || attempt.outcome === 'quote_missing') {
+            attempt.outcome = 'mapping_changed'
+            attempt.failureCode = 'SUPPLIER_MAPPING_REVISION_CHANGED'
+          }
+          mapping = await loadMapping(trx, currentHead.id)
+          attempt.mapping = mapping
+        }
+
+        if (mapping && (attempt.outcome === 'observed' || attempt.outcome === 'quote_missing')
+          && lockedSku.revision === body.expectedSkuRevision && lockedProduct.revision === body.expectedProductRevision) {
+          try {
+            const context = await lockMappingTarget(trx, {
+              productId, skuId, connectionId: mapping.connectionId,
+              configurationVersionId: mapping.configurationVersionId,
+              templateVersionId: mapping.templateVersion.id, mappingId: mapping.id,
+              expectedRevision: mapping.revision,
+            })
+            if (context.mapping?.status !== 'reviewed') {
+              attempt.outcome = 'mapping_stale'
+              attempt.failureCode = 'SUPPLIER_MAPPING_STALE'
+              mapping = await loadMapping(trx, mapping.id)
+              attempt.mapping = mapping
+            }
+          } catch (error) {
+            if (!(error instanceof MappingAdminError || error instanceof SupplierAdminError)) throw error
+            attempt.outcome = error.code === 'SUPPLIER_VERSION_CHANGED' ? 'configuration_changed' : 'mapping_changed'
+            attempt.failureCode = error.code
+            mapping = await loadMapping(trx, mapping.id).catch(() => mapping)
+            attempt.mapping = mapping
+          }
+        }
+        if (mapping) attempt.mapping = mapping
+        return insertQuoteObservation(trx, request.admin!.id, productId, skuId, attempt)
+      })
+      return reply.send(success(observation, request.id))
+    } catch (error) { return sendError(reply, error, request.id) }
+  })
+
   app.get('/api/v1/admin/supplier-product-mappings/catalog', {
     preHandler: authenticate,
     schema: { tags: ['admin', 'catalog'], summary: 'List local SKUs, applied frozen form versions and mapping state',
@@ -517,7 +815,7 @@ export function registerAdminSupplierProductMappingRoutes(app: FastifyInstance, 
     try {
       const rows = await sql<{
         product_id: string; product_name: string; product_status: string; product_revision: number;
-        sku_id: string; sku_code: string; sku_enabled: boolean; sku_retired_at: Date | null;
+        sku_id: string; sku_revision: number; sku_code: string; sku_enabled: boolean; sku_retired_at: Date | null;
         applied_template_id: string | null; applied_template_version_id: string | null; applied_template_name: string | null;
         applied_template_version_number: number | null; applied_template_sha256: string | null;
         mapping_id: string | null; mapping_status: SupplierMappingStatus | null; mapping_revision: number | null;
@@ -526,7 +824,7 @@ export function registerAdminSupplierProductMappingRoutes(app: FastifyInstance, 
         mapping_upstream_sku_code: string | null; mapping_template_version_id: string | null; mapping_updated_at: Date | null;
       }>`
         SELECT product.id AS product_id, product.name AS product_name, product.status AS product_status,
-          product.revision AS product_revision, sku.id AS sku_id, sku.sku_code, sku.enabled AS sku_enabled,
+          product.revision AS product_revision, sku.id AS sku_id, sku.revision AS sku_revision, sku.sku_code, sku.enabled AS sku_enabled,
           sku.retired_at AS sku_retired_at,
           applied.template_id AS applied_template_id, applied.id AS applied_template_version_id,
           applied.name AS applied_template_name, applied.version_number AS applied_template_version_number,
@@ -561,7 +859,7 @@ export function registerAdminSupplierProductMappingRoutes(app: FastifyInstance, 
         .where('singleton', '=', true).executeTakeFirstOrThrow()
       const items: SupplierMappingCatalogSku[] = rows.rows.map(row => ({
         productId: row.product_id, productName: row.product_name, productStatus: row.product_status,
-        productRevision: row.product_revision, skuId: row.sku_id, skuCode: row.sku_code,
+        productRevision: row.product_revision, skuId: row.sku_id, skuRevision: row.sku_revision, skuCode: row.sku_code,
         skuEnabled: row.sku_enabled, skuRetiredAt: row.sku_retired_at?.toISOString() ?? null,
         appliedTemplateVersion: row.applied_template_version_id && row.applied_template_id
           ? { id: row.applied_template_version_id, templateId: row.applied_template_id,

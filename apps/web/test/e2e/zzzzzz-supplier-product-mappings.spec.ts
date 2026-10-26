@@ -359,6 +359,29 @@ test('prepares, previews, reviews and restores a supplier product mapping with t
   expect(persistedMapping.revision).toBe(newestRevision)
   await page.unroute(reverseRefreshUrl)
 
+  const quoteStatsBefore = await (await page.request.get('http://127.0.0.1:3102/__fixture/stats')).json()
+  await page.getByRole('heading', { name: '上游参考报价观察' }).scrollIntoViewIfNeeded()
+  await expect(page.getByRole('button', { name: '读取当前映射报价', exact: true })).toBeEnabled()
+  const quoteObserveUrl = `${origin}/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes/observe`
+  const lateQuote = responseBarrier()
+  await holdOneResponse(page, quoteObserveUrl, 'POST', lateQuote)
+  await page.getByRole('button', { name: '读取当前映射报价', exact: true }).click()
+  await lateQuote.entered
+  await selectB()
+  await lateQuote.release()
+  await lateQuote.completed
+  await expect(page.locator('body')).not.toContainText('1.23456')
+  await page.unroute(quoteObserveUrl)
+  await selectA()
+  await page.getByRole('heading', { name: '上游参考报价观察' }).scrollIntoViewIfNeeded()
+  await page.getByRole('button', { name: '读取当前映射报价', exact: true }).click()
+  await expect(page.getByRole('status').filter({ hasText: '连接配置 v1' })).toBeVisible()
+  await expect(page.getByText('1.23456', { exact: true }).first()).toBeVisible()
+  await expect(page.getByText('币种未声明 · 单位未验证 · 非实际扣费', { exact: true })).toBeVisible()
+  const quoteStatsAfter = await (await page.request.get('http://127.0.0.1:3102/__fixture/stats')).json()
+  expect(quoteStatsAfter.paths.length).toBeGreaterThan(quoteStatsBefore.paths.length)
+  expect(quoteStatsAfter.paths.every((path: string) => ['/api/v3/user/getAccount', '/api/v3/goods/getList', '/api/v3/goods/getDetail'].includes(path))).toBe(true)
+
   await page.setViewportSize({ width: 390, height: 844 })
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
   const stats = await (await page.request.get('http://127.0.0.1:3102/__fixture/stats')).json()

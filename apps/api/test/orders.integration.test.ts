@@ -1673,10 +1673,19 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
       productRevision: number; items: Array<{ skuId: string; skuRevision: number }>;
     }
     const initialPrice = initialPricePage.items.find(item => item.skuId === catalog.skuId)!
+    const costPreview = await inject({
+      method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/cost-preview`, headers: adminHeaders(admin),
+      payload: { expectedRevision: initialPricePage.productRevision, updates: [{
+        skuId: catalog.skuId, expectedSkuRevision: initialPrice.skuRevision, costPrice: '1.00000',
+      }] },
+    })
+    expect(costPreview.statusCode, costPreview.body).toBe(200)
+    const previewItem = (costPreview.json().data as { items: Array<{ skuId: string; skuRevision: number; inputDigest: string; newCostPrice: string | null }> }).items[0]!
     const savedCost = await inject({
       method: 'PATCH', url: `/api/v1/admin/products/${catalog.productId}/prices/batch`, headers: adminHeaders(admin),
       payload: { expectedRevision: initialPricePage.productRevision, updates: [{
-        skuId: catalog.skuId, expectedSkuRevision: initialPrice.skuRevision, costPrice: '1.00000',
+        skuId: previewItem.skuId, expectedSkuRevision: previewItem.skuRevision,
+        costPrice: previewItem.newCostPrice, costPreviewDigest: previewItem.inputDigest,
       }] },
     })
     expect(savedCost.statusCode, savedCost.body).toBe(200)
@@ -1738,6 +1747,26 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     expect(replay.json().data).toMatchObject({ created: false, order: { id: originalOrderId, totalAmount: '1.20' } })
     expect((await db.selectFrom('orders').select('total_amount').where('id', '=', originalOrderId).executeTakeFirstOrThrow()).total_amount).toBe('1.20')
     expect((await db.selectFrom('order_items').select('unit_price').where('order_id', '=', originalOrderId).executeTakeFirstOrThrow()).unit_price).toBe('1.20')
+
+    const currentPrices = await inject({ method: 'GET', url: `/api/v1/admin/products/${catalog.productId}/prices?page=1&pageSize=50`, headers: { cookie: admin.cookie } })
+    const currentPricePage = currentPrices.json().data as { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> }
+    const currentSku = currentPricePage.items.find(item => item.skuId === catalog.skuId)!
+    const postOrderCostPreview = await inject({ method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/cost-preview`, headers: adminHeaders(admin),
+      payload: { expectedRevision: currentPricePage.productRevision, updates: [{ skuId: catalog.skuId,
+        expectedSkuRevision: currentSku.skuRevision, costPrice: '1.50000' }] } })
+    expect(postOrderCostPreview.statusCode, postOrderCostPreview.body).toBe(200)
+    const postOrderPreviewItem = (postOrderCostPreview.json().data as { items: Array<{ skuId: string; skuRevision: number; inputDigest: string; newCostPrice: string }> }).items[0]!
+    const postOrderCostSaved = await inject({ method: 'PATCH', url: `/api/v1/admin/products/${catalog.productId}/prices/batch`, headers: adminHeaders(admin),
+      payload: { expectedRevision: currentPricePage.productRevision, updates: [{ skuId: postOrderPreviewItem.skuId,
+        expectedSkuRevision: postOrderPreviewItem.skuRevision, costPrice: postOrderPreviewItem.newCostPrice,
+        costPreviewDigest: postOrderPreviewItem.inputDigest }] } })
+    expect(postOrderCostSaved.statusCode, postOrderCostSaved.body).toBe(200)
+    const replayAfterCostChange = await createOrder(items, '0'.repeat(64), customer, oldKey)
+    expect(replayAfterCostChange.statusCode).toBe(200)
+    expect(replayAfterCostChange.json().data).toMatchObject({ created: false, order: { id: originalOrderId, totalAmount: '1.20' } })
+    const originalOrderItem = await db.selectFrom('order_items').select(['unit_price', 'line_amount'])
+      .where('order_id', '=', originalOrderId).executeTakeFirstOrThrow()
+    expect(originalOrderItem).toEqual({ unit_price: '1.20', line_amount: '1.20' })
 
     const renewedQuote = await quote(items, customer)
     expect(renewedQuote.json().data.items[0].unitPrice).toBe('2.00')

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type {
   AdminProductCategory,
+  AdminProductCostPreview,
   AdminProductInventorySummary,
   AdminProductVariantInventory,
   AdminProductVariantPrices,
@@ -96,6 +97,10 @@ const pricePage = ref<AdminProductVariantPricesPage | null>(null)
 const pricePageNumber = ref(1)
 const priceDraft = reactive<Record<string, { salePrice: string; compareAtPrice: string; costPrice: string }>>({})
 const bulkSalePrice = ref('')
+const costPreview = shallowRef<AdminProductCostPreview | null>(null)
+const costPreviewOpen = ref(false)
+const confirmManualCost = ref(false)
+let costOperationSequence = 0
 
 const inventorySummary = shallowRef<AdminProductInventorySummary | null>(null)
 const manualFulfillment = ref<ManualFulfillmentConfigPage>([])
@@ -1412,7 +1417,22 @@ function priceChanged(row: AdminProductVariantPrices) {
     || draft.compareAtPrice.trim() !== (row.compareAtPrice ?? '')
     || draft.costPrice.trim() !== (row.costPrice ?? '')))
 }
-function markPriceDirty() { dirty.prices = currentPriceItems.value.some(priceChanged) }
+function priceFieldsChanged(row: AdminProductVariantPrices) {
+  const draft = priceDraft[row.skuId]
+  return Boolean(draft && (draft.salePrice.trim() !== row.salePrice
+    || draft.compareAtPrice.trim() !== (row.compareAtPrice ?? '')))
+}
+function costChanged(row: AdminProductVariantPrices) {
+  const draft = priceDraft[row.skuId]
+  return Boolean(draft && draft.costPrice.trim() !== (row.costPrice ?? ''))
+}
+function markPriceDirty() {
+  dirty.prices = currentPriceItems.value.some(priceChanged)
+  costOperationSequence++
+  costPreview.value = null
+  costPreviewOpen.value = false
+  confirmManualCost.value = false
+}
 function applyBulkSalePrice() {
   if (!bulkSalePrice.value.trim()) return
   for (const row of currentPriceItems.value) {
@@ -1422,17 +1442,19 @@ function applyBulkSalePrice() {
 }
 async function savePrices() {
   if (!product.value || isArchived.value || saving.value || !pricePage.value) return
-  const updates = pricePage.value.items.filter(priceChanged).map(row => {
+  const updates = pricePage.value.items.filter(priceFieldsChanged).map(row => {
     const draft = priceDraft[row.skuId]!
     return {
       skuId: row.skuId,
       expectedSkuRevision: row.skuRevision,
       ...(draft.salePrice.trim() !== row.salePrice ? { salePrice: draft.salePrice.trim() } : {}),
       ...(draft.compareAtPrice.trim() !== (row.compareAtPrice ?? '') ? { compareAtPrice: draft.compareAtPrice.trim() || null } : {}),
-      ...(draft.costPrice.trim() !== (row.costPrice ?? '') ? { costPrice: draft.costPrice.trim() || null } : {}),
     }
   })
-  if (!updates.length) { dirty.prices = false; return }
+  if (!updates.length) {
+    dirty.prices = currentPriceItems.value.some(costChanged)
+    return
+  }
   saving.value = 'prices'
   clearSectionStatus('prices')
   try {
@@ -1442,11 +1464,124 @@ async function savePrices() {
     setProductRevision(result.productRevision)
     pricePage.value = { ...pricePage.value, productRevision: result.productRevision,
       items: pricePage.value.items.map(row => result.items.find(updated => updated.skuId === row.skuId) ?? row) }
-    for (const row of result.items) priceDraft[row.skuId] = { salePrice: row.salePrice, compareAtPrice: row.compareAtPrice ?? '', costPrice: row.costPrice ?? '' }
-    dirty.prices = false
-    sectionSuccess.prices = `已原子保存 ${result.items.length} 个 SKU 的价格。`
+    for (const row of result.items) {
+      const draft = priceDraft[row.skuId]
+      if (draft) {
+        draft.salePrice = row.salePrice
+        draft.compareAtPrice = row.compareAtPrice ?? ''
+      }
+    }
+    dirty.prices = currentPriceItems.value.some(priceChanged)
+    costPreview.value = null
+    sectionSuccess.prices = `已原子保存 ${updates.length} 个 SKU 的售价或划线价。`
   } catch (error) { await handleSectionError('prices', error) } finally { saving.value = '' }
 }
+
+function costPreviewRiskLabel(risk: string) {
+  return ({
+    MANUAL_MODE: '手动模式不生成售价建议', COST_MISSING: '原成本或新成本缺失', NEGATIVE_PROFIT: '按当前售价计算为负毛利润',
+    FREE_PRICE: '当前售价为免费价', ZERO_COST: '新成本为零', ROUNDING_TO_CENT: '建议售价按分四舍五入',
+    ROUNDING_TO_ZERO: '建议售价舍入为 ¥0.00', PRICE_OVERFLOW: '建议售价超过金额上限', INVALID_PRECISION: '金额精度无效',
+    SKU_RETIRED: 'SKU 已退役', SKU_DISABLED: 'SKU 已停用', COMPARE_AT_PRICE_CONFLICT: '建议售价不低于划线价',
+  } as Record<string, string>)[risk] ?? risk
+}
+
+async function previewCostChanges() {
+  if (!product.value || !pricePage.value || isArchived.value || saving.value) return
+  const costRows = pricePage.value.items.filter(costChanged)
+  if (!costRows.length) return
+  if (pricePage.value.items.some(priceFieldsChanged)) {
+    sectionErrors.prices = '请先保存售价或划线价，再单独预览成本变更。'
+    return
+  }
+  const owner = {
+    sequence: ++costOperationSequence,
+    productId: productId.value,
+    page: pricePageNumber.value,
+    productRevision: product.value.revision,
+    edits: costRows.map(row => ({ skuId: row.skuId, value: priceDraft[row.skuId]!.costPrice.trim() })),
+  }
+  saving.value = 'cost-preview'
+  clearSectionStatus('prices')
+  try {
+    const result = await request<AdminProductCostPreview>(`/api/v1/admin/products/${owner.productId}/cost-preview`, {
+      method: 'POST',
+      body: {
+        expectedRevision: owner.productRevision,
+        updates: costRows.map(row => ({
+          skuId: row.skuId,
+          expectedSkuRevision: row.skuRevision,
+          costPrice: priceDraft[row.skuId]!.costPrice.trim() || null,
+        })),
+      },
+    })
+    const currentEdits = pricePage.value?.items.filter(costChanged).map(row => ({ skuId: row.skuId, value: priceDraft[row.skuId]!.costPrice.trim() })) ?? []
+    if (owner.sequence !== costOperationSequence || owner.productId !== productId.value || owner.page !== pricePageNumber.value
+      || owner.productRevision !== product.value?.revision || JSON.stringify(owner.edits) !== JSON.stringify(currentEdits)) return
+    costPreview.value = result
+    confirmManualCost.value = false
+    costPreviewOpen.value = true
+  } catch (error) {
+    if (owner.sequence === costOperationSequence && owner.productId === productId.value) {
+      sectionErrors.prices = error instanceof Error ? error.message : '成本预览失败，请刷新商品后重试。'
+    }
+  } finally {
+    if (owner.sequence === costOperationSequence) saving.value = ''
+  }
+}
+
+async function confirmCostChanges() {
+  const preview = costPreview.value
+  if (!preview || !confirmManualCost.value || !product.value || !pricePage.value || saving.value
+    || preview.productId !== productId.value || preview.productRevision !== product.value.revision
+    || preview.items.some(item => !item.canConfirm)) return
+  const owner = { sequence: ++costOperationSequence, productId: productId.value, page: pricePageNumber.value }
+  saving.value = 'cost-confirm'
+  clearSectionStatus('prices')
+  try {
+    const result = await request<{ productId: string; productRevision: number; items: AdminProductVariantPrices[] }>(`/api/v1/admin/products/${owner.productId}/prices/batch`, {
+      method: 'PATCH',
+      body: {
+        expectedRevision: preview.productRevision,
+        updates: preview.items.map(item => ({
+          skuId: item.skuId,
+          expectedSkuRevision: item.skuRevision,
+          costPrice: item.newCostPrice,
+          costPreviewDigest: item.inputDigest,
+        })),
+      },
+    })
+    if (owner.sequence !== costOperationSequence || owner.productId !== productId.value || owner.page !== pricePageNumber.value) return
+    setProductRevision(result.productRevision)
+    pricePage.value = { ...pricePage.value, productRevision: result.productRevision,
+      items: pricePage.value.items.map(row => result.items.find(updated => updated.skuId === row.skuId) ?? row) }
+    for (const row of result.items) {
+      const draft = priceDraft[row.skuId]
+      if (draft) draft.costPrice = row.costPrice ?? ''
+    }
+    dirty.prices = currentPriceItems.value.some(priceChanged)
+    costPreview.value = null
+    costPreviewOpen.value = false
+    confirmManualCost.value = false
+    sectionSuccess.prices = `已确认并保存 ${result.items.length} 个 SKU 的人工 CNY 内部单位成本。售价与划线价未更改；适用的定价策略已过期，需重新预览后另行确认售价。`
+  } catch (error) {
+    if (owner.sequence === costOperationSequence && owner.productId === productId.value) {
+      sectionErrors.prices = error instanceof Error ? error.message : '成本确认失败，请刷新商品后检查当前修订。'
+      costPreview.value = null
+      costPreviewOpen.value = false
+      confirmManualCost.value = false
+    }
+  } finally {
+    if (owner.sequence === costOperationSequence) saving.value = ''
+  }
+}
+
+watch(productId, () => {
+  costOperationSequence++
+  costPreview.value = null
+  costPreviewOpen.value = false
+  confirmManualCost.value = false
+})
 async function changePricePage(page: number) {
   if (dirty.prices && !window.confirm('本页价格尚未保存，切换页面会丢弃这些输入。继续吗？')) return
   if (dirty.prices && pricePage.value) {
@@ -3033,8 +3168,8 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     >
                       价格
                     </h2>
-                    <p class="mt-1 text-sm text-muted">
-                      销售价最多两位小数，划线价须高于销售价；成本价仅后台可见，最多五位小数。
+                    <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
+                      售价和划线价可单独保存。成本按 CNY/件人工确认，最多五位小数；先预览成本与利润影响，再单独确认，不代表供应商实际扣费。
                     </p>
                   </div>
                   <UBadge
@@ -3148,8 +3283,8 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                         />
                       </UFormField>
                       <UFormField
-                        label="成本价（¥）"
-                        hint="仅后台展示，可留空"
+                        label="人工确认成本（CNY/件）"
+                        hint="留空表示缺失；仅管理员可见"
                       >
                         <UInput
                           v-model="priceDraft[row.skuId]!.costPrice"
@@ -3187,13 +3322,24 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                   </UButton>
                 </div>
                 <div class="mt-4 flex justify-end">
-                  <UButton
-                    :loading="saving === 'prices'"
-                    :disabled="isArchived || saving !== '' || !dirty.prices"
-                    @click="savePrices"
-                  >
-                    原子保存本页价格
-                  </UButton>
+                  <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                    <UButton
+                      color="neutral"
+                      variant="outline"
+                      :loading="saving === 'cost-preview'"
+                      :disabled="isArchived || saving !== '' || !pricePage?.items.some(costChanged)"
+                      @click="previewCostChanges"
+                    >
+                      预览成本变更
+                    </UButton>
+                    <UButton
+                      :loading="saving === 'prices'"
+                      :disabled="isArchived || saving !== '' || !pricePage?.items.some(priceFieldsChanged)"
+                      @click="savePrices"
+                    >
+                      保存本页售价与划线价
+                    </UButton>
+                  </div>
                 </div>
                 <AdminProductPricingRulesPanel
                   :product-id="product.id"
@@ -4604,6 +4750,155 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
               </div>
             </aside>
           </div>
+
+          <UModal
+            v-model:open="costPreviewOpen"
+            title="成本变更预览"
+            description="以下是人工确认的内部 CNY 单位成本变化。参考报价不会写入成本或售价。"
+            :scrollable="true"
+            :ui="{ content: 'max-w-5xl' }"
+          >
+            <template #body>
+              <div
+                v-if="costPreview"
+                class="grid gap-4"
+              >
+                <UAlert
+                  color="warning"
+                  variant="soft"
+                  title="成本写入与售价调整是两步确认"
+                  description="确认后只更新 cost_price。sale_price 与 compare_at_price 保持原值；适用定价规则会变为 stale。若要改售价，需回到定价规则区重新预览并确认应用。人工录入不证明供应商实际扣费。"
+                />
+                <article
+                  v-for="item in costPreview.items"
+                  :key="item.skuId"
+                  class="min-w-0 rounded-xl border border-default p-4"
+                >
+                  <header class="flex flex-wrap items-start justify-between gap-2">
+                    <div class="min-w-0">
+                      <h3 class="font-mono text-sm font-semibold text-highlighted">
+                        {{ item.skuCode }}
+                      </h3>
+                      <p class="mt-1 break-all text-xs text-dimmed">
+                        SKU {{ item.skuId }} · 修订 {{ item.skuRevision }} · {{ item.mode === 'manual' ? '手动售价' : item.mode === 'fixed_profit' ? '成本 + 固定利润' : `成本加价 ${item.markupRate ?? ''}%` }}
+                      </p>
+                    </div>
+                    <UBadge
+                      color="neutral"
+                      variant="subtle"
+                    >
+                      售价当前保持不变
+                    </UBadge>
+                  </header>
+                  <dl class="mt-4 grid gap-3 text-sm sm:grid-cols-2 xl:grid-cols-4">
+                    <div class="rounded-lg bg-muted/40 p-3">
+                      <dt class="text-muted">
+                        成本（CNY/件）
+                      </dt>
+                      <dd class="mt-1 font-medium tabular-nums text-highlighted">
+                        {{ item.currentCostPrice === null ? '未填写' : `¥${item.currentCostPrice}` }} → {{ item.newCostPrice === null ? '未填写' : `¥${item.newCostPrice}` }}
+                      </dd>
+                      <dd class="mt-1 text-xs text-muted">
+                        差额 {{ item.costDelta === null ? '不可计算（缺少成本基准）' : `¥${item.costDelta}` }}
+                      </dd>
+                    </div>
+                    <div class="rounded-lg bg-muted/40 p-3">
+                      <dt class="text-muted">
+                        当前真实售价
+                      </dt>
+                      <dd class="mt-1 font-medium tabular-nums text-highlighted">
+                        ¥{{ item.salePrice }}
+                      </dd>
+                      <dd class="mt-1 text-xs text-muted">
+                        划线价 {{ item.compareAtPrice === null ? '未设置' : `¥${item.compareAtPrice}` }}
+                      </dd>
+                    </div>
+                    <div class="rounded-lg bg-muted/40 p-3">
+                      <dt class="text-muted">
+                        当前成本下毛利润 / 毛利率
+                      </dt>
+                      <dd class="mt-1 font-medium tabular-nums text-highlighted">
+                        {{ item.currentGrossProfit === null ? '不可计算' : `¥${item.currentGrossProfit}` }}
+                      </dd>
+                      <dd class="mt-1 text-xs text-muted">
+                        {{ item.currentGrossMarginRate === null ? '毛利率不可计算' : `${item.currentGrossMarginRate}%` }}
+                      </dd>
+                    </div>
+                    <div class="rounded-lg bg-muted/40 p-3">
+                      <dt class="text-muted">
+                        新成本下售价不变
+                      </dt>
+                      <dd class="mt-1 font-medium tabular-nums text-highlighted">
+                        {{ item.afterCostGrossProfit === null ? '不可计算' : `¥${item.afterCostGrossProfit}` }}
+                      </dd>
+                      <dd class="mt-1 text-xs text-muted">
+                        {{ item.afterCostGrossMarginRate === null ? '毛利率不可计算' : `${item.afterCostGrossMarginRate}%` }}
+                      </dd>
+                    </div>
+                  </dl>
+                  <div class="mt-3 rounded-lg border border-default p-3 text-sm">
+                    <p class="font-medium text-highlighted">
+                      按当前规则重新计算的建议售价
+                    </p>
+                    <p
+                      v-if="item.suggestedSalePrice !== null"
+                      class="mt-1 tabular-nums"
+                    >
+                      ¥{{ item.suggestedSalePrice }} <span class="text-muted">（变化 {{ item.salePriceDelta === null ? '—' : `¥${item.salePriceDelta}` }}）</span>
+                    </p>
+                    <p
+                      v-else
+                      class="mt-1 text-muted"
+                    >
+                      手动模式保留当前售价，不生成需要执行的调价结果。
+                    </p>
+                    <p
+                      v-if="item.suggestedSalePrice !== null"
+                      class="mt-1 text-xs text-muted"
+                    >
+                      建议毛利润 {{ item.suggestedGrossProfit === null ? '不可计算' : `¥${item.suggestedGrossProfit}` }} · 毛利率 {{ item.suggestedGrossMarginRate === null ? '不可计算' : `${item.suggestedGrossMarginRate}%` }}
+                    </p>
+                  </div>
+                  <div
+                    v-if="item.risks.length"
+                    class="mt-3 flex flex-wrap gap-2"
+                    aria-label="成本预览风险"
+                  >
+                    <UBadge
+                      v-for="risk in item.risks"
+                      :key="risk"
+                      color="warning"
+                      variant="subtle"
+                    >
+                      {{ costPreviewRiskLabel(risk) }}
+                    </UBadge>
+                  </div>
+                </article>
+                <UCheckbox
+                  v-model="confirmManualCost"
+                  label="我确认这些是以 CNY/件人工核定的本店内部成本，并已检查成本缺失、零成本、利润和售价建议风险。"
+                />
+              </div>
+            </template>
+            <template #footer>
+              <div class="flex w-full flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <UButton
+                  color="neutral"
+                  variant="outline"
+                  @click="costPreviewOpen = false"
+                >
+                  返回检查
+                </UButton>
+                <UButton
+                  :loading="saving === 'cost-confirm'"
+                  :disabled="!confirmManualCost || saving !== '' || !costPreview?.items.every(item => item.canConfirm)"
+                  @click="confirmCostChanges"
+                >
+                  确认内部成本（不调整售价）
+                </UButton>
+              </div>
+            </template>
+          </UModal>
 
           <UModal
             v-model:open="categoryManagerOpen"

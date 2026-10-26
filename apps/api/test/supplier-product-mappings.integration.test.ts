@@ -223,12 +223,18 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
     }
     const guest = await inject({ method: 'GET', url: '/api/v1/admin/supplier-product-mappings', headers: { cookie: `aikayun_guest_session=${guestToken}` } })
     expect(guest.statusCode).toBe(401)
+    const customerQuoteHistory = await inject({ method: 'GET', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes`,
+      headers: { cookie: `aikayun_customer_session=${customerA.token}` } })
+    expect(customerQuoteHistory.statusCode).toBe(401)
     const connection = (await connections()).find(row => row.id === connectionId)!
     const noCsrf = await inject({ method: 'POST', url: '/api/v1/admin/supplier-product-mappings/observe',
       headers: { origin, cookie: adminCookie }, payload: { connectionId, expectedConfigurationVersionId: connection.currentVersion.id,
         upstreamProductId: '201001', upstreamSkuType: 1, upstreamSkuCode: 'cn-member' } })
     expect(noCsrf.statusCode).toBe(403)
-    expect(JSON.stringify([guest.json(), noCsrf.json()])).not.toContain(fixtureKayixinCredentials.appSecret)
+    const noQuoteCsrf = await inject({ method: 'POST', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes/observe`,
+      headers: { origin, cookie: adminCookie }, payload: { expectedProductRevision: 1, expectedSkuRevision: 1, expectedMappingRevision: null } })
+    expect(noQuoteCsrf.statusCode).toBe(403)
+    expect(JSON.stringify([guest.json(), noCsrf.json(), customerQuoteHistory.json(), noQuoteCsrf.json()])).not.toContain(fixtureKayixinCredentials.appSecret)
   })
 
   it('distinguishes no-SKU, skuType 1 and skuType 2 by stable upstream codes, and refuses unknown or ambiguous identities', async () => {
@@ -292,6 +298,76 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
     expect(connectionState).toMatchObject({ enabled: false, fulfillmentEligible: false })
     expect((await inject({ method: 'POST', url: `/api/v1/admin/supplier-connections/${connectionId}/catalog/goods/201001`, headers: adminHeaders })).json().data.procurementReady).toBe(false)
     expect(reviewed.body).not.toContain(fixtureKayixinCredentials.appSecret)
+
+    const localRevisions = await db.selectFrom('products').innerJoin('product_variants', 'product_variants.product_id', 'products.id')
+      .select(['products.revision as product_revision', 'product_variants.revision as sku_revision'])
+      .where('products.id', '=', productId).where('product_variants.id', '=', skuId).executeTakeFirstOrThrow()
+    const observeQuote = (productRevision: number, skuRevision: number) => inject({
+      method: 'POST', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes/observe`, headers: adminHeaders,
+      payload: { expectedProductRevision: productRevision, expectedSkuRevision: skuRevision,
+        expectedMappingRevision: reviewed.json().data.mapping.revision },
+    })
+    const firstQuote = await observeQuote(localRevisions.product_revision, localRevisions.sku_revision)
+    expect(firstQuote.statusCode, firstQuote.body).toBe(200)
+    expect(firstQuote.json().data).toMatchObject({
+      productId, skuId, mappingId, mappingStatus: 'reviewed', mappingVersionId: reviewed.json().data.mapping.reviewedVersionId,
+      source: { connectionId, protocol: 'kayixin_customer_v3', configurationVersionNumber: 1 },
+      upstreamProductId: '201001', upstreamSkuType: 1, upstreamSkuCode: 'cn-member',
+      quoteScope: 'variant', quoteAmount: '12.345678901234567890', quoteCurrency: null,
+      currencyStatus: 'unspecified', quoteBasis: 'upstream_account_reference',
+      quoteUnitStatus: 'unverified', actualDebitVerified: false, outcome: 'observed',
+      comparison: { comparable: false, reason: 'first_observation', rawReferenceDelta: null },
+    })
+    fixture.setData((path, body) => {
+      if (path.endsWith('/getList')) return { allCount: 3, allPage: 1,
+        items: [fixtureProduct(201001), fixtureProduct(201002), fixtureProduct(203001)] }
+      if (!path.endsWith('/getDetail')) return { balance: '1.00' }
+      const product = fixtureProduct(Number(body.goodsId)) as FixtureProductData
+      const deep = product.rechargeTemplates?.[5]?.options?.[0]?.expand?.[0]?.options?.[0]?.expand?.[0]
+      if (deep) deep.required = 0
+      ensureAlternateCascadeOption(product)
+      const detail = product.goodsSku?.details?.find((item) => item.sku === 'cn-member') as Record<string, unknown> | undefined
+      if (detail) detail.money = '10.25'
+      return product
+    })
+    const secondQuote = await observeQuote(localRevisions.product_revision, localRevisions.sku_revision)
+    expect(secondQuote.statusCode, secondQuote.body).toBe(200)
+    expect(secondQuote.json().data).toMatchObject({ quoteAmount: '10.25', actualDebitVerified: false,
+      comparison: { comparable: true, reason: 'comparable_same_source_and_structure', previousAmount: '12.345678901234567890',
+        rawReferenceDelta: '-2.095678901234567890' } })
+    fixture.setData((path, body) => {
+      if (path.endsWith('/getList')) return { allCount: 3, allPage: 1,
+        items: [fixtureProduct(201001), fixtureProduct(201002), fixtureProduct(203001)] }
+      if (!path.endsWith('/getDetail')) return { balance: '1.00' }
+      const product = fixtureProduct(Number(body.goodsId)) as FixtureProductData
+      const deep = product.rechargeTemplates?.[5]?.options?.[0]?.expand?.[0]?.options?.[0]?.expand?.[0]
+      if (deep) deep.required = 0
+      ensureAlternateCascadeOption(product)
+      const detail = product.goodsSku?.details?.find((item) => (item as { sku?: string }).sku === 'cn-member') as Record<string, unknown> | undefined
+      if (detail) detail.money = null
+      return product
+    })
+    const missingQuote = await observeQuote(localRevisions.product_revision, localRevisions.sku_revision)
+    expect(missingQuote.statusCode, missingQuote.body).toBe(200)
+    expect(missingQuote.json().data).toMatchObject({ outcome: 'quote_missing', quoteAmount: null, actualDebitVerified: false,
+      comparison: { comparable: false, reason: 'quote_missing', previousAmount: '10.25', rawReferenceDelta: null } })
+    const quoteHistory = await inject({ method: 'GET', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes`, headers: adminHeaders })
+    expect(quoteHistory.statusCode, quoteHistory.body).toBe(200)
+    expect(quoteHistory.json().data.items).toHaveLength(3)
+    expect(JSON.stringify([firstQuote.json(), secondQuote.json(), quoteHistory.json()])).not.toContain(fixtureKayixinCredentials.appSecret)
+    const publicProduct = await inject({ method: 'GET', url: `/api/v1/public/products/${productId}` })
+    expect(publicProduct.statusCode, publicProduct.body).toBe(200)
+    expect(publicProduct.body).not.toContain('12.345678901234567890')
+    expect(publicProduct.body).not.toContain('10.25')
+    expect(publicProduct.body).not.toContain('quoteAmount')
+    expect(publicProduct.body).not.toContain('actualDebitVerified')
+    for (let index = 0; index < 48; index += 1) {
+      const repeated = await observeQuote(localRevisions.product_revision, localRevisions.sku_revision)
+      expect(repeated.statusCode, repeated.body).toBe(200)
+    }
+    const boundedQuoteHistory = await inject({ method: 'GET', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes`, headers: adminHeaders })
+    expect(boundedQuoteHistory.json().data.items).toHaveLength(50)
+    expect(boundedQuoteHistory.json().data.items.some((item: { id: string }) => item.id === firstQuote.json().data.id)).toBe(false)
 
     const beforeDuplicateAttempt = await db.selectFrom('supplier_product_mapping_versions').select('id').where('mapping_id', '=', mappingId).execute()
     const duplicateOptionRules = structuredClone(rules)
@@ -376,6 +452,17 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
     expect(changedConnection.statusCode, changedConnection.body).toBe(200)
     const afterConfigRotation = await inject({ method: 'GET', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders })
     expect(afterConfigRotation.json().data.status).toBe('stale')
+    const quoteTarget = await db.selectFrom('products').innerJoin('product_variants', 'product_variants.product_id', 'products.id')
+      .select(['products.revision as product_revision', 'product_variants.revision as sku_revision'])
+      .where('products.id', '=', productId).where('product_variants.id', '=', skuId).executeTakeFirstOrThrow()
+    const requestCountBeforeStaleQuote = fixture.requests.length
+    const staleConfigurationQuote = await inject({ method: 'POST', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes/observe`,
+      headers: adminHeaders, payload: { expectedProductRevision: quoteTarget.product_revision,
+        expectedSkuRevision: quoteTarget.sku_revision, expectedMappingRevision: afterConfigRotation.json().data.revision } })
+    expect(staleConfigurationQuote.statusCode, staleConfigurationQuote.body).toBe(200)
+    expect(staleConfigurationQuote.json().data).toMatchObject({ outcome: 'configuration_changed', quoteAmount: null,
+      actualDebitVerified: false, mappingStatus: 'stale', comparison: { comparable: false } })
+    expect(fixture.requests).toHaveLength(requestCountBeforeStaleQuote)
     const configRefresh = await inject({ method: 'POST', url: `/api/v1/admin/supplier-product-mappings/${mappingId}/refresh`, headers: adminHeaders,
       payload: { expectedRevision: afterConfigRotation.json().data.revision } })
     expect(configRefresh.statusCode, configRefresh.body).toBe(200)

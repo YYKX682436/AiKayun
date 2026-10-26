@@ -348,6 +348,7 @@ export const UpdateAdminProductVariantPricesBatchBodySchema = Type.Object({
     salePrice: Type.Optional(ProductSalePriceSchema),
     compareAtPrice: Type.Optional(Type.Union([ProductSalePriceSchema, Type.Null()])),
     costPrice: Type.Optional(Type.Union([ProductCostPriceSchema, Type.Null()])),
+    costPreviewDigest: Type.Optional(Type.String({ pattern: '^[a-f0-9]{64}$' })),
   }, { additionalProperties: false, minProperties: 3 }), { minItems: 1, maxItems: 50 }),
 }, { additionalProperties: false })
 
@@ -363,7 +364,17 @@ export const UpdateAdminProductVariantPricesBodySchema = Type.Object({
   salePrice: Type.Optional(ProductSalePriceSchema),
   compareAtPrice: Type.Optional(Type.Union([ProductSalePriceSchema, Type.Null()])),
   costPrice: Type.Optional(Type.Union([ProductCostPriceSchema, Type.Null()])),
+  costPreviewDigest: Type.Optional(Type.String({ pattern: '^[a-f0-9]{64}$' })),
 }, { additionalProperties: false, minProperties: 3 })
+
+export const AdminProductCostPreviewRequestSchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  updates: Type.Array(Type.Object({
+    skuId: Type.String({ format: 'uuid' }),
+    expectedSkuRevision: Type.Integer({ minimum: 1 }),
+    costPrice: Type.Union([ProductCostPriceSchema, Type.Null()]),
+  }, { additionalProperties: false }), { minItems: 1, maxItems: 50 }),
+}, { additionalProperties: false })
 
 export const ProductPricingModeSchema = Type.Union([
   Type.Literal('manual'), Type.Literal('fixed_profit'), Type.Literal('percentage_markup'),
@@ -428,8 +439,41 @@ export const PricingPreviewRiskSchema = Type.Union([
   Type.Literal('MANUAL_MODE'), Type.Literal('COST_MISSING'), Type.Literal('NEGATIVE_PROFIT'),
   Type.Literal('FREE_PRICE'), Type.Literal('ROUNDING_TO_CENT'), Type.Literal('ROUNDING_TO_ZERO'),
   Type.Literal('PRICE_OVERFLOW'), Type.Literal('INVALID_PRECISION'), Type.Literal('SKU_RETIRED'),
-  Type.Literal('SKU_DISABLED'), Type.Literal('COMPARE_AT_PRICE_CONFLICT'),
+  Type.Literal('SKU_DISABLED'), Type.Literal('COMPARE_AT_PRICE_CONFLICT'), Type.Literal('ZERO_COST'),
 ])
+
+export const AdminProductCostPreviewItemSchema = Type.Object({
+  skuId: Type.String({ format: 'uuid' }),
+  skuCode: Type.String({ minLength: 1, maxLength: 64 }),
+  skuRevision: Type.Integer({ minimum: 1 }),
+  ruleRevision: Type.Integer({ minimum: 0 }),
+  inputDigest: Type.String({ pattern: '^[a-f0-9]{64}$' }),
+  mode: ProductPricingModeSchema,
+  ruleStatus: ProductPricingRuleStatusSchema,
+  fixedProfit: Type.Union([ProductCostPriceSchema, Type.Null()]),
+  markupRate: Type.Union([Type.String({ pattern: '^(?:0|[1-9]\\d{0,5})(?:\\.\\d{1,4})?$' }), Type.Null()]),
+  currentCostPrice: Type.Union([ProductCostPriceSchema, Type.Null()]),
+  newCostPrice: Type.Union([ProductCostPriceSchema, Type.Null()]),
+  costDelta: Type.Union([Type.String({ pattern: '^-?(?:0|[1-9]\\d{0,12})\\.\\d{5}$' }), Type.Null()]),
+  salePrice: ProductSalePriceSchema,
+  compareAtPrice: Type.Union([ProductSalePriceSchema, Type.Null()]),
+  currentGrossProfit: Type.Union([Type.String({ pattern: '^-?(?:0|[1-9]\\d{0,12})\\.\\d{5}$' }), Type.Null()]),
+  currentGrossMarginRate: Type.Union([Type.String({ pattern: '^-?(?:0|[1-9]\\d{0,19})\\.\\d{4}$' }), Type.Null()]),
+  afterCostGrossProfit: Type.Union([Type.String({ pattern: '^-?(?:0|[1-9]\\d{0,12})\\.\\d{5}$' }), Type.Null()]),
+  afterCostGrossMarginRate: Type.Union([Type.String({ pattern: '^-?(?:0|[1-9]\\d{0,19})\\.\\d{4}$' }), Type.Null()]),
+  suggestedSalePrice: Type.Union([ProductSalePriceSchema, Type.Null()]),
+  suggestedGrossProfit: Type.Union([Type.String({ pattern: '^-?(?:0|[1-9]\\d{0,12})\\.\\d{5}$' }), Type.Null()]),
+  suggestedGrossMarginRate: Type.Union([Type.String({ pattern: '^-?(?:0|[1-9]\\d{0,19})\\.\\d{4}$' }), Type.Null()]),
+  salePriceDelta: Type.Union([Type.String({ pattern: '^-?(?:0|[1-9]\\d{0,12})\\.\\d{2}$' }), Type.Null()]),
+  risks: Type.Array(PricingPreviewRiskSchema, { maxItems: 10 }),
+  canConfirm: Type.Boolean(),
+}, { additionalProperties: false })
+
+export const AdminProductCostPreviewSchema = Type.Object({
+  productId: Type.String({ format: 'uuid' }),
+  productRevision: Type.Integer({ minimum: 1 }),
+  items: Type.Array(AdminProductCostPreviewItemSchema, { minItems: 1, maxItems: 50 }),
+}, { additionalProperties: false })
 
 export const AdminProductPricingPreviewItemSchema = Type.Object({
   skuId: Type.String({ format: 'uuid' }),
@@ -2996,6 +3040,9 @@ export type AdminProductVariantPrices = Static<typeof AdminProductVariantPricesS
 export type AdminProductVariantPricesQuery = Static<typeof AdminProductVariantPricesQuerySchema>
 export type AdminProductVariantPricesPage = Static<typeof AdminProductVariantPricesPageSchema>
 export type UpdateAdminProductVariantPricesBatchBody = Static<typeof UpdateAdminProductVariantPricesBatchBodySchema>
+export type AdminProductCostPreviewRequest = Static<typeof AdminProductCostPreviewRequestSchema>
+export type AdminProductCostPreviewItem = Static<typeof AdminProductCostPreviewItemSchema>
+export type AdminProductCostPreview = Static<typeof AdminProductCostPreviewSchema>
 export type AdminProductVariantPricesBatchResult = Static<typeof AdminProductVariantPricesBatchResultSchema>
 export type UpdateAdminProductVariantPricesBody = Static<typeof UpdateAdminProductVariantPricesBodySchema>
 export type ProductPricingMode = Static<typeof ProductPricingModeSchema>

@@ -168,6 +168,20 @@ export function preserveSupplierReferenceAmount(value: string): string {
   return value
 }
 
+/** Exact raw-reference arithmetic for same-source observations. This value has
+ * no currency or procurement meaning and must never be used as an internal cost. */
+export function subtractSupplierReferenceAmounts(left: string, right: string): string {
+  preserveSupplierReferenceAmount(left)
+  preserveSupplierReferenceAmount(right)
+  const leftAmount = new ExactDecimal(left)
+  const rightAmount = new ExactDecimal(right)
+  const scale = Math.max(left.split('.')[1]?.length ?? 0, right.split('.')[1]?.length ?? 0)
+  const formatted = leftAmount.minus(rightAmount).toFixed(scale)
+  if (scale === 0) return formatted
+  const [whole, fraction = ''] = formatted.split('.')
+  return `${whole}.${fraction.padEnd(scale, '0')}`
+}
+
 export type UnitPricingRule =
   | { mode: 'fixed_profit'; fixedProfit: string }
   | { mode: 'percentage_markup'; markupRate: string }

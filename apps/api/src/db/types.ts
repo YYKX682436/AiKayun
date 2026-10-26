@@ -429,6 +429,48 @@ export interface SupplierProductMappingObservationsTable {
   expires_at: Date
 }
 
+export type SupplierReferenceQuoteOutcome = 'observed' | 'quote_missing' | 'mapping_missing'
+  | 'mapping_not_reviewed' | 'mapping_stale' | 'configuration_changed' | 'identity_changed'
+  | 'structure_changed' | 'read_failed' | 'mapping_changed' | 'sku_changed'
+export type SupplierReferenceQuoteComparisonReason = 'comparable_same_source_and_structure' | 'first_observation'
+  | 'previous_observation_unusable' | 'different_connection' | 'different_configuration' | 'different_product'
+  | 'different_sku' | 'different_quote_scope' | 'structure_changed' | 'quote_missing'
+
+export interface SupplierReferenceQuoteObservationsTable {
+  id: string
+  administrator_id: string
+  product_id: string
+  product_variant_id: string
+  mapping_id: string | null
+  mapping_version_id: string | null
+  mapping_revision: number | null
+  mapping_status: 'none' | 'draft' | 'reviewed' | 'stale'
+  supplier_connection_id: string | null
+  supplier_connection_version_id: string | null
+  configuration_version_number: number | null
+  upstream_product_id: string | null
+  upstream_sku_type: 0 | 1 | 2 | null
+  upstream_sku_code: string | null
+  upstream_combination: ColumnType<Array<{ title: string; value: string }>, string, string>
+  quote_scope: 'product' | 'variant' | null
+  quote_amount: string | null
+  quote_currency: null
+  currency_status: 'unspecified'
+  quote_basis: 'upstream_account_reference' | null
+  quote_unit_status: 'unverified'
+  actual_debit_verified: false
+  outcome: SupplierReferenceQuoteOutcome
+  observed_at: Generated<Date>
+  source_read_at: Date | null
+  structure_fingerprint: string | null
+  failure_code: string | null
+  comparable_to_previous: Generated<boolean>
+  comparison_reason: SupplierReferenceQuoteComparisonReason
+  previous_observation_id: string | null
+  previous_amount: string | null
+  raw_reference_delta: string | null
+}
+
 export interface SupplierProductMappingVersionsTable {
   id: string
   mapping_id: string
@@ -1311,6 +1353,7 @@ export interface Database {
   supplier_connection_audit_events: SupplierConnectionAuditEventsTable
   supplier_product_mapping_heads: SupplierProductMappingHeadsTable
   supplier_product_mapping_observations: SupplierProductMappingObservationsTable
+  supplier_reference_quote_observations: SupplierReferenceQuoteObservationsTable
   supplier_product_mapping_versions: SupplierProductMappingVersionsTable
   supplier_product_mapping_audit_events: SupplierProductMappingAuditEventsTable
   api_fulfillment_audit_events: ApiFulfillmentAuditEventsTable

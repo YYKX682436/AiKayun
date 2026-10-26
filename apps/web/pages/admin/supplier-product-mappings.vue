@@ -21,6 +21,8 @@ import {
   type SupplierProductMappingRefreshObservation,
   type SupplierProductMappingVersion,
   type SupplierPurchaseField,
+  type SupplierReferenceQuoteObservation,
+  type SupplierReferenceQuoteObservationPage,
 } from '@aikayun/contracts'
 import { useAdminApi } from '~/composables/useAdminApi'
 
@@ -72,9 +74,15 @@ const mapping = shallowRef<SupplierProductMapping | null>(null)
 const appliedTemplate = shallowRef<PurchaseTemplateVersion | null>(null)
 const rules = shallowRef<SupplierMappingRules>({ version: 1, fields: [] })
 const history = shallowRef<SupplierProductMappingHistory | null>(null)
+const quoteHistory = shallowRef<SupplierReferenceQuoteObservation[]>([])
 const loading = ref(true)
 const reading = ref(false)
 const saving = ref(false)
+const quoteLoading = ref(false)
+const quoteObserving = ref(false)
+const quoteError = ref('')
+const quoteMessage = ref('')
+const quoteRequestFailed = ref(false)
 const errorMessage = ref('')
 const successMessage = ref('')
 const refreshMessage = ref('')
@@ -84,6 +92,7 @@ let skuGeneration = 0
 let operationSequence = 0
 let activeReadOperation: number | null = null
 let activeSaveOperation: number | null = null
+let quoteOperation = 0
 
 const root = '/api/v1/admin/supplier-product-mappings'
 const kayixinConnections = computed(() => connections.value.filter(item => item.providerType === 'kayixin_customer_v3'))
@@ -127,6 +136,21 @@ const sourceVersionLabel = computed(() => observation.value
   : mapping.value ? `${mapping.value.configurationVersionNumber} · ${formatDate(mapping.value.observedAt)}` : '尚未读取')
 const canSave = computed(() => Boolean(canEditTarget.value && selectedSku.value?.appliedTemplateVersion && selectedConnection.value && observation.value && rules.value.version === 1 && !saving.value))
 const canEditTarget = computed(() => Boolean(selectedSku.value && selectedSku.value.productStatus !== 'archived' && !selectedSku.value.skuRetiredAt))
+const canObserveQuote = computed(() => Boolean(selectedSku.value && !selectedSku.value.skuRetiredAt && !quoteObserving.value))
+const latestQuoteObservation = computed(() => quoteHistory.value[0] ?? null)
+const quoteContextWarning = computed(() => {
+  const latest = latestQuoteObservation.value
+  if (!latest) return ''
+  if (quoteObserving.value) return '正在读取新的上游报价；以下仍是前次观察记录，不是本次读取结果。'
+  if (quoteRequestFailed.value) return '本次报价读取未完成；以下仍是前次观察记录，不代表当前上游报价。'
+  const current = mapping.value ?? mappingForSelectedSku.value
+  if (!current) return '当前 SKU 没有供应商映射；以下报价只属于历史观察，不代表当前上游报价。'
+  if (current.status !== 'reviewed' || current.id !== latest.mappingId
+    || current.revision !== latest.mappingRevision || current.reviewedVersionId !== latest.mappingVersionId) {
+    return '当前映射状态或版本已变化；以下报价只属于对应版本的历史观察，不代表当前上游报价。请先处理映射状态，再主动读取新报价。'
+  }
+  return ''
+})
 const preview = computed(() => {
   if (!currentDefinition.value) return null
   return previewSupplierProductMapping({ definition: currentDefinition.value, upstreamFields: observedFields.value, rules: rules.value })
@@ -135,6 +159,19 @@ const blockingIssues = computed(() => preview.value?.issues.filter(issue => issu
 const fieldTypeLabel = (type: string) => ({ text: '单行文本', digits: '数字字符', textarea: '多行文本', select: '单选', cascade: '级联', image: '图片' }[type] ?? type)
 const upstreamTypeLabel = (type: number | null) => ({ 0: '文本（0）', 1: '图片（1）', 13: '数字字符（13）', 14: '单选（14）', 15: '多行文本（15）', 16: '级联（16）' }[type ?? -1] ?? `未知类型（${type ?? '缺失'}）`)
 const statusLabel = (status: string) => ({ draft: '草稿', reviewed: '已审核', stale: '需重新审核' }[status] ?? status)
+const quoteOutcomeLabel = (outcome: string) => ({
+  observed: '已观察到参考报价', quote_missing: '上游未提供报价', mapping_missing: '尚未建立 SKU 映射',
+  mapping_not_reviewed: '映射尚未审核', mapping_stale: '映射已过期', configuration_changed: '供应商配置已轮换',
+  identity_changed: '上游商品或 SKU 身份变化', structure_changed: '上游结构变化', read_failed: '只读请求失败',
+  mapping_changed: '观察期间映射发生变化', sku_changed: '观察期间本地 SKU 发生变化',
+}[outcome] ?? outcome)
+const quoteComparisonLabel = (reason: string) => ({
+  comparable_same_source_and_structure: '同连接、同配置、同 SKU 与同结构；仅比较上游原始数值',
+  first_observation: '首次观察，没有前次可比记录', previous_observation_unusable: '前次观察失败或缺少报价',
+  different_connection: '供应商连接不同', different_configuration: '供应商配置版本不同',
+  different_product: '上游商品身份不同', different_sku: '上游 SKU 身份不同',
+  different_quote_scope: '报价字段来源不同', structure_changed: '上游结构指纹不同', quote_missing: '本次观察缺少报价',
+}[reason] ?? reason)
 const issueLabel = (code: string) => ({
   UPSTREAM_PURCHASE_FIELDS_MISSING: '上游未返回购买字段结构', UPSTREAM_FIELD_TYPE_UNKNOWN: '上游字段类型未知',
   UPSTREAM_REQUIRED_SEMANTICS_UNKNOWN: '上游必填语义未知', UPSTREAM_FIELD_DUPLICATE_AMBIGUOUS: '上游字段结构重复，无法唯一定位',
@@ -441,6 +478,7 @@ async function loadPage(options: { preserveSource?: boolean } = {}) {
   } catch (error) {
     if (current === generation) errorMessage.value = error instanceof Error ? error.message : '映射配置加载失败。'
   } finally { if (current === generation) loading.value = false }
+  if (current === generation && selectedSku.value) void loadQuoteHistory()
 }
 async function loadAppliedTemplate(expectedGeneration = generation) {
   const sku = localSkus.value.find(item => item.skuId === selectedSkuId.value)
@@ -628,6 +666,79 @@ async function loadHistory() {
     if (operation === historyOperation && ownsCurrentSelection(owner)) errorMessage.value = error instanceof Error ? error.message : '映射历史加载失败。'
   }
 }
+async function loadQuoteHistory() {
+  const sku = selectedSku.value
+  if (!sku) { quoteHistory.value = []; return }
+  const operation = ++quoteOperation
+  const owner = { generation, skuId: sku.skuId, productId: sku.productId }
+  quoteLoading.value = true
+  try {
+    const result = await request<SupplierReferenceQuoteObservationPage>(
+      `/api/v1/admin/products/${owner.productId}/variants/${owner.skuId}/reference-quotes`,
+    )
+    if (operation === quoteOperation && owner.generation === generation
+      && selectedSkuId.value === owner.skuId && selectedSku.value?.productId === owner.productId) {
+      quoteHistory.value = result.items
+    }
+  } catch (error) {
+    if (operation === quoteOperation && owner.generation === generation && selectedSkuId.value === owner.skuId) {
+      quoteError.value = error instanceof Error ? error.message : '参考报价历史读取失败。'
+    }
+  } finally {
+    if (operation === quoteOperation) quoteLoading.value = false
+  }
+}
+async function observeReferenceQuote() {
+  const sku = selectedSku.value
+  if (!sku || !canObserveQuote.value) return
+  const targetMapping = mapping.value ?? mappingForSelectedSku.value
+  const owner = {
+    operation: ++quoteOperation,
+    generation,
+    productId: sku.productId,
+    skuId: sku.skuId,
+    productRevision: sku.productRevision,
+    skuRevision: sku.skuRevision,
+    mappingId: targetMapping?.id ?? null,
+    mappingRevision: targetMapping?.revision ?? null,
+    connectionId: targetMapping?.connectionId ?? null,
+    configurationVersionId: targetMapping?.configurationVersionId ?? null,
+  }
+  quoteObserving.value = true
+  quoteError.value = ''
+  quoteMessage.value = ''
+  quoteRequestFailed.value = false
+  try {
+    const observation = await request<SupplierReferenceQuoteObservation>(
+      `/api/v1/admin/products/${owner.productId}/variants/${owner.skuId}/reference-quotes/observe`,
+      { method: 'POST', body: {
+        expectedProductRevision: owner.productRevision,
+        expectedSkuRevision: owner.skuRevision,
+        expectedMappingRevision: owner.mappingRevision,
+      } },
+    )
+    const ownsTarget = owner.operation === quoteOperation && owner.generation === generation
+      && selectedSkuId.value === owner.skuId && selectedSku.value?.productId === owner.productId
+      && (mapping.value?.id ?? mappingForSelectedSku.value?.id ?? null) === owner.mappingId
+      && (mapping.value?.revision ?? mappingForSelectedSku.value?.revision ?? null) === owner.mappingRevision
+    if (!ownsTarget) return
+    quoteHistory.value = [observation, ...quoteHistory.value.filter(item => item.id !== observation.id)].slice(0, 50)
+    quoteMessage.value = `${quoteOutcomeLabel(observation.outcome)} · ${observation.source ? `连接配置 v${observation.source.configurationVersionNumber}` : '无有效上游来源'}。`
+    if (observation.mappingId && observation.mappingId === owner.mappingId) {
+      const refreshed = await request<SupplierProductMapping>(`${root}/${observation.mappingId}`)
+      const refreshedOwner = captureSelectionOwner()
+      const merged = mergeMappingResult(refreshed, refreshedOwner, owner.connectionId, owner.configurationVersionId)
+      if (owner.operation === quoteOperation && ownsCurrentSelection(refreshedOwner) && merged) mapping.value = merged
+    }
+  } catch (error) {
+    if (owner.operation === quoteOperation && owner.generation === generation && selectedSkuId.value === owner.skuId) {
+      quoteRequestFailed.value = true
+      quoteError.value = error instanceof Error ? error.message : '参考报价观察失败。请重新读取商品和映射状态。'
+    }
+  } finally {
+    if (owner.operation === quoteOperation) quoteObserving.value = false
+  }
+}
 async function restoreVersion(version: SupplierProductMappingVersion) {
   const owner = captureSelectionOwner()
   if (!owner.mappingId || owner.mappingRevision === null || version.mappingId !== owner.mappingId || saving.value) return
@@ -657,20 +768,23 @@ async function restoreVersion(version: SupplierProductMappingVersion) {
 }
 watch(selectedSkuId, () => {
   if (loading.value) return
+  quoteOperation++; quoteObserving.value = false; quoteHistory.value = []; quoteError.value = ''; quoteMessage.value = ''; quoteRequestFailed.value = false
   generation++; activeReadOperation = null; activeSaveOperation = null; reading.value = false; saving.value = false
   errorMessage.value = ''; successMessage.value = ''; refreshMessage.value = ''; history.value = null
   mapping.value = mappingForSelectedSku.value
   catalog.value = null; observation.value = null; upstreamProduct.value = null; selectedUpstreamSku.value = ''
   void loadAppliedTemplate()
+  void loadQuoteHistory()
 })
 watch(selectedConnectionId, () => {
   if (loading.value) return
+  quoteOperation++; quoteObserving.value = false
   generation++; activeReadOperation = null; activeSaveOperation = null; reading.value = false; saving.value = false
   errorMessage.value = ''; successMessage.value = ''; refreshMessage.value = ''; history.value = null
   catalog.value = null; upstreamProduct.value = null; observation.value = null
 })
 onMounted(() => { void loadPage() })
-onBeforeUnmount(() => { generation++; skuGeneration++; activeReadOperation = null; activeSaveOperation = null })
+onBeforeUnmount(() => { generation++; skuGeneration++; quoteOperation++; activeReadOperation = null; activeSaveOperation = null })
 </script>
 
 <template>
@@ -1030,6 +1144,182 @@ onBeforeUnmount(() => { generation++; skuGeneration++; activeReadOperation = nul
               </p>
             </section>
           </div>
+
+          <section
+            aria-labelledby="supplier-reference-quotes-title"
+            class="min-w-0 rounded-xl border border-default bg-elevated p-4 sm:p-5"
+          >
+            <header class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div class="min-w-0">
+                <h2
+                  id="supplier-reference-quotes-title"
+                  class="font-semibold text-highlighted"
+                >
+                  上游参考报价观察
+                </h2>
+                <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
+                  仅在管理员点击时重新读取当前审核映射对应的 V3 商品 / SKU。原始报价的币种、单位和实际扣费均未验证；这里的数值变化不是 CNY 成本变化。
+                </p>
+              </div>
+              <UButton
+                icon="i-lucide-scan-search"
+                :loading="quoteObserving"
+                :disabled="!canObserveQuote"
+                class="min-h-11 shrink-0"
+                @click="observeReferenceQuote"
+              >
+                读取当前映射报价
+              </UButton>
+            </header>
+            <UAlert
+              v-if="quoteError"
+              class="mt-4"
+              color="error"
+              variant="soft"
+              :title="quoteError"
+              role="alert"
+            />
+            <UAlert
+              v-if="quoteMessage"
+              class="mt-4"
+              color="info"
+              variant="soft"
+              :title="quoteMessage"
+              role="status"
+            />
+            <UAlert
+              v-if="quoteContextWarning"
+              class="mt-4"
+              color="warning"
+              variant="soft"
+              title="当前报价状态已变化"
+              :description="quoteContextWarning"
+              role="status"
+            />
+            <div
+              v-if="latestQuoteObservation"
+              class="mt-4 rounded-xl border border-default bg-default p-4"
+            >
+              <div class="flex flex-wrap items-start justify-between gap-2">
+                <div class="min-w-0">
+                  <p class="font-medium text-highlighted">
+                    {{ quoteOutcomeLabel(latestQuoteObservation.outcome) }}
+                  </p>
+                  <p class="mt-1 text-xs text-muted">
+                    本地观察 {{ formatDate(latestQuoteObservation.observedAt) }}
+                    <span v-if="latestQuoteObservation.sourceReadAt">· 上游读取 {{ formatDate(latestQuoteObservation.sourceReadAt) }}</span>
+                  </p>
+                </div>
+                <UBadge
+                  :color="latestQuoteObservation.outcome === 'observed' ? 'neutral' : 'warning'"
+                  variant="subtle"
+                >
+                  {{ latestQuoteObservation.mappingStatus === 'reviewed' ? '映射已审核' : latestQuoteObservation.mappingStatus === 'stale' ? '映射已过期' : latestQuoteObservation.mappingStatus === 'draft' ? '映射草稿' : '无映射' }}
+                </UBadge>
+              </div>
+              <dl class="mt-4 grid gap-3 text-sm sm:grid-cols-2 xl:grid-cols-4">
+                <div class="rounded-lg bg-elevated p-3">
+                  <dt class="text-muted">
+                    上游原始参考报价
+                  </dt>
+                  <dd class="mt-1 break-all font-mono text-lg font-semibold tabular-nums text-highlighted">
+                    {{ latestQuoteObservation.quoteAmount ?? '未提供' }}
+                  </dd>
+                  <dd class="mt-1 text-xs text-muted">
+                    币种未声明 · 单位未验证 · 非实际扣费
+                  </dd>
+                </div>
+                <div class="rounded-lg bg-elevated p-3">
+                  <dt class="text-muted">
+                    只读来源
+                  </dt>
+                  <dd class="mt-1 break-all font-medium text-highlighted">
+                    {{ latestQuoteObservation.source ? `连接 ${latestQuoteObservation.source.connectionId} · 配置 v${latestQuoteObservation.source.configurationVersionNumber}` : '无可用来源' }}
+                  </dd>
+                  <dd class="mt-1 text-xs text-muted">
+                    商品 {{ latestQuoteObservation.upstreamProductId ?? '—' }} · {{ latestQuoteObservation.quoteScope === 'variant' ? `上游 SKU ${latestQuoteObservation.upstreamSkuCode ?? '—'}` : latestQuoteObservation.quoteScope === 'product' ? '商品级报价' : '报价范围未知' }}
+                  </dd>
+                  <dd class="mt-1 break-words text-xs text-muted">
+                    观察规格 {{ latestQuoteObservation.upstreamCombination.map(part => `${part.title}：${part.value}`).join(' / ') || '无规格组合' }}
+                  </dd>
+                </div>
+                <div class="rounded-lg bg-elevated p-3">
+                  <dt class="text-muted">
+                    审核映射版本
+                  </dt>
+                  <dd class="mt-1 break-all font-mono text-xs text-highlighted">
+                    {{ latestQuoteObservation.mappingVersionId ?? '无审核版本' }}
+                  </dd>
+                  <dd class="mt-1 text-xs text-muted">
+                    修订 {{ latestQuoteObservation.mappingRevision ?? '—' }} · {{ latestQuoteObservation.mappingStatus }}
+                  </dd>
+                </div>
+                <div class="rounded-lg bg-elevated p-3">
+                  <dt class="text-muted">
+                    报价结构来源
+                  </dt>
+                  <dd class="mt-1 break-all font-mono text-xs text-highlighted">
+                    {{ latestQuoteObservation.structureFingerprint ?? '没有可验证指纹' }}
+                  </dd>
+                  <dd class="mt-1 text-xs text-muted">
+                    {{ latestQuoteObservation.failureCode ?? 'quote.amount 原值' }}
+                  </dd>
+                </div>
+              </dl>
+              <div class="mt-3 rounded-lg border border-default p-3 text-sm">
+                <p class="font-medium text-highlighted">
+                  与前次观察的可比性
+                </p>
+                <p class="mt-1 text-muted">
+                  {{ quoteComparisonLabel(latestQuoteObservation.comparison.reason) }}
+                </p>
+                <p
+                  v-if="latestQuoteObservation.comparison.comparable"
+                  class="mt-1 font-medium tabular-nums text-highlighted"
+                >
+                  原始参考数值变化 {{ latestQuoteObservation.comparison.rawReferenceDelta }} · 不是 CNY 成本变化
+                </p>
+                <p
+                  v-else
+                  class="mt-1 text-xs text-muted"
+                >
+                  未计算数值差；不会沿用前次观察作为本次报价。
+                </p>
+              </div>
+            </div>
+            <div
+              v-if="quoteLoading"
+              class="mt-4 flex items-center gap-2 text-sm text-muted"
+              role="status"
+              aria-live="polite"
+            >
+              <UIcon
+                name="i-lucide-loader-circle"
+                class="size-4 animate-spin"
+                aria-hidden="true"
+              />
+              正在读取本地报价观察历史…
+            </div>
+            <ul
+              v-if="quoteHistory.length > 1"
+              class="mt-3 grid gap-2"
+            >
+              <li
+                v-for="item in quoteHistory.slice(1)"
+                :key="item.id"
+                class="flex flex-col gap-1 rounded-lg border border-default p-3 text-sm sm:flex-row sm:items-center sm:justify-between"
+              >
+                <span class="min-w-0 break-words text-highlighted">{{ formatDate(item.observedAt) }} · {{ quoteOutcomeLabel(item.outcome) }} · 原值 {{ item.quoteAmount ?? '缺失' }}</span>
+                <span class="shrink-0 text-xs text-muted">配置 v{{ item.source?.configurationVersionNumber ?? '—' }} · {{ item.mappingStatus === 'reviewed' ? '审核映射' : '不可用映射' }}</span>
+              </li>
+            </ul>
+            <p
+              v-if="!quoteLoading && !quoteHistory.length"
+              class="mt-4 text-sm text-muted"
+            >
+              尚无报价观察。观察不会在顾客浏览、报价或下单时触发。
+            </p>
+          </section>
 
           <section
             aria-labelledby="field-mapping-title"
