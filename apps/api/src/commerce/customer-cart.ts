@@ -37,6 +37,7 @@ import { quoteCheckoutItems, quoteCheckoutPurchaseLines, normalizeCheckoutItems,
 import { assertGuestSession, guestSessionCookie } from './orders.js'
 import { PurchaseDraftServiceError, claimGuestPurchaseDraftsInTransaction,
   createPurchaseDraftInTransaction, savePurchaseDraftInTransaction,
+  discardCartLineReplacementDraftsInTransaction, prepareCartReplacementAttachmentCopies,
   releaseUnreferencedPurchaseDraftAttachment, transferCartReplacementAttachmentsInTransaction,
   validatePurchaseDraftForPurchaseInTransaction, type PreparedCartReplacementAttachmentCopy } from './purchase-forms.js'
 import { normalizePurchaseLineRequests, preparedPurchaseFormVersion, purchaseLineContentIdentity,
@@ -224,17 +225,62 @@ function mergeDigest(items: CartSkuQuantity[]): string {
 }
 
 async function discardPendingLineReplacements(trx: Transaction<Database>, lineIds: string[]): Promise<void> {
-  if (!lineIds.length) return
-  const relations = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
-    .where('line_id', 'in', lineIds).orderBy('line_id').forUpdate().execute()
-  if (!relations.length) return
-  const targetIds = relations.map(relation => relation.replacement_draft_id).sort()
-  await trx.selectFrom('purchase_drafts').select('id').where('id', 'in', targetIds).orderBy('id').forUpdate().execute()
-  await trx.deleteFrom('customer_cart_line_replacement_drafts').where('line_id', 'in', lineIds).execute()
-  await trx.updateTable('purchase_drafts').set({ status: 'deleting' }).where('id', 'in', targetIds).execute()
-  await trx.deleteFrom('purchase_draft_attachment_references').where('draft_id', 'in', targetIds).execute()
-  await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: new Date() })
-    .where('draft_id', 'in', targetIds).where('status', 'in', ['uploading', 'ready', 'failed']).execute()
+  await discardCartLineReplacementDraftsInTransaction(trx, lineIds)
+}
+
+type ReplacementSourceLine = {
+  line_id: string
+  customer_id: string
+  revision: number
+  draft_id: string | null
+  draft_revision: number | null
+  template_version_id: string | null
+  content_identity: string
+}
+
+/** Keep the relation alive only when the bound source identity is unchanged. */
+async function reconcileReplacementAfterCartLineUpdate(
+  trx: Transaction<Database>,
+  before: ReplacementSourceLine,
+  after: ReplacementSourceLine,
+): Promise<void> {
+  const relation = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
+    .where('line_id', '=', before.line_id).where('customer_id', '=', before.customer_id).forUpdate().executeTakeFirst()
+  if (!relation) return
+  const draftIds = [...new Set([relation.source_draft_id, relation.replacement_draft_id])].sort()
+  const drafts = await trx.selectFrom('purchase_drafts').select(['id', 'status', 'expires_at', 'revision', 'template_version_id'])
+    .where('id', 'in', draftIds).orderBy('id').forUpdate().execute()
+  const target = drafts.find(draft => draft.id === relation.replacement_draft_id)
+  const source = drafts.find(draft => draft.id === after.draft_id)
+  const unchanged = before.draft_id !== null && before.draft_id === after.draft_id
+    && before.template_version_id === after.template_version_id
+    && before.draft_revision === after.draft_revision
+    && before.content_identity === after.content_identity
+  const relationStillMatches = relation.source_draft_id === before.draft_id
+    && relation.source_line_revision === before.revision
+    && relation.source_draft_revision === before.draft_revision
+  const nextSourceValid = source?.status === 'active' && source.expires_at > new Date()
+    && source.revision === after.draft_revision && source.template_version_id === after.template_version_id
+  const targetValid = target?.status === 'active' && target.expires_at > new Date()
+    && target.template_version_id === after.template_version_id
+  if (unchanged && relationStillMatches && nextSourceValid && targetValid) {
+    await trx.updateTable('customer_cart_line_replacement_drafts').set({
+      source_line_revision: after.revision,
+      source_draft_revision: after.draft_revision!,
+    }).where('line_id', '=', before.line_id).execute()
+    return
+  }
+  await discardPendingLineReplacements(trx, [before.line_id])
+}
+
+async function setCartLineQuantityInTransaction(
+  trx: Transaction<Database>, before: ReplacementSourceLine, quantity: number,
+): Promise<number> {
+  const updated = await trx.updateTable('customer_cart_items').set({ quantity })
+    .where('customer_id', '=', before.customer_id).where('line_id', '=', before.line_id)
+    .returning('revision').executeTakeFirstOrThrow()
+  await reconcileReplacementAfterCartLineUpdate(trx, before, { ...before, revision: updated.revision })
+  return updated.revision
 }
 
 async function releaseUncommittedReplacementCopies(
@@ -274,7 +320,7 @@ async function addCartLineInTransaction(
   trx: Transaction<Database>, customerId: string, line: CartLineContent,
 ): Promise<{ retainedLineId: string; changed: boolean }> {
   const currentRows = await trx.selectFrom('customer_cart_items')
-    .select(['line_id', 'sku_id', 'quantity', 'content_identity', 'draft_id', 'draft_revision', 'template_version_id'])
+    .select(['line_id', 'sku_id', 'quantity', 'revision', 'content_identity', 'draft_id', 'draft_revision', 'template_version_id'])
     .where('customer_id', '=', customerId).orderBy('line_id').execute()
   const skuTotal = currentRows.filter(row => row.sku_id === line.skuId)
     .reduce((total, row) => total + row.quantity, 0)
@@ -293,14 +339,23 @@ async function addCartLineInTransaction(
         || bound.revision !== existing.draft_revision || bound.template_version_id !== existing.template_version_id
       if (stale) {
         if (!line.draftId) throw new CartError(409, 'PURCHASE_DRAFT_INVALID', '原购物车填写资料已失效，请重新确认。')
+        await discardPendingLineReplacements(trx, [existing.line_id])
         replacement = {
           draft_id: line.draftId, draft_revision: line.draftRevision,
           template_version_id: line.templateVersionId, normalization_version: line.normalizationVersion,
         }
       }
     }
-    await trx.updateTable('customer_cart_items').set({ quantity: existing.quantity + line.quantity, ...replacement })
-      .where('line_id', '=', existing.line_id).execute()
+    const updated = await trx.updateTable('customer_cart_items').set({ quantity: existing.quantity + line.quantity, ...replacement })
+      .where('line_id', '=', existing.line_id).returning('revision').executeTakeFirstOrThrow()
+    const after: ReplacementSourceLine = {
+      line_id: existing.line_id, customer_id: customerId, revision: updated.revision,
+      draft_id: replacement.draft_id ?? existing.draft_id,
+      draft_revision: replacement.draft_revision ?? existing.draft_revision,
+      template_version_id: replacement.template_version_id ?? existing.template_version_id,
+      content_identity: existing.content_identity,
+    }
+    await reconcileReplacementAfterCartLineUpdate(trx, { ...existing, customer_id: customerId }, after)
     return { retainedLineId: existing.line_id, changed: true }
   }
   if (currentRows.length >= maxCartLines) {
@@ -548,14 +603,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
         if (other.reduce((sum, row) => sum + row.quantity, body.quantity) > maxLineQuantity) {
           throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
         }
-        const updated = await trx.updateTable('customer_cart_items').set({ quantity: body.quantity })
-          .where('line_id', '=', lineId).returning('revision').executeTakeFirstOrThrow()
-        const replacement = await trx.selectFrom('customer_cart_line_replacement_drafts').select('line_id')
-          .where('line_id', '=', lineId).forUpdate().executeTakeFirst()
-        if (replacement) {
-          await trx.updateTable('customer_cart_line_replacement_drafts')
-            .set({ source_line_revision: updated.revision }).where('line_id', '=', lineId).execute()
-        }
+        await setCartLineQuantityInTransaction(trx, line, body.quantity)
       })
       const cart = await authenticatedCartSnapshot(db, request.customer!, config)
       reply.header('cache-control', 'no-store')
@@ -589,27 +637,31 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
         }
         const effective = await effectivePurchaseFormForSku(trx, line.sku_id, { lockStatus: 'share' })
         if (!effective.templateVersionId || effective.templateVersionId !== line.template_version_id) {
-          throw new CartError(409, 'PURCHASE_FORM_VERSION_CHANGED', '商品填写模板已变化，当前购买行仍保留原资料。')
+          await discardPendingLineReplacements(trx, [lineId])
+          return { httpStatus: 409 as const, error: {
+            code: 'PURCHASE_FORM_VERSION_CHANGED', message: '商品填写模板已变化，当前购买行仍保留原资料。',
+          } }
         }
         const existing = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
           .where('line_id', '=', lineId).where('customer_id', '=', customer.id).forUpdate().executeTakeFirst()
         if (existing) {
-          if (existing.source_draft_id !== line.draft_id || existing.source_line_revision !== line.revision
-            || existing.source_draft_revision !== line.draft_revision) {
-            throw new CartError(409, 'CART_REPLACEMENT_CONFLICT', '此购买行的编辑草稿已失效，请重新打开购买行。')
-          }
           const target = await trx.selectFrom('purchase_drafts').select(['id', 'revision', 'status', 'expires_at', 'template_version_id'])
             .where('id', '=', existing.replacement_draft_id).forUpdate().executeTakeFirst()
-          if (!target || target.status !== 'active' || target.expires_at <= new Date()
-            || target.template_version_id !== effective.templateVersionId) {
-            throw new CartError(409, 'CART_REPLACEMENT_EXPIRED', '编辑草稿已过期或模板已变化；原购物车资料仍保留。')
+          const relationCurrent = existing.source_draft_id === line.draft_id
+            && existing.source_line_revision === line.revision
+            && existing.source_draft_revision === line.draft_revision
+          if (relationCurrent && target && target.status === 'active' && target.expires_at > new Date()
+            && target.template_version_id === effective.templateVersionId) {
+            return { httpStatus: 200 as const, value: {
+              lineId, sourceDraftId: line.draft_id, sourceLineRevision: line.revision,
+              sourceDraftRevision: line.draft_revision, replacementDraftId: target.id,
+              replacementDraftRevision: target.revision, templateVersionId: target.template_version_id,
+              omittedSourceAttachmentIds: existing.omitted_source_attachment_ids,
+            } }
           }
-          return { httpStatus: 200 as const, value: {
-            lineId, sourceDraftId: line.draft_id, sourceLineRevision: line.revision,
-            sourceDraftRevision: line.draft_revision, replacementDraftId: target.id,
-            replacementDraftRevision: target.revision, templateVersionId: target.template_version_id,
-            omittedSourceAttachmentIds: existing.omitted_source_attachment_ids,
-          } }
+          // The source identity or target lifecycle changed. Commit invalidation
+          // before creating a fresh isolated draft; never re-label stale data.
+          await discardPendingLineReplacements(trx, [lineId])
         }
         const uploading = await trx.selectFrom('purchase_draft_attachments').select('id')
           .where('draft_id', '=', line.draft_id).where('status', '=', 'uploading').forShare().executeTakeFirst()
@@ -635,6 +687,8 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
         } }
       })
       reply.header('cache-control', 'private, no-store')
+      if ('error' in result) return reply.code(result.httpStatus).send(failure(result.error.code,
+        result.error.message, request.id))
       return reply.code(result.httpStatus).send(success(result.value, request.id))
     } catch (error) { return mapError(error, reply, request.id) }
   })
@@ -818,8 +872,21 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
         replacements?: Array<{ oldAttachmentId: string; newAttachmentId: string }>
         replacementDraft?: { draftId: string; draftRevision: number }
       }
+      const customer = request.customer!
+      if (body.replacementDraft && body.values) {
+        if (body.expectedDraftRevision === null) {
+          throw new CartError(409, 'CART_REPLACEMENT_CONFLICT', '原购物车资料已变化，请刷新后继续编辑。')
+        }
+        await prepareCartReplacementAttachmentCopies(db, { kind: 'customer', customer },
+          purchaseAttachmentStorage, preparedCopies, {
+            lineId, replacementDraftId: body.replacementDraft.draftId,
+            replacementDraftRevision: body.replacementDraft.draftRevision,
+            sourceLineRevision: body.expectedLineRevision,
+            sourceDraftRevision: body.expectedDraftRevision,
+            values: body.values,
+          })
+      }
       const retainedLineId = await db.transaction().execute(async (trx) => {
-        const customer = request.customer!
         await lockCustomer(trx, customer, true)
         const line = await trx.selectFrom('customer_cart_items').selectAll()
           .where('customer_id', '=', customer.id).where('line_id', '=', lineId)
@@ -840,7 +907,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
               throw new CartError(409, 'PURCHASE_FORM_VERSION_CHANGED', '填写模板已变化，原购物车资料仍保留。')
             }
             const transferred = await transferCartReplacementAttachmentsInTransaction(trx, { kind: 'customer', customer },
-              purchaseAttachmentStorage, preparedCopies, {
+              preparedCopies, {
               lineId, sourceDraftId: line.draft_id, sourceDraftRevision: body.expectedDraftRevision,
               replacementDraftId: body.replacementDraft.draftId,
               replacementDraftRevision: body.replacementDraft.draftRevision,
@@ -856,7 +923,9 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
             }
             const contentIdentity = purchaseLineContentIdentity(line.sku_id, line.template_version_id,
               line.normalization_version, saved.normalizedValues)
-            const collision = await trx.selectFrom('customer_cart_items').select(['line_id', 'quantity'])
+            const collision = await trx.selectFrom('customer_cart_items').select([
+              'line_id', 'quantity', 'revision', 'draft_id', 'draft_revision', 'template_version_id', 'content_identity',
+            ])
               .where('customer_id', '=', customer.id).where('sku_id', '=', line.sku_id)
               .where('content_identity', '=', contentIdentity).where('line_id', '!=', lineId)
               .forUpdate().executeTakeFirst()
@@ -865,8 +934,10 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
                 throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
               }
               await trx.deleteFrom('customer_cart_items').where('line_id', '=', lineId).execute()
-              await trx.updateTable('customer_cart_items').set({ quantity: collision.quantity + line.quantity })
-                .where('line_id', '=', collision.line_id).execute()
+              const merged = await trx.updateTable('customer_cart_items').set({ quantity: collision.quantity + line.quantity })
+                .where('line_id', '=', collision.line_id).returning('revision').executeTakeFirstOrThrow()
+              await reconcileReplacementAfterCartLineUpdate(trx,
+                { ...collision, customer_id: customer.id }, { ...collision, customer_id: customer.id, revision: merged.revision })
               await trx.deleteFrom('customer_cart_line_replacement_drafts').where('line_id', '=', lineId).execute()
               await trx.updateTable('purchase_drafts').set({ status: 'deleting' }).where('id', '=', line.draft_id).execute()
               await trx.updateTable('purchase_drafts').set({ status: 'deleting' })
@@ -896,7 +967,9 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
             draftId: body.replacementDraft.draftId, draftRevision: body.replacementDraft.draftRevision,
           }], 'update')
           if (!resolved?.validatedDraft) throw new CartError(409, 'PURCHASE_FORM_REQUIRED', '请先完成当前 SKU 的填写资料。')
-          const collision = await trx.selectFrom('customer_cart_items').select(['line_id', 'quantity'])
+          const collision = await trx.selectFrom('customer_cart_items').select([
+            'line_id', 'quantity', 'revision', 'draft_id', 'draft_revision', 'template_version_id', 'content_identity',
+          ])
             .where('customer_id', '=', customer.id).where('sku_id', '=', line.sku_id)
             .where('content_identity', '=', resolved.contentIdentity).where('line_id', '!=', lineId)
             .forUpdate().executeTakeFirst()
@@ -904,17 +977,25 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
             if (collision.quantity + line.quantity > maxLineQuantity) {
               throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
             }
+            await discardPendingLineReplacements(trx, [lineId])
             await trx.deleteFrom('customer_cart_items').where('line_id', '=', lineId).execute()
-            await trx.updateTable('customer_cart_items').set({ quantity: collision.quantity + line.quantity })
-              .where('line_id', '=', collision.line_id).execute()
+            const merged = await trx.updateTable('customer_cart_items').set({ quantity: collision.quantity + line.quantity })
+              .where('line_id', '=', collision.line_id).returning('revision').executeTakeFirstOrThrow()
+            await reconcileReplacementAfterCartLineUpdate(trx,
+              { ...collision, customer_id: customer.id }, { ...collision, customer_id: customer.id, revision: merged.revision })
             return collision.line_id
           }
-          await trx.updateTable('customer_cart_items').set({
+          const updated = await trx.updateTable('customer_cart_items').set({
             draft_id: resolved.draftId, draft_revision: resolved.draftRevision,
             template_version_id: resolved.templateVersionId,
             normalization_version: resolved.normalizationVersion,
             content_identity: resolved.contentIdentity,
-          }).where('line_id', '=', lineId).execute()
+          }).where('line_id', '=', lineId).returning('revision').executeTakeFirstOrThrow()
+          await reconcileReplacementAfterCartLineUpdate(trx, line, {
+            ...line, revision: updated.revision, draft_id: resolved.draftId,
+            draft_revision: resolved.draftRevision, template_version_id: resolved.templateVersionId,
+            content_identity: resolved.contentIdentity,
+          })
           return lineId
         }
         if (!line.draft_id || !body.values || body.expectedDraftRevision === null || !body.draftRevision) {
@@ -937,7 +1018,9 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
         }
         const contentIdentity = purchaseLineContentIdentity(line.sku_id, line.template_version_id,
           line.normalization_version, saved.normalizedValues)
-        const collision = await trx.selectFrom('customer_cart_items').select(['line_id', 'quantity'])
+        const collision = await trx.selectFrom('customer_cart_items').select([
+          'line_id', 'quantity', 'revision', 'draft_id', 'draft_revision', 'template_version_id', 'content_identity',
+        ])
           .where('customer_id', '=', customer.id).where('sku_id', '=', line.sku_id)
           .where('content_identity', '=', contentIdentity).where('line_id', '!=', lineId)
           .forUpdate().executeTakeFirst()
@@ -945,14 +1028,20 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           if (collision.quantity + line.quantity > maxLineQuantity) {
             throw new CartError(409, 'CART_QUANTITY_LIMIT', `同一 SKU 的购物车数量不能超过 ${maxLineQuantity}。`)
           }
+          await discardPendingLineReplacements(trx, [lineId])
           await trx.deleteFrom('customer_cart_items').where('line_id', '=', lineId).execute()
-          await trx.updateTable('customer_cart_items').set({ quantity: collision.quantity + line.quantity })
-            .where('line_id', '=', collision.line_id).execute()
+          const merged = await trx.updateTable('customer_cart_items').set({ quantity: collision.quantity + line.quantity })
+            .where('line_id', '=', collision.line_id).returning('revision').executeTakeFirstOrThrow()
+          await reconcileReplacementAfterCartLineUpdate(trx,
+            { ...collision, customer_id: customer.id }, { ...collision, customer_id: customer.id, revision: merged.revision })
           return collision.line_id
         }
-        await trx.updateTable('customer_cart_items').set({
+        const updated = await trx.updateTable('customer_cart_items').set({
           draft_revision: saved.revision, content_identity: contentIdentity,
-        }).where('line_id', '=', lineId).execute()
+        }).where('line_id', '=', lineId).returning('revision').executeTakeFirstOrThrow()
+        await reconcileReplacementAfterCartLineUpdate(trx, line, {
+          ...line, revision: updated.revision, draft_revision: saved.revision, content_identity: contentIdentity,
+        })
         return lineId
       })
       const cart = await authenticatedCartSnapshot(db, request.customer!, config)

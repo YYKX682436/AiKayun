@@ -940,7 +940,7 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
         version: 2, skuId: catalog!.skuId, quantity: 1, draftId: initial.id, draftRevision: initial.revision,
       } })
     expect(added.statusCode, JSON.stringify(added.json())).toBe(200)
-    const line = added.json().data.cart.items[0] as {
+    let line = added.json().data.cart.items[0] as {
       lineId: string; lineRevision: number; draftId: string; draftRevision: number; contentIdentity: string
     }
 
@@ -956,6 +956,42 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
       replacementDraftId: string; replacementDraftRevision: number; sourceDraftId: string
     }
     expect(replacement.sourceDraftId).toBe(line.draftId)
+
+    // A second independently saved draft with the same content adds quantity to
+    // the existing line. The edit relation must follow that quantity-only
+    // revision so the customer can resume the same in-progress edit.
+    const duplicateDraft = await createPurchaseDraft(db, config, owner, versionId)
+    const duplicate = await savePurchaseDraft(db, config, owner, {
+      draftId: duplicateDraft.id, expectedRevision: duplicateDraft.revision,
+      values: { [fieldId]: 'original-account' },
+    })
+    const appended = await app.inject({ method: 'POST', url: '/api/v1/customer/cart/items',
+      headers: customerHeaders(customer), payload: {
+        version: 2, skuId: catalog!.skuId, quantity: 1, draftId: duplicate.id, draftRevision: duplicate.revision,
+      } })
+    expect(appended.statusCode, JSON.stringify(appended.json())).toBe(200)
+    expect(appended.json().data.retainedLineId).toBe(line.lineId)
+    line = appended.json().data.cart.items[0] as typeof line
+    expect(line).toMatchObject({ quantity: 2, lineRevision: 2, draftId: initial.id })
+    const quantityThree = await app.inject({ method: 'PATCH', url: `/api/v1/customer/cart/lines/${line.lineId}`,
+      headers: customerHeaders(customer), payload: { expectedLineRevision: line.lineRevision, quantity: 3 } })
+    expect(quantityThree.statusCode, JSON.stringify(quantityThree.json())).toBe(200)
+    line = quantityThree.json().data.cart.items[0] as typeof line
+    const quantityTwo = await app.inject({ method: 'PATCH', url: `/api/v1/customer/cart/lines/${line.lineId}`,
+      headers: customerHeaders(customer), payload: { expectedLineRevision: line.lineRevision, quantity: 2 } })
+    expect(quantityTwo.statusCode, JSON.stringify(quantityTwo.json())).toBe(200)
+    line = quantityTwo.json().data.cart.items[0] as typeof line
+    const resumed = await app.inject({ method: 'GET', url: replacementPath,
+      headers: { cookie: customer.sessionCookie } })
+    expect(resumed.statusCode, JSON.stringify(resumed.json())).toBe(200)
+    expect(resumed.json().data).toMatchObject({
+      sourceDraftId: line.draftId,
+      sourceDraftRevision: line.draftRevision,
+      sourceLineRevision: line.lineRevision,
+      replacementDraftId: replacement.replacementDraftId,
+    })
+    replacement.replacementDraftRevision = resumed.json().data.replacementDraftRevision as number
+
     const partial = await app.inject({
       method: 'PUT', url: replacementPath,
       headers: customerHeaders(customer), payload: {
@@ -988,13 +1024,110 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     })
     expect(completed.statusCode, JSON.stringify(completed.json())).toBe(200)
     expect(completed.json().data.cart.items[0]).toMatchObject({
-      lineId: line.lineId, quantity: 1, draftId: replacement.replacementDraftId,
+      lineId: line.lineId, quantity: 2, draftId: replacement.replacementDraftId,
       draftRevision: partial.json().data.replacementDraftRevision + 1, lineRevision: line.lineRevision + 1,
     })
     expect((await getPurchaseDraft(db, config, owner, replacement.replacementDraftId)).values)
       .toEqual({ [fieldId]: 'updated-account' })
     expect(await db.selectFrom('purchase_drafts').select('status').where('id', '=', line.draftId).executeTakeFirstOrThrow())
       .toMatchObject({ status: 'deleting' })
+
+    const committedLine = completed.json().data.cart.items[0] as typeof line
+    const nextEdit = await app.inject({ method: 'POST', url: replacementPath,
+      headers: customerHeaders(customer), payload: {
+        expectedLineRevision: committedLine.lineRevision, expectedDraftRevision: committedLine.draftRevision,
+      } })
+    expect(nextEdit.statusCode, JSON.stringify(nextEdit.json())).toBe(201)
+    const changedSource = await app.inject({ method: 'PATCH',
+      url: `/api/v1/customer/cart/lines/${line.lineId}/purchase-form`, headers: customerHeaders(customer), payload: {
+        expectedLineRevision: committedLine.lineRevision,
+        expectedDraftRevision: committedLine.draftRevision,
+        draftRevision: committedLine.draftRevision,
+        values: { [fieldId]: 'changed-source-account' },
+      } })
+    expect(changedSource.statusCode, JSON.stringify(changedSource.json())).toBe(200)
+    const staleRecovery = await app.inject({ method: 'GET', url: replacementPath,
+      headers: { cookie: customer.sessionCookie } })
+    expect(staleRecovery.statusCode, JSON.stringify(staleRecovery.json())).toBe(404)
+    expect(await db.selectFrom('customer_cart_line_replacement_drafts').select('line_id')
+      .where('line_id', '=', line.lineId).execute()).toEqual([])
+    expect(await db.selectFrom('purchase_drafts').select('status')
+      .where('id', '=', nextEdit.json().data.replacementDraftId).executeTakeFirstOrThrow()).toEqual({ status: 'deleting' })
+
+    const changedLine = changedSource.json().data.cart.items[0] as typeof line
+    const mergeCollisionDraft = await createPurchaseDraft(db, config, owner, versionId)
+    const mergeCollisionSaved = await savePurchaseDraft(db, config, owner, {
+      draftId: mergeCollisionDraft.id, expectedRevision: mergeCollisionDraft.revision,
+      values: { [fieldId]: 'collision-account' },
+    })
+    const secondAdded = await app.inject({ method: 'POST', url: '/api/v1/customer/cart/items',
+      headers: customerHeaders(customer), payload: {
+        version: 2, skuId: catalog!.skuId, quantity: 1,
+        draftId: mergeCollisionSaved.id, draftRevision: mergeCollisionSaved.revision,
+      } })
+    expect(secondAdded.statusCode, JSON.stringify(secondAdded.json())).toBe(200)
+    const destinationLine = secondAdded.json().data.cart.items.find((item: typeof line) => item.lineId !== changedLine.lineId) as typeof line
+    const destinationPath = `/api/v1/customer/cart/lines/${destinationLine.lineId}/purchase-form/replacement-draft`
+    const destinationEdit = await app.inject({ method: 'POST', url: destinationPath,
+      headers: customerHeaders(customer), payload: {
+        expectedLineRevision: destinationLine.lineRevision, expectedDraftRevision: destinationLine.draftRevision,
+      } })
+    const sourceEdit = await app.inject({ method: 'POST', url: replacementPath,
+      headers: customerHeaders(customer), payload: {
+        expectedLineRevision: changedLine.lineRevision, expectedDraftRevision: changedLine.draftRevision,
+      } })
+    expect(destinationEdit.statusCode, JSON.stringify(destinationEdit.json())).toBe(201)
+    expect(sourceEdit.statusCode, JSON.stringify(sourceEdit.json())).toBe(201)
+    const collisionMerge = await app.inject({ method: 'PATCH',
+      url: `/api/v1/customer/cart/lines/${changedLine.lineId}/purchase-form`, headers: customerHeaders(customer), payload: {
+        expectedLineRevision: changedLine.lineRevision,
+        expectedDraftRevision: changedLine.draftRevision,
+        replacementDraft: {
+          draftId: sourceEdit.json().data.replacementDraftId,
+          draftRevision: sourceEdit.json().data.replacementDraftRevision,
+        },
+        values: { [fieldId]: 'collision-account' },
+      } })
+    expect(collisionMerge.statusCode, JSON.stringify(collisionMerge.json())).toBe(200)
+    expect(collisionMerge.json().data.cart.items).toHaveLength(1)
+    expect(collisionMerge.json().data.cart.items[0]).toMatchObject({
+      lineId: destinationLine.lineId, quantity: 3,
+    })
+    const resumedCollisionEdit = await app.inject({ method: 'GET', url: destinationPath,
+      headers: { cookie: customer.sessionCookie } })
+    expect(resumedCollisionEdit.statusCode, JSON.stringify(resumedCollisionEdit.json())).toBe(200)
+    expect(resumedCollisionEdit.json().data).toMatchObject({
+      replacementDraftId: destinationEdit.json().data.replacementDraftId,
+      sourceLineRevision: collisionMerge.json().data.cart.items[0].lineRevision,
+    })
+    const replayedStart = await app.inject({ method: 'POST', url: destinationPath,
+      headers: customerHeaders(customer), payload: {
+        expectedLineRevision: resumedCollisionEdit.json().data.sourceLineRevision,
+        expectedDraftRevision: resumedCollisionEdit.json().data.sourceDraftRevision,
+      } })
+    expect(replayedStart.statusCode, JSON.stringify(replayedStart.json())).toBe(200)
+    expect(replayedStart.json().data.replacementDraftId).toBe(destinationEdit.json().data.replacementDraftId)
+    const revoked = await app.inject({ method: 'DELETE', url: destinationPath, headers: customerHeaders(customer), payload: {
+      expectedLineRevision: resumedCollisionEdit.json().data.sourceLineRevision,
+      expectedDraftRevision: resumedCollisionEdit.json().data.sourceDraftRevision,
+      expectedReplacementDraftRevision: resumedCollisionEdit.json().data.replacementDraftRevision,
+    } })
+    expect(revoked.statusCode, JSON.stringify(revoked.json())).toBe(200)
+    expect((await app.inject({ method: 'GET', url: destinationPath,
+      headers: { cookie: customer.sessionCookie } })).statusCode).toBe(404)
+    const deletionEdit = await app.inject({ method: 'POST', url: destinationPath,
+      headers: customerHeaders(customer), payload: {
+        expectedLineRevision: resumedCollisionEdit.json().data.sourceLineRevision,
+        expectedDraftRevision: resumedCollisionEdit.json().data.sourceDraftRevision,
+      } })
+    expect(deletionEdit.statusCode, JSON.stringify(deletionEdit.json())).toBe(201)
+    const deletedLine = await app.inject({ method: 'DELETE',
+      url: `/api/v1/customer/cart/lines/${destinationLine.lineId}`, headers: customerHeaders(customer) })
+    expect(deletedLine.statusCode, JSON.stringify(deletedLine.json())).toBe(200)
+    expect(await db.selectFrom('customer_cart_line_replacement_drafts').select('line_id')
+      .where('line_id', '=', destinationLine.lineId).execute()).toEqual([])
+    expect(await db.selectFrom('purchase_drafts').select('status')
+      .where('id', '=', deletionEdit.json().data.replacementDraftId).executeTakeFirstOrThrow()).toEqual({ status: 'deleting' })
   })
 
   it('isolates authenticated carts, merges concurrent adds, supports quantity changes and enforces CSRF', async () => {

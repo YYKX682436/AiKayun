@@ -218,6 +218,62 @@ async function makeAdminSession() {
   }
 }
 
+async function makeCartImageEditFixture() {
+  const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+  const customer = await makeCustomer()
+  const owner = customerOwner(customer)
+  const catalog = await createCatalog()
+  await db.insertInto('product_purchase_form_settings').values({
+    product_id: catalog.productId, mode: 'template', template_version_id: fixture.versionId,
+    applied_mode: 'template', applied_template_version_id: fixture.versionId, updated_by_admin_id: adminId,
+  }).execute()
+  const state = await db.selectFrom('storefront_customer_policy').select('purchase_forms_status')
+    .where('singleton', '=', true).executeTakeFirstOrThrow()
+  if (state.purchase_forms_status !== 'active') {
+    await db.updateTable('storefront_customer_policy').set({ purchase_forms_status: 'active' })
+      .where('singleton', '=', true).execute()
+  }
+
+  const draftStorage = new PurchaseAttachmentStorage(privateRoot)
+  const png = await sharp({ create: { width: 10, height: 8, channels: 4, background: '#5a7b9d' } }).png().toBuffer()
+  const sourceDraft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+  const sourceImage = await uploadPurchaseDraftAttachment(db, configA, draftStorage, owner, {
+    draftId: sourceDraft.id, expectedRevision: sourceDraft.revision, fieldId: fixture.ids.imageId,
+    claimedMimeType: 'image/png', stream: Readable.from([png]),
+  })
+  const sourceValues = {
+    [fixture.ids.accountId]: '00071', [fixture.ids.selectId]: fixture.options.planA,
+    [fixture.ids.cascadeId]: { path: [fixture.ids.regionId, fixture.ids.serverId],
+      expanded: { [fixture.ids.playerId]: 'Cart Edit' } },
+    [fixture.ids.imageId]: [sourceImage.attachmentId],
+  }
+  const source = await savePurchaseDraft(db, configA, owner, {
+    draftId: sourceDraft.id, expectedRevision: sourceDraft.revision, values: sourceValues,
+  })
+  const csrfResponse = await inject({ method: 'GET', url: '/api/v1/customer/auth/csrf' })
+  const headers = {
+    origin,
+    cookie: `aikayun_customer_session=${customer.token}; ${cookieFrom(csrfResponse, 'aikayun_customer_csrf')}`,
+    'x-csrf-token': csrfResponse.json().data.csrfToken as string,
+  }
+  const added = await inject({ method: 'POST', url: '/api/v1/customer/cart/items', headers,
+    payload: { version: 2, skuId: catalog.skuId, quantity: 1, draftId: source.id, draftRevision: source.revision } })
+  expect(added.statusCode, JSON.stringify(added.json())).toBe(200)
+  const line = added.json().data.cart.items[0] as {
+    lineId: string; lineRevision: number; draftId: string; draftRevision: number
+  }
+  const replacementPath = `/api/v1/customer/cart/lines/${line.lineId}/purchase-form/replacement-draft`
+  const started = await inject({ method: 'POST', url: replacementPath, headers, payload: {
+    expectedLineRevision: line.lineRevision, expectedDraftRevision: line.draftRevision,
+  } })
+  expect(started.statusCode, JSON.stringify(started.json())).toBe(201)
+  return {
+    fixture, customer, owner, catalog, headers, draftStorage, sourceDraft, source, sourceImage,
+    sourceValues, line, replacementPath,
+    replacement: started.json().data as { replacementDraftId: string; replacementDraftRevision: number },
+  }
+}
+
 beforeAll(async () => {
   if (!testDatabaseUrl || !new URL(testDatabaseUrl).pathname.slice(1).endsWith('_test')) {
     throw new Error('TEST_DATABASE_URL must name an isolated PostgreSQL database ending in _test')
@@ -1450,6 +1506,111 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     expect(retry.removedFiles).toBe(0)
   }, 45_000)
 
+  it('reclaims an expired cart edit source without blocking other draft cleanup', async () => {
+    const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
+    const customer = await makeCustomer()
+    const owner = customerOwner(customer)
+    const catalog = await createCatalog()
+    const storage = new PurchaseAttachmentStorage(privateRoot)
+    const png = await sharp({ create: { width: 9, height: 7, channels: 4, background: '#b35a31' } }).png().toBuffer()
+
+    const sourceDraft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const sourceImage = await uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: sourceDraft.id, expectedRevision: sourceDraft.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    const source = await savePurchaseDraft(db, configA, owner, {
+      draftId: sourceDraft.id, expectedRevision: sourceDraft.revision, values: {
+        [fixture.ids.accountId]: '00072', [fixture.ids.selectId]: fixture.options.planA,
+        [fixture.ids.cascadeId]: { path: [fixture.ids.regionId, fixture.ids.serverId],
+          expanded: { [fixture.ids.playerId]: 'Expiry Source' } },
+        [fixture.ids.imageId]: [sourceImage.attachmentId],
+      },
+    })
+    const replacement = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const replacementImage = await uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: replacement.id, expectedRevision: replacement.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    const unrelated = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const unrelatedImage = await uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: unrelated.id, expectedRevision: unrelated.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    const lineId = randomUUID()
+    await db.insertInto('customer_cart_items').values({
+      line_id: lineId, customer_id: customer.id, sku_id: catalog.skuId, quantity: 1,
+      content_identity: purchaseLineContentIdentity(catalog.skuId, fixture.versionId, 1, source.normalizedValues),
+      draft_id: source.id, draft_revision: source.revision,
+      template_version_id: fixture.versionId, normalization_version: 1,
+    }).execute()
+    await db.insertInto('customer_cart_line_replacement_drafts').values({
+      line_id: lineId, customer_id: customer.id, source_draft_id: source.id,
+      replacement_draft_id: replacement.id, source_line_revision: 1, source_draft_revision: source.revision,
+      omitted_source_attachment_ids: [],
+    }).execute()
+    const cleanupTime = new Date(Date.now() + 2_000)
+    const liveSourceDraft = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const liveSource = await savePurchaseDraft(db, configA, owner, {
+      draftId: liveSourceDraft.id, expectedRevision: liveSourceDraft.revision, values: {
+        [fixture.ids.accountId]: '00073', [fixture.ids.selectId]: fixture.options.planA,
+        [fixture.ids.cascadeId]: { path: [fixture.ids.regionId, fixture.ids.serverId],
+          expanded: { [fixture.ids.playerId]: 'Expiry Target' } },
+      },
+    })
+    const expiredTarget = await createPurchaseDraft(db, configA, owner, fixture.versionId)
+    const expiredTargetImage = await uploadPurchaseDraftAttachment(db, configA, storage, owner, {
+      draftId: expiredTarget.id, expectedRevision: expiredTarget.revision, fieldId: fixture.ids.imageId,
+      claimedMimeType: 'image/png', stream: Readable.from([png]),
+    })
+    const secondLineId = randomUUID()
+    await db.insertInto('customer_cart_items').values({
+      line_id: secondLineId, customer_id: customer.id, sku_id: catalog.skuId, quantity: 1,
+      content_identity: purchaseLineContentIdentity(catalog.skuId, fixture.versionId, 1, liveSource.normalizedValues),
+      draft_id: liveSource.id, draft_revision: liveSource.revision,
+      template_version_id: fixture.versionId, normalization_version: 1,
+    }).execute()
+    await db.insertInto('customer_cart_line_replacement_drafts').values({
+      line_id: secondLineId, customer_id: customer.id, source_draft_id: liveSource.id,
+      replacement_draft_id: expiredTarget.id, source_line_revision: 1, source_draft_revision: liveSource.revision,
+      omitted_source_attachment_ids: [],
+    }).execute()
+    await db.updateTable('purchase_drafts').set({ expires_at: new Date(cleanupTime.getTime() - 1_000) })
+      .where('id', 'in', [source.id, unrelated.id, expiredTarget.id]).execute()
+
+    const result = await reconcilePurchaseDrafts(db, storage, {
+      repair: true, now: cleanupTime, graceHours: 0, batchSize: 500,
+    })
+
+    expect(result.expiredDrafts).toBe(2)
+    expect(await db.selectFrom('customer_cart_items').select(['line_id', 'draft_id'])
+      .where('line_id', '=', lineId).executeTakeFirst()).toEqual({ line_id: lineId, draft_id: source.id })
+    expect(await db.selectFrom('customer_cart_line_replacement_drafts').select('line_id')
+      .where('line_id', 'in', [lineId, secondLineId]).execute()).toEqual([])
+    expect(await db.selectFrom('purchase_drafts').select('id')
+      .where('id', 'in', [source.id, replacement.id, unrelated.id, expiredTarget.id]).execute()).toEqual([])
+    expect(await db.selectFrom('customer_cart_items').select(['line_id', 'draft_id'])
+      .where('line_id', '=', secondLineId).executeTakeFirst()).toEqual({ line_id: secondLineId, draft_id: liveSource.id })
+    expect(await getPurchaseDraft(db, configA, owner, liveSource.id)).toMatchObject({
+      values: {
+        [fixture.ids.accountId]: '00073', [fixture.ids.selectId]: fixture.options.planA,
+        [fixture.ids.cascadeId]: { path: [fixture.ids.regionId, fixture.ids.serverId],
+          expanded: { [fixture.ids.playerId]: 'Expiry Target' } },
+      },
+    })
+    expect(await db.selectFrom('purchase_draft_attachments').select('id')
+      .where('id', 'in', [sourceImage.attachmentId, replacementImage.attachmentId,
+        unrelatedImage.attachmentId, expiredTargetImage.attachmentId]).execute())
+      .toEqual([])
+    const files = await storage.scanFiles()
+    expect(files.some(file => [sourceImage.attachmentId, replacementImage.attachmentId,
+      unrelatedImage.attachmentId, expiredTargetImage.attachmentId].includes(file.id))).toBe(false)
+    const repeated = await reconcilePurchaseDrafts(db, storage, {
+      repair: true, now: cleanupTime, graceHours: 0, batchSize: 500,
+    })
+    expect(repeated).toMatchObject({ expiredDrafts: 0, removedFiles: 0, missingObjects: 0 })
+  }, 45_000)
+
   it('rechecks renewed draft expiry after an old-ready candidate query and rejects renewal after cleanup wins', async () => {
     const fixture = await createTemplateFixture({ headers: adminHeaders() } as Awaited<ReturnType<typeof makeAdminSession>>)
     const customer = await makeCustomer()
@@ -1682,4 +1843,176 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     await expect(sql`SELECT purchase_forms_enabled FROM storefront_customer_policy`.execute(db))
       .rejects.toMatchObject({ code: '42703' })
   })
+
+  it('does not hold customer locks during a slow cart attachment copy and rejects a changed source', async () => {
+    const setup = await makeCartImageEditFixture()
+    const beforeFiles = (await setup.draftStorage.scanFiles()).map(file => file.id).sort()
+    let reachedRead!: () => void
+    let releaseRead!: () => void
+    const readReached = new Promise<void>(resolve => { reachedRead = resolve })
+    const readGate = new Promise<void>(resolve => { releaseRead = resolve })
+    const originalRead = PurchaseAttachmentStorage.prototype.readVerified
+    PurchaseAttachmentStorage.prototype.readVerified = async function (id, storageKey, sizeBytes, sha256) {
+      if (id === setup.sourceImage.attachmentId) {
+        reachedRead()
+        await readGate
+      }
+      return originalRead.call(this, id, storageKey, sizeBytes, sha256)
+    }
+
+    const finalEdit = inject({ method: 'PATCH', url: `/api/v1/customer/cart/lines/${setup.line.lineId}/purchase-form`,
+      headers: setup.headers, payload: {
+        expectedLineRevision: setup.line.lineRevision,
+        expectedDraftRevision: setup.line.draftRevision,
+        replacementDraft: { draftId: setup.replacement.replacementDraftId,
+          draftRevision: setup.replacement.replacementDraftRevision },
+        values: { ...setup.sourceValues, [setup.fixture.ids.accountId]: '00072' },
+      } })
+    let competingResponse: Awaited<ReturnType<typeof inject>> | undefined
+    let competingSettled = false
+    let sawDatabaseLockWait = false
+    let competing!: Promise<void>
+    try {
+      await readReached
+      competing = inject({ method: 'PATCH', url: `/api/v1/customer/cart/lines/${setup.line.lineId}/purchase-form`,
+        headers: setup.headers, payload: {
+          expectedLineRevision: setup.line.lineRevision,
+          expectedDraftRevision: setup.line.draftRevision,
+          draftRevision: setup.source.revision,
+          values: { ...setup.sourceValues, [setup.fixture.ids.accountId]: '00073' },
+        } }).then(response => { competingResponse = response; competingSettled = true })
+
+      const deadline = Date.now() + 10_000
+      while (!competingSettled && Date.now() < deadline) {
+        const waiting = await sql<{ pid: number }>`
+          SELECT pid FROM pg_stat_activity
+          WHERE datname = current_database() AND application_name = 'aikayun-api'
+            AND state = 'active' AND wait_event_type = 'Lock' AND query ILIKE '%customers%'
+          LIMIT 1
+        `.execute(db)
+        if (waiting.rows.length) { sawDatabaseLockWait = true; break }
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+    } finally {
+      releaseRead()
+      await finalEdit.catch(() => undefined)
+      if (competing) await competing
+      PurchaseAttachmentStorage.prototype.readVerified = originalRead
+    }
+
+    expect(sawDatabaseLockWait).toBe(false)
+    expect(competingSettled).toBe(true)
+    expect(competingResponse?.statusCode, JSON.stringify(competingResponse?.json())).toBe(200)
+    const finalResponse = await finalEdit
+    expect(finalResponse.statusCode, JSON.stringify(finalResponse.json())).toBe(409)
+    const line = await db.selectFrom('customer_cart_items').selectAll()
+      .where('line_id', '=', setup.line.lineId).executeTakeFirstOrThrow()
+    const currentSource = await getPurchaseDraft(db, configA, setup.owner, setup.source.id)
+    expect(line).toMatchObject({ draft_id: setup.source.id, draft_revision: currentSource.revision })
+    expect(currentSource.values[setup.fixture.ids.accountId]).toBe('00073')
+    expect((await readPurchaseDraftAttachment(db, setup.draftStorage, setup.owner,
+      setup.source.id, setup.sourceImage.attachmentId)).sha256).toBe(setup.sourceImage.sha256)
+    expect(await db.selectFrom('customer_cart_line_replacement_drafts').select('line_id')
+      .where('line_id', '=', setup.line.lineId).execute()).toEqual([])
+    expect(await db.selectFrom('purchase_drafts').select('status')
+      .where('id', '=', setup.replacement.replacementDraftId).executeTakeFirstOrThrow()).toEqual({ status: 'deleting' })
+    expect((await setup.draftStorage.scanFiles()).map(file => file.id).sort()).toEqual(beforeFiles)
+  }, 45_000)
+
+  it('keeps the bound image when a prepared cart copy fails and reaps only its orphan object', async () => {
+    const setup = await makeCartImageEditFixture()
+    const originalStore = PurchaseAttachmentStorage.prototype.store
+    let copiedId: string | undefined
+    PurchaseAttachmentStorage.prototype.store = async function (id, bytes) {
+      await originalStore.call(this, id, bytes)
+      copiedId = id
+      throw new Error('test injected lost private-copy acknowledgement after object publication')
+    }
+    let response: Awaited<ReturnType<typeof inject>>
+    try {
+      response = await inject({ method: 'PATCH',
+        url: `/api/v1/customer/cart/lines/${setup.line.lineId}/purchase-form`, headers: setup.headers, payload: {
+          expectedLineRevision: setup.line.lineRevision,
+          expectedDraftRevision: setup.line.draftRevision,
+          replacementDraft: { draftId: setup.replacement.replacementDraftId,
+            draftRevision: setup.replacement.replacementDraftRevision },
+          values: setup.sourceValues,
+        } })
+    } finally {
+      PurchaseAttachmentStorage.prototype.store = originalStore
+    }
+    expect(response!.statusCode, JSON.stringify(response!.json())).toBe(409)
+    expect(response!.json().error.code).toBe('PURCHASE_ATTACHMENT_COPY_FAILED')
+    expect(copiedId).toBeDefined()
+    const line = await db.selectFrom('customer_cart_items').selectAll()
+      .where('line_id', '=', setup.line.lineId).executeTakeFirstOrThrow()
+    expect(line).toMatchObject({ draft_id: setup.source.id, draft_revision: setup.source.revision,
+      revision: setup.line.lineRevision })
+    expect((await getPurchaseDraft(db, configA, setup.owner, setup.source.id)).values).toEqual(setup.sourceValues)
+    expect(await db.selectFrom('customer_cart_line_replacement_drafts').select('replacement_draft_id')
+      .where('line_id', '=', setup.line.lineId).executeTakeFirstOrThrow())
+      .toEqual({ replacement_draft_id: setup.replacement.replacementDraftId })
+    expect((await readPurchaseDraftAttachment(db, setup.draftStorage, setup.owner,
+      setup.source.id, setup.sourceImage.attachmentId)).sha256).toBe(setup.sourceImage.sha256)
+    expect((await setup.draftStorage.scanFiles()).some(file => file.id === copiedId)).toBe(true)
+
+    const repaired = await reconcilePurchaseDrafts(db, setup.draftStorage, {
+      repair: true, now: new Date(Date.now() + 2_000), graceHours: 0,
+    })
+    expect(repaired.oldOrphanFiles).toBeGreaterThanOrEqual(1)
+    expect((await setup.draftStorage.scanFiles()).some(file => file.id === copiedId)).toBe(false)
+    expect((await readPurchaseDraftAttachment(db, setup.draftStorage, setup.owner,
+      setup.source.id, setup.sourceImage.attachmentId)).sha256).toBe(setup.sourceImage.sha256)
+  }, 45_000)
+
+  it('preserves a referenced replacement image when the final cart commit acknowledgement is lost', async () => {
+    const setup = await makeCartImageEditFixture()
+    const originalDescriptor = Object.getOwnPropertyDescriptor(db, 'transaction')
+    const originalTransaction = db.transaction.bind(db)
+    let transactionCount = 0
+    Object.defineProperty(db, 'transaction', {
+      configurable: true,
+      value: () => {
+        const builder = originalTransaction()
+        return {
+          execute: async <T>(callback: (trx: Transaction<Database>) => Promise<T>): Promise<T> => {
+            const result = await builder.execute(callback)
+            transactionCount += 1
+            if (transactionCount === 2) throw new Error('test simulated lost acknowledgement after cart edit commit')
+            return result
+          },
+        }
+      },
+    })
+    let response: Awaited<ReturnType<typeof inject>>
+    try {
+      response = await inject({ method: 'PATCH',
+        url: `/api/v1/customer/cart/lines/${setup.line.lineId}/purchase-form`, headers: setup.headers, payload: {
+          expectedLineRevision: setup.line.lineRevision,
+          expectedDraftRevision: setup.line.draftRevision,
+          replacementDraft: { draftId: setup.replacement.replacementDraftId,
+            draftRevision: setup.replacement.replacementDraftRevision },
+          values: setup.sourceValues,
+        } })
+    } finally {
+      if (originalDescriptor) Object.defineProperty(db, 'transaction', originalDescriptor)
+      else Reflect.deleteProperty(db, 'transaction')
+    }
+    expect(transactionCount).toBe(3)
+    expect(response!.statusCode).toBe(500)
+    const line = await db.selectFrom('customer_cart_items').selectAll()
+      .where('line_id', '=', setup.line.lineId).executeTakeFirstOrThrow()
+    expect(line).toMatchObject({ draft_id: setup.replacement.replacementDraftId,
+      revision: setup.line.lineRevision + 1 })
+    const committed = await getPurchaseDraft(db, configA, setup.owner, setup.replacement.replacementDraftId)
+    const imageId = (committed.values[setup.fixture.ids.imageId] as string[])[0]!
+    expect(imageId).not.toBe(setup.sourceImage.attachmentId)
+    const attachment = await readPurchaseDraftAttachment(db, setup.draftStorage, setup.owner,
+      setup.replacement.replacementDraftId, imageId)
+    expect(attachment.sha256).toBe(setup.sourceImage.sha256)
+    expect((await setup.draftStorage.scanFiles()).some(file => file.id === imageId)).toBe(true)
+    await reconcilePurchaseDrafts(db, setup.draftStorage, { repair: true })
+    expect((await readPurchaseDraftAttachment(db, setup.draftStorage, setup.owner,
+      setup.replacement.replacementDraftId, imageId)).sha256).toBe(setup.sourceImage.sha256)
+  }, 45_000)
 })

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { Kysely, Selectable, Transaction } from 'kysely'
+import { sql, type Kysely, type Selectable, type Transaction } from 'kysely'
 import { canonicalPurchaseFormJson, PURCHASE_FORM_LIMITS, PURCHASE_FORM_NORMALIZATION_VERSION, normalizePurchaseFormAnswers, validatePurchaseFormDefinition } from '@aikayun/contracts'
 import type { PurchaseFormDefinition, PurchaseFormLeafField, PurchaseFormValues } from '@aikayun/contracts'
 import type { AppConfig } from '../config.js'
@@ -231,7 +231,61 @@ export function collectImageReferences(definition: PurchaseFormDefinition, value
   return result
 }
 
-export type PreparedCartReplacementAttachmentCopy = { draftId: string; id: string; storageKey: string }
+export type PreparedCartReplacementAttachmentCopy = {
+  draftId: string
+  id: string
+  storageKey: string
+  sourceAttachmentId: string
+  sourceStorageKey: string
+  fieldId: string
+  byteSize: number
+  reservedBytes: number
+  width: number
+  height: number
+  sha256: string
+}
+
+/**
+ * Drop an edit relationship while retaining the cart's current bound draft.
+ * Callers must already hold the customer and source cart-line locks. Drafts
+ * are then locked in UUID order, followed by target attachments, matching the
+ * checkout/edit lock hierarchy. A target already rebound to any cart line is
+ * preserved as that line's current data rather than collected as an orphan.
+ */
+export async function discardCartLineReplacementDraftsInTransaction(
+  trx: Transaction<Database>,
+  lineIds: string[],
+  now = new Date(),
+): Promise<void> {
+  if (!lineIds.length) return
+  const relations = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
+    .where('line_id', 'in', lineIds).orderBy('line_id').forUpdate().execute()
+  if (!relations.length) return
+  const draftIds = [...new Set(relations.flatMap(relation => [relation.source_draft_id, relation.replacement_draft_id]))].sort()
+  await trx.selectFrom('purchase_drafts').select('id').where('id', 'in', draftIds).orderBy('id').forUpdate().execute()
+  const targetIds = [...new Set(relations.map(relation => relation.replacement_draft_id))].sort()
+  const targetsStillBound = new Set((await trx.selectFrom('customer_cart_items').select('draft_id')
+    .where('draft_id', 'in', targetIds).where('draft_id', 'is not', null).execute())
+    .flatMap(row => row.draft_id ? [row.draft_id] : []))
+  const discardTargetIds = targetIds.filter(id => !targetsStillBound.has(id))
+  const targetAttachments = discardTargetIds.length
+    ? await trx.selectFrom('purchase_draft_attachments').select(['id', 'draft_id'])
+      .where('draft_id', 'in', discardTargetIds).orderBy('draft_id').orderBy('id').forUpdate().execute()
+    : []
+  await trx.deleteFrom('customer_cart_line_replacement_drafts').where('line_id', 'in', lineIds).execute()
+  if (!discardTargetIds.length) return
+  await trx.updateTable('purchase_drafts').set({ status: 'deleting' })
+    .where('id', 'in', discardTargetIds).where('status', '=', 'active').execute()
+  await trx.deleteFrom('purchase_draft_attachment_references').where('draft_id', 'in', discardTargetIds).execute()
+  if (targetAttachments.length) {
+    await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: now })
+      .where('id', 'in', targetAttachments.map(attachment => attachment.id))
+      // Uploads are physical I/O outside the database transaction. Keep their
+      // reservations in place until upload finalization fails or a stale-upload
+      // sweep can prove no writer still owns the part file.
+      .where('status', 'in', ['ready', 'failed']).execute()
+  }
+}
 
 function replaceCopiedAttachmentIds(value: unknown, replacements: ReadonlyMap<string, string>): unknown {
   if (typeof value === 'string') return replacements.get(value.toLowerCase()) ?? value
@@ -248,10 +302,126 @@ function replaceCopiedAttachmentIds(value: unknown, replacements: ReadonlyMap<st
  * draft. Attachment ownership is immutable in the database, so the source row
  * stays intact until the cart/draft swap commits and then enters normal cleanup.
  */
+export async function prepareCartReplacementAttachmentCopies(
+  db: Kysely<Database>,
+  owner: PurchaseDraftOwner,
+  storage: PurchaseAttachmentStorage,
+  preparedCopies: PreparedCartReplacementAttachmentCopy[],
+  input: {
+    lineId: string
+    replacementDraftId: string
+    replacementDraftRevision: number
+    sourceLineRevision: number
+    sourceDraftRevision: number
+    values: Record<string, unknown>
+  },
+): Promise<void> {
+  // Snapshot and validate with ordinary database locks, then commit that short
+  // read transaction before private-file reads/copies begin. The final edit
+  // transaction repeats every identity and revision check before it can bind
+  // any prepared object.
+  const plan = await db.transaction().execute(async trx => {
+    const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
+    if (identity.kind !== 'customer') throw new PurchaseDraftServiceError(403,
+      'CART_REPLACEMENT_CUSTOMER_REQUIRED', '购物车绑定资料编辑需要登录顾客身份。')
+    const line = await trx.selectFrom('customer_cart_items').selectAll()
+      .where('customer_id', '=', identity.customerId).where('line_id', '=', input.lineId).forUpdate().executeTakeFirst()
+    if (!line || !line.draft_id || line.revision !== input.sourceLineRevision
+      || line.draft_revision !== input.sourceDraftRevision) {
+      throw new PurchaseDraftServiceError(409, 'CART_REPLACEMENT_CONFLICT', '原购买行已变化；上次有效资料仍保留。')
+    }
+    const relation = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
+      .where('line_id', '=', input.lineId).where('customer_id', '=', identity.customerId).forUpdate().executeTakeFirst()
+    if (!relation || relation.source_draft_id !== line.draft_id
+      || relation.source_line_revision !== line.revision || relation.source_draft_revision !== line.draft_revision
+      || relation.replacement_draft_id !== input.replacementDraftId) {
+      throw new PurchaseDraftServiceError(409, 'CART_REPLACEMENT_CONFLICT', '购物车资料编辑已失效，请刷新购买行后重试。')
+    }
+    const effective = await effectivePurchaseFormForSku(trx, line.sku_id, { lockStatus: 'share' })
+    if (!effective.templateVersionId || effective.templateVersionId !== line.template_version_id) {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_FORM_VERSION_CHANGED', '填写模板已变化；原购物车资料仍保留。')
+    }
+    const draftIds = [line.draft_id, input.replacementDraftId].sort()
+    const drafts = await trx.selectFrom('purchase_drafts').selectAll().where('id', 'in', draftIds)
+      .orderBy('id').forUpdate().execute()
+    if (drafts.length !== 2) throw draftNotFound()
+    const source = drafts.find(draft => draft.id === line.draft_id)
+    const target = drafts.find(draft => draft.id === input.replacementDraftId)
+    const now = new Date()
+    if (!source || !target || source.customer_id !== identity.customerId || target.customer_id !== identity.customerId
+      || source.guest_order_session_id !== null || target.guest_order_session_id !== null
+      || source.status !== 'active' || target.status !== 'active'
+      || source.expires_at <= now || target.expires_at <= now) throw draftNotFound()
+    if (source.revision !== input.sourceDraftRevision || target.revision !== input.replacementDraftRevision) {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '购物车资料编辑已变化，请重新读取后继续。')
+    }
+    if (source.template_version_id !== target.template_version_id
+      || source.template_version_id !== effective.templateVersionId) {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_TEMPLATE_VERSION_CONFLICT', '购物车资料编辑模板已变化，请重新确认。')
+    }
+    const sourceAttachments = await listDraftAttachments(trx, source.id, true)
+    if (sourceAttachments.some(attachment => attachment.status === 'uploading')) {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_UPLOAD_IN_PROGRESS', '原图片仍在保存，请稍后再完成资料替换。')
+    }
+    const targetAttachments = await listDraftAttachments(trx, target.id, true)
+    const definition = await loadDraftTemplate(trx, target.template_version_id)
+    const normalized = normalizeForDraft(definition, input.values, [...targetAttachments, ...sourceAttachments])
+    const sourceIds = new Set(sourceAttachments.map(attachment => attachment.id))
+    const references = collectImageReferences(definition, normalized.value)
+    const omitted = new Set(relation.omitted_source_attachment_ids)
+    if (references.some(reference => omitted.has(reference.attachmentId))) {
+      throw new PurchaseDraftServiceError(409, 'CART_REPLACEMENT_ATTACHMENT_INVALID', '已移除的原图片不能重新附加，请重新上传图片。')
+    }
+    const selectedSourceIds = new Set(references.map(reference => reference.attachmentId).filter(id => sourceIds.has(id)))
+    const selected = sourceAttachments.filter(row => selectedSourceIds.has(row.id))
+    const referencedSourceIds = new Set((selected.length
+      ? await trx.selectFrom('purchase_draft_attachment_references').select('attachment_id')
+        .where('draft_id', '=', source.id).where('attachment_id', 'in', selected.map(row => row.id)).forShare().execute()
+      : []).map(row => row.attachment_id))
+    if (referencedSourceIds.size !== selected.length) {
+      throw new PurchaseDraftServiceError(409, 'CART_REPLACEMENT_ATTACHMENT_INVALID', '原图片已不再属于当前购买资料，请刷新后重新确认。')
+    }
+    return selected.map(attachment => {
+      if (attachment.status !== 'ready' || attachment.byte_size === null || attachment.sha256 === null
+        || attachment.width === null || attachment.height === null) {
+        throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_UNAVAILABLE', '原购买图片暂时无法安全复制；购物车中的资料仍保留。')
+      }
+      return {
+        sourceAttachmentId: attachment.id, fieldId: attachment.field_id,
+        byteSize: attachment.byte_size, reservedBytes: attachment.reserved_bytes,
+        width: attachment.width, height: attachment.height, sha256: attachment.sha256,
+        storageKey: attachment.storage_key,
+      }
+    })
+  })
+
+  for (const attachment of plan) {
+    const id = randomUUID()
+    let bytes: Buffer
+    try { bytes = await storage.readVerified(attachment.sourceAttachmentId, attachment.storageKey,
+      attachment.byteSize, attachment.sha256) }
+    catch {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_UNAVAILABLE', '原购买图片暂时无法读取；购物车中的资料仍保留。')
+    }
+    let storageKey: string
+    try { storageKey = await storage.store(id, bytes) }
+    catch {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_COPY_FAILED', '图片暂时无法安全复制；购物车中的资料仍保留，请重试。')
+    }
+    preparedCopies.push({ draftId: input.replacementDraftId, id, storageKey,
+      sourceAttachmentId: attachment.sourceAttachmentId, fieldId: attachment.fieldId,
+      sourceStorageKey: attachment.storageKey,
+      byteSize: attachment.byteSize, reservedBytes: attachment.reservedBytes,
+      width: attachment.width, height: attachment.height, sha256: attachment.sha256 })
+  }
+}
+
+/** Perform only short SQL work in the final transaction. Every file object is
+ * prepared before entry; the source, relation and destination are revalidated
+ * under their normal locks before an attachment row can reference a copy. */
 export async function transferCartReplacementAttachmentsInTransaction(
   trx: Transaction<Database>,
   owner: PurchaseDraftOwner,
-  storage: PurchaseAttachmentStorage,
   preparedCopies: PreparedCartReplacementAttachmentCopy[],
   input: {
     lineId: string
@@ -266,21 +436,11 @@ export async function transferCartReplacementAttachmentsInTransaction(
   const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
   if (identity.kind !== 'customer') throw new PurchaseDraftServiceError(403,
     'CART_REPLACEMENT_CUSTOMER_REQUIRED', '购物车绑定资料编辑需要登录顾客身份。')
-  const draftIds = [input.sourceDraftId, input.replacementDraftId].sort()
-  const drafts = await trx.selectFrom('purchase_drafts').selectAll().where('id', 'in', draftIds)
-    .orderBy('id').forUpdate().execute()
-  if (drafts.length !== 2) throw draftNotFound()
-  const source = drafts.find(draft => draft.id === input.sourceDraftId)
-  const target = drafts.find(draft => draft.id === input.replacementDraftId)
-  if (!source || !target || source.customer_id !== identity.customerId || target.customer_id !== identity.customerId
-    || source.guest_order_session_id !== null || target.guest_order_session_id !== null
-    || source.status !== 'active' || target.status !== 'active'
-    || source.expires_at <= new Date() || target.expires_at <= new Date()) throw draftNotFound()
-  if (source.revision !== input.sourceDraftRevision || target.revision !== input.replacementDraftRevision) {
-    throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '购物车资料编辑已变化，请重新读取后继续。')
-  }
-  if (source.template_version_id !== target.template_version_id) {
-    throw new PurchaseDraftServiceError(409, 'PURCHASE_TEMPLATE_VERSION_CONFLICT', '购物车资料编辑模板已变化，请重新确认。')
+  const line = await trx.selectFrom('customer_cart_items').selectAll()
+    .where('customer_id', '=', identity.customerId).where('line_id', '=', input.lineId).forUpdate().executeTakeFirst()
+  if (!line || line.draft_id !== input.sourceDraftId || line.revision !== input.sourceLineRevision
+    || line.draft_revision !== input.sourceDraftRevision) {
+    throw new PurchaseDraftServiceError(409, 'CART_REPLACEMENT_CONFLICT', '原购买行已变化；上次有效资料仍保留。')
   }
   const relation = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
     .where('line_id', '=', input.lineId).where('customer_id', '=', identity.customerId)
@@ -289,6 +449,28 @@ export async function transferCartReplacementAttachmentsInTransaction(
   if (!relation || relation.source_line_revision !== input.sourceLineRevision
     || relation.source_draft_revision !== input.sourceDraftRevision) {
     throw new PurchaseDraftServiceError(409, 'CART_REPLACEMENT_CONFLICT', '购物车资料编辑已失效，请刷新购买行后重试。')
+  }
+  const effective = await effectivePurchaseFormForSku(trx, line.sku_id, { lockStatus: 'share' })
+  if (!effective.templateVersionId || effective.templateVersionId !== line.template_version_id) {
+    throw new PurchaseDraftServiceError(409, 'PURCHASE_FORM_VERSION_CHANGED', '填写模板已变化；原购物车资料仍保留。')
+  }
+  const draftIds = [input.sourceDraftId, input.replacementDraftId].sort()
+  const drafts = await trx.selectFrom('purchase_drafts').selectAll().where('id', 'in', draftIds)
+    .orderBy('id').forUpdate().execute()
+  if (drafts.length !== 2) throw draftNotFound()
+  const source = drafts.find(draft => draft.id === input.sourceDraftId)
+  const target = drafts.find(draft => draft.id === input.replacementDraftId)
+  const now = new Date()
+  if (!source || !target || source.customer_id !== identity.customerId || target.customer_id !== identity.customerId
+    || source.guest_order_session_id !== null || target.guest_order_session_id !== null
+    || source.status !== 'active' || target.status !== 'active'
+    || source.expires_at <= now || target.expires_at <= now) throw draftNotFound()
+  if (source.revision !== input.sourceDraftRevision || target.revision !== input.replacementDraftRevision) {
+    throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '购物车资料编辑已变化，请重新读取后继续。')
+  }
+  if (source.template_version_id !== target.template_version_id
+    || source.template_version_id !== effective.templateVersionId) {
+    throw new PurchaseDraftServiceError(409, 'PURCHASE_TEMPLATE_VERSION_CONFLICT', '购物车资料编辑模板已变化，请重新确认。')
   }
   const sourceAttachments = await listDraftAttachments(trx, source.id, true)
   if (sourceAttachments.some(attachment => attachment.status === 'uploading')) {
@@ -304,39 +486,50 @@ export async function transferCartReplacementAttachmentsInTransaction(
     throw new PurchaseDraftServiceError(409, 'CART_REPLACEMENT_ATTACHMENT_INVALID', '已移除的原图片不能重新附加，请重新上传图片。')
   }
   const selectedSourceIds = new Set(references.map(reference => reference.attachmentId).filter(id => sourceIds.has(id)))
+  const selected = sourceAttachments.filter(row => selectedSourceIds.has(row.id))
+  const referencedSourceIds = new Set((selected.length
+    ? await trx.selectFrom('purchase_draft_attachment_references').select('attachment_id')
+      .where('draft_id', '=', source.id).where('attachment_id', 'in', selected.map(row => row.id)).forShare().execute()
+    : []).map(row => row.attachment_id))
+  if (referencedSourceIds.size !== selected.length) {
+    throw new PurchaseDraftServiceError(409, 'CART_REPLACEMENT_ATTACHMENT_INVALID', '原图片已不再属于当前购买资料，请刷新后重新确认。')
+  }
+  if (preparedCopies.length !== selected.length) {
+    throw new PurchaseDraftServiceError(409, 'CART_REPLACEMENT_ATTACHMENT_CHANGED', '图片资料已变化，请刷新后重新确认。')
+  }
+  const copiesBySource = new Map(preparedCopies.map(copy => [copy.sourceAttachmentId, copy]))
+  if (copiesBySource.size !== preparedCopies.length) {
+    throw new PurchaseDraftServiceError(409, 'CART_REPLACEMENT_ATTACHMENT_CHANGED', '图片资料已变化，请刷新后重新确认。')
+  }
   const copiedIds = new Map<string, string>()
-
-  for (const attachment of sourceAttachments.filter(row => selectedSourceIds.has(row.id))) {
-    if (attachment.status !== 'ready' || attachment.byte_size === null || attachment.sha256 === null
-      || attachment.width === null || attachment.height === null) {
-      throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_UNAVAILABLE', '原购买图片暂时无法安全复制；购物车中的资料仍保留。')
+  for (const attachment of selected) {
+    const copy = copiesBySource.get(attachment.id)
+    if (!copy || copy.draftId !== target.id || !uuidPattern.test(copy.id)
+      || copy.storageKey !== `objects/${copy.id.slice(0, 2)}/${copy.id}.webp`
+      || copy.sourceStorageKey !== attachment.storage_key || copy.fieldId !== attachment.field_id
+      || copy.byteSize !== attachment.byte_size
+      || copy.reservedBytes !== attachment.reserved_bytes || copy.width !== attachment.width
+      || copy.height !== attachment.height || copy.sha256 !== attachment.sha256) {
+      throw new PurchaseDraftServiceError(409, 'CART_REPLACEMENT_ATTACHMENT_CHANGED', '图片资料已变化，请刷新后重新确认。')
     }
-    const id = randomUUID()
+    const existingCopy = await trx.selectFrom('purchase_draft_attachments').select('id')
+      .where('id', '=', copy.id).executeTakeFirst()
+    if (existingCopy) throw new PurchaseDraftServiceError(409,
+      'CART_REPLACEMENT_ATTACHMENT_CHANGED', '图片资料已变化，请刷新后重新确认。')
     await assertOwnerAttachmentCapacity(trx, identity, 0,
-      { attachmentId: attachment.id, byteSize: attachment.byte_size }, 1, id)
-    let bytes: Buffer
-    try { bytes = await storage.readVerified(attachment.id, attachment.storage_key, attachment.byte_size, attachment.sha256) }
-    catch {
-      throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_UNAVAILABLE', '原购买图片暂时无法读取；购物车中的资料仍保留。')
-    }
-    let storageKey: string
-    try { storageKey = await storage.store(id, bytes) }
-    catch {
-      throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_COPY_FAILED', '图片暂时无法安全复制；购物车中的资料仍保留，请重试。')
-    }
-    preparedCopies.push({ draftId: target.id, id, storageKey })
+      { attachmentId: attachment.id, byteSize: attachment.byte_size! }, 1, copy.id)
     await trx.insertInto('purchase_draft_attachments').values({
-      id, draft_id: target.id, field_id: attachment.field_id, status: 'ready', storage_key: storageKey,
+      id: copy.id, draft_id: target.id, field_id: attachment.field_id, status: 'ready', storage_key: copy.storageKey,
       mime_type: 'image/webp', byte_size: attachment.byte_size, reserved_bytes: attachment.reserved_bytes,
       width: attachment.width, height: attachment.height, sha256: attachment.sha256,
-      replaces_attachment_id: attachment.id, updated_at: new Date(),
+      replaces_attachment_id: attachment.id, updated_at: now,
     }).execute()
-    copiedIds.set(attachment.id.toLowerCase(), id)
+    copiedIds.set(attachment.id.toLowerCase(), copy.id)
   }
 
   await trx.deleteFrom('purchase_draft_attachment_references').where('draft_id', '=', source.id).execute()
   if (sourceAttachments.length) {
-    await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: new Date() })
+    await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: now })
       .where('draft_id', '=', source.id).where('id', 'in', sourceAttachments.map(attachment => attachment.id))
       .where('status', 'in', ['ready', 'failed']).execute()
   }
@@ -1216,56 +1409,215 @@ export async function reconcilePurchaseDrafts(
   let removedFiles = 0
 
   if (options.repair) {
-    await db.transaction().execute(async (trx) => {
-      const expired = await trx.selectFrom('purchase_drafts').select('id')
-        .where('status', '=', 'active').where('expires_at', '<=', now)
-        .orderBy('expires_at').orderBy('id').limit(batchSize).forUpdate().skipLocked().execute()
-      for (const draft of expired) {
-        await trx.updateTable('purchase_drafts').set({ status: 'deleting' }).where('id', '=', draft.id).execute()
-        await trx.deleteFrom('purchase_draft_attachment_references').where('draft_id', '=', draft.id).execute()
-        await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: now })
-          .where('draft_id', '=', draft.id).where('status', 'in', ['ready', 'failed']).execute()
+    // First unlink stale edit relationships under customer -> cart line ->
+    // relationship -> sorted drafts -> target attachments. The source FK stays
+    // RESTRICT as a database guard: a source can only be reclaimed after this
+    // protocol has also made its incomplete target unavailable.
+    const staleRelations = await sql<{ line_id: string; customer_id: string }>`
+      SELECT relation.line_id, relation.customer_id
+      FROM customer_cart_line_replacement_drafts AS relation
+      LEFT JOIN customer_cart_items AS line ON line.line_id = relation.line_id
+      LEFT JOIN purchase_drafts AS source ON source.id = relation.source_draft_id
+      LEFT JOIN purchase_drafts AS target ON target.id = relation.replacement_draft_id
+      WHERE line.line_id IS NULL
+        OR line.customer_id IS DISTINCT FROM relation.customer_id
+        OR line.draft_id IS DISTINCT FROM relation.source_draft_id
+        OR line.revision IS DISTINCT FROM relation.source_line_revision
+        OR line.draft_revision IS DISTINCT FROM relation.source_draft_revision
+        OR line.template_version_id IS DISTINCT FROM source.template_version_id
+        OR source.customer_id IS DISTINCT FROM relation.customer_id
+        OR source.guest_order_session_id IS NOT NULL
+        OR source.status IS DISTINCT FROM 'active'
+        OR source.expires_at <= ${now}
+        OR source.revision IS DISTINCT FROM relation.source_draft_revision
+        OR target.customer_id IS DISTINCT FROM relation.customer_id
+        OR target.guest_order_session_id IS NOT NULL
+        OR target.status IS DISTINCT FROM 'active'
+        OR target.expires_at <= ${now}
+        OR target.template_version_id IS DISTINCT FROM source.template_version_id
+      ORDER BY relation.customer_id, relation.line_id
+      LIMIT ${batchSize}
+    `.execute(db)
+    for (const candidate of staleRelations.rows) {
+      try {
+        await db.transaction().execute(async trx => {
+          const customer = await trx.selectFrom('customers').select('id')
+            .where('id', '=', candidate.customer_id).forUpdate().executeTakeFirst()
+          if (!customer) return
+          const line = await trx.selectFrom('customer_cart_items').selectAll()
+            .where('customer_id', '=', candidate.customer_id).where('line_id', '=', candidate.line_id)
+            .forUpdate().executeTakeFirst()
+          if (!line) return
+          const relation = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
+            .where('customer_id', '=', candidate.customer_id).where('line_id', '=', candidate.line_id)
+            .forUpdate().executeTakeFirst()
+          if (!relation) return
+          const draftIds = [relation.source_draft_id, relation.replacement_draft_id].sort()
+          const drafts = await trx.selectFrom('purchase_drafts').selectAll().where('id', 'in', draftIds)
+            .orderBy('id').forUpdate().execute()
+          const source = drafts.find(draft => draft.id === relation.source_draft_id)
+          const target = drafts.find(draft => draft.id === relation.replacement_draft_id)
+          const stillStale = !source || !target
+            || line.customer_id !== relation.customer_id
+            || line.draft_id !== relation.source_draft_id
+            || line.revision !== relation.source_line_revision
+            || line.draft_revision !== relation.source_draft_revision
+            || line.template_version_id !== source.template_version_id
+            || source.customer_id !== relation.customer_id || source.guest_order_session_id !== null
+            || source.status !== 'active' || source.expires_at <= now
+            || source.revision !== relation.source_draft_revision
+            || target.customer_id !== relation.customer_id || target.guest_order_session_id !== null
+            || target.status !== 'active' || target.expires_at <= now
+            || target.template_version_id !== source.template_version_id
+          if (stillStale) await discardCartLineReplacementDraftsInTransaction(trx, [candidate.line_id], now)
+        })
+      } catch {
+        // Isolate a damaged relationship; its RESTRICT FK keeps the source safe
+        // while unrelated expired drafts and files continue to be reclaimed.
       }
-      expiredDrafts = expired.length
+    }
 
-      const staleUploading = await trx.selectFrom('purchase_draft_attachments as attachment')
-        .innerJoin('purchase_drafts as draft', 'draft.id', 'attachment.draft_id')
-        .select(['attachment.id', 'draft.status as draft_status'])
-        .where('attachment.status', '=', 'uploading').where('attachment.created_at', '<=', cutoff)
-        .orderBy('attachment.created_at').orderBy('attachment.id').limit(batchSize).forUpdate('attachment').skipLocked().execute()
-      for (const row of staleUploading) {
-        await trx.updateTable('purchase_draft_attachments').set({ status: row.draft_status === 'deleting' ? 'deleting' : 'failed', updated_at: now })
-          .where('id', '=', row.id).where('status', '=', 'uploading').execute()
+    // Capture old-ready candidates before taking expiry locks. This keeps the
+    // candidate snapshot independent from concurrent renewal transactions;
+    // each candidate is rechecked under draft -> attachment locks below.
+    const oldReady = await db.selectFrom('purchase_draft_attachments as attachment')
+      .innerJoin('purchase_drafts as draft', 'draft.id', 'attachment.draft_id')
+      .select(['attachment.id', 'attachment.draft_id'])
+      .where('attachment.status', '=', 'ready').where('attachment.created_at', '<=', cutoff)
+      .where(eb => eb.or([eb('draft.status', '=', 'deleting'), eb('draft.expires_at', '<=', now)]))
+      .orderBy('attachment.created_at').orderBy('attachment.id').limit(batchSize).execute()
+
+    const expired = await db.selectFrom('purchase_drafts').select(['id', 'customer_id'])
+      .where('status', '=', 'active').where('expires_at', '<=', now)
+      .orderBy('expires_at').orderBy('id').limit(batchSize).execute()
+    for (const candidate of expired) {
+      try {
+        const expiredNow = await db.transaction().execute(async trx => {
+          if (candidate.customer_id) {
+            const customer = await trx.selectFrom('customers').select('id')
+              .where('id', '=', candidate.customer_id).forUpdate().executeTakeFirst()
+            if (!customer) return false
+            const relationHints = await trx.selectFrom('customer_cart_line_replacement_drafts')
+              .select('line_id').where(eb => eb.or([
+                eb('source_draft_id', '=', candidate.id), eb('replacement_draft_id', '=', candidate.id),
+              ])).orderBy('line_id').execute()
+            const boundLines = await trx.selectFrom('customer_cart_items').select('line_id')
+              .where('customer_id', '=', candidate.customer_id).where('draft_id', '=', candidate.id).execute()
+            const affectedLineIds = [...new Set([
+              ...relationHints.map(row => row.line_id), ...boundLines.map(row => row.line_id),
+            ])].sort()
+            if (affectedLineIds.length) {
+              await trx.selectFrom('customer_cart_items').select('line_id')
+                .where('customer_id', '=', candidate.customer_id).where('line_id', 'in', affectedLineIds)
+                .orderBy('line_id').forUpdate().execute()
+            }
+            const relations = await trx.selectFrom('customer_cart_line_replacement_drafts').selectAll()
+              .where(eb => eb.or([
+                eb('source_draft_id', '=', candidate.id), eb('replacement_draft_id', '=', candidate.id),
+              ])).orderBy('line_id').forUpdate().execute()
+            const affectedDraftIds = [...new Set([
+              candidate.id,
+              ...relations.flatMap(row => [row.source_draft_id, row.replacement_draft_id]),
+            ])].sort()
+            const lockedDrafts = await trx.selectFrom('purchase_drafts').selectAll()
+              .where('id', 'in', affectedDraftIds).orderBy('id').forUpdate().execute()
+            const draft = lockedDrafts.find(row => row.id === candidate.id)
+            if (!draft || draft.status !== 'active' || draft.expires_at > now) return false
+            // Lock every affected attachment in stable draft/id order before
+            // unlinking relationships. The helper repeats these locks safely.
+            await trx.selectFrom('purchase_draft_attachments').select('id')
+              .where('draft_id', 'in', affectedDraftIds).orderBy('draft_id').orderBy('id').forUpdate().execute()
+            if (relations.length) {
+              await discardCartLineReplacementDraftsInTransaction(
+                trx, relations.map(row => row.line_id), now,
+              )
+            }
+            await trx.updateTable('purchase_drafts').set({ status: 'deleting' })
+              .where('id', '=', candidate.id).where('status', '=', 'active').where('expires_at', '<=', now).execute()
+            await trx.deleteFrom('purchase_draft_attachment_references')
+              .where('draft_id', '=', candidate.id).execute()
+            await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: now })
+              .where('draft_id', '=', candidate.id).where('status', 'in', ['ready', 'failed']).execute()
+            return true
+          }
+
+          const draft = await trx.selectFrom('purchase_drafts').select(['id', 'status', 'expires_at'])
+            .where('id', '=', candidate.id).forUpdate().executeTakeFirst()
+          if (!draft || draft.status !== 'active' || draft.expires_at > now) return false
+          await trx.selectFrom('purchase_draft_attachments').select('id').where('draft_id', '=', candidate.id)
+            .orderBy('id').forUpdate().execute()
+          await trx.updateTable('purchase_drafts').set({ status: 'deleting' })
+            .where('id', '=', candidate.id).where('status', '=', 'active').where('expires_at', '<=', now).execute()
+          await trx.deleteFrom('purchase_draft_attachment_references').where('draft_id', '=', candidate.id).execute()
+          await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: now })
+            .where('draft_id', '=', candidate.id).where('status', 'in', ['ready', 'failed']).execute()
+          return true
+        })
+        if (expiredNow) expiredDrafts += 1
+      } catch {
+        // A single malformed or concurrently changing draft must not block the
+        // remainder of this batch. The next repair retries it idempotently.
       }
+    }
 
-      await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: now })
-        .where('status', '=', 'failed').where('created_at', '<=', cutoff).execute()
-      const oldReady = await trx.selectFrom('purchase_draft_attachments as attachment')
-        .innerJoin('purchase_drafts as draft', 'draft.id', 'attachment.draft_id')
-        .select(['attachment.id', 'attachment.draft_id'])
-        .where('attachment.status', '=', 'ready').where('attachment.created_at', '<=', cutoff)
-        .where(eb => eb.or([eb('draft.status', '=', 'deleting'), eb('draft.expires_at', '<=', now)]))
-        .orderBy('attachment.created_at').orderBy('attachment.id').limit(batchSize).execute()
-      for (const candidate of oldReady) {
+    const staleUploading = await db.selectFrom('purchase_draft_attachments').select(['id', 'draft_id'])
+      .where('status', '=', 'uploading').where('created_at', '<=', cutoff)
+      .orderBy('created_at').orderBy('id').limit(batchSize).execute()
+    for (const candidate of staleUploading) {
+      await db.transaction().execute(async trx => {
+        const draft = await trx.selectFrom('purchase_drafts').select(['id', 'status'])
+          .where('id', '=', candidate.draft_id).forUpdate().skipLocked().executeTakeFirst()
+        if (!draft) return
+        const attachment = await trx.selectFrom('purchase_draft_attachments').select('id')
+          .where('id', '=', candidate.id).where('draft_id', '=', candidate.draft_id)
+          .where('status', '=', 'uploading').where('created_at', '<=', cutoff)
+          .forUpdate().skipLocked().executeTakeFirst()
+        if (!attachment) return
+        await trx.updateTable('purchase_draft_attachments').set({
+          status: draft.status === 'deleting' ? 'deleting' : 'failed', updated_at: now,
+        }).where('id', '=', attachment.id).where('status', '=', 'uploading').execute()
+      })
+    }
+
+    const oldFailed = await db.selectFrom('purchase_draft_attachments').select(['id', 'draft_id'])
+      .where('status', '=', 'failed').where('created_at', '<=', cutoff)
+      .orderBy('created_at').orderBy('id').limit(batchSize).execute()
+    for (const candidate of oldFailed) {
+      await db.transaction().execute(async trx => {
+        const draft = await trx.selectFrom('purchase_drafts').select('id')
+          .where('id', '=', candidate.draft_id).forUpdate().skipLocked().executeTakeFirst()
+        if (!draft) return
+        const attachment = await trx.selectFrom('purchase_draft_attachments').select('id')
+          .where('id', '=', candidate.id).where('draft_id', '=', candidate.draft_id)
+          .where('status', '=', 'failed').where('created_at', '<=', cutoff)
+          .forUpdate().skipLocked().executeTakeFirst()
+        if (attachment) {
+          await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: now })
+            .where('id', '=', attachment.id).where('status', '=', 'failed').execute()
+        }
+      })
+    }
+
+    for (const candidate of oldReady) {
+      await db.transaction().execute(async trx => {
         const draft = await trx.selectFrom('purchase_drafts').select(['id', 'status', 'expires_at'])
           .where('id', '=', candidate.draft_id).forUpdate().skipLocked().executeTakeFirst()
-        if (!draft) continue
+        if (!draft) return
         const stillExpired = draft.status === 'deleting' || (draft.status === 'active' && draft.expires_at <= now)
-        if (!stillExpired) continue
+        if (!stillExpired) return
         const attachment = await trx.selectFrom('purchase_draft_attachments').select(['id', 'created_at'])
           .where('id', '=', candidate.id).where('draft_id', '=', candidate.draft_id)
           .where('status', '=', 'ready').where('created_at', '<=', cutoff)
           .forUpdate().skipLocked().executeTakeFirst()
-        if (!attachment) continue
-        if (attachment.created_at > cutoff) continue
+        if (!attachment) return
         const reference = await trx.selectFrom('purchase_draft_attachment_references').select('attachment_id')
           .where('draft_id', '=', candidate.draft_id).where('attachment_id', '=', candidate.id).executeTakeFirst()
         if (!reference) {
           await trx.updateTable('purchase_draft_attachments').set({ status: 'deleting', updated_at: now })
             .where('id', '=', candidate.id).where('status', '=', 'ready').execute()
         }
-      }
-    })
+      })
+    }
 
     const pending = await db.selectFrom('purchase_draft_attachments').selectAll()
       .where('status', '=', 'deleting').orderBy('created_at').orderBy('id').limit(batchSize).execute()
@@ -1285,10 +1637,19 @@ export async function reconcilePurchaseDrafts(
     for (const draft of candidates) {
       const attachment = await db.selectFrom('purchase_draft_attachments').select('id')
         .where('draft_id', '=', draft.id).executeTakeFirst()
-      if (!attachment) removableDrafts.push(draft)
+      const relationship = await db.selectFrom('customer_cart_line_replacement_drafts').select('line_id')
+        .where('source_draft_id', '=', draft.id).executeTakeFirst()
+      if (!attachment && !relationship) removableDrafts.push(draft)
     }
     for (const draft of removableDrafts) {
-      await db.deleteFrom('purchase_drafts').where('id', '=', draft.id).where('status', '=', 'deleting').execute()
+      try {
+        await db.deleteFrom('purchase_drafts').where('id', '=', draft.id).where('status', '=', 'deleting')
+          .where(eb => eb.not(eb.exists(eb.selectFrom('customer_cart_line_replacement_drafts')
+            .select('line_id').whereRef('source_draft_id', '=', 'purchase_drafts.id')))).execute()
+      } catch {
+        // Keep one still-referenced draft for a later repair without stopping
+        // reclamation of the remaining candidates.
+      }
     }
   }
 
