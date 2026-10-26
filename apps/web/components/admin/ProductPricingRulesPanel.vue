@@ -5,8 +5,10 @@ import type {
   AdminProductPricingRuleHistory,
   AdminProductPricingRuleHistoryItem,
   AdminProductPricingRuleItem,
+  AdminProductPricingRulesBatchResult,
   AdminProductPricingRulesPage,
   ProductPricingMode,
+  RestoreAdminProductPricingRuleResult,
 } from '@aikayun/contracts'
 import { AdminApiError, useAdminApi } from '~/composables/useAdminApi'
 
@@ -16,24 +18,40 @@ const props = defineProps<{
   archived: boolean
 }>()
 
-const emit = defineEmits<{ revisionChanged: [revision: number]; pricesChanged: [] }>()
+const emit = defineEmits<{
+  revisionChanged: [revision: number]
+  pricesChanged: []
+  dirtyChanged: [dirty: boolean]
+}>()
 const { request } = useAdminApi()
 
 type RuleDraft = { mode: ProductPricingMode; fixedProfit: string; markupRate: string }
+type PreviewContext = { productId: string; productRevision: number; page: number; inputGeneration: number; selectedIds: string[] }
+type RestoreCandidate = { productId: string; skuId: string; skuCode: string; version: AdminProductPricingRuleHistoryItem }
 const page = shallowRef<AdminProductPricingRulesPage | null>(null)
 const preview = shallowRef<AdminProductPricingPreview | null>(null)
+const previewContext = shallowRef<PreviewContext | null>(null)
 const history = shallowRef<AdminProductPricingRuleHistory | null>(null)
 const historySkuId = ref('')
+const restoreCandidate = shallowRef<RestoreCandidate | null>(null)
 const drafts = reactive<Record<string, RuleDraft>>({})
 const selected = reactive<Record<string, boolean>>({})
+const draftEditGenerations = reactive<Record<string, number>>({})
 const loading = ref(false)
 const working = ref('')
 const pageNumber = ref(1)
+const rulesRequestGeneration = ref(0)
+const historyRequestGeneration = ref(0)
+const operationGeneration = ref(0)
+const previewRequestGeneration = ref(0)
+const inputGeneration = ref(0)
+const historyLoading = ref(false)
 const error = ref('')
 const message = ref('')
 const historyError = ref('')
 const historyOpen = ref(false)
 const confirmationOpen = ref(false)
+const restoreConfirmationOpen = ref(false)
 const confirmedPreview = ref(false)
 const confirmedRisks = ref(false)
 
@@ -46,43 +64,118 @@ const modeItems = [
 const selectedIds = computed(() => (page.value?.items ?? [])
   .filter(row => selected[row.skuId] && row.retiredAt === null)
   .map(row => row.skuId))
-const dirty = computed(() => (page.value?.items ?? []).some((row) => {
+const selectedIdsKey = computed(() => [...selectedIds.value].sort().join('|'))
+function rowIsDirty(row: AdminProductPricingRuleItem) {
   const draft = drafts[row.skuId]
   if (!draft) return false
   return draft.mode !== row.mode
     || (draft.mode === 'fixed_profit' && draft.fixedProfit.trim() !== (row.fixedProfit ?? ''))
     || (draft.mode === 'percentage_markup' && draft.markupRate.trim() !== (row.markupRate ?? ''))
+}
+const dirty = computed(() => (page.value?.items ?? []).some((row) => {
+  return rowIsDirty(row)
 }))
+const previewIsCurrent = computed(() => {
+  const context = previewContext.value
+  return Boolean(preview.value && context && !dirty.value
+    && context.productId === props.productId
+    && context.productRevision === page.value?.productRevision
+    && context.page === pageNumber.value
+    && context.inputGeneration === inputGeneration.value
+    && context.selectedIds.join('|') === [...selectedIds.value].sort().join('|')
+    && preview.value.productId === props.productId
+    && preview.value.productRevision === context.productRevision
+    && [...preview.value.items.map(item => item.skuId)].sort().join('|') === context.selectedIds.join('|'))
+})
 const requiresRiskAck = computed(() => (preview.value?.items ?? []).some(item =>
   item.risks.includes('NEGATIVE_PROFIT') || item.risks.includes('FREE_PRICE')))
-const canConfirmApply = computed(() => Boolean(preview.value?.items.length)
+const canConfirmApply = computed(() => previewIsCurrent.value && Boolean(preview.value?.items.length)
   && preview.value!.items.every(item => item.canApply)
   && confirmedPreview.value
   && (!requiresRiskAck.value || confirmedRisks.value)
   && !props.archived
   && !working.value)
-const historyItems = computed(() => history.value?.items ?? [])
+const historyItems = computed(() => history.value?.productId === props.productId
+  && history.value.skuId === historySkuId.value
+  ? history.value.items
+  : [])
+const canConfirmRestore = computed(() => {
+  const candidate = restoreCandidate.value
+  return Boolean(candidate && candidate.productId === props.productId
+    && candidate.skuId === historySkuId.value
+    && history.value?.productId === candidate.productId
+    && history.value.skuId === candidate.skuId
+    && history.value.items.some(item => item.id === candidate.version.id && item.skuId === candidate.skuId)
+    && !props.archived && !working.value)
+})
 
-function seedDrafts(items: AdminProductPricingRuleItem[]) {
+function draftFromServer(row: AdminProductPricingRuleItem) {
+  drafts[row.skuId] = { mode: row.mode, fixedProfit: row.fixedProfit ?? '', markupRate: row.markupRate ?? '' }
+}
+
+function syncDraftsFromPage(
+  items: AdminProductPricingRuleItem[],
+  editGenerationsAtStart: Record<string, number>,
+  dirtyIdsAtStart: Set<string>,
+) {
   for (const row of items) {
-    drafts[row.skuId] ??= { mode: row.mode, fixedProfit: row.fixedProfit ?? '', markupRate: row.markupRate ?? '' }
+    const changedWhileLoading = (draftEditGenerations[row.skuId] ?? 0) !== (editGenerationsAtStart[row.skuId] ?? 0)
+    if (!dirtyIdsAtStart.has(row.skuId) && !changedWhileLoading) draftFromServer(row)
     if (selected[row.skuId] === undefined) selected[row.skuId] = row.retiredAt === null
   }
 }
 
+function invalidatePreview() {
+  previewRequestGeneration.value += 1
+  if (working.value === 'preview') working.value = ''
+  preview.value = null
+  previewContext.value = null
+  confirmationOpen.value = false
+  confirmedPreview.value = false
+  confirmedRisks.value = false
+}
+
+function onDraftEdited(skuId: string) {
+  draftEditGenerations[skuId] = (draftEditGenerations[skuId] ?? 0) + 1
+  inputGeneration.value += 1
+  invalidatePreview()
+  message.value = ''
+}
+
+function onSelectionChanged() {
+  inputGeneration.value += 1
+  invalidatePreview()
+}
+
 async function loadRules(pageToLoad = pageNumber.value) {
+  const requestGeneration = ++rulesRequestGeneration.value
+  const targetProductId = props.productId
+  const previousPage = pageNumber.value
+  pageNumber.value = pageToLoad
+  const editGenerationsAtStart = { ...draftEditGenerations }
+  const dirtyIdsAtStart = new Set((page.value?.items ?? []).filter(rowIsDirty).map(row => row.skuId))
+  invalidatePreview()
   loading.value = true
   error.value = ''
   try {
-    const result = await request<AdminProductPricingRulesPage>(`/api/v1/admin/products/${props.productId}/pricing-rules?page=${pageToLoad}&pageSize=50`)
+    const result = await request<AdminProductPricingRulesPage>(`/api/v1/admin/products/${targetProductId}/pricing-rules?page=${pageToLoad}&pageSize=50`)
+    if (requestGeneration !== rulesRequestGeneration.value || targetProductId !== props.productId) return
+    if (result.productId !== targetProductId) return
     page.value = result
     pageNumber.value = result.page
-    seedDrafts(result.items)
-    if (!historySkuId.value) historySkuId.value = result.items.find(row => row.retiredAt === null)?.skuId ?? ''
+    syncDraftsFromPage(result.items, editGenerationsAtStart, dirtyIdsAtStart)
+    if (!result.items.some(row => row.skuId === historySkuId.value)) {
+      historySkuId.value = result.items.find(row => row.retiredAt === null)?.skuId ?? ''
+    }
     if (result.productRevision > props.productRevision) emit('revisionChanged', result.productRevision)
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '定价规则读取失败。'
-  } finally { loading.value = false }
+    if (requestGeneration === rulesRequestGeneration.value && targetProductId === props.productId) {
+      pageNumber.value = previousPage
+      error.value = cause instanceof Error ? cause.message : '定价规则读取失败。'
+    }
+  } finally {
+    if (requestGeneration === rulesRequestGeneration.value && targetProductId === props.productId) loading.value = false
+  }
 }
 
 function ruleUpdate(row: AdminProductPricingRuleItem) {
@@ -106,53 +199,105 @@ async function saveRules() {
       || (draft.mode === 'percentage_markup' && draft.markupRate.trim() !== (row.markupRate ?? '')))
   }).map(ruleUpdate)
   if (!updates.length) return
+  const targetProductId = props.productId
+  const targetPage = page.value.page
+  const editGenerationsAtStart = Object.fromEntries(updates.map(item => [item.skuId, draftEditGenerations[item.skuId] ?? 0]))
+  const operation = ++operationGeneration.value
   working.value = 'save'
   error.value = ''
   message.value = ''
-  preview.value = null
+  invalidatePreview()
   try {
-    const result = await request<{ productRevision: number }>(`/api/v1/admin/products/${props.productId}/pricing-rules/batch`, {
+    const result = await request<AdminProductPricingRulesBatchResult>(`/api/v1/admin/products/${targetProductId}/pricing-rules/batch`, {
       method: 'PUT', body: { expectedRevision: page.value.productRevision, updates },
     })
+    if (operation !== operationGeneration.value || targetProductId !== props.productId || result.productId !== targetProductId) return
+    if (!mergeRuleItems(result.productRevision, result.items, new Map(Object.entries(editGenerationsAtStart)))) {
+      void loadRules(targetPage)
+      return
+    }
     emit('revisionChanged', result.productRevision)
     message.value = `已为 ${updates.length} 个 SKU 保存新的规则版本；售价尚未更改。`
-    await loadRules()
   } catch (cause) {
+    if (operation !== operationGeneration.value || targetProductId !== props.productId) return
     error.value = cause instanceof Error ? cause.message : '规则保存失败。'
-    if (cause instanceof AdminApiError && cause.code.includes('REVISION')) await loadRules()
-  } finally { working.value = '' }
+    if (cause instanceof AdminApiError && cause.code.includes('REVISION')) await loadRules(targetPage)
+  } finally {
+    if (operation === operationGeneration.value && targetProductId === props.productId) working.value = ''
+  }
 }
 
 async function makePreview() {
   if (props.archived || !selectedIds.value.length || working.value) return
+  if (dirty.value) {
+    invalidatePreview()
+    error.value = '规则有未保存修改。请先保存规则，再重新预览和确认应用。'
+    return
+  }
+  const targetProductId = props.productId
+  const targetPage = page.value?.page ?? pageNumber.value
+  const targetPageRevision = page.value?.productRevision
+  const targetInputGeneration = inputGeneration.value
+  const targetSkuIds = [...selectedIds.value]
+  const requestGeneration = ++previewRequestGeneration.value
   working.value = 'preview'
   error.value = ''
   message.value = ''
   preview.value = null
+  previewContext.value = null
   try {
-    preview.value = await request<AdminProductPricingPreview>(`/api/v1/admin/products/${props.productId}/pricing-rules/preview`, {
-      method: 'POST', body: { skuIds: selectedIds.value },
+    const result = await request<AdminProductPricingPreview>(`/api/v1/admin/products/${targetProductId}/pricing-rules/preview`, {
+      method: 'POST', body: { skuIds: targetSkuIds },
     })
-    if (preview.value.productRevision > props.productRevision) emit('revisionChanged', preview.value.productRevision)
+    if (requestGeneration !== previewRequestGeneration.value || targetProductId !== props.productId
+      || targetInputGeneration !== inputGeneration.value || dirty.value || selectedIdsKey.value !== [...targetSkuIds].sort().join('|')) return
+    if (result.productId !== targetProductId || result.productRevision !== targetPageRevision) {
+      error.value = '商品或 SKU 数据已变化，规则已刷新；请重新预览后再确认。'
+      void loadRules(targetPage)
+      return
+    }
+    preview.value = result
+    previewContext.value = {
+      productId: targetProductId,
+      productRevision: result.productRevision,
+      page: targetPage,
+      inputGeneration: targetInputGeneration,
+      selectedIds: [...result.items.map(item => item.skuId)].sort(),
+    }
+    if (result.productRevision > props.productRevision) emit('revisionChanged', result.productRevision)
     confirmedPreview.value = false
     confirmedRisks.value = false
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '预览计算失败。'
-  } finally { working.value = '' }
+    if (requestGeneration === previewRequestGeneration.value && targetProductId === props.productId) {
+      error.value = cause instanceof Error ? cause.message : '预览计算失败。'
+    }
+  } finally {
+    if (requestGeneration === previewRequestGeneration.value && targetProductId === props.productId) working.value = ''
+  }
 }
 
 async function applyPreview() {
-  if (!preview.value || !canConfirmApply.value || working.value) return
+  if (!preview.value || !previewIsCurrent.value || !canConfirmApply.value || working.value) {
+    invalidatePreview()
+    error.value = dirty.value
+      ? '规则有未保存修改。请先保存规则，再重新预览和确认应用。'
+      : '当前预览已失效，请重新预览后确认应用。'
+    return
+  }
+  const targetProductId = props.productId
+  const targetPage = page.value?.page ?? pageNumber.value
+  const operation = ++operationGeneration.value
+  const expectedPreview = preview.value
   working.value = 'apply'
   error.value = ''
   message.value = ''
   try {
-    const result = await request<{ productRevision: number; items: AdminProductPricingRuleItem[] }>(`/api/v1/admin/products/${props.productId}/pricing-rules/apply`, {
+    const result = await request<AdminProductPricingRulesBatchResult>(`/api/v1/admin/products/${targetProductId}/pricing-rules/apply`, {
       method: 'POST',
       body: {
-        expectedRevision: preview.value.productRevision,
+        expectedRevision: expectedPreview.productRevision,
         confirmLossAndFreePrice: confirmedRisks.value,
-        items: preview.value.items.map(item => ({
+        items: expectedPreview.items.map(item => ({
           skuId: item.skuId,
           expectedSkuRevision: item.skuRevision,
           expectedRuleRevision: item.ruleRevision,
@@ -160,6 +305,11 @@ async function applyPreview() {
         })),
       },
     })
+    if (operation !== operationGeneration.value || targetProductId !== props.productId || result.productId !== targetProductId) return
+    if (!mergeRuleItems(result.productRevision, result.items)) {
+      void loadRules(targetPage)
+      return
+    }
     emit('revisionChanged', result.productRevision)
     emit('pricesChanged')
     message.value = `已确认应用 ${result.items.length} 个 SKU 的建议售价。`
@@ -167,15 +317,24 @@ async function applyPreview() {
     confirmationOpen.value = false
     confirmedPreview.value = false
     confirmedRisks.value = false
-    await loadRules()
     if (historyOpen.value && historySkuId.value) await loadHistory(historySkuId.value)
   } catch (cause) {
+    if (operation !== operationGeneration.value || targetProductId !== props.productId) return
     error.value = cause instanceof Error ? cause.message : '定价应用失败。'
     if (cause instanceof AdminApiError && cause.code.includes('STALE')) preview.value = null
-  } finally { working.value = '' }
+  } finally {
+    if (operation === operationGeneration.value && targetProductId === props.productId) working.value = ''
+  }
 }
 
 function openApplyConfirmation() {
+  if (!previewIsCurrent.value || dirty.value) {
+    invalidatePreview()
+    error.value = dirty.value
+      ? '规则有未保存修改。请先保存规则，再重新预览和确认应用。'
+      : '当前预览已失效，请重新预览后确认应用。'
+    return
+  }
   confirmedPreview.value = false
   confirmedRisks.value = false
   confirmationOpen.value = true
@@ -209,11 +368,26 @@ function deltaLabel(item: AdminProductPricingPreviewItem) {
 }
 
 async function loadHistory(skuId = historySkuId.value) {
-  if (!skuId) return
+  const targetProductId = props.productId
+  if (!skuId || skuId !== historySkuId.value || !historyOpen.value) return
+  const requestGeneration = ++historyRequestGeneration.value
+  history.value = null
+  historyLoading.value = true
   historyError.value = ''
   try {
-    history.value = await request<AdminProductPricingRuleHistory>(`/api/v1/admin/products/${props.productId}/variants/${skuId}/pricing-rules/history`)
-  } catch (cause) { historyError.value = cause instanceof Error ? cause.message : '规则历史读取失败。' }
+    const result = await request<AdminProductPricingRuleHistory>(`/api/v1/admin/products/${targetProductId}/variants/${skuId}/pricing-rules/history`)
+    if (requestGeneration !== historyRequestGeneration.value || targetProductId !== props.productId
+      || skuId !== historySkuId.value || !historyOpen.value
+      || result.productId !== targetProductId || result.skuId !== skuId) return
+    history.value = result
+  } catch (cause) {
+    if (requestGeneration === historyRequestGeneration.value && targetProductId === props.productId
+      && skuId === historySkuId.value) {
+      historyError.value = cause instanceof Error ? cause.message : '规则历史读取失败。'
+    }
+  } finally {
+    if (requestGeneration === historyRequestGeneration.value && targetProductId === props.productId) historyLoading.value = false
+  }
 }
 
 function versionLabel(version: AdminProductPricingRuleHistoryItem) {
@@ -222,48 +396,153 @@ function versionLabel(version: AdminProductPricingRuleHistoryItem) {
   return `成本加价 ${version.markupRate}%`
 }
 
-async function restoreVersion(version: AdminProductPricingRuleHistoryItem) {
-  const row = page.value?.items.find(item => item.skuId === version.skuId)
-  if (!row || props.archived || row.retiredAt || working.value) return
+function previewRuleLabel(item: AdminProductPricingPreviewItem) {
+  if (item.mode === 'fixed_profit') return `固定利润 ¥${item.fixedProfit}`
+  if (item.mode === 'percentage_markup') return `成本加价 ${item.markupRate}%`
+  return '手动售价'
+}
+
+function openRestoreConfirmation(version: AdminProductPricingRuleHistoryItem) {
+  const skuId = historySkuId.value
+  const historyForSku = history.value
+  const row = page.value?.items.find(item => item.skuId === skuId)
+  if (!historyOpen.value || !row || version.skuId !== skuId || !historyForSku
+    || historyForSku.productId !== props.productId || historyForSku.skuId !== skuId
+    || !historyForSku.items.some(item => item.id === version.id && item.skuId === skuId)
+    || props.archived || row.retiredAt || working.value) return
+  restoreCandidate.value = { productId: props.productId, skuId, skuCode: row.skuCode, version }
+  restoreConfirmationOpen.value = true
+}
+
+async function confirmRestoreVersion() {
+  const candidate = restoreCandidate.value
+  if (!candidate || !canConfirmRestore.value || working.value) return
+  const targetProductId = candidate.productId
+  const targetSkuId = candidate.skuId
+  const targetVersion = candidate.version
+  const row = page.value?.items.find(item => item.skuId === targetSkuId)
+  if (targetProductId !== props.productId || targetSkuId !== historySkuId.value
+    || history.value?.productId !== targetProductId || history.value.skuId !== targetSkuId
+    || !history.value.items.some(item => item.id === targetVersion.id && item.skuId === targetSkuId)
+    || !row || props.archived || row.retiredAt) {
+    restoreConfirmationOpen.value = false
+    restoreCandidate.value = null
+    historyError.value = '当前历史选择已变化，请重新选择 SKU 和规则版本。'
+    return
+  }
+  const targetPage = page.value!.page
+  const editGenerationAtStart = draftEditGenerations[targetSkuId] ?? 0
+  const operation = ++operationGeneration.value
   working.value = 'restore'
   error.value = ''
+  message.value = ''
   try {
-    const result = await request<{ productRevision: number; restoredFromRevision: number }>(`/api/v1/admin/products/${props.productId}/variants/${row.skuId}/pricing-rules/restore`, {
+    const result = await request<RestoreAdminProductPricingRuleResult>(`/api/v1/admin/products/${targetProductId}/variants/${targetSkuId}/pricing-rules/restore`, {
       method: 'POST', body: {
         expectedRevision: page.value!.productRevision,
         expectedSkuRevision: row.skuRevision,
         expectedRuleRevision: row.ruleRevision,
-        sourceRevision: version.revision,
+        sourceRevision: targetVersion.revision,
       },
     })
+    if (operation !== operationGeneration.value || targetProductId !== props.productId || result.productId !== targetProductId) return
+    if (!mergeRuleItems(result.productRevision, [result.item], new Map([[targetSkuId, editGenerationAtStart]]))) {
+      void loadRules(targetPage)
+      return
+    }
     emit('revisionChanged', result.productRevision)
-    preview.value = null
     message.value = `已从规则版本 v${result.restoredFromRevision} 恢复，并生成新的规则版本。售价未更改。`
-    await loadRules()
-    await loadHistory(version.skuId)
-  } catch (cause) { error.value = cause instanceof Error ? cause.message : '恢复规则失败。' }
-  finally { working.value = '' }
+    restoreConfirmationOpen.value = false
+    restoreCandidate.value = null
+    if (historySkuId.value === targetSkuId && historyOpen.value) await loadHistory(targetSkuId)
+  } catch (cause) {
+    if (operation !== operationGeneration.value || targetProductId !== props.productId) return
+    error.value = cause instanceof Error ? cause.message : '恢复规则失败。'
+  } finally {
+    if (operation === operationGeneration.value && targetProductId === props.productId) working.value = ''
+  }
+}
+
+function mergeRuleItems(
+  productRevision: number,
+  updatedItems: AdminProductPricingRuleItem[],
+  editGenerationsAtStart = new Map(updatedItems.map(item => [item.skuId, draftEditGenerations[item.skuId] ?? 0])),
+): boolean {
+  const current = page.value
+  if (!current || current.productId !== props.productId || productRevision < current.productRevision) return false
+  const updatedById = new Map(updatedItems.map(item => [item.skuId, item]))
+  page.value = {
+    ...current,
+    productRevision,
+    items: current.items.map(row => ({ ...updatedById.get(row.skuId) ?? row, productRevision })),
+  }
+  for (const item of updatedItems) {
+    if ((draftEditGenerations[item.skuId] ?? 0) === (editGenerationsAtStart.get(item.skuId) ?? 0)) draftFromServer(item)
+  }
+  invalidatePreview()
+  return true
+}
+
+function invalidateHistorySelection() {
+  historyRequestGeneration.value += 1
+  history.value = null
+  historyLoading.value = false
+  historyError.value = ''
+  restoreCandidate.value = null
+  restoreConfirmationOpen.value = false
 }
 
 watch(() => props.productId, () => {
+  rulesRequestGeneration.value += 1
+  operationGeneration.value += 1
+  invalidateHistorySelection()
+  historyOpen.value = false
+  historySkuId.value = ''
+  loading.value = false
+  working.value = ''
   page.value = null
-  preview.value = null
-  history.value = null
+  invalidatePreview()
   pageNumber.value = 1
+  for (const skuId of Object.keys(drafts)) delete drafts[skuId]
+  for (const skuId of Object.keys(selected)) delete selected[skuId]
+  for (const skuId of Object.keys(draftEditGenerations)) delete draftEditGenerations[skuId]
   void loadRules(1)
-})
+}, { flush: 'sync' })
 
 watch(() => props.productRevision, (revision) => {
-  if (page.value && page.value.productRevision !== revision && !dirty.value && !working.value) void loadRules()
+  if (page.value && page.value.productId === props.productId && page.value.productRevision !== revision) {
+    invalidatePreview()
+    void loadRules(pageNumber.value)
+  }
+})
+
+watch(historySkuId, (skuId) => {
+  invalidateHistorySelection()
+  if (skuId && historyOpen.value) void loadHistory(skuId)
+}, { flush: 'sync' })
+
+watch(historyOpen, (isOpen) => {
+  if (isOpen && historySkuId.value) void loadHistory(historySkuId.value)
+  if (!isOpen) {
+    restoreCandidate.value = null
+    restoreConfirmationOpen.value = false
+  }
 })
 
 watch(dirty, (hasUncommittedRuleChanges) => {
-  if (hasUncommittedRuleChanges) {
-    preview.value = null
-    confirmationOpen.value = false
-    confirmedPreview.value = false
-    confirmedRisks.value = false
-  }
+  emit('dirtyChanged', hasUncommittedRuleChanges)
+  if (hasUncommittedRuleChanges) invalidatePreview()
+}, { immediate: true })
+
+watch(() => props.archived, (archived) => {
+  if (archived) invalidatePreview()
+})
+
+onBeforeUnmount(() => {
+  rulesRequestGeneration.value += 1
+  historyRequestGeneration.value += 1
+  operationGeneration.value += 1
+  invalidatePreview()
 })
 
 onMounted(() => { void loadRules(1) })
@@ -367,6 +646,7 @@ onMounted(() => { void loadRules(1) })
               v-model="selected[row.skuId]"
               :disabled="archived || Boolean(row.retiredAt)"
               :aria-label="`选择 ${row.skuCode} 进行定价预览`"
+              @update:model-value="onSelectionChanged"
             />
             <span class="font-mono text-sm font-semibold text-highlighted">{{ row.skuCode }}</span>
             <UBadge
@@ -396,8 +676,9 @@ onMounted(() => { void loadRules(1) })
                 :items="modeItems"
                 value-key="value"
                 label-key="label"
-                :disabled="archived || Boolean(row.retiredAt) || Boolean(working)"
+                :disabled="archived || Boolean(row.retiredAt) || working === 'preview' || working === 'apply'"
                 class="w-full"
+                @update:model-value="onDraftEdited(row.skuId)"
               />
             </UFormField>
             <UFormField
@@ -408,8 +689,9 @@ onMounted(() => { void loadRules(1) })
               <UInput
                 v-model="drafts[row.skuId]!.fixedProfit"
                 inputmode="decimal"
-                :disabled="archived || Boolean(row.retiredAt) || Boolean(working)"
+                :disabled="archived || Boolean(row.retiredAt) || working === 'preview' || working === 'apply'"
                 class="w-full"
+                @update:model-value="onDraftEdited(row.skuId)"
               />
             </UFormField>
             <UFormField
@@ -420,8 +702,9 @@ onMounted(() => { void loadRules(1) })
               <UInput
                 v-model="drafts[row.skuId]!.markupRate"
                 inputmode="decimal"
-                :disabled="archived || Boolean(row.retiredAt) || Boolean(working)"
+                :disabled="archived || Boolean(row.retiredAt) || working === 'preview' || working === 'apply'"
                 class="w-full"
+                @update:model-value="onDraftEdited(row.skuId)"
               />
             </UFormField>
             <p
@@ -445,7 +728,7 @@ onMounted(() => { void loadRules(1) })
           color="neutral"
           variant="outline"
           size="sm"
-          :disabled="pageNumber <= 1 || dirty || Boolean(working)"
+          :disabled="pageNumber <= 1 || dirty || loading || Boolean(working)"
           @click="loadRules(pageNumber - 1)"
         >
           上一页
@@ -455,7 +738,7 @@ onMounted(() => { void loadRules(1) })
           color="neutral"
           variant="outline"
           size="sm"
-          :disabled="pageNumber >= page.totalPages || dirty || Boolean(working)"
+          :disabled="pageNumber >= page.totalPages || dirty || loading || Boolean(working)"
           @click="loadRules(pageNumber + 1)"
         >
           下一页
@@ -545,6 +828,7 @@ onMounted(() => { void loadRules(1) })
               :items="page.items.map(row => ({ label: row.skuCode, value: row.skuId }))"
               value-key="value"
               label-key="label"
+              :disabled="working === 'restore'"
               class="min-w-48 flex-1 sm:flex-none"
               aria-label="选择查看规则历史的 SKU"
             />
@@ -552,7 +836,7 @@ onMounted(() => { void loadRules(1) })
               color="neutral"
               variant="outline"
               :disabled="!historySkuId || Boolean(working)"
-              @click="historyOpen = !historyOpen; historyOpen && loadHistory()"
+              @click="historyOpen = !historyOpen"
             >
               {{ historyOpen ? '收起历史' : '查看历史' }}
             </UButton>
@@ -569,6 +853,13 @@ onMounted(() => { void loadRules(1) })
             variant="soft"
             :title="historyError"
           />
+          <p
+            v-if="historyLoading"
+            class="py-3 text-sm text-muted"
+            role="status"
+          >
+            正在读取所选 SKU 的规则历史…
+          </p>
           <div
             v-if="historyItems.length"
             class="grid gap-2"
@@ -590,15 +881,16 @@ onMounted(() => { void loadRules(1) })
                 color="neutral"
                 variant="outline"
                 size="sm"
-                :disabled="archived || Boolean(page.items.find(row => row.skuId === version.skuId)?.retiredAt) || Boolean(working)"
-                @click="restoreVersion(version)"
+                :aria-label="`恢复 SKU ${page.items.find(row => row.skuId === version.skuId)?.skuCode ?? version.skuId} 的规则 v${version.revision}`"
+                :disabled="archived || Boolean(page.items.find(row => row.skuId === version.skuId)?.retiredAt) || Boolean(working) || historyLoading"
+                @click="openRestoreConfirmation(version)"
               >
                 恢复为新版本
               </UButton>
             </article>
           </div>
           <p
-            v-else
+            v-else-if="!historyLoading"
             class="py-4 text-sm text-muted"
           >
             此 SKU 尚无策略版本历史。
@@ -616,6 +908,21 @@ onMounted(() => { void loadRules(1) })
           <p class="text-sm leading-6 text-muted">
             将把 {{ preview?.items.length ?? 0 }} 个 SKU 的售价写入现有 sale_price。确认期间若商品、SKU、成本或规则发生变化，整批都会被拒绝。
           </p>
+          <ul
+            v-if="preview && previewIsCurrent"
+            class="grid max-h-64 gap-2 overflow-y-auto rounded-lg border border-default p-3 text-sm"
+            aria-label="本次确认应用的 SKU、规则版本和建议售价"
+          >
+            <li
+              v-for="item in preview.items"
+              :key="item.skuId"
+              class="flex flex-wrap items-center justify-between gap-2"
+            >
+              <span class="font-mono font-medium">{{ item.skuCode }}</span>
+              <span class="text-muted">规则 v{{ item.ruleRevision }} · {{ previewRuleLabel(item) }}</span>
+              <span class="font-semibold tabular-nums">建议 {{ item.suggestedSalePrice === null ? '—' : `¥${item.suggestedSalePrice}` }}</span>
+            </li>
+          </ul>
           <UCheckbox
             v-model="confirmedPreview"
             label="我已逐项核对当前售价、建议售价、毛利润和毛利率，并确认应用此批结果。"
@@ -640,6 +947,37 @@ onMounted(() => { void loadRules(1) })
               @click="applyPreview"
             >
               确认并原子应用
+            </UButton>
+          </div>
+        </div>
+      </template>
+    </UModal>
+    <UModal
+      v-model:open="restoreConfirmationOpen"
+      title="确认恢复定价规则"
+    >
+      <template #body>
+        <div class="space-y-4">
+          <p class="text-sm leading-6 text-muted">
+            即将为 SKU <span class="font-mono font-semibold text-highlighted">{{ restoreCandidate?.skuCode }}</span>
+            恢复规则 v{{ restoreCandidate?.version.revision }}（{{ restoreCandidate ? versionLabel(restoreCandidate.version) : '' }}）。
+            这会创建一个新规则版本，不会修改售价。
+          </p>
+          <div class="flex justify-end gap-2">
+            <UButton
+              color="neutral"
+              variant="outline"
+              :disabled="Boolean(working)"
+              @click="restoreConfirmationOpen = false; restoreCandidate = null"
+            >
+              取消
+            </UButton>
+            <UButton
+              :loading="working === 'restore'"
+              :disabled="!canConfirmRestore"
+              @click="confirmRestoreVersion"
+            >
+              确认恢复此 SKU 规则
             </UButton>
           </div>
         </div>

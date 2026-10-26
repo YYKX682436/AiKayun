@@ -56,6 +56,7 @@ const sectionErrors = reactive<Record<string, string>>({})
 const sectionSuccess = reactive<Record<string, string>>({})
 const saving = ref('')
 const dirty = reactive({ basic: false, categories: false, attributes: false, gallery: false, rich: false, matrix: false, prices: false, inventory: false })
+const pricingRulesDirty = ref(false)
 const productPurchaseLimitDraft = reactive({ perOrder: '', lifetime: '', rolling24Hours: '' })
 const skuPurchaseLimitDrafts = reactive<Record<string, { perOrder: string; lifetime: string; rolling24Hours: string }>>({})
 const productPurchaseLimitDraftDirty = computed(() => {
@@ -73,7 +74,7 @@ const skuPurchaseLimitDraftDirty = computed(() => {
   })
   return productChanged || skuChanged
 })
-const hasUnsavedChanges = computed(() => Object.values(dirty).some(Boolean) || skuPurchaseLimitDraftDirty.value)
+const hasUnsavedChanges = computed(() => Object.values(dirty).some(Boolean) || pricingRulesDirty.value || skuPurchaseLimitDraftDirty.value)
 const conflictSection = ref('')
 const conflictLatest = ref<ProductDetail | null>(null)
 const conflictPrices = ref<AdminProductVariantPricesPage | null>(null)
@@ -3037,7 +3038,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     </p>
                   </div>
                   <UBadge
-                    v-if="dirty.prices"
+                    v-if="dirty.prices || pricingRulesDirty"
                     color="warning"
                     variant="subtle"
                   >
@@ -3200,6 +3201,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                   :archived="isArchived"
                   @revision-changed="setProductRevision"
                   @prices-changed="refreshPricesAfterPricingApply"
+                  @dirty-changed="pricingRulesDirty = $event"
                 />
               </section>
 
@@ -4568,10 +4570,10 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                   >
                     <span class="text-muted">{{ label }}</span>
                     <UBadge
-                      :color="dirty[key as keyof typeof dirty] ? 'warning' : 'success'"
+                      :color="(dirty[key as keyof typeof dirty] || (key === 'prices' && pricingRulesDirty)) ? 'warning' : 'success'"
                       variant="subtle"
                     >
-                      {{ dirty[key as keyof typeof dirty] ? '未保存' : '已保存' }}
+                      {{ (dirty[key as keyof typeof dirty] || (key === 'prices' && pricingRulesDirty)) ? '未保存' : '已保存' }}
                     </UBadge>
                   </li>
                 </ul>

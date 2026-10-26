@@ -117,6 +117,313 @@ test('管理员可在移动端预览并确认应用按成本计算的加价率',
   await runPricingRuleFlow(page, { width: 390, height: 844 }, 'percentage_markup', '12.65')
 })
 
+test('未保存的规则不能预览旧建议，确认内容绑定当前 SKU 与规则版本', async ({ page }) => {
+  await signIn(page)
+  const productName = `D6-3A R1 预览一致性 ${randomUUID().slice(0, 8)}`
+  await page.goto('/admin/products/new')
+  await expect(page.getByLabel('商品名称')).toBeEnabled()
+  await page.getByLabel('商品名称').fill(productName)
+  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByRole('button', { name: '保存为草稿' }).click()
+  await continueToCreatedProduct(page)
+
+  const prices = page.locator('#prices')
+  const priceRow = prices.locator('article').first()
+  await priceRow.getByLabel('划线价（¥）').fill('30.00')
+  await priceRow.getByLabel('成本价（¥）').fill('10.00000')
+  await prices.getByRole('button', { name: '原子保存本页价格' }).click()
+  await expect(prices.getByRole('status')).toContainText('已原子保存')
+
+  const pricing = page.locator('#pricing-rules')
+  await pricing.getByLabel('定价模式').click()
+  await page.getByRole('option', { name: '成本 + 固定利润' }).click()
+  const fixedProfit = pricing.getByLabel('每件固定利润（¥）')
+  await fixedProfit.fill('1')
+  await pricing.getByRole('button', { name: '保存本页规则版本' }).click()
+  await expect(pricing.getByRole('status')).toContainText('售价尚未更改')
+  const configuredRule = await page.evaluate(async (id) => {
+    const result = await fetch(`/api/v1/admin/products/${id}/pricing-rules?page=1&pageSize=50`).then(response => response.json()) as {
+      data: { items: Array<{ skuCode: string; mode: string; fixedProfit: string | null }> }
+    }
+    return result.data.items[0]
+  }, page.url().split('/').at(-1)!)
+  expect(configuredRule).toMatchObject({ mode: 'fixed_profit', fixedProfit: '1.00000' })
+
+  await fixedProfit.fill('2')
+  await pricing.getByRole('button', { name: /预览所选 SKU/ }).click()
+  await expect(pricing.getByRole('alert')).toContainText('请先保存规则')
+  await expect(pricing.getByRole('heading', { name: '调价预览' })).toHaveCount(0)
+
+  await pricing.getByRole('button', { name: '保存本页规则版本' }).click()
+  await expect(pricing.getByRole('status')).toContainText('售价尚未更改')
+  await expect(fixedProfit).toHaveValue('2.00000')
+  await expect(pricing.getByText('规则有未保存修改')).toHaveCount(0)
+  const savedRule = await page.evaluate(async (id) => {
+    const result = await fetch(`/api/v1/admin/products/${id}/pricing-rules?page=1&pageSize=50`).then(response => response.json()) as {
+      data: { items: Array<{ ruleRevision: number; fixedProfit: string | null }> }
+    }
+    return result.data.items[0]
+  }, page.url().split('/').at(-1)!)
+  expect(savedRule).toMatchObject({ ruleRevision: 2, fixedProfit: '2.00000' })
+
+  await pricing.getByRole('button', { name: /预览所选 SKU/ }).click()
+  await expect(pricing.getByRole('heading', { name: '调价预览' })).toBeVisible()
+  await expect(pricing.getByText('建议 ¥12.00', { exact: true })).toBeVisible()
+  await pricing.getByRole('button', { name: '确认应用本批建议售价' }).click()
+  const confirmation = page.getByRole('dialog', { name: '确认应用调价建议' })
+  const confirmationRows = confirmation.getByRole('list', { name: '本次确认应用的 SKU、规则版本和建议售价' })
+  await expect(confirmationRows.getByText(configuredRule!.skuCode, { exact: true })).toBeVisible()
+  await expect(confirmationRows.getByText('规则 v2 · 固定利润 ¥2.00000', { exact: true })).toBeVisible()
+  await expect(confirmationRows.getByText('建议 ¥12.00', { exact: true })).toBeVisible()
+  await confirmation.getByRole('button', { name: '返回预览' }).click()
+  await fixedProfit.fill('3')
+  await expect(pricing.getByRole('heading', { name: '调价预览' })).toHaveCount(0)
+  await expect(page.getByRole('dialog', { name: '确认应用调价建议' })).toHaveCount(0)
+  await fixedProfit.fill('4')
+  await pricing.getByRole('button', { name: /预览所选 SKU/ }).click()
+  await expect(pricing.getByRole('alert')).toContainText('请先保存规则')
+  await expect(pricing.getByRole('heading', { name: '调价预览' })).toHaveCount(0)
+  await expect(page.getByRole('dialog', { name: '确认应用调价建议' })).toHaveCount(0)
+  page.once('dialog', async (dialog) => {
+    expect(dialog.message()).toContain('此商品仍有未保存的修改')
+    await dialog.dismiss()
+  })
+  await page.getByRole('navigation', { name: '面包屑' }).getByRole('link', { name: '商品管理' }).click()
+  await expect(page).toHaveURL(/\/admin\/products\/[0-9a-f-]+$/)
+})
+
+test('规则保存采用服务端规范化值，恢复历史后不会把旧草稿重新写回', async ({ page }) => {
+  await signIn(page)
+  const productName = `D6-3A R1 历史恢复 ${randomUUID().slice(0, 8)}`
+  await page.goto('/admin/products/new')
+  await expect(page.getByLabel('商品名称')).toBeEnabled()
+  await page.getByLabel('商品名称').fill(productName)
+  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByRole('button', { name: '保存为草稿' }).click()
+  await continueToCreatedProduct(page)
+  const productId = page.url().split('/').at(-1)!
+  const sku = await page.evaluate(async (id) => {
+    const result = await fetch(`/api/v1/admin/products/${id}`).then(response => response.json()) as { data: { variants: Array<{ id: string; skuCode: string }> } }
+    return result.data.variants[0]!
+  }, productId)
+  const pricing = page.locator('#pricing-rules')
+  const mode = pricing.getByLabel('定价模式')
+  await mode.click()
+  await page.getByRole('option', { name: '成本 + 固定利润' }).click()
+  const profit = pricing.getByLabel('每件固定利润（¥）')
+  await profit.fill('1')
+  await pricing.getByRole('button', { name: '保存本页规则版本' }).click()
+  await expect(profit).toHaveValue('1.00000')
+  await expect(pricing.getByText('规则有未保存修改')).toHaveCount(0)
+  await profit.fill('2')
+  await pricing.getByRole('button', { name: '保存本页规则版本' }).click()
+  await expect(profit).toHaveValue('2.00000')
+
+  await pricing.getByRole('button', { name: '查看历史' }).click()
+  const history = pricing.getByText('v1 · 成本 + ¥1.00000', { exact: true })
+  await expect(history).toBeVisible()
+  await pricing.getByRole('button', { name: `恢复 SKU ${sku.skuCode} 的规则 v1` }).click()
+  const restore = page.getByRole('dialog', { name: '确认恢复定价规则' })
+  await expect(restore).toContainText(`SKU ${sku.skuCode}`)
+  await expect(restore).toContainText('规则 v1')
+  const restoreResponse = page.waitForResponse(response => response.url().endsWith(`/variants/${sku.id}/pricing-rules/restore`) && response.request().method() === 'POST')
+  await restore.getByRole('button', { name: '确认恢复此 SKU 规则' }).click()
+  expect((await restoreResponse).status()).toBe(200)
+  await expect(profit).toHaveValue('1.00000')
+  await expect(pricing.getByText('规则有未保存修改')).toHaveCount(0)
+  await expect(pricing.getByRole('status')).toContainText('从规则版本 v1 恢复')
+  await expect.poll(async () => page.evaluate(async (id) => {
+    const result = await fetch(`/api/v1/admin/products/${id}/pricing-rules?page=1&pageSize=50`).then(response => response.json()) as { data: { items: Array<{ mode: string; fixedProfit: string | null; ruleRevision: number }> } }
+    return result.data.items[0]
+  }, productId)).toMatchObject({ mode: 'fixed_profit', fixedProfit: '1.00000', ruleRevision: 3 })
+  await expect(pricing.getByRole('button', { name: '保存本页规则版本' })).toBeDisabled()
+
+  await mode.click()
+  await page.getByRole('option', { name: '按成本加价率' }).click()
+  await pricing.getByLabel('按成本加价率（%）').fill('25')
+  await pricing.getByRole('button', { name: '保存本页规则版本' }).click()
+  await expect(pricing.getByLabel('按成本加价率（%）')).toHaveValue('25.0000')
+  await expect(pricing.getByText('规则有未保存修改')).toHaveCount(0)
+})
+
+test('保存响应迟到时保留请求期间的新编辑及其未保存状态', async ({ page }) => {
+  await signIn(page)
+  const productName = `D6-3A R1 保存竞态 ${randomUUID().slice(0, 8)}`
+  await page.goto('/admin/products/new')
+  await page.getByLabel('商品名称').fill(productName)
+  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByRole('button', { name: '保存为草稿' }).click()
+  await continueToCreatedProduct(page)
+  const pricing = page.locator('#pricing-rules')
+  await pricing.getByLabel('定价模式').click()
+  await page.getByRole('option', { name: '成本 + 固定利润' }).click()
+  const profit = pricing.getByLabel('每件固定利润（¥）')
+  await profit.fill('1')
+  let releaseResponse!: () => void
+  const heldResponse = new Promise<void>(resolve => { releaseResponse = resolve })
+  let markRequestReached!: () => void
+  const requestReached = new Promise<void>(resolve => { markRequestReached = resolve })
+  await page.route('**/pricing-rules/batch', async (route) => {
+    const response = await route.fetch()
+    markRequestReached()
+    await heldResponse
+    await route.fulfill({ response })
+  })
+  try {
+    await pricing.getByRole('button', { name: '保存本页规则版本' }).click()
+    await requestReached
+    await profit.fill('3')
+    releaseResponse()
+    await expect(profit).toHaveValue('3')
+    await expect(pricing.getByText('规则有未保存修改')).toBeVisible()
+    await expect(pricing.getByRole('status')).toContainText('售价尚未更改')
+  } finally {
+    releaseResponse()
+    await page.unroute('**/pricing-rules/batch')
+  }
+  const currentRule = await page.evaluate(async () => {
+    const productId = location.pathname.split('/').at(-1)!
+    const result = await fetch(`/api/v1/admin/products/${productId}/pricing-rules?page=1&pageSize=50`).then(response => response.json()) as { data: { items: Array<{ fixedProfit: string | null }> } }
+    return result.data.items[0]?.fixedProfit
+  })
+  expect(currentRule).toBe('1.00000')
+  await expect(profit).toHaveValue('3')
+  await expect(pricing.getByText('规则有未保存修改')).toBeVisible()
+})
+
+test('策略历史切换 SKU 后立即隔离旧数据并忽略迟到的 A 历史响应', async ({ page }) => {
+  await signIn(page)
+  const productName = `D6-3A R1 SKU 历史隔离 ${randomUUID().slice(0, 8)}`
+  await page.goto('/admin/products/new')
+  await expect(page.getByLabel('商品名称')).toBeEnabled()
+  await page.getByLabel('商品名称').fill(productName)
+  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByRole('button', { name: '保存为草稿' }).click()
+  await continueToCreatedProduct(page)
+  const productId = page.url().split('/').at(-1)!
+  const matrix = page.locator('#variants')
+  await matrix.getByRole('button', { name: '添加规格组' }).click()
+  await page.getByLabel('规格组 1 名称').fill('测试 SKU')
+  await page.getByLabel('测试 SKU 的选项 1').fill('A')
+  await matrix.getByRole('button', { name: '添加规格值' }).click()
+  await page.getByLabel('测试 SKU 的选项 2').fill('B')
+  await page.getByLabel('新增 SKU 默认售价（人民币）').fill('15.00')
+  await matrix.getByRole('button', { name: '自动生成全部组合' }).click()
+  const productBeforeMatrix = await page.evaluate(async (id) => {
+    const result = await fetch(`/api/v1/admin/products/${id}`).then(response => response.json()) as { data: { variants: Array<{ id: string; skuCode: string }> } }
+    return result.data.variants[0]!
+  }, productId)
+  page.once('dialog', dialog => dialog.accept())
+  await matrix.locator('li').filter({ hasText: productBeforeMatrix.skuCode }).getByRole('button', { name: '永久退役' }).click()
+  await matrix.getByRole('button', { name: '保留所选组合' }).click()
+  await matrix.getByLabel('保留组合 A').check()
+  await matrix.getByLabel('保留组合 B').check()
+  await matrix.getByRole('button', { name: '预览 SKU 差异' }).click()
+  await matrix.getByLabel('我已查看移除、改配和退役影响，确认提交此差异').check()
+  await matrix.getByRole('button', { name: '保存规格与 SKU' }).click()
+  await expect(matrix.getByRole('status')).toContainText('规格组和 SKU 矩阵已保存')
+  const activeSkus = await page.evaluate(async (id) => {
+    const result = await fetch(`/api/v1/admin/products/${id}`).then(response => response.json()) as { data: { variants: Array<{ id: string; skuCode: string; retiredAt: string | null; options: Array<{ valueName: string }> }> } }
+    return result.data.variants.filter(variant => variant.retiredAt === null)
+  }, productId)
+  const skuA = activeSkus.find(variant => variant.options[0]?.valueName === 'A')!
+  const skuB = activeSkus.find(variant => variant.options[0]?.valueName === 'B')!
+  const pricing = page.locator('#pricing-rules')
+  for (const [sku, profitValue] of [[skuA, '1'], [skuB, '2']] as const) {
+    const row = pricing.locator('article').filter({ hasText: sku.skuCode })
+    await row.getByLabel('定价模式').click()
+    await page.getByRole('option', { name: '成本 + 固定利润' }).click()
+    await row.getByLabel('每件固定利润（¥）').fill(profitValue)
+  }
+  await pricing.getByRole('button', { name: '保存本页规则版本' }).click()
+  await expect(pricing.getByText('规则有未保存修改')).toHaveCount(0)
+
+  let releaseA!: () => void
+  const holdA = new Promise<void>(resolve => { releaseA = resolve })
+  let markAReached!: () => void
+  const aReached = new Promise<void>(resolve => { markAReached = resolve })
+  await page.route('**/pricing-rules/history', async (route) => {
+    const response = await route.fetch()
+    if (route.request().url().includes(`/variants/${skuA.id}/`)) {
+      markAReached()
+      await holdA
+    }
+    await route.fulfill({ response })
+  })
+  try {
+    const historySelect = pricing.getByLabel('选择查看规则历史的 SKU')
+    await historySelect.click()
+    await page.getByRole('option', { name: skuA.skuCode }).click()
+    await pricing.getByRole('button', { name: '查看历史' }).click()
+    await aReached
+    await historySelect.click()
+    await page.getByRole('option', { name: skuB.skuCode }).click()
+    await expect(pricing.getByText('v1 · 成本 + ¥2.00000', { exact: true })).toBeVisible()
+    await expect(pricing.getByText('v1 · 成本 + ¥1.00000', { exact: true })).toHaveCount(0)
+    releaseA()
+    await expect(pricing.getByText('v1 · 成本 + ¥2.00000', { exact: true })).toBeVisible()
+    await expect(pricing.getByText('v1 · 成本 + ¥1.00000', { exact: true })).toHaveCount(0)
+    await expect(pricing.getByRole('button', { name: `恢复 SKU ${skuA.skuCode} 的规则 v1` })).toHaveCount(0)
+    await pricing.getByRole('button', { name: `恢复 SKU ${skuB.skuCode} 的规则 v1` }).click()
+    const restore = page.getByRole('dialog', { name: '确认恢复定价规则' })
+    await expect(restore).toContainText(`SKU ${skuB.skuCode}`)
+    await expect(restore).toContainText('规则 v1')
+    await restore.getByRole('button', { name: '取消' }).click()
+  } finally {
+    releaseA()
+    await page.unroute('**/pricing-rules/history')
+  }
+})
+
+test('商品 A 的迟到规则读取不能接管当前商品 B 的编辑状态', async ({ page }) => {
+  await signIn(page)
+  const makeDraft = async (name: string) => {
+    await page.goto('/admin/products/new')
+    await expect(page.getByLabel('商品名称')).toBeEnabled()
+    await page.getByLabel('商品名称').fill(name)
+    await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+    await page.getByRole('button', { name: '保存为草稿' }).click()
+    await continueToCreatedProduct(page)
+    const productId = page.url().split('/').at(-1)!
+    const sku = await page.evaluate(async (id) => {
+      const result = await fetch(`/api/v1/admin/products/${id}`).then(response => response.json()) as { data: { variants: Array<{ skuCode: string }> } }
+      return result.data.variants[0]!.skuCode
+    }, productId)
+    return { productId, sku }
+  }
+  const productA = await makeDraft(`D6-3A R1 规则读取 A ${randomUUID().slice(0, 8)}`)
+  const productB = await makeDraft(`D6-3A R1 规则读取 B ${randomUUID().slice(0, 8)}`)
+  let releaseA!: () => void
+  const holdA = new Promise<void>(resolve => { releaseA = resolve })
+  let markAReached!: () => void
+  const aReached = new Promise<void>(resolve => { markAReached = resolve })
+  await page.route('**/pricing-rules?page=*', async (route) => {
+    const response = await route.fetch()
+    if (route.request().url().includes(`/products/${productA.productId}/`)) {
+      markAReached()
+      await holdA
+    }
+    await route.fulfill({ response })
+  })
+  try {
+    await page.goto(`/admin/products/${productA.productId}`)
+    await aReached
+    await page.getByRole('navigation', { name: '面包屑' }).getByRole('link', { name: '商品管理' }).click()
+    await expect(page.getByRole('main').getByRole('heading', { level: 1, name: '商品管理' })).toBeVisible()
+    const productRow = page.getByRole('row').filter({ hasText: /规则读取 B/ })
+    await productRow.getByRole('link', { name: '编辑' }).click()
+    await expect(page.getByRole('heading', { name: /规则读取 B/ })).toBeVisible()
+    const pricing = page.locator('#pricing-rules')
+    await expect(pricing.locator('article').filter({ hasText: productB.sku })).toHaveCount(1)
+    releaseA()
+    await expect(pricing.locator('article').filter({ hasText: productB.sku })).toHaveCount(1)
+    await expect(pricing.getByText(productA.sku, { exact: true })).toHaveCount(0)
+  } finally {
+    releaseA()
+    await page.unroute('**/pricing-rules?page=*')
+  }
+})
+
 test('admin manages a real product through category, SKU, price, media, rich text, stock and lifecycle', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
   const editorWarnings: string[] = []
