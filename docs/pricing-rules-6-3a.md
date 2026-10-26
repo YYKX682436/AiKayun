@@ -80,8 +80,8 @@ R1 从 `553862ae122dd9410bb79f1c06793919d5297306` 开始。修改应用代码前
 - 历史 SKU A→B 测试将 A 的真实历史 GET 延迟至 B 的历史加载完成后才返回，确认 A 的版本/恢复按钮立即消失，迟到响应不能替换 B；恢复确认明确显示 B 与 B 的版本。跨商品测试同样延迟 A 的规则读取，使用后台 SPA 列表导航到 B，确认页面只保留 B 的编辑状态。
 - 用户操作对应的数据库状态以上述真实 PostgreSQL API 回读验证；最后的全量主浏览器套件包含以上竞态测试。
 
-R1 仍只调整后台编辑/预览/确认状态和测试；没有改变金额公式、数据库迁移、订单/支付/库存或供应商行为。最终本地验证记录如下；对应 GitHub Actions 会在推送后核验。
+R1 仍只调整后台编辑/预览/确认状态和测试；没有改变金额公式、数据库迁移、订单/支付/库存或供应商行为。
 
 最终 R1 本地完整 `pnpm verify`：退出码 0。金额单测 15/15；真实 PostgreSQL API 集成 23 个测试文件、392/392；生产主浏览器 88/88；alternate-brand 1/1、SSR 3/3、dev-preview 1/1、production-brand 1/1，以上均 0 skipped。lint 为 0 errors、7 条既有商品详情页 warning。Nuxt 字体构建多次访问 Google Fonts 元数据超时，但构建和各浏览器套件通过。本地 `pnpm verify` 不含 Docker Compose 验收；Compose 的通过/跳过状态以最终提交对应 GitHub Actions 为准。
 
-GitHub Actions 对定价 R1 代码提交 `6bb96234d2ce90e75377717661beba07fc1b792b` 的 [CI run 40346714920](https://github.com/YYKX682436/AiKayun/actions/runs/40346714920) 全部成功，任务耗时 24m28s：lint、类型检查、金额/API/PostgreSQL 测试、生产构建、生产主浏览器 88/88、runtime branding 1/1 均通过；Compose 启动、Compose web/API/admin E2E、PostgreSQL 重建持久性和数字履约 SIGKILL/备份恢复/不可信 TLS 验收均通过。Compose 浏览器套件为 79 passed、9 skipped；这 9 项依赖隔离供应商 fixture（Kayixin R1 6 项、Kayixin 只读 1 项、外部 API supplier 1 项、供应商映射 1 项），Compose job 不启用这些 fixture。代码之外的该文档结果补记会触发新的 main CI；最终 HEAD 的对应 CI SHA 以推送核验为准。
+定价 R1 代码提交 `6bb96234d2ce90e75377717661beba07fc1b792b` 的 [GitHub Actions run 40346714920](https://github.com/YYKX682436/AiKayun/actions/runs/40346714920) 全部成功，任务耗时 24m28s。文档结果提交 `88a14abbb9f20e8e8bf0edec1b7b199e2f468ced` 的 [GitHub Actions run 40351016795](https://github.com/YYKX682436/AiKayun/actions/runs/40351016795) 也全部成功，任务耗时 28m22s：lint、类型检查、金额/API/PostgreSQL 测试、生产构建、生产主浏览器 88/88、runtime branding 1/1 均通过；Compose 启动、Compose web/API/admin 流程、PostgreSQL 重建持久性和数字履约 SIGKILL/备份恢复/不可信 TLS 验收均通过。Compose 浏览器套件为 79 passed、9 skipped；这 9 项依赖隔离供应商 fixture（Kayixin R1 6 项、Kayixin 只读 1 项、外部 API supplier 1 项、供应商映射 1 项），Compose job 不启用这些 fixture。补记本段会生成新的文档提交及 main CI；本地、origin 与 GitHub main 的最终提交及其 CI 结果在交付前再核对。
