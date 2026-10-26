@@ -985,6 +985,9 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
       headers: { cookie: customer.sessionCookie } })
     expect(resumed.statusCode, JSON.stringify(resumed.json())).toBe(200)
     expect(resumed.json().data).toMatchObject({
+      lineId: line.lineId,
+      skuId: catalog!.skuId,
+      quantity: 2,
       sourceDraftId: line.draftId,
       sourceDraftRevision: line.draftRevision,
       sourceLineRevision: line.lineRevision,

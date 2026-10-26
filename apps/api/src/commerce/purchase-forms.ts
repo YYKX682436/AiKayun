@@ -232,6 +232,7 @@ export function collectImageReferences(definition: PurchaseFormDefinition, value
 }
 
 export type PreparedCartReplacementAttachmentCopy = {
+  preparedAt: number
   draftId: string
   id: string
   storageKey: string
@@ -397,6 +398,7 @@ export async function prepareCartReplacementAttachmentCopies(
 
   for (const attachment of plan) {
     const id = randomUUID()
+    const preparedAt = Date.now()
     let bytes: Buffer
     try { bytes = await storage.readVerified(attachment.sourceAttachmentId, attachment.storageKey,
       attachment.byteSize, attachment.sha256) }
@@ -408,7 +410,7 @@ export async function prepareCartReplacementAttachmentCopies(
     catch {
       throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_COPY_FAILED', '图片暂时无法安全复制；购物车中的资料仍保留，请重试。')
     }
-    preparedCopies.push({ draftId: input.replacementDraftId, id, storageKey,
+    preparedCopies.push({ preparedAt, draftId: input.replacementDraftId, id, storageKey,
       sourceAttachmentId: attachment.sourceAttachmentId, fieldId: attachment.fieldId,
       sourceStorageKey: attachment.storageKey,
       byteSize: attachment.byteSize, reservedBytes: attachment.reservedBytes,
@@ -433,6 +435,18 @@ export async function transferCartReplacementAttachmentsInTransaction(
     values: Record<string, unknown>
   },
 ): Promise<{ sourceDraftId: string; values: Record<string, unknown> }> {
+  // A copier can wait outside SQL transactions. Reject old preparations before
+  // registration; they must remain younger than the normal 24-hour orphan grace.
+  // The transaction lock then fences collection until COMMIT/ROLLBACK resolves.
+  for (const copy of [...preparedCopies].sort((a, b) => a.id.localeCompare(b.id))) {
+    if (!Number.isFinite(copy.preparedAt) || copy.preparedAt < Date.now() - 60 * 60_000) {
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_ATTACHMENT_COPY_EXPIRED', '图片准备已超时；原购物车资料仍保留，请重试。')
+    }
+    const result = await sql<{ locked: boolean }>`SELECT pg_try_advisory_xact_lock(
+      hashtextextended(${`purchase-draft-object:${copy.id}`}, 0)) AS locked`.execute(trx)
+    if (!result.rows[0]?.locked) throw new PurchaseDraftServiceError(409,
+      'PURCHASE_ATTACHMENT_COPY_BUSY', '图片正在安全整理；原购物车资料仍保留，请重试。')
+  }
   const identity = await validateAndLockPurchaseDraftOwner(trx, owner, 'update')
   if (identity.kind !== 'customer') throw new PurchaseDraftServiceError(403,
     'CART_REPLACEMENT_CUSTOMER_REQUIRED', '购物车绑定资料编辑需要登录顾客身份。')
@@ -1403,6 +1417,10 @@ export async function reconcilePurchaseDrafts(
   const now = options.now ?? new Date()
   const graceMs = (options.graceHours ?? PURCHASE_DRAFT_RECONCILE_GRACE_HOURS) * 60 * 60 * 1000
   const cutoff = new Date(now.getTime() - graceMs)
+  // Unregistered objects may be durable preparations for a transaction that
+  // has not started yet. Do not shorten their safety window with row-cleanup
+  // tuning; registration refuses preparations older than one hour.
+  const orphanCutoff = new Date(now.getTime() - Math.max(graceMs, PURCHASE_DRAFT_RECONCILE_GRACE_HOURS * 60 * 60_000))
   const batchSize = Math.min(500, Math.max(1, options.batchSize ?? 100))
   let expiredDrafts = 0
   let oldOrphanFiles = 0
@@ -1665,10 +1683,30 @@ export async function reconcilePurchaseDrafts(
       ? expected.has(file.storageKey)
       : await db.selectFrom('purchase_draft_attachments').select('id').where('id', '=', file.id)
         .where('status', '=', 'uploading').executeTakeFirst().then(Boolean)
-    if (!registered && file.modifiedAt <= cutoff) {
+    if (!registered && file.modifiedAt <= orphanCutoff) {
       oldOrphanFiles += 1
       if (options.repair) {
-        try { await storage.removeScannedFile(file.path); removedFiles += 1 } catch { /* retain for a later retry */ }
+        try {
+          // A session advisory lock spans this one object's read/remove without
+          // opening a database transaction or holding customer/draft row locks.
+          // Final copy registration uses the same key as an xact lock. If its
+          // COMMIT is unresolved, skip this object and retry on a later repair.
+          const removed = await db.connection().execute(async connection => {
+            const result = await sql<{ locked: boolean }>`SELECT pg_try_advisory_lock(
+              hashtextextended(${`purchase-draft-object:${file.id}`}, 0)) AS locked`.execute(connection)
+            if (!result.rows[0]?.locked) return false
+            try {
+              const registeredNow = await connection.selectFrom('purchase_draft_attachments').select('id')
+                .where('id', '=', file.id).executeTakeFirst()
+              if (registeredNow) return false
+              await storage.removeScannedFile(file.path)
+              return true
+            } finally {
+              await sql`SELECT pg_advisory_unlock(hashtextextended(${`purchase-draft-object:${file.id}`}, 0))`.execute(connection)
+            }
+          })
+          if (removed) removedFiles += 1
+        } catch { /* retain for a later retry */ }
       }
     }
   }

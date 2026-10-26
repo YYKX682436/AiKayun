@@ -951,6 +951,18 @@ export const CustomerCartUpdateBodySchema = Type.Object({
 }, { additionalProperties: false })
 
 export const CustomerCartLineParamsSchema = Type.Object({ lineId: PurchaseLineIdSchema }, { additionalProperties: false })
+export const CustomerCartReplacementDraftSchema = Type.Object({
+  lineId: PurchaseLineIdSchema,
+  skuId: Type.String({ format: 'uuid' }),
+  quantity: Type.Integer({ minimum: 1, maximum: 99 }),
+  sourceDraftId: Type.String({ format: 'uuid' }),
+  sourceLineRevision: Type.Integer({ minimum: 1 }),
+  sourceDraftRevision: Type.Integer({ minimum: 1 }),
+  replacementDraftId: Type.String({ format: 'uuid' }),
+  replacementDraftRevision: Type.Integer({ minimum: 1 }),
+  templateVersionId: Type.String({ format: 'uuid' }),
+  omittedSourceAttachmentIds: Type.Array(Type.String({ format: 'uuid' }), { maxItems: 10 }),
+}, { additionalProperties: false })
 export const CustomerCartLineQuantityBodySchema = Type.Object({
   quantity: PurchaseLineQuantitySchema,
   expectedLineRevision: Type.Integer({ minimum: 1 }),
@@ -2892,6 +2904,7 @@ export type CheckoutRequestLineV2 = Static<typeof CheckoutRequestLineV2Schema>
 export type CustomerCartAddBody = Static<typeof CustomerCartAddBodySchema>
 export type CustomerCartUpdateBody = Static<typeof CustomerCartUpdateBodySchema>
 export type CustomerCartLineParams = Static<typeof CustomerCartLineParamsSchema>
+export type CustomerCartReplacementDraft = Static<typeof CustomerCartReplacementDraftSchema>
 export type CustomerCartLineQuantityBody = Static<typeof CustomerCartLineQuantityBodySchema>
 export type CustomerCartLinePurchaseFormBody = Static<typeof CustomerCartLinePurchaseFormBodySchema>
 export type CustomerCartMergeBodyV1 = Static<typeof CustomerCartMergeBodyV1Schema>

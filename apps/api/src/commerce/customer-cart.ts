@@ -9,6 +9,7 @@ import {
   CheckoutQuoteSchema,
   CustomerCartAddBodySchema,
   CustomerCartLineParamsSchema,
+  CustomerCartReplacementDraftSchema,
   CustomerCartLinePurchaseFormBodySchema,
   CustomerCartLineQuantityBodySchema,
   CustomerCartMergeBodySchema,
@@ -66,16 +67,7 @@ const cartReplacementDraftSaveSchema = Type.Object({
     newAttachmentId: Type.String({ format: 'uuid' }),
   }, { additionalProperties: false }), { maxItems: 10 })),
 }, { additionalProperties: false })
-const cartReplacementDraftResponseSchema = Type.Object({
-  lineId: Type.String({ format: 'uuid' }),
-  sourceDraftId: Type.String({ format: 'uuid' }),
-  sourceLineRevision: Type.Integer({ minimum: 1 }),
-  sourceDraftRevision: Type.Integer({ minimum: 1 }),
-  replacementDraftId: Type.String({ format: 'uuid' }),
-  replacementDraftRevision: Type.Integer({ minimum: 1 }),
-  templateVersionId: Type.String({ format: 'uuid' }),
-  omittedSourceAttachmentIds: Type.Array(Type.String({ format: 'uuid' }), { maxItems: 10 }),
-}, { additionalProperties: false })
+
 
 class CartError extends Error {
   constructor(
@@ -297,9 +289,8 @@ async function releaseUncommittedReplacementCopies(
         await storage.remove(copy.id, copy.storageKey)
         continue
       }
-      // The transaction outcome may be ambiguous. The regular release primitive
-      // locks draft before attachment and will preserve a row that was actually
-      // committed into the final encrypted purchase values.
+      // This helper is called only before finalization or after its callback
+      // failed, when COMMIT was never requested. Keep the reference guard too.
       await releaseUnreferencedPurchaseDraftAttachment(db, storage,
         { kind: 'customer', customer }, existing.draft_id, copy.id)
     } catch { /* Keep uncertain copies for the private attachment reconciler. */ }
@@ -617,7 +608,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
     schema: {
       tags: ['customer'], summary: 'Start or resume the isolated edit draft for one valid cart line',
       params: CustomerCartLineParamsSchema, body: cartReplacementDraftRequestSchema,
-      response: { 200: ApiSuccessSchemaOf(cartReplacementDraftResponseSchema), 201: ApiSuccessSchemaOf(cartReplacementDraftResponseSchema),
+      response: { 200: ApiSuccessSchemaOf(CustomerCartReplacementDraftSchema), 201: ApiSuccessSchemaOf(CustomerCartReplacementDraftSchema),
         400: ApiErrorSchema, 401: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema, 429: ApiErrorSchema },
     },
   }, async (request, reply) => {
@@ -653,7 +644,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           if (relationCurrent && target && target.status === 'active' && target.expires_at > new Date()
             && target.template_version_id === effective.templateVersionId) {
             return { httpStatus: 200 as const, value: {
-              lineId, sourceDraftId: line.draft_id, sourceLineRevision: line.revision,
+              lineId, skuId: line.sku_id, quantity: line.quantity, sourceDraftId: line.draft_id, sourceLineRevision: line.revision,
               sourceDraftRevision: line.draft_revision, replacementDraftId: target.id,
               replacementDraftRevision: target.revision, templateVersionId: target.template_version_id,
               omittedSourceAttachmentIds: existing.omitted_source_attachment_ids,
@@ -680,7 +671,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           source_draft_revision: line.draft_revision, omitted_source_attachment_ids: [],
         }).execute()
         return { httpStatus: 201 as const, value: {
-          lineId, sourceDraftId: source.id, sourceLineRevision: line.revision,
+          lineId, skuId: line.sku_id, quantity: line.quantity, sourceDraftId: source.id, sourceLineRevision: line.revision,
           sourceDraftRevision: line.draft_revision, replacementDraftId: created.id,
           replacementDraftRevision: created.revision, templateVersionId: effective.templateVersionId,
           omittedSourceAttachmentIds: [],
@@ -698,7 +689,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
     schema: {
       tags: ['customer'], summary: 'Read safe metadata for one cart line replacement draft',
       params: CustomerCartLineParamsSchema,
-      response: { 200: ApiSuccessSchemaOf(cartReplacementDraftResponseSchema), 401: ApiErrorSchema,
+      response: { 200: ApiSuccessSchemaOf(CustomerCartReplacementDraftSchema), 401: ApiErrorSchema,
         404: ApiErrorSchema, 409: ApiErrorSchema },
     },
   }, async (request, reply) => {
@@ -719,13 +710,28 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           || line.draft_revision !== relation.source_draft_revision) {
           throw new CartError(409, 'CART_REPLACEMENT_CONFLICT', '购买行已变化；原购买资料仍保留。')
         }
-        const target = await trx.selectFrom('purchase_drafts').select(['id', 'revision', 'status', 'expires_at', 'template_version_id'])
-          .where('id', '=', relation.replacement_draft_id).forShare().executeTakeFirst()
+        const effective = await effectivePurchaseFormForSku(trx, line.sku_id, { lockStatus: 'share' })
+        const drafts = await trx.selectFrom('purchase_drafts').select([
+          'id', 'revision', 'status', 'expires_at', 'template_version_id', 'customer_id', 'guest_order_session_id',
+        ]).where('id', 'in', [relation.source_draft_id, relation.replacement_draft_id].sort())
+          .orderBy('id').forShare().execute()
+        const source = drafts.find(draft => draft.id === relation.source_draft_id)
+        const target = drafts.find(draft => draft.id === relation.replacement_draft_id)
+        if (!source || source.customer_id !== customer.id || source.guest_order_session_id !== null
+          || source.status !== 'active' || source.expires_at <= new Date()
+          || source.revision !== relation.source_draft_revision || source.template_version_id !== line.template_version_id
+          || !effective.templateVersionId || effective.templateVersionId !== source.template_version_id) {
+          throw new CartError(409, 'CART_REPLACEMENT_CONFLICT', '购买行来源或模板已变化；原购买资料仍保留，请重新确认。')
+        }
         if (!target || target.status !== 'active' || target.expires_at <= new Date()) {
           throw new CartError(410, 'CART_REPLACEMENT_EXPIRED', '编辑草稿已过期；原购物车资料仍保留。')
         }
+        if (target.customer_id !== customer.id || target.guest_order_session_id !== null
+          || target.template_version_id !== source.template_version_id) {
+          throw new CartError(409, 'CART_REPLACEMENT_CONFLICT', '购买行编辑资料已变化，请重新确认。')
+        }
         return {
-          lineId, sourceDraftId: relation.source_draft_id, sourceLineRevision: relation.source_line_revision,
+          lineId, skuId: line.sku_id, quantity: line.quantity, sourceDraftId: relation.source_draft_id, sourceLineRevision: relation.source_line_revision,
           sourceDraftRevision: relation.source_draft_revision, replacementDraftId: target.id,
           replacementDraftRevision: target.revision, templateVersionId: target.template_version_id,
           omittedSourceAttachmentIds: relation.omitted_source_attachment_ids,
@@ -862,6 +868,8 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
     },
   }, async (request, reply) => {
     const preparedCopies: PreparedCartReplacementAttachmentCopy[] = []
+    let finalTransactionStarted = false
+    let finalCallbackCompleted = false
     try {
       const { lineId } = request.params as { lineId: string }
       const body = request.body as {
@@ -886,7 +894,7 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
             values: body.values,
           })
       }
-      const retainedLineId = await db.transaction().execute(async (trx) => {
+      const mutateCart = async (trx: Transaction<Database>) => {
         await lockCustomer(trx, customer, true)
         const line = await trx.selectFrom('customer_cart_items').selectAll()
           .where('customer_id', '=', customer.id).where('line_id', '=', lineId)
@@ -1043,12 +1051,21 @@ export function registerCustomerCartRoutes(app: FastifyInstance, db: Kysely<Data
           ...line, revision: updated.revision, draft_revision: saved.revision, content_identity: contentIdentity,
         })
         return lineId
+      }
+      finalTransactionStarted = true
+      const retainedLineId = await db.transaction().execute(async trx => {
+        const retained = await mutateCart(trx)
+        finalCallbackCompleted = true
+        return retained
       })
       const cart = await authenticatedCartSnapshot(db, request.customer!, config)
       reply.header('cache-control', 'no-store')
       return success({ changed: true, merged: false, skippedSkuIds: [], retainedLineId, cart } satisfies CustomerCartMutation, request.id)
     } catch (error) {
-      if (preparedCopies.length) await releaseUncommittedReplacementCopies(
+      // Once the callback returned, COMMIT may still be running on PostgreSQL.
+      // A separate connection seeing no row cannot prove rollback. Leave such
+      // objects to the grace-period reconciler and its in-flight object fence.
+      if (preparedCopies.length && (!finalTransactionStarted || !finalCallbackCompleted)) await releaseUncommittedReplacementCopies(
         db, purchaseAttachmentStorage, request.customer!, preparedCopies,
       )
       return mapError(error, reply, request.id)

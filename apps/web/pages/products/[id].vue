@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { toRaw } from 'vue'
-import { normalizePurchaseFormAnswers, validatePurchaseFormDefinition, type ApiSuccess, type CheckoutQuote, type CheckoutQuoteItem, type PurchaseDraft, type PurchaseFormDefinition, type PurchaseFormField, type StorefrontPurchaseForm, type PublicInventorySummary, type PublicProductDetail, type PublicProductVariant } from '@aikayun/contracts'
+import { normalizePurchaseFormAnswers, validatePurchaseFormDefinition, type ApiSuccess, type CustomerCartReplacementDraft, type CheckoutQuote, type CheckoutQuoteItem, type PurchaseDraft, type PurchaseFormDefinition, type PurchaseFormField, type StorefrontPurchaseForm, type PublicInventorySummary, type PublicProductDetail, type PublicProductVariant } from '@aikayun/contracts'
 
 const route = useRoute()
 const siteUrl = usePublicSiteUrl()
@@ -50,6 +50,7 @@ const purchaseFormResetKey = ref(0)
 const immediateLineId = ref('')
 const storefrontInteractive = ref(false)
 let purchaseFormGeneration = 0
+let purchaseFormLoadSequence = 0
 let purchaseFormOperationSequence = 0
 let activePurchaseFormOperation = 0
 let purchaseFormDisposed = false
@@ -72,6 +73,7 @@ type PurchaseFormOperationContext = {
   operationId: number
 }
 type CartEditContext = {
+  sourceVerified: boolean
   lineId: string
   skuId: string
   lineRevision: number | null
@@ -127,17 +129,56 @@ function parseCartEditContext(): CartEditContext | null {
     || (draftId !== null && !uuid.test(draftId))
     || (replacementDraftId !== null && !uuid.test(replacementDraftId))
     || !Number.isSafeInteger(quantityValue) || quantityValue < 1 || quantityValue > 99) return null
-  return { lineId: lineId.toLowerCase(), skuId: skuId.toLowerCase(), lineRevision: lineRevisionValue,
+  return { sourceVerified: false, lineId: lineId.toLowerCase(), skuId: skuId.toLowerCase(), lineRevision: lineRevisionValue,
     expectedDraftRevision: expectedDraftRevisionValue, draftId: draftId?.toLowerCase() ?? null,
     replacementDraftId: replacementDraftId?.toLowerCase() ?? null, omittedSourceAttachmentIds: [], quantity: quantityValue }
 }
 
 watch(() => [route.query.editLineId, route.query.skuId, route.query.lineRevision, route.query.expectedDraftRevision, route.query.draftId, route.query.replacementDraftId, route.query.quantity], () => {
-  cartEdit.value = parseCartEditContext()
+  const parsed = parseCartEditContext()
+  const current = cartEdit.value
+  cartEdit.value = parsed && current?.sourceVerified && sameCartEditSource(parsed, current)
+    ? { ...parsed, sourceVerified: true, lineRevision: current.lineRevision, quantity: current.quantity }
+    : parsed
 }, { immediate: true, flush: 'sync' })
 const isEditingCartLine = computed(() => Boolean(cartEdit.value && cartEdit.value.skuId === selectedVariant.value?.skuId.toLowerCase()))
 const hasCartReplacementDraft = computed(() => Boolean(isEditingCartLine.value && cartEdit.value?.replacementDraftId
   && purchaseDraft.value?.id === cartEdit.value.replacementDraftId))
+
+function sameCartEditSource(a: CartEditContext, b: CartEditContext): boolean {
+  return a.lineId === b.lineId && a.skuId === b.skuId && a.draftId === b.draftId
+    && a.expectedDraftRevision === b.expectedDraftRevision
+}
+
+function adoptCartEditSource(edit: CartEditContext, source: Pick<CustomerCartReplacementDraft,
+  'lineId' | 'skuId' | 'quantity' | 'sourceDraftId' | 'sourceLineRevision' | 'sourceDraftRevision' | 'templateVersionId'>): boolean {
+  const current = cartEdit.value
+  if (!current || !sameCartEditSource(current, edit) || source.lineId !== edit.lineId || source.skuId !== edit.skuId
+    || source.sourceDraftId !== edit.draftId || source.sourceDraftRevision !== edit.expectedDraftRevision
+    || source.templateVersionId !== purchaseForm.value?.templateVersionId) {
+    purchaseFormError.value = '购物车来源资料已变化；原购买资料仍保留，请返回购物车重新确认。'
+    return false
+  }
+  let lineRevision = source.sourceLineRevision
+  let lineQuantity = source.quantity
+  const row = shoppingCart.cartView.value?.items.find(item => item.lineId === edit.lineId)
+  if (row?.lineRevision !== null && row?.lineRevision !== undefined && row.lineRevision >= lineRevision) {
+    if (row.skuId !== edit.skuId || row.draftId !== edit.draftId || row.draftRevision !== edit.expectedDraftRevision
+      || row.templateVersionId !== source.templateVersionId) {
+      purchaseFormError.value = '购物车来源资料已变化；请返回购物车重新确认。'
+      return false
+    }
+    lineRevision = row.lineRevision
+    lineQuantity = row.quantity
+  }
+  if (current.sourceVerified && current.lineRevision !== null && current.lineRevision > lineRevision) {
+    lineRevision = current.lineRevision
+    lineQuantity = current.quantity
+  }
+  cartEdit.value = { ...current, sourceVerified: true, lineRevision, quantity: lineQuantity }
+  quantity.value = lineQuantity
+  return true
+}
 
 function installPurchaseDraft(draft: PurchaseDraft, newPurchaseSelection = false) {
   installingPurchaseDraft = true
@@ -410,6 +451,12 @@ async function refreshPurchaseQuote(): Promise<void> {
 }
 
 async function loadPurchaseFormForSku(skuId: string, generation: number): Promise<void> {
+  const loadSequence = ++purchaseFormLoadSequence
+  const identityVersion = customerApi.identityVersion.value
+  const edit = cartEdit.value ? { ...cartEdit.value } : null
+  const loadIsCurrent = () => purchasePageIsCurrent(skuId, generation)
+    && loadSequence === purchaseFormLoadSequence && identityVersion === customerApi.identityVersion.value
+    && (!edit || (cartEdit.value !== null && sameCartEditSource(edit, cartEdit.value)))
   purchaseForm.value = null
   purchaseDraft.value = null
   cartReplacementSourceDraft.value = null
@@ -425,37 +472,41 @@ async function loadPurchaseFormForSku(skuId: string, generation: number): Promis
   purchaseFormBusy.value = true
   try {
     const form = await customerApi.request<StorefrontPurchaseForm>(`/api/v1/storefront/skus/${encodeURIComponent(skuId)}/purchase-form`)
-    if (!purchasePageIsCurrent(skuId, generation)) return
+    if (!loadIsCurrent()) return
     purchaseForm.value = form
     if (!form.required) return
-    const requestedDraftId = cartEdit.value?.skuId === skuId ? cartEdit.value.draftId
+    const requestedDraftId = edit?.skuId === skuId ? edit.draftId
       : typeof route.query.draftId === 'string' ? route.query.draftId : null
     if (requestedDraftId) {
       try {
         const current = await customerApi.request<PurchaseDraft>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(requestedDraftId)}?skuId=${encodeURIComponent(skuId)}`)
-        if (!purchasePageIsCurrent(skuId, generation)) return
+        if (!loadIsCurrent()) return
         if (current.templateVersionId === form.templateVersionId && !current.templateChanged) {
-          if (isCustomer.value && cartEdit.value?.skuId === skuId && cartEdit.value.lineId) {
+          if (isCustomer.value && edit?.skuId === skuId) {
+            if (edit.draftId !== current.id || edit.expectedDraftRevision !== current.revision) {
+              purchaseFormError.value = '购物车来源资料已变化；原购买资料仍保留，请返回购物车重新确认。'
+              return
+            }
             try {
-              const replacement = await customerApi.request<{
-                lineId: string; sourceDraftId: string; sourceLineRevision: number; sourceDraftRevision: number
-                replacementDraftId: string; replacementDraftRevision: number; templateVersionId: string
-                omittedSourceAttachmentIds: string[]
-              }>(`/api/v1/customer/cart/lines/${encodeURIComponent(cartEdit.value.lineId)}/purchase-form/replacement-draft`)
-              if (!purchasePageIsCurrent(skuId, generation)) return
-              if (replacement.sourceDraftId !== current.id || replacement.sourceDraftRevision !== current.revision
+              const replacement = await customerApi.request<CustomerCartReplacementDraft>(`/api/v1/customer/cart/lines/${encodeURIComponent(edit.lineId)}/purchase-form/replacement-draft`)
+              if (!loadIsCurrent()) return
+              if (replacement.lineId !== edit.lineId || replacement.skuId !== skuId
+                || replacement.sourceDraftId !== edit.draftId || replacement.sourceDraftRevision !== edit.expectedDraftRevision
+                || replacement.sourceDraftId !== current.id || replacement.sourceDraftRevision !== current.revision
                 || replacement.templateVersionId !== form.templateVersionId) {
                 purchaseFormError.value = '购物车编辑草稿已变化；原购买资料仍保留，请返回购物车刷新后继续。'
                 return
               }
               const target = await customerApi.request<PurchaseDraft>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(replacement.replacementDraftId)}?skuId=${encodeURIComponent(skuId)}`)
-              if (!purchasePageIsCurrent(skuId, generation)) return
-              if (target.templateVersionId !== form.templateVersionId || target.templateChanged) {
+              if (!loadIsCurrent()) return
+              if (target.id !== replacement.replacementDraftId || target.revision < replacement.replacementDraftRevision
+                || target.templateVersionId !== form.templateVersionId || target.templateChanged) {
                 purchaseFormError.value = '模板版本已变化；原购物车资料仍保留，请返回购物车重新确认。'
                 return
               }
+              if (!adoptCartEditSource(edit, replacement)) return
               cartReplacementSourceDraft.value = current
-              cartEdit.value = { ...cartEdit.value, replacementDraftId: target.id,
+              cartEdit.value = { ...cartEdit.value!, replacementDraftId: target.id,
                 omittedSourceAttachmentIds: replacement.omittedSourceAttachmentIds }
               installPurchaseDraft(mergeReplacementDraftForDisplay(target, current,
                 replacement.omittedSourceAttachmentIds, purchaseDefinition.value!), true)
@@ -466,18 +517,31 @@ async function loadPurchaseFormForSku(skuId: string, generation: number): Promis
               const status = Number((replacementError as { status?: number; statusCode?: number })?.status
                 ?? (replacementError as { statusCode?: number })?.statusCode ?? 0)
               if (status !== 404) {
-                if (purchasePageIsCurrent(skuId, generation)) purchaseFormError.value = replacementError instanceof Error
+                if (loadIsCurrent()) purchaseFormError.value = replacementError instanceof Error
                   ? replacementError.message : '无法恢复购物车资料编辑。'
                 return
               }
             }
+          }
+          if (isCustomer.value && edit?.skuId === skuId) {
+            await shoppingCart.refresh()
+            if (!loadIsCurrent()) return
+            const row = shoppingCart.cartView.value?.items.find(item => item.lineId === edit.lineId)
+            if (!row?.draftId || row.lineRevision === null || row.draftRevision === null || !row.templateVersionId
+              || !adoptCartEditSource(edit, { lineId: edit.lineId, skuId: row.skuId, quantity: row.quantity,
+                sourceDraftId: row.draftId, sourceDraftRevision: row.draftRevision,
+                sourceLineRevision: row.lineRevision, templateVersionId: row.templateVersionId })) {
+              purchaseFormError.value = '购物车来源资料已变化；原购买资料仍保留，请返回购物车重新确认。'
+              return
+            }
+            cartEdit.value = { ...cartEdit.value!, replacementDraftId: null, omittedSourceAttachmentIds: [] }
           }
           cartReplacementSourceDraft.value = null
           installPurchaseDraft(current, true)
           const validation = await customerApi.request<{ revision: number; complete: boolean; incompleteFieldIds: string[] }>(`/api/v1/storefront/purchase-drafts/${encodeURIComponent(current.id)}/validate`, {
             method: 'POST', body: { expectedRevision: current.revision },
           })
-          if (!purchasePageIsCurrent(skuId, generation) || !installedDraftMatches(current.id)) return
+          if (!loadIsCurrent() || !installedDraftMatches(current.id)) return
           purchaseDraftComplete.value = validation.complete
           if (!validation.complete) setIncompleteErrors(validation.incompleteFieldIds)
           return
@@ -488,8 +552,18 @@ async function loadPurchaseFormForSku(skuId: string, generation: number): Promis
         }
         return
       } catch {
-        if (!purchasePageIsCurrent(skuId, generation)) return
+        if (!loadIsCurrent()) return
         if (cartEdit.value?.skuId === skuId) {
+          if (isCustomer.value && edit) {
+            await shoppingCart.refresh()
+            if (!loadIsCurrent()) return
+            const row = shoppingCart.cartView.value?.items.find(item => item.lineId === edit.lineId)
+            if (!row || row.draftId !== edit.draftId || row.draftRevision !== edit.expectedDraftRevision
+              || row.templateVersionId !== form.templateVersionId) {
+              purchaseFormError.value = '购物车来源资料已变化或暂时无法核对；原购买行仍保留，请返回购物车重新确认。'
+              return
+            }
+          }
           purchaseFormError.value = '原购买资料已过期或无法恢复；购物车仍保留原购买行。请重新填写后确认替换。'
           await createCurrentDraft(form, skuId, generation, true)
         } else purchaseFormError.value = '无法恢复这份草稿。它可能已过期、已删除或不属于当前账号；原购物车购买行未更改。'
@@ -497,13 +571,13 @@ async function loadPurchaseFormForSku(skuId: string, generation: number): Promis
       }
     }
     const recoveries = await customerApi.request<PurchaseDraftRecovery[]>(`/api/v1/storefront/skus/${encodeURIComponent(skuId)}/purchase-drafts`)
-    if (!purchasePageIsCurrent(skuId, generation)) return
+    if (!loadIsCurrent()) return
     const boundGuestDrafts = new Set(shoppingCart.guestItems.value.flatMap(item => 'draftId' in item && item.draftId ? [item.draftId] : []))
     purchaseDraftRecoveries.value = recoveries.filter(candidate => !boundGuestDrafts.has(candidate.id))
   } catch (error) {
-    if (purchasePageIsCurrent(skuId, generation)) purchaseFormError.value = error instanceof Error ? error.message : '无法读取当前 SKU 的填写模板。'
+    if (loadIsCurrent()) purchaseFormError.value = error instanceof Error ? error.message : '无法读取当前 SKU 的填写模板。'
   } finally {
-    if (purchasePageIsCurrent(skuId, generation)) {
+    if (loadIsCurrent()) {
       purchaseFormBusy.value = false
       if (purchaseForm.value && (!purchaseForm.value.required || purchaseDraftComplete.value)) {
         void refreshPurchaseQuote()
@@ -659,11 +733,7 @@ async function startCartLineReplacementEdit(): Promise<void> {
   purchaseFormError.value = ''
   purchaseFormMessage.value = '正在为此购物车行准备独立编辑草稿…'
   try {
-    const replacement = await customerApi.request<{
-      lineId: string; sourceDraftId: string; sourceLineRevision: number; sourceDraftRevision: number
-      replacementDraftId: string; replacementDraftRevision: number; templateVersionId: string
-      omittedSourceAttachmentIds: string[]
-    }>(`/api/v1/customer/cart/lines/${encodeURIComponent(edit.lineId)}/purchase-form/replacement-draft`, {
+    const replacement = await customerApi.request<CustomerCartReplacementDraft>(`/api/v1/customer/cart/lines/${encodeURIComponent(edit.lineId)}/purchase-form/replacement-draft`, {
       method: 'POST', body: { expectedLineRevision: edit.lineRevision, expectedDraftRevision: edit.expectedDraftRevision },
     })
     if (!purchasePageContextIsCurrent(context) || replacement.sourceDraftId !== source.id
@@ -672,8 +742,9 @@ async function startCartLineReplacementEdit(): Promise<void> {
     if (!purchasePageContextIsCurrent(context) || target.templateVersionId !== source.templateVersionId || target.templateChanged) return
     const definition = purchaseDefinition.value
     if (!definition) return
+    if (!adoptCartEditSource(edit, replacement)) return
     cartReplacementSourceDraft.value = source
-    cartEdit.value = { ...edit, replacementDraftId: target.id,
+    cartEdit.value = { ...cartEdit.value!, replacementDraftId: target.id,
       omittedSourceAttachmentIds: replacement.omittedSourceAttachmentIds }
     const composite = mergeReplacementDraftForDisplay(target, source,
       replacement.omittedSourceAttachmentIds, definition)
@@ -687,6 +758,26 @@ async function startCartLineReplacementEdit(): Promise<void> {
       purchaseFormError.value = error instanceof Error ? error.message : '无法开始安全编辑。购物车中的原资料仍保留。'
       purchaseFormMessage.value = ''
     }
+  } finally { finishPurchaseOperation(context) }
+}
+
+async function cancelCartLineReplacementEdit(): Promise<void> {
+  const edit = cartEdit.value ? { ...cartEdit.value } : null
+  if (!edit?.replacementDraftId || edit.lineRevision === null || edit.expectedDraftRevision === null
+    || !isCustomer.value || purchaseFormBusy.value) return
+  const operationId = beginPurchaseOperation()
+  const context = purchaseOperationContext(operationId)
+  if (!context) { activePurchaseFormOperation = 0; purchaseFormBusy.value = false; return }
+  purchaseFormError.value = ''
+  try {
+    await customerApi.request(`/api/v1/customer/cart/lines/${encodeURIComponent(edit.lineId)}/purchase-form/replacement-draft`, {
+      method: 'DELETE', body: { expectedLineRevision: edit.lineRevision,
+        expectedDraftRevision: edit.expectedDraftRevision, expectedReplacementDraftRevision: context.draftRevision },
+    })
+    if (purchasePageContextIsCurrent(context)) await navigateTo('/cart')
+  } catch (error) {
+    if (purchasePageContextIsCurrent(context)) purchaseFormError.value = error instanceof Error
+      ? error.message : '暂时无法撤销编辑；购物车仍保留原购买资料。'
   } finally { finishPurchaseOperation(context) }
 }
 
@@ -772,7 +863,8 @@ async function savePurchaseValues(
       if (purchasePageContextIsCurrent(context, false)) {
         const row = shoppingCart.cartView.value?.items.find(item => item.lineId === line.lineId)
         if (row?.lineRevision !== null && row?.lineRevision !== undefined) {
-          cartEdit.value = { ...line, lineRevision: row.lineRevision, expectedDraftRevision: row.draftRevision }
+          cartEdit.value = { ...line, sourceVerified: true, quantity: row.quantity, lineRevision: row.lineRevision, expectedDraftRevision: row.draftRevision }
+          quantity.value = row.quantity
         }
       }
       saved = { revision: context.draftRevision + 1, complete: true, incompleteFieldIds: [] }
@@ -894,7 +986,10 @@ async function attachValidatedDraftToCart(draft: PurchaseDraft, context: Purchas
   if (isCustomer.value) {
     const current = shoppingCart.cartView.value?.items.find(item => item.lineId === edit.lineId)
     if (current?.draftId === draft.id && current.draftRevision === draft.revision) {
-      if (current.lineRevision !== null) cartEdit.value = { ...edit, lineRevision: current.lineRevision, expectedDraftRevision: current.draftRevision }
+      if (current.lineRevision !== null) {
+        cartEdit.value = { ...edit, sourceVerified: true, quantity: current.quantity, lineRevision: current.lineRevision, expectedDraftRevision: current.draftRevision }
+        quantity.value = current.quantity
+      }
       return true
     }
     if (edit.lineRevision === null) {
@@ -920,7 +1015,8 @@ async function attachValidatedDraftToCart(draft: PurchaseDraft, context: Purchas
     const row = shoppingCart.cartView.value?.items.find(item => item.lineId === retainedLineId)
     if (row?.lineRevision !== null && row?.lineRevision !== undefined) {
       cartEdit.value = { ...edit, draftId: draft.id, replacementDraftId: null, omittedSourceAttachmentIds: [],
-        lineRevision: row.lineRevision, expectedDraftRevision: row.draftRevision }
+        sourceVerified: true, quantity: row.quantity, lineRevision: row.lineRevision, expectedDraftRevision: row.draftRevision }
+      quantity.value = row.quantity
     }
     // Finalizing an isolated cart edit writes the normalized values and copied
     // attachments once more in the same transaction as the line swap. Adopt
@@ -1439,6 +1535,7 @@ async function buySelectedNow() {
                 <UFormField
                   label="购买数量"
                   name="quantity"
+                  :hint="isEditingCartLine ? '数量以购物车当前购买行为准' : undefined"
                 >
                   <div class="flex w-fit items-center rounded-lg border border-default">
                     <UButton
@@ -1448,7 +1545,7 @@ async function buySelectedNow() {
                       icon="i-lucide-minus"
                       aria-label="减少数量"
                       class="min-h-11 min-w-11 justify-center"
-                      :disabled="quantity <= 1 || shoppingCart.busy.value"
+                      :disabled="isEditingCartLine || quantity <= 1 || shoppingCart.busy.value"
                       @click="quantity = Math.max(1, quantity - 1)"
                     />
                     <UInput
@@ -1459,7 +1556,7 @@ async function buySelectedNow() {
                       inputmode="numeric"
                       aria-label="购买数量"
                       class="w-20 text-center tabular-nums"
-                      :disabled="shoppingCart.busy.value"
+                      :disabled="isEditingCartLine || shoppingCart.busy.value"
                       @change="quantity = Math.min(99, Math.max(1, Math.trunc(quantity || 1)))"
                     />
                     <UButton
@@ -1469,7 +1566,7 @@ async function buySelectedNow() {
                       icon="i-lucide-plus"
                       aria-label="增加数量"
                       class="min-h-11 min-w-11 justify-center"
-                      :disabled="quantity >= 99 || shoppingCart.busy.value"
+                      :disabled="isEditingCartLine || quantity >= 99 || shoppingCart.busy.value"
                       @click="quantity = Math.min(99, quantity + 1)"
                     />
                   </div>
@@ -1595,6 +1692,16 @@ async function buySelectedNow() {
                       @click="validatePurchaseValues"
                     >
                       校验完整性
+                    </UButton>
+                    <UButton
+                      v-if="hasCartReplacementDraft && isCustomer"
+                      color="neutral"
+                      variant="ghost"
+                      class="min-h-11 justify-center"
+                      :disabled="purchaseFormBusy"
+                      @click="cancelCartLineReplacementEdit"
+                    >
+                      撤销本次编辑
                     </UButton>
                   </div>
                   <p

@@ -1956,14 +1956,136 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
       setup.source.id, setup.sourceImage.attachmentId)).sha256).toBe(setup.sourceImage.sha256)
     expect((await setup.draftStorage.scanFiles()).some(file => file.id === copiedId)).toBe(true)
 
-    const repaired = await reconcilePurchaseDrafts(db, setup.draftStorage, {
+    const recent = await reconcilePurchaseDrafts(db, setup.draftStorage, {
       repair: true, now: new Date(Date.now() + 2_000), graceHours: 0,
+    })
+    expect(recent.oldOrphanFiles).toBe(0)
+    expect((await setup.draftStorage.scanFiles()).some(file => file.id === copiedId)).toBe(true)
+    const repaired = await reconcilePurchaseDrafts(db, setup.draftStorage, {
+      repair: true, now: new Date(Date.now() + 25 * 60 * 60_000),
     })
     expect(repaired.oldOrphanFiles).toBeGreaterThanOrEqual(1)
     expect((await setup.draftStorage.scanFiles()).some(file => file.id === copiedId)).toBe(false)
     expect((await readPurchaseDraftAttachment(db, setup.draftStorage, setup.owner,
       setup.source.id, setup.sourceImage.attachmentId)).sha256).toBe(setup.sourceImage.sha256)
   }, 45_000)
+
+  it.each([true, false])('retains a prepared image while final transaction is invisible, eventual commit=%s', async commit => {
+    const setup = await makeCartImageEditFixture()
+    const priorFileIds = new Set((await setup.draftStorage.scanFiles()).map(file => file.id))
+    const originalStore = PurchaseAttachmentStorage.prototype.store
+    let copiedId = ''
+    PurchaseAttachmentStorage.prototype.store = async function (id, bytes) {
+      const key = await originalStore.call(this, id, bytes)
+      copiedId = id
+      return key
+    }
+    const originalDescriptor = Object.getOwnPropertyDescriptor(db, 'transaction')
+    const originalTransaction = db.transaction.bind(db)
+    let releaseCommit!: () => void
+    let writesReady!: () => void
+    const commitGate = new Promise<void>(resolve => { releaseCommit = resolve })
+    const written = new Promise<void>(resolve => { writesReady = resolve })
+    let transactionCount = 0
+    let pending: Promise<unknown> | undefined
+    Object.defineProperty(db, 'transaction', { configurable: true, value: () => {
+      const builder = originalTransaction()
+      return { execute: async <T>(callback: (trx: Transaction<Database>) => Promise<T>): Promise<T> => {
+        transactionCount += 1
+        if (transactionCount !== 2) return builder.execute(callback)
+        pending = builder.execute(async trx => {
+          const result = await callback(trx)
+          writesReady()
+          await commitGate
+          if (!commit) throw new Error('test eventual rollback after unknown client result')
+          return result
+        })
+        void pending.catch(() => undefined)
+        await written
+        // Unlike the post-commit regression below, the actual PostgreSQL
+        // transaction still owns its uncommitted rows and has not returned.
+        throw new Error('test client loses confirmation while transaction is still pending')
+      } }
+    } })
+    let retainedWhileInvisible: boolean
+    try {
+      const response = await inject({ method: 'PATCH',
+        url: `/api/v1/customer/cart/lines/${setup.line.lineId}/purchase-form`, headers: setup.headers, payload: {
+          expectedLineRevision: setup.line.lineRevision, expectedDraftRevision: setup.line.draftRevision,
+          replacementDraft: { draftId: setup.replacement.replacementDraftId,
+            draftRevision: setup.replacement.replacementDraftRevision }, values: setup.sourceValues,
+        } })
+      expect(response.statusCode).toBe(500)
+      expect(await db.selectFrom('purchase_draft_attachments').select('id')
+        .where('draft_id', '=', setup.replacement.replacementDraftId).execute()).toEqual([])
+      expect((await db.selectFrom('customer_cart_items').select('draft_id')
+        .where('line_id', '=', setup.line.lineId).executeTakeFirstOrThrow()).draft_id).toBe(setup.source.id)
+      const objects = await setup.draftStorage.scanFiles()
+      expect(priorFileIds.has(copiedId)).toBe(false)
+      retainedWhileInvisible = objects.some(file => file.id === copiedId)
+      // Advance only the repair clock beyond the normal orphan grace. An
+      // outstanding final transaction must fence collection even at that age.
+      await reconcilePurchaseDrafts(db, setup.draftStorage, {
+        repair: true, now: new Date(Date.now() + 25 * 60 * 60_000),
+      })
+      retainedWhileInvisible &&= (await setup.draftStorage.scanFiles()).some(file => file.id === copiedId)
+      if (commit) {
+        const scan = setup.draftStorage.scanFiles.bind(setup.draftStorage)
+        setup.draftStorage.scanFiles = async () => {
+          const files = await scan()
+          releaseCommit()
+          await pending
+          return files
+        }
+        try {
+          // The ready-row snapshot predates COMMIT. The per-object lookup must
+          // still protect the now-committed image after scanFiles returns.
+          await reconcilePurchaseDrafts(db, setup.draftStorage, {
+            repair: true, now: new Date(Date.now() + 25 * 60 * 60_000),
+          })
+        } finally { setup.draftStorage.scanFiles = scan }
+      }
+    } finally {
+      releaseCommit()
+      if (pending) await pending.catch(() => undefined)
+      if (originalDescriptor) Object.defineProperty(db, 'transaction', originalDescriptor)
+      else Reflect.deleteProperty(db, 'transaction')
+      PurchaseAttachmentStorage.prototype.store = originalStore
+    }
+    expect(retainedWhileInvisible, 'an invisible pending transaction must not lose its prepared object').toBe(true)
+    if (commit) {
+      const current = await getPurchaseDraft(db, configA, setup.owner, setup.replacement.replacementDraftId)
+      expect(current.values[setup.fixture.ids.imageId]).toEqual([copiedId])
+      expect((await readPurchaseDraftAttachment(db, setup.draftStorage, setup.owner,
+        current.id, copiedId)).sha256).toBe(setup.sourceImage.sha256)
+    }
+    await reconcilePurchaseDrafts(db, setup.draftStorage, { repair: true, now: new Date(Date.now() + 25 * 60 * 60_000) })
+    await reconcilePurchaseDrafts(db, setup.draftStorage, { repair: true, now: new Date(Date.now() + 25 * 60 * 60_000) })
+    expect((await setup.draftStorage.scanFiles()).some(file => file.id === copiedId)).toBe(commit)
+    const retainedDraftId = commit ? setup.replacement.replacementDraftId : setup.source.id
+    const retainedImageId = commit ? copiedId : setup.sourceImage.attachmentId
+    expect((await readPurchaseDraftAttachment(db, setup.draftStorage, setup.owner,
+      retainedDraftId, retainedImageId)).sha256).toBe(setup.sourceImage.sha256)
+  }, 45_000)
+
+  it('immediately releases copies after a final callback fails before COMMIT is requested', async () => {
+    const setup = await makeCartImageEditFixture()
+    const filesBefore = (await setup.draftStorage.scanFiles()).map(file => file.id).sort()
+    const values = { ...setup.sourceValues, [setup.fixture.ids.accountId]: '' }
+    const response = await inject({ method: 'PATCH',
+      url: `/api/v1/customer/cart/lines/${setup.line.lineId}/purchase-form`, headers: setup.headers, payload: {
+        expectedLineRevision: setup.line.lineRevision, expectedDraftRevision: setup.line.draftRevision,
+        replacementDraft: { draftId: setup.replacement.replacementDraftId,
+          draftRevision: setup.replacement.replacementDraftRevision }, values,
+      } })
+    expect(response.statusCode, JSON.stringify(response.json())).toBe(422)
+    expect((await setup.draftStorage.scanFiles()).map(file => file.id).sort()).toEqual(filesBefore)
+    expect((await db.selectFrom('customer_cart_items').select(['draft_id', 'revision'])
+      .where('line_id', '=', setup.line.lineId).executeTakeFirstOrThrow()))
+      .toEqual({ draft_id: setup.source.id, revision: setup.line.lineRevision })
+    expect((await readPurchaseDraftAttachment(db, setup.draftStorage, setup.owner,
+      setup.source.id, setup.sourceImage.attachmentId)).sha256).toBe(setup.sourceImage.sha256)
+  })
 
   it('preserves a referenced replacement image when the final cart commit acknowledgement is lost', async () => {
     const setup = await makeCartImageEditFixture()
@@ -1998,7 +2120,7 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
       if (originalDescriptor) Object.defineProperty(db, 'transaction', originalDescriptor)
       else Reflect.deleteProperty(db, 'transaction')
     }
-    expect(transactionCount).toBe(3)
+    expect(transactionCount).toBe(2)
     expect(response!.statusCode).toBe(500)
     const line = await db.selectFrom('customer_cart_items').selectAll()
       .where('line_id', '=', setup.line.lineId).executeTakeFirstOrThrow()
