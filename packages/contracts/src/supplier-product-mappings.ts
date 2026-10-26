@@ -546,6 +546,7 @@ export function validateSupplierProductMapping(
   const localById = new Map(local.fields.map(item => [item.field.id.toLowerCase(), item]))
   const localOptionById = new Map(local.options.map(item => [item.optionId, item]))
   const fieldRules = new Map<string, SupplierMappingFieldRule[]>()
+  const resolvedFieldTargets = new Map<string, Array<{ localFieldId: string; upstreamPath: SupplierMappingPath }>>()
   for (const rule of rules.fields) fieldRules.set(rule.localFieldId.toLowerCase(), [...(fieldRules.get(rule.localFieldId.toLowerCase()) ?? []), rule])
   for (const [fieldId, sameIdRules] of fieldRules) {
     const localRef = localById.get(fieldId)
@@ -557,31 +558,35 @@ export function validateSupplierProductMapping(
     const resolved = resolveSupplierMappingPath(upstreamFields, rule.upstreamPath)
     if (!resolved || resolved.kind !== 'field') { pushIssue(issues, 'UPSTREAM_FIELD_LOCATOR_MISSING', { localFieldId: fieldId, upstreamPath: rule.upstreamPath }); continue }
     const upstreamField = resolved.field
+    const fieldTargetKey = canonicalSupplierMappingJson(rule.upstreamPath)
+    resolvedFieldTargets.set(fieldTargetKey, [...(resolvedFieldTargets.get(fieldTargetKey) ?? []), { localFieldId: fieldId, upstreamPath: rule.upstreamPath }])
     if (!isCompatible(localRef.field.type, upstreamField.type)) {
       pushIssue(issues, upstreamField.type === null || ![0, 1, 13, 14, 15, 16].includes(upstreamField.type) ? 'UPSTREAM_FIELD_TYPE_UNKNOWN' : 'FIELD_TYPE_INCOMPATIBLE', {
         localFieldId: fieldId, upstreamPath: rule.upstreamPath,
       })
     }
     if (upstreamField.required === null) pushIssue(issues, 'UPSTREAM_REQUIRED_SEMANTICS_UNKNOWN', { localFieldId: fieldId, upstreamPath: rule.upstreamPath })
+    const localBranchId = localRef.parentOptionId
+    const sourceParentOptionPath = rule.upstreamPath.at(-1)?.kind === 'expand'
+      ? rule.upstreamPath.slice(0, -1) as SupplierMappingPath : null
+    if (Boolean(localBranchId) !== Boolean(sourceParentOptionPath)) {
+      pushIssue(issues, 'UPSTREAM_FIELD_CONDITIONAL_SOURCE_MISMATCH', { localFieldId: fieldId, upstreamPath: rule.upstreamPath })
+    } else if (localBranchId) {
+      const parentOption = localOptionById.get(localBranchId)
+      const parentFieldRules = parentOption ? fieldRules.get(parentOption.parentFieldId) : null
+      const parentFieldRule = parentFieldRules?.length === 1 ? parentFieldRules[0] : null
+      const parentOptionRule = parentFieldRule?.options.find(option => option.localOptionId.toLowerCase() === localBranchId)
+      if (!parentOptionRule || canonicalSupplierMappingJson(parentOptionRule.upstreamPath) !== canonicalSupplierMappingJson(sourceParentOptionPath)) {
+        pushIssue(issues, 'UPSTREAM_FIELD_CONDITIONAL_SOURCE_MISMATCH', { localFieldId: fieldId, upstreamPath: rule.upstreamPath })
+      }
+    }
     if (upstreamField.required === true) {
       if (!localRef.field.required) pushIssue(issues, 'LOCAL_REQUIREDNESS_TOO_WEAK', { localFieldId: fieldId, upstreamPath: rule.upstreamPath })
-      const localBranchId = localRef.parentOptionId
-      const sourceParentOptionPath = rule.upstreamPath.at(-1)?.kind === 'expand'
-        ? rule.upstreamPath.slice(0, -1) as SupplierMappingPath : null
-      if (Boolean(localBranchId) !== Boolean(sourceParentOptionPath)) {
-        pushIssue(issues, 'UPSTREAM_REQUIRED_SOURCE_CONDITIONAL', { localFieldId: fieldId, upstreamPath: rule.upstreamPath })
-      } else if (localBranchId) {
-        const parentOption = localOptionById.get(localBranchId!)
-        const parentFieldRule = parentOption && fieldRules.get(parentOption.parentFieldId)?.[0]
-        const parentOptionRule = parentFieldRule?.options.find(option => option.localOptionId.toLowerCase() === localBranchId)
-        if (!parentOptionRule || canonicalSupplierMappingJson(parentOptionRule.upstreamPath) !== canonicalSupplierMappingJson(sourceParentOptionPath)) {
-          pushIssue(issues, 'UPSTREAM_REQUIRED_SOURCE_CONDITIONAL', { localFieldId: fieldId, upstreamPath: rule.upstreamPath })
-        }
-      }
     }
 
     const localOptions = localOptionsFor(localRef.field)
     const optionRules = new Map<string, SupplierMappingOptionRule[]>()
+    const resolvedOptionTargets = new Map<string, Array<{ localOptionId: string; upstreamPath: SupplierMappingPath }>>()
     for (const optionRule of rule.options) optionRules.set(optionRule.localOptionId.toLowerCase(), [...(optionRules.get(optionRule.localOptionId.toLowerCase()) ?? []), optionRule])
     if (localRef.field.type === 'select' || localRef.field.type === 'cascade') {
       for (const option of localOptions) {
@@ -592,6 +597,10 @@ export function validateSupplierProductMapping(
         if (sourceFieldPath(optionRule.upstreamPath)) { pushIssue(issues, 'UPSTREAM_OPTION_LOCATOR_INVALID', { localFieldId: fieldId, localOptionId: option.optionId, upstreamPath: optionRule.upstreamPath }); continue }
         const source = resolveSupplierMappingPath(upstreamFields, optionRule.upstreamPath)
         if (!source || source.kind !== 'option') { pushIssue(issues, 'UPSTREAM_OPTION_LOCATOR_MISSING', { localFieldId: fieldId, localOptionId: option.optionId, upstreamPath: optionRule.upstreamPath }); continue }
+        const optionTargetKey = canonicalSupplierMappingJson(optionRule.upstreamPath)
+        resolvedOptionTargets.set(optionTargetKey, [...(resolvedOptionTargets.get(optionTargetKey) ?? []), {
+          localOptionId: option.optionId, upstreamPath: optionRule.upstreamPath,
+        }])
         const parent = sourceOptionParentPath(optionRule.upstreamPath)
         if (parent === null) { pushIssue(issues, 'UPSTREAM_OPTION_LOCATOR_INVALID', { localFieldId: fieldId, localOptionId: option.optionId, upstreamPath: optionRule.upstreamPath }); continue }
         if (localRef.field.type === 'select') {
@@ -611,6 +620,11 @@ export function validateSupplierProductMapping(
       for (const [optionId] of optionRules) if (!currentLocalOptionIds.has(optionId)) {
         pushIssue(issues, 'LOCAL_OPTION_UNKNOWN', { localFieldId: fieldId, localOptionId: optionId })
       }
+      for (const owners of resolvedOptionTargets.values()) if (owners.length > 1) {
+        for (const owner of owners) pushIssue(issues, 'UPSTREAM_OPTION_TARGET_REUSED', {
+          localFieldId: fieldId, localOptionId: owner.localOptionId, upstreamPath: owner.upstreamPath,
+        })
+      }
     } else if (rule.options.length) {
       pushIssue(issues, 'UNEXPECTED_OPTION_MAPPINGS', { localFieldId: fieldId, upstreamPath: rule.upstreamPath })
     }
@@ -621,6 +635,11 @@ export function validateSupplierProductMapping(
   }
   for (const localRef of local.fields) if (!fieldRules.has(localRef.field.id.toLowerCase())) {
     pushIssue(issues, 'LOCAL_FIELD_UNMAPPED', { localFieldId: localRef.field.id })
+  }
+  for (const owners of resolvedFieldTargets.values()) if (owners.length > 1) {
+    for (const owner of owners) pushIssue(issues, 'UPSTREAM_FIELD_TARGET_REUSED', {
+      localFieldId: owner.localFieldId, upstreamPath: owner.upstreamPath,
+    })
   }
 
   // Every required upstream field must have a direct, unconditional local source.

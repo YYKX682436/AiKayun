@@ -66,7 +66,7 @@ function cookie(response: { headers: Record<string, string | string[] | undefine
 function templateFixture() {
   const id = () => randomUUID()
   const account = id(), image = id(), digits = id(), channel = id(), channelOption = id(), note = id()
-  const region = id(), north = id(), city = id(), verification = id(), verificationOption = id(), extraNote = id()
+  const region = id(), north = id(), city = id(), south = id(), verification = id(), verificationOption = id(), extraNote = id()
   const definition: PurchaseFormDefinition = { fields: [
     { id: account, meaningKey: 'account_name', type: 'text', label: '账号', required: true, maxLength: 120 },
     { id: image, meaningKey: 'proof_image', type: 'image', label: '凭证图片', required: false, maxCount: 2 },
@@ -80,7 +80,7 @@ function templateFixture() {
           options: [{ id: verificationOption, meaningKey: 'identity_tail', label: '身份证后六位' }] },
         { id: extraNote, meaningKey: 'extra_note', type: 'text', label: '扩展备注', required: false },
       ], children: [{ id: city, meaningKey: 'nanning', label: '南宁市' }],
-    }] },
+    }, { id: south, meaningKey: 'south_china_other', label: '广东', expandedFields: [], children: [] }] },
   ] }
   const field = (index: number, localFieldId: string, localMeaningKey: string, options: SupplierMappingRules['fields'][number]['options'] = []) => ({
     localFieldId, localMeaningKey, upstreamPath: [{ kind: 'field' as const, index }], options,
@@ -93,6 +93,7 @@ function templateFixture() {
     field(5, region, 'region', [
       { localOptionId: north, localMeaningKey: 'south_china', upstreamPath: [{ kind: 'field', index: 5 }, { kind: 'option', index: 0 }] },
       { localOptionId: city, localMeaningKey: 'nanning', upstreamPath: [{ kind: 'field', index: 5 }, { kind: 'option', index: 0 }, { kind: 'child', index: 0 }] },
+      { localOptionId: south, localMeaningKey: 'south_china_other', upstreamPath: [{ kind: 'field', index: 5 }, { kind: 'option', index: 1 }] },
     ]),
     { localFieldId: verification, localMeaningKey: 'verification_code',
       upstreamPath: [{ kind: 'field', index: 5 }, { kind: 'option', index: 0 }, { kind: 'expand', index: 0 }],
@@ -130,8 +131,15 @@ function setProductOverride() {
     const region = row.rechargeTemplates[5]?.options?.[0]
     const deep = region?.expand?.[0]?.options?.[0]?.expand?.[0]
     if (deep) deep.required = 0
+    ensureAlternateCascadeOption(row)
     return row
   })
+}
+function ensureAlternateCascadeOption(row: FixtureProductData) {
+  const cascade = row.rechargeTemplates?.find(field => field.type === 16)
+  if (!cascade || Number(row.skuType) === 0) return
+  cascade.options ??= []
+  if (cascade.options.length === 1) cascade.options.push({ name: '广东', value: 'guangdong', children: [], expand: [] })
 }
 
 beforeAll(async () => {
@@ -284,6 +292,22 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
     expect(connectionState).toMatchObject({ enabled: false, fulfillmentEligible: false })
     expect((await inject({ method: 'POST', url: `/api/v1/admin/supplier-connections/${connectionId}/catalog/goods/201001`, headers: adminHeaders })).json().data.procurementReady).toBe(false)
     expect(reviewed.body).not.toContain(fixtureKayixinCredentials.appSecret)
+
+    const beforeDuplicateAttempt = await db.selectFrom('supplier_product_mapping_versions').select('id').where('mapping_id', '=', mappingId).execute()
+    const duplicateOptionRules = structuredClone(rules)
+    duplicateOptionRules.fields.find(rule => rule.localMeaningKey === 'region')!.options[2]!.upstreamPath = [
+      { kind: 'field', index: 5 }, { kind: 'option', index: 0 },
+    ]
+    const duplicateDraft = await inject({ method: 'PUT', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders,
+      payload: { expectedRevision: reviewed.json().data.mapping.revision, productId, skuId, observationId, templateVersionId, rules: duplicateOptionRules } })
+    expect(duplicateDraft.statusCode, duplicateDraft.body).toBe(200)
+    const duplicateReview = await inject({ method: 'POST', url: `/api/v1/admin/supplier-product-mappings/${mappingId}/review`, headers: adminHeaders,
+      payload: { expectedRevision: duplicateDraft.json().data.revision } })
+    expect(duplicateReview.statusCode, duplicateReview.body).toBe(200)
+    expect(duplicateReview.json().data.reviewed).toBe(false)
+    expect(duplicateReview.json().data.issues).toContainEqual(expect.objectContaining({ code: 'UPSTREAM_OPTION_TARGET_REUSED', blocking: true }))
+    expect(await db.selectFrom('supplier_product_mapping_versions').select('id').where('mapping_id', '=', mappingId).execute())
+      .toEqual(beforeDuplicateAttempt)
   }, 45_000)
 
   it('uses optimistic revisions, preserves reviewed rows, and treats price/name/stock as non-structural observations', async () => {
@@ -310,6 +334,7 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
       const product = fixtureProduct(Number(body.goodsId)) as FixtureProductData
       const deep = product.rechargeTemplates[5]?.options?.[0]?.expand?.[0]?.options?.[0]?.expand?.[0]
       if (deep) deep.required = 0
+      ensureAlternateCascadeOption(product)
       product.name = '夹具会员改名'
       product.salesPrice = '987.654321'
       product.stockCount = 0
@@ -333,6 +358,7 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
       product.rechargeTemplates.unshift({ type: 15, title: '新增上游字段', placeholder: '', required: 1, regex: '', options: [] })
       const deep = product.rechargeTemplates[6]?.options?.[0]?.expand?.[0]?.options?.[0]?.expand?.[0]
       if (deep) deep.required = 0
+      ensureAlternateCascadeOption(product)
       return product
     })
     const structureRefresh = await inject({ method: 'POST', url: `/api/v1/admin/supplier-product-mappings/${mappingId}/refresh`, headers: adminHeaders,
@@ -401,6 +427,7 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
       const product = fixtureProduct(Number(body.goodsId)) as FixtureProductData
       const deep = product.rechargeTemplates[5]?.options?.[0]?.expand?.[0]?.options?.[0]?.expand?.[0]
       if (deep) deep.required = 0
+      ensureAlternateCascadeOption(product)
       return product
     })
     const restoredStructure = await inject({ method: 'POST', url: `/api/v1/admin/supplier-product-mappings/${mappingId}/refresh`, headers: adminHeaders,

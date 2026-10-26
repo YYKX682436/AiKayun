@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import {
+  canonicalSupplierMappingJson,
   previewSupplierProductMapping,
   type PurchaseFormCascadeOption,
   type PurchaseFormDefinition,
@@ -34,8 +35,27 @@ type UpstreamStructureRow = { key: string; kind: 'field' | 'option'; path: Suppl
 type LocalFieldRow = { field: PurchaseFormField | PurchaseFormLeafField; branch: string }
 type LocalOptionRow = { option: { id: string; meaningKey: string; label: string }; parentId: string | null; branch: string }
 type ApiMappingList = { items: SupplierProductMapping[] }
+type SupplierMappingCatalogSummary = NonNullable<SupplierMappingCatalogSku['mapping']>
 type RefreshResult = { mapping: SupplierProductMapping; observation: SupplierProductMappingRefreshObservation | null; issues: SupplierProductMappingIssue[]; structureChanged: boolean; configurationChanged: boolean; templateChanged: boolean; identityChanged: boolean }
 type EditorObservation = SupplierProductMappingObservation | SupplierProductMappingRefreshObservation
+type SelectionOwner = {
+  generation: number
+  skuId: string | null
+  productId: string | null
+  connectionId: string | null
+  configurationVersionId: string | null
+  mappingId: string | null
+  mappingRevision: number | null
+  mappingConnectionId: string | null
+  mappingConfigurationVersionId: string | null
+  templateVersionId: string | null
+  observationId: string | null
+  observationConnectionId: string | null
+  observationConfigurationVersionId: string | null
+  upstreamProductId: string | null
+  upstreamSkuCode: string | null
+  rulesJson: string
+}
 
 const { request } = useAdminApi()
 const localSkus = shallowRef<SupplierMappingCatalogSku[]>([])
@@ -61,6 +81,9 @@ const refreshMessage = ref('')
 const listPage = ref(1)
 let generation = 0
 let skuGeneration = 0
+let operationSequence = 0
+let activeReadOperation: number | null = null
+let activeSaveOperation: number | null = null
 
 const root = '/api/v1/admin/supplier-product-mappings'
 const kayixinConnections = computed(() => connections.value.filter(item => item.providerType === 'kayixin_customer_v3'))
@@ -118,12 +141,128 @@ const issueLabel = (code: string) => ({
   UPSTREAM_FIELD_TITLE_DUPLICATE: '上游存在同名字段，需检查结构定位', UPSTREAM_OPTION_VALUE_DUPLICATE: '上游选项原始 value 重复',
   UPSTREAM_REQUIRED_FIELD_UNMAPPED: '上游必填字段没有来源', LOCAL_FIELD_UNMAPPED: '本地字段尚未对应',
   FIELD_TYPE_INCOMPATIBLE: '本地与上游字段类型不兼容', LOCAL_REQUIREDNESS_TOO_WEAK: '上游必填字段对应到本地非必填字段',
-  UPSTREAM_REQUIRED_SOURCE_CONDITIONAL: '上游条件必填分支与本地分支不一致', IMAGE_ENCODING_UNVERIFIED: '图片来源已对应，但数量与编码语义仍未验证',
+  UPSTREAM_REQUIRED_SOURCE_CONDITIONAL: '上游条件必填分支与本地分支不一致',
+  UPSTREAM_FIELD_CONDITIONAL_SOURCE_MISMATCH: '本地扩展字段与上游条件分支不一致',
+  UPSTREAM_FIELD_TARGET_REUSED: '多个本地字段对应到同一上游字段',
+  UPSTREAM_OPTION_TARGET_REUSED: '多个本地选项对应到同一上游选项',
+  IMAGE_ENCODING_UNVERIFIED: '图片来源已对应，但数量与编码语义仍未验证',
   LOCAL_OPTION_UNMAPPED: '本地选项尚未对应上游原始 value', UPSTREAM_OPTION_LOCATOR_MISSING: '上游选项路径不存在',
   CASCADE_OPTION_SOURCE_MISMATCH: '级联选项层级不匹配', SELECT_OPTION_SOURCE_MISMATCH: '单选选项不属于所选上游字段',
   UPSTREAM_FIELD_LOCATOR_MISSING: '上游字段路径不存在', UPSTREAM_FIELD_LOCATOR_INVALID: '上游字段路径无效',
   UPSTREAM_FIELD_OPTIONS_UNVERIFIED: '此上游字段带有未验证选项结构', UPSTREAM_BRANCH_SEMANTICS_UNVERIFIED: '上游分支语义未验证',
 }[code] ?? code)
+
+function captureSelectionOwner(): SelectionOwner {
+  const sku = selectedSku.value
+  const connection = selectedConnection.value
+  const currentMapping = mapping.value
+  const currentObservation = observation.value
+  return {
+    generation,
+    skuId: sku?.skuId ?? null,
+    productId: sku?.productId ?? null,
+    connectionId: connection?.id ?? null,
+    configurationVersionId: connection?.currentVersion.id ?? null,
+    mappingId: currentMapping?.id ?? null,
+    mappingRevision: currentMapping?.revision ?? null,
+    mappingConnectionId: currentMapping?.connectionId ?? null,
+    mappingConfigurationVersionId: currentMapping?.configurationVersionId ?? null,
+    templateVersionId: sku?.appliedTemplateVersion?.id ?? null,
+    observationId: currentObservation?.id ?? null,
+    observationConnectionId: currentObservation?.source.connectionId ?? null,
+    observationConfigurationVersionId: currentObservation?.source.configurationVersionId ?? null,
+    upstreamProductId: currentObservation?.upstreamProductId ?? upstreamProduct.value?.upstreamProductId ?? null,
+    upstreamSkuCode: (currentObservation?.skuCode ?? selectedUpstreamSku.value) || null,
+    rulesJson: canonicalSupplierMappingJson(rules.value),
+  }
+}
+
+function ownsCurrentSelection(owner: SelectionOwner, options: { token?: number; kind?: 'read' | 'save'; checkRules?: boolean; checkObservation?: boolean } = {}): boolean {
+  const sku = selectedSku.value
+  const connection = selectedConnection.value
+  const currentMapping = mapping.value
+  if (owner.generation !== generation || owner.skuId !== (sku?.skuId ?? null) || owner.productId !== (sku?.productId ?? null)
+    || owner.connectionId !== (connection?.id ?? null) || owner.configurationVersionId !== (connection?.currentVersion.id ?? null)
+    || owner.mappingId !== (currentMapping?.id ?? null) || owner.mappingRevision !== (currentMapping?.revision ?? null)
+    || owner.templateVersionId !== (sku?.appliedTemplateVersion?.id ?? null)) return false
+  if (options.kind === 'read' && options.token !== undefined && activeReadOperation !== options.token) return false
+  if (options.kind === 'save' && options.token !== undefined && activeSaveOperation !== options.token) return false
+  if (options.checkRules && owner.rulesJson !== canonicalSupplierMappingJson(rules.value)) return false
+  if (options.checkObservation && (owner.observationId !== (observation.value?.id ?? null)
+    || owner.observationConnectionId !== (observation.value?.source.connectionId ?? null)
+    || owner.observationConfigurationVersionId !== (observation.value?.source.configurationVersionId ?? null))) return false
+  return true
+}
+
+function beginReadOperation(): number {
+  const token = ++operationSequence
+  activeReadOperation = token
+  reading.value = true
+  return token
+}
+
+function finishReadOperation(token: number): void {
+  if (activeReadOperation !== token) return
+  activeReadOperation = null
+  reading.value = false
+}
+
+function beginSaveOperation(): number {
+  const token = ++operationSequence
+  activeSaveOperation = token
+  saving.value = true
+  return token
+}
+
+function finishSaveOperation(token: number): void {
+  if (activeSaveOperation !== token) return
+  activeSaveOperation = null
+  saving.value = false
+}
+
+function isMappingResultAtLeastAsNew(incoming: SupplierProductMapping, existing: SupplierProductMapping): boolean {
+  if (incoming.revision !== existing.revision) return incoming.revision > existing.revision
+  if (incoming.status === 'stale' && existing.status !== 'stale') return true
+  if (existing.status === 'stale' && incoming.status !== 'stale') return false
+  return incoming.updatedAt >= existing.updatedAt
+}
+
+function mappingCatalogSummary(value: SupplierProductMapping): SupplierMappingCatalogSummary {
+  return { id: value.id, status: value.status, revision: value.revision, connectionId: value.connectionId,
+    configurationVersionId: value.configurationVersionId, upstreamProductId: value.upstreamProductId,
+    upstreamSkuType: value.upstreamSkuType, upstreamSkuCode: value.upstreamSkuCode,
+    templateVersionId: value.templateVersion.id, updatedAt: value.updatedAt }
+}
+
+function mergeMappingResult(value: SupplierProductMapping, owner: SelectionOwner, expectedConnectionId: string | null,
+  expectedConfigurationVersionId?: string | null): SupplierProductMapping | null {
+  if (!owner.skuId || !owner.productId || value.skuId !== owner.skuId || value.productId !== owner.productId
+    || value.connectionId !== expectedConnectionId || (expectedConfigurationVersionId !== undefined
+      && value.configurationVersionId !== expectedConfigurationVersionId)
+    || (owner.mappingId && value.id !== owner.mappingId)) return null
+  const existing = mappings.value.find(item => item.id === value.id)
+  const currentSku = localSkus.value.find(item => item.skuId === value.skuId)
+  const existingSummary = currentSku?.mapping
+  if (existingSummary?.id === value.id && (existingSummary.revision > value.revision
+    || (existingSummary.revision === value.revision && ((existingSummary.status === 'stale' && value.status !== 'stale')
+      || (existingSummary.status === value.status && existingSummary.updatedAt > value.updatedAt))))) {
+    return existing && existing.revision >= existingSummary.revision ? existing : null
+  }
+  const selected = existing && !isMappingResultAtLeastAsNew(value, existing) ? existing : value
+  mappings.value = existing
+    ? mappings.value.map(item => item.id === value.id ? selected : item)
+    : [...mappings.value, selected]
+  if (currentSku) {
+    const incomingSummary = mappingCatalogSummary(selected)
+    const existingSummary = currentSku.mapping
+    const summaryIsNewer = !existingSummary || incomingSummary.revision > existingSummary.revision
+      || (incomingSummary.revision === existingSummary.revision
+        && ((incomingSummary.status === 'stale' && existingSummary.status !== 'stale')
+          || (existingSummary.status !== 'stale' && incomingSummary.status === existingSummary.status && incomingSummary.updatedAt >= existingSummary.updatedAt)))
+    if (summaryIsNewer) localSkus.value = localSkus.value.map(item => item.skuId === value.skuId ? { ...item, mapping: incomingSummary } : item)
+  }
+  return selected
+}
 
 function formatDate(value: string) { return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) }
 function pathKey(path: SupplierMappingPath) { return JSON.stringify(path) }
@@ -327,26 +466,46 @@ async function loadAppliedTemplate(expectedGeneration = generation) {
 async function readGoods() {
   if (!selectedConnection.value || reading.value) return
   const current = ++generation
+  const owner = captureSelectionOwner()
+  const connectionId = owner.connectionId
+  const page = listPage.value
+  const keyword = search.value.trim()
+  if (!connectionId || !owner.configurationVersionId) return
+  const token = beginReadOperation()
   reading.value = true; errorMessage.value = ''; successMessage.value = ''; catalog.value = null; upstreamProduct.value = null; observation.value = null
   try {
-    catalog.value = await request<SupplierCatalogPage>(`/api/v1/admin/supplier-connections/${selectedConnectionId.value}/catalog/goods`, {
-      method: 'POST', body: { page: listPage.value, keyWord: search.value.trim() },
+    const result = await request<SupplierCatalogPage>(`/api/v1/admin/supplier-connections/${connectionId}/catalog/goods`, {
+      method: 'POST', body: { page, keyWord: keyword },
     })
-    if (current !== generation) return
-  } catch (error) { if (current === generation) errorMessage.value = error instanceof Error ? error.message : '上游商品读取失败。' }
-  finally { if (current === generation) reading.value = false }
+    if (current !== generation || !ownsCurrentSelection(owner, { token, kind: 'read' })
+      || result.source.connectionId !== connectionId || result.source.configurationVersionId !== owner.configurationVersionId
+      || listPage.value !== page || search.value.trim() !== keyword) return
+    catalog.value = result
+  } catch (error) {
+    if (current === generation && ownsCurrentSelection(owner, { token, kind: 'read' })) {
+      errorMessage.value = error instanceof Error ? error.message : '上游商品读取失败。'
+    }
+  } finally { finishReadOperation(token) }
 }
 async function readDetail(goodsId: string) {
   if (!selectedConnection.value || reading.value) return
   const current = ++generation
-  reading.value = true; errorMessage.value = ''; observation.value = null
+  const owner = captureSelectionOwner()
+  const connectionId = owner.connectionId
+  if (!connectionId || !owner.configurationVersionId) return
+  const token = beginReadOperation()
+  errorMessage.value = ''; observation.value = null
   try {
-    const detail = await request<SupplierCatalogProduct>(`/api/v1/admin/supplier-connections/${selectedConnectionId.value}/catalog/goods/${goodsId}`, { method: 'POST' })
-    if (current !== generation) return
+    const detail = await request<SupplierCatalogProduct>(`/api/v1/admin/supplier-connections/${connectionId}/catalog/goods/${goodsId}`, { method: 'POST' })
+    if (current !== generation || !ownsCurrentSelection(owner, { token, kind: 'read' }) || detail.upstreamProductId !== goodsId
+      || detail.source.connectionId !== connectionId || detail.source.configurationVersionId !== owner.configurationVersionId) return
     upstreamProduct.value = detail
     selectedUpstreamSku.value = detail.skuType === 0 ? '__none__' : detail.variants[0]?.upstreamSku ?? ''
-  } catch (error) { if (current === generation) errorMessage.value = error instanceof Error ? error.message : '上游商品详情读取失败。' }
-  finally { if (current === generation) reading.value = false }
+  } catch (error) {
+    if (current === generation && ownsCurrentSelection(owner, { token, kind: 'read' })) {
+      errorMessage.value = error instanceof Error ? error.message : '上游商品详情读取失败。'
+    }
+  } finally { finishReadOperation(token) }
 }
 async function observeSelectedSku() {
   const product = upstreamProduct.value
@@ -356,99 +515,162 @@ async function observeSelectedSku() {
   const code = skuType === 0 ? null : selectedUpstreamSku.value
   if (skuType !== 0 && !code) { errorMessage.value = '请明确选择上游 SKU 编码和规格组合。'; return }
   const current = ++generation
-  reading.value = true; errorMessage.value = ''; observation.value = null
+  const owner = captureSelectionOwner()
+  const connectionId = owner.connectionId
+  const configurationVersionId = owner.configurationVersionId
+  if (!connectionId || !configurationVersionId) return
+  const token = beginReadOperation()
+  errorMessage.value = ''; observation.value = null
   try {
     const result = await request<SupplierProductMappingObservation>(`${root}/observe`, { method: 'POST', body: {
-      connectionId: selectedConnection.value.id, expectedConfigurationVersionId: selectedConnection.value.currentVersion.id,
+      connectionId, expectedConfigurationVersionId: configurationVersionId,
       upstreamProductId: product.upstreamProductId, upstreamSkuType: skuType, upstreamSkuCode: code,
     } })
-    if (current === generation) { observation.value = result; successMessage.value = '已保存带有效期的服务端只读结构观察；审核时会重新读取并校验。' }
-  } catch (error) { if (current === generation) errorMessage.value = error instanceof Error ? error.message : '上游商品结构观察失败。' }
-  finally { if (current === generation) reading.value = false }
+    if (current !== generation || !ownsCurrentSelection(owner, { token, kind: 'read' })
+      || upstreamProduct.value?.upstreamProductId !== product.upstreamProductId || selectedUpstreamSku.value !== (code ?? '__none__')
+      || result.upstreamProductId !== product.upstreamProductId || result.skuCode !== code
+      || result.source.connectionId !== connectionId || result.source.configurationVersionId !== configurationVersionId) return
+    observation.value = result
+    successMessage.value = '已保存带有效期的服务端只读结构观察；审核时会重新读取并校验。'
+  } catch (error) {
+    if (current === generation && ownsCurrentSelection(owner, { token, kind: 'read' })) {
+      errorMessage.value = error instanceof Error ? error.message : '上游商品结构观察失败。'
+    }
+  } finally { finishReadOperation(token) }
 }
 async function saveDraft() {
-  const sku = selectedSku.value
+  const owner = captureSelectionOwner()
   const observed = observation.value
-  if (!sku?.appliedTemplateVersion || !selectedConnection.value || !observed || saving.value) return
-  saving.value = true; errorMessage.value = ''; successMessage.value = ''
+  if (!owner.productId || !owner.skuId || !owner.templateVersionId || !owner.connectionId || !observed || saving.value
+    || observed.source.connectionId !== owner.connectionId || observed.source.configurationVersionId !== owner.configurationVersionId) return
+  const token = beginSaveOperation()
+  errorMessage.value = ''; successMessage.value = ''
   try {
-    const body = { productId: sku.productId, skuId: sku.skuId, observationId: observed.id,
-      templateVersionId: sku.appliedTemplateVersion.id, rules: structuredClone(rules.value) }
-    const saved = mapping.value
-      ? await request<SupplierProductMapping>(`${root}/${mapping.value.id}`, { method: 'PUT', body: { ...body, expectedRevision: mapping.value.revision } })
+    const body = { productId: owner.productId, skuId: owner.skuId, observationId: observed.id,
+      templateVersionId: owner.templateVersionId, rules: structuredClone(rules.value) }
+    const saved = owner.mappingId
+      ? await request<SupplierProductMapping>(`${root}/${owner.mappingId}`, { method: 'PUT', body: { ...body, expectedRevision: owner.mappingRevision } })
       : await request<SupplierProductMapping>(root, { method: 'POST', body })
-    mapping.value = saved
-    successMessage.value = '草稿已保存。草稿校验结果不等于审核通过或采购资格。'
-    await loadPage({ preserveSource: true })
-    mapping.value = mappings.value.find(item => item.id === saved.id) ?? saved
-    rules.value = structuredClone(saved.rules)
-  } catch (error) { errorMessage.value = error instanceof Error ? error.message : '草稿保存失败。请刷新后检查修订号。' }
-  finally { saving.value = false }
+    const merged = mergeMappingResult(saved, owner, owner.connectionId, owner.observationConfigurationVersionId)
+    const ownsEditor = ownsCurrentSelection(owner, { token, kind: 'save' })
+    const editorContentUnchanged = ownsCurrentSelection(owner, { token, kind: 'save', checkRules: true, checkObservation: true })
+    if (ownsEditor && merged) {
+      mapping.value = merged
+      if (editorContentUnchanged) {
+        rules.value = structuredClone(saved.rules)
+      }
+      successMessage.value = '草稿已保存。草稿校验结果不等于审核通过或采购资格。'
+    } else if (ownsEditor) {
+      errorMessage.value = '保存响应的商品、SKU、连接或配置版本与本次编辑来源不一致；当前内容已保留，请重新读取。'
+    }
+  } catch (error) {
+    if (ownsCurrentSelection(owner, { token, kind: 'save' })) {
+      errorMessage.value = error instanceof Error ? error.message : '草稿保存失败。请刷新后检查修订号。'
+    }
+  } finally { finishSaveOperation(token) }
 }
 async function refreshStructure() {
+  const owner = captureSelectionOwner()
   const currentMapping = mapping.value
-  if (!currentMapping || saving.value) return
-  saving.value = true; errorMessage.value = ''; successMessage.value = ''; refreshMessage.value = ''
+  if (!currentMapping || !owner.mappingId || owner.mappingRevision === null || saving.value) return
+  const token = beginSaveOperation()
+  errorMessage.value = ''; successMessage.value = ''; refreshMessage.value = ''
   try {
-    const result = await request<RefreshResult>(`${root}/${currentMapping.id}/refresh`, { method: 'POST', body: { expectedRevision: currentMapping.revision } })
-    mapping.value = result.mapping
-    observation.value = result.observation
-    refreshMessage.value = [result.structureChanged ? '上游字段或规格结构变化' : '', result.configurationChanged ? '供应商配置版本变化' : '', result.templateChanged ? '本地应用模板版本变化' : '', result.identityChanged ? '上游商品/SKU 身份变化' : ''].filter(Boolean).join('；') || '结构指纹未变化。观察时间、报价、余额和库存不会改变字段结构身份。'
-    successMessage.value = '已重新读取当前上游详情并更新结构检查。'
-    await loadPage({ preserveSource: true })
-    mapping.value = mappings.value.find(item => item.id === result.mapping.id) ?? result.mapping
-  } catch (error) { errorMessage.value = error instanceof Error ? error.message : '上游结构刷新失败。' }
-  finally { saving.value = false }
+    const result = await request<RefreshResult>(`${root}/${owner.mappingId}/refresh`, { method: 'POST', body: { expectedRevision: owner.mappingRevision } })
+    const currentSourceVersion = result.observation?.source.configurationVersionId
+      ?? (result.identityChanged ? owner.mappingConfigurationVersionId : owner.configurationVersionId)
+    const merged = mergeMappingResult(result.mapping, owner, owner.mappingConnectionId, currentSourceVersion)
+    const observationMatchesSelection = !result.observation || (owner.connectionId === owner.mappingConnectionId
+      && result.observation.source.connectionId === owner.connectionId
+      && result.observation.source.configurationVersionId === owner.configurationVersionId)
+    if (ownsCurrentSelection(owner, { token, kind: 'save' }) && merged) {
+      mapping.value = merged
+      observation.value = observationMatchesSelection ? result.observation : null
+      refreshMessage.value = [result.structureChanged ? '上游字段或规格结构变化' : '', result.configurationChanged ? '供应商配置版本变化' : '', result.templateChanged ? '本地应用模板版本变化' : '', result.identityChanged ? '上游商品/SKU 身份变化' : ''].filter(Boolean).join('；') || '结构指纹未变化。观察时间、报价、余额和库存不会改变字段结构身份。'
+      successMessage.value = '已重新读取当前上游详情并更新结构检查。'
+    } else if (ownsCurrentSelection(owner, { token, kind: 'save' })) {
+      errorMessage.value = '刷新响应的商品、SKU、连接或配置版本与本次选择不一致；当前内容已保留，请重新读取。'
+    }
+  } catch (error) {
+    if (ownsCurrentSelection(owner, { token, kind: 'save' })) errorMessage.value = error instanceof Error ? error.message : '上游结构刷新失败。'
+  } finally { finishSaveOperation(token) }
 }
 async function reviewMapping() {
-  if (!mapping.value || saving.value || blockingIssues.value.length) return
-  saving.value = true; errorMessage.value = ''; successMessage.value = ''
+  const owner = captureSelectionOwner()
+  if (!owner.mappingId || owner.mappingRevision === null || saving.value || blockingIssues.value.length) return
+  const token = beginSaveOperation()
+  errorMessage.value = ''; successMessage.value = ''
   try {
-    const result = await request<{ reviewed: boolean; mapping: SupplierProductMapping; issues: SupplierProductMappingIssue[] }>(`${root}/${mapping.value.id}/review`, {
-      method: 'POST', body: { expectedRevision: mapping.value.revision },
+    const result = await request<{ reviewed: boolean; mapping: SupplierProductMapping; issues: SupplierProductMappingIssue[] }>(`${root}/${owner.mappingId}/review`, {
+      method: 'POST', body: { expectedRevision: owner.mappingRevision },
     })
-    mapping.value = result.mapping
-    if (result.reviewed) successMessage.value = '结构映射审核版本已追加并冻结。此状态不代表自动采购资格。'
-    else errorMessage.value = result.issues.map(issue => issueLabel(issue.code)).join('；') || '审核未通过，请检查校验结果。'
-    await loadPage()
-    mapping.value = mappings.value.find(item => item.id === result.mapping.id) ?? result.mapping
-  } catch (error) { errorMessage.value = error instanceof Error ? error.message : '审核请求失败。请重新读取当前版本。' }
-  finally { saving.value = false }
+    const merged = mergeMappingResult(result.mapping, owner, owner.mappingConnectionId, owner.mappingConfigurationVersionId)
+    if (ownsCurrentSelection(owner, { token, kind: 'save' }) && merged) {
+      mapping.value = merged
+      if (result.reviewed) successMessage.value = '结构映射审核版本已追加并冻结。此状态不代表自动采购资格。'
+      else errorMessage.value = result.issues.map(issue => issueLabel(issue.code)).join('；') || '审核未通过，请检查校验结果。'
+    } else if (ownsCurrentSelection(owner, { token, kind: 'save' })) {
+      errorMessage.value = '审核响应的商品、SKU、连接或配置版本与本次映射不一致；当前内容已保留，请重新读取。'
+    }
+  } catch (error) {
+    if (ownsCurrentSelection(owner, { token, kind: 'save' })) errorMessage.value = error instanceof Error ? error.message : '审核请求失败。请重新读取当前版本。'
+  } finally { finishSaveOperation(token) }
 }
+let historyOperation = 0
 async function loadHistory() {
-  if (!mapping.value) return
-  try { history.value = await request<SupplierProductMappingHistory>(`${root}/${mapping.value.id}/history?page=1&pageSize=50`) }
-  catch (error) { errorMessage.value = error instanceof Error ? error.message : '映射历史加载失败。' }
+  const owner = captureSelectionOwner()
+  if (!owner.mappingId) return
+  const operation = ++historyOperation
+  try {
+    const result = await request<SupplierProductMappingHistory>(`${root}/${owner.mappingId}/history?page=1&pageSize=50`)
+    if (operation === historyOperation && ownsCurrentSelection(owner)) history.value = result
+  } catch (error) {
+    if (operation === historyOperation && ownsCurrentSelection(owner)) errorMessage.value = error instanceof Error ? error.message : '映射历史加载失败。'
+  }
 }
 async function restoreVersion(version: SupplierProductMappingVersion) {
-  if (!mapping.value || saving.value) return
-  saving.value = true; errorMessage.value = ''; successMessage.value = ''
+  const owner = captureSelectionOwner()
+  if (!owner.mappingId || owner.mappingRevision === null || version.mappingId !== owner.mappingId || saving.value) return
+  const token = beginSaveOperation()
+  errorMessage.value = ''; successMessage.value = ''
   try {
-    const restored = await request<SupplierProductMapping>(`${root}/${mapping.value.id}/restore`, {
-      method: 'POST', body: { expectedRevision: mapping.value.revision, versionId: version.id },
+    const restored = await request<SupplierProductMapping>(`${root}/${owner.mappingId}/restore`, {
+      method: 'POST', body: { expectedRevision: owner.mappingRevision, versionId: version.id },
     })
-    mapping.value = restored; rules.value = structuredClone(restored.rules)
-    successMessage.value = `历史审核版本 v${version.versionNumber} 已恢复为新草稿。`
-    await loadPage()
-    mapping.value = mappings.value.find(item => item.id === restored.id) ?? restored
-  } catch (error) { errorMessage.value = error instanceof Error ? error.message : '恢复草稿失败。请刷新后检查修订号。' }
-  finally { saving.value = false }
+    const merged = mergeMappingResult(restored, owner, owner.mappingConnectionId, owner.mappingConfigurationVersionId)
+    const ownsEditor = ownsCurrentSelection(owner, { token, kind: 'save' })
+    const rulesUnchanged = ownsCurrentSelection(owner, { token, kind: 'save', checkRules: true })
+    if (ownsEditor && merged) {
+      mapping.value = merged
+      if (rulesUnchanged) {
+        rules.value = structuredClone(restored.rules)
+        successMessage.value = `历史审核版本 v${version.versionNumber} 已恢复为新草稿。`
+      } else {
+        successMessage.value = `历史审核版本 v${version.versionNumber} 已恢复为新草稿；请求期间的当前编辑内容已保留。`
+      }
+    } else if (ownsEditor) {
+      errorMessage.value = '恢复响应的商品、SKU、连接或配置版本与本次映射不一致；当前内容已保留，请重新读取。'
+    }
+  } catch (error) {
+    if (ownsCurrentSelection(owner, { token, kind: 'save' })) errorMessage.value = error instanceof Error ? error.message : '恢复草稿失败。请刷新后检查修订号。'
+  } finally { finishSaveOperation(token) }
 }
 watch(selectedSkuId, () => {
   if (loading.value) return
-  generation++; reading.value = false; observation.value = null; upstreamProduct.value = null; selectedUpstreamSku.value = ''
+  generation++; activeReadOperation = null; activeSaveOperation = null; reading.value = false; saving.value = false
+  errorMessage.value = ''; successMessage.value = ''; refreshMessage.value = ''; history.value = null
+  mapping.value = mappingForSelectedSku.value
+  catalog.value = null; observation.value = null; upstreamProduct.value = null; selectedUpstreamSku.value = ''
   void loadAppliedTemplate()
 })
 watch(selectedConnectionId, () => {
   if (loading.value) return
-  generation++; reading.value = false; catalog.value = null; upstreamProduct.value = null; observation.value = null
-})
-watch([selectedSkuId, mappings], () => {
-  mapping.value = mappingForSelectedSku.value
-  if (appliedTemplate.value) setRulesForSelection()
+  generation++; activeReadOperation = null; activeSaveOperation = null; reading.value = false; saving.value = false
+  errorMessage.value = ''; successMessage.value = ''; refreshMessage.value = ''; history.value = null
+  catalog.value = null; upstreamProduct.value = null; observation.value = null
 })
 onMounted(() => { void loadPage() })
-onBeforeUnmount(() => { generation++; skuGeneration++ })
+onBeforeUnmount(() => { generation++; skuGeneration++; activeReadOperation = null; activeSaveOperation = null })
 </script>
 
 <template>

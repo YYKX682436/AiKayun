@@ -9,6 +9,47 @@ async function choose(page: Page, combo: Locator, text: RegExp) {
   await page.getByRole('option').filter({ hasText: text }).first().click()
 }
 
+function responseBarrier() {
+  let release!: () => void
+  let entered!: () => void
+  let completed!: () => void
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  const enteredPromise = new Promise<void>(resolve => { entered = resolve })
+  const completedPromise = new Promise<void>(resolve => { completed = resolve })
+  return {
+    entered: enteredPromise,
+    completed: completedPromise,
+    release,
+    async hold(route: import('@playwright/test').Route) {
+      const response = await route.fetch()
+      entered()
+      await waiting
+      await route.fulfill({ response })
+      completed()
+    },
+  }
+}
+
+async function holdOneResponse(page: Page, url: string, method: string, barrier: ReturnType<typeof responseBarrier>) {
+  let held = false
+  await page.route(url, async route => {
+    if (!held && route.request().method() === method) {
+      held = true
+      await barrier.hold(route)
+    } else await route.continue()
+  })
+}
+
+async function ensureAObservedProduct(page: Page) {
+  await page.getByRole('button', { name: '读取商品列表', exact: true }).click()
+  const product = page.getByRole('button', { name: /夹具多单规格/u })
+  await expect(product).toBeVisible()
+  await product.click()
+  await choose(page, page.getByRole('combobox', { name: '上游 SKU 与规格组合' }), /月卡.*monthly/u)
+  await page.getByRole('button', { name: '重新读取并固定本次结构观察', exact: true }).click()
+  await expect(page.getByRole('status')).toContainText('已保存带有效期的服务端只读结构观察')
+}
+
 test('prepares, previews, reviews and restores a supplier product mapping with the read-only V3 fixture', async ({ page }) => {
   test.skip(process.env.PLAYWRIGHT_EXTERNAL_SERVER === 'true', 'The external Compose server does not include the isolated V3 fixture.')
   test.setTimeout(120_000)
@@ -96,7 +137,42 @@ test('prepares, previews, reviews and restores a supplier product mapping with t
     baseUrl: 'http://127.0.0.1:3102', credentials: { appId: '602401', appSecret: fixtureSecret },
   } })
   expect(connectionResponse.status(), await connectionResponse.text()).toBe(201)
-  const connectionName = (await connectionResponse.json()).data[0].name as string
+  const createdConnection = (await connectionResponse.json()).data[0]
+  const connectionId = createdConnection.id as string
+  const connectionName = createdConnection.name as string
+
+  const secondProductResponse = await page.request.post('/api/v1/admin/products', { headers, data: {
+    name: `异步归属 B 商品 ${randomUUID().slice(0, 8)}`, description: '', productType: 'digital', defaultSku: { salePrice: '1.00' },
+  } })
+  expect(secondProductResponse.status(), await secondProductResponse.text()).toBe(201)
+  let secondProduct = (await secondProductResponse.json()).data
+  const secondProductId = secondProduct.id as string
+  const secondSkuId = secondProduct.variants[0].id as string
+  const secondActivated = await page.request.patch(`/api/v1/admin/products/${secondProductId}/lifecycle`, {
+    headers, data: { expectedRevision: secondProduct.revision, status: 'active' },
+  })
+  expect(secondActivated.status(), await secondActivated.text()).toBe(200)
+  const secondInventory = (await (await page.request.get(`/api/v1/admin/products/${secondProductId}/inventory`)).json()).data
+  const secondInventorySku = secondInventory.variants.find((row: { skuId: string }) => row.skuId === secondSkuId)
+  const secondInventoryMode = await page.request.put(`/api/v1/admin/products/${secondProductId}/variants/${secondSkuId}/inventory-mode`, {
+    headers, data: { expectedRevision: secondInventory.productRevision, expectedSkuRevision: secondInventorySku.skuRevision,
+      expectedInventoryRevision: secondInventorySku.inventoryRevision, inventoryMode: 'unlimited' },
+  })
+  expect(secondInventoryMode.status(), await secondInventoryMode.text()).toBe(200)
+  const secondManualFulfillment = await page.request.put(`/api/v1/admin/products/${secondProductId}/variants/${secondSkuId}/manual-fulfillment`, {
+    headers, data: { enabled: true },
+  })
+  expect(secondManualFulfillment.status(), await secondManualFulfillment.text()).toBe(200)
+  secondProduct = (await (await page.request.get(`/api/v1/admin/products/${secondProductId}`)).json()).data
+  const secondAssigned = await page.request.put(`/api/v1/admin/products/${secondProductId}/purchase-form`, {
+    headers, data: { expectedRevision: secondProduct.revision, mode: 'template', templateVersionId },
+  })
+  expect(secondAssigned.status(), await secondAssigned.text()).toBe(200)
+  secondProduct = (await (await page.request.get(`/api/v1/admin/products/${secondProductId}`)).json()).data
+  const secondApplied = await page.request.post(`/api/v1/admin/products/${secondProductId}/purchase-form/apply`, {
+    headers, data: { expectedRevision: secondProduct.revision, expectedMode: 'template', expectedTemplateVersionId: templateVersionId },
+  })
+  expect(secondApplied.status(), await secondApplied.text()).toBe(200)
 
   await page.setViewportSize({ width: 1440, height: 1000 })
   await page.goto('/admin/supplier-product-mappings')
@@ -159,6 +235,129 @@ test('prepares, previews, reviews and restores a supplier product mapping with t
   await expect(page.getByRole('status')).toContainText('已恢复为新草稿')
   await expect(page.getByText('状态：草稿')).toBeVisible()
   await expect(page.locator('body')).not.toContainText(fixtureSecret)
+
+  const mappingList = (await (await page.request.get(`${origin}/api/v1/admin/supplier-product-mappings`)).json()).data.items
+  let persistedMapping = mappingList.find((item: { skuId: string }) => item.skuId === skuId)
+  expect(persistedMapping).toMatchObject({ productId, skuId })
+  const mappingId = persistedMapping.id as string
+  const localSkuCombo = page.getByRole('combobox', { name: '本地商品与 SKU' })
+  const connectionCombo = page.getByRole('combobox', { name: '卡易信只读连接' })
+  const selectA = async () => choose(page, localSkuCombo, /映射 UI 商品/u)
+  const selectB = async () => choose(page, localSkuCombo, /异步归属 B 商品/u)
+  const refreshButton = () => page.getByRole('button', { name: '重新读取与识别漂移', exact: true })
+  const reviewButton = () => page.getByRole('button', { name: '审核并追加版本', exact: true })
+  const formRoot = `${origin}/api/v1/admin/supplier-product-mappings/${mappingId}`
+
+  await selectA()
+  await choose(page, connectionCombo, new RegExp(connectionName))
+  const lateCatalog = responseBarrier()
+  const catalogUrl = `${origin}/api/v1/admin/supplier-connections/${connectionId}/catalog/goods`
+  await holdOneResponse(page, catalogUrl, 'POST', lateCatalog)
+  await page.getByRole('button', { name: '读取商品列表', exact: true }).click()
+  await lateCatalog.entered
+  await selectB()
+  await lateCatalog.release()
+  await lateCatalog.completed
+  await expect(page.getByRole('button', { name: /夹具多单规格/u })).toHaveCount(0)
+  await expect(localSkuCombo).toContainText('异步归属 B 商品')
+  await page.unroute(catalogUrl)
+
+  await selectA()
+  await page.getByRole('button', { name: '读取商品列表', exact: true }).click()
+  const detailButton = page.getByRole('button', { name: /夹具多单规格/u })
+  await expect(detailButton).toBeVisible()
+  const lateDetail = responseBarrier()
+  const detailUrl = `${catalogUrl}/201002`
+  await holdOneResponse(page, detailUrl, 'POST', lateDetail)
+  await detailButton.click()
+  await lateDetail.entered
+  await selectB()
+  await lateDetail.release()
+  await lateDetail.completed
+  await expect(page.getByRole('combobox', { name: '上游 SKU 与规格组合' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: '重新读取并固定本次结构观察', exact: true })).toHaveCount(0)
+  await page.unroute(detailUrl)
+
+  await selectA()
+  await ensureAObservedProduct(page)
+  const lateSave = responseBarrier()
+  await holdOneResponse(page, formRoot, 'PUT', lateSave)
+  await page.getByRole('button', { name: '保存草稿', exact: true }).click()
+  await lateSave.entered
+  await selectB()
+  await lateSave.release()
+  await lateSave.completed
+  await expect(page.getByText('映射状态：未建立')).toBeVisible()
+  await expect(page.locator('body')).not.toContainText('草稿已保存')
+  persistedMapping = (await (await page.request.get(`${origin}/api/v1/admin/supplier-product-mappings/${mappingId}`)).json()).data
+  expect(persistedMapping).toMatchObject({ id: mappingId, productId, skuId })
+  await page.unroute(formRoot)
+
+  await selectA()
+  const lateRefresh = responseBarrier()
+  const refreshUrl = `${formRoot}/refresh`
+  await holdOneResponse(page, refreshUrl, 'POST', lateRefresh)
+  await refreshButton().click()
+  await lateRefresh.entered
+  await selectB()
+  await lateRefresh.release()
+  await lateRefresh.completed
+  await expect(page.getByText('映射状态：未建立')).toBeVisible()
+  await expect(page.locator('body')).not.toContainText('已重新读取当前上游详情')
+  await page.unroute(refreshUrl)
+
+  await selectA()
+  await expect(reviewButton()).toBeEnabled()
+  const lateReview = responseBarrier()
+  const reviewUrl = `${formRoot}/review`
+  await holdOneResponse(page, reviewUrl, 'POST', lateReview)
+  await reviewButton().click()
+  await lateReview.entered
+  await selectB()
+  await lateReview.release()
+  await lateReview.completed
+  await expect(page.getByText('映射状态：未建立')).toBeVisible()
+  await expect(page.locator('body')).not.toContainText('结构映射审核版本已追加并冻结')
+  await page.unroute(reviewUrl)
+  const reviewedA = (await (await page.request.get(`${origin}/api/v1/admin/supplier-product-mappings/${mappingId}`)).json()).data
+  expect(reviewedA).toMatchObject({ productId, skuId, status: 'reviewed' })
+
+  await selectA()
+  await page.getByRole('button', { name: '查看历史', exact: true }).click()
+  await expect(page.getByRole('heading', { name: '不可变审核历史' })).toBeVisible()
+  const lateRestore = responseBarrier()
+  const restoreUrl = `${formRoot}/restore`
+  await holdOneResponse(page, restoreUrl, 'POST', lateRestore)
+  await page.getByRole('button', { name: '恢复为新草稿', exact: true }).first().click()
+  await lateRestore.entered
+  await selectB()
+  await lateRestore.release()
+  await lateRestore.completed
+  await expect(page.getByText('映射状态：未建立')).toBeVisible()
+  await expect(page.locator('body')).not.toContainText('已恢复为新草稿')
+  await page.unroute(restoreUrl)
+  const restoredA = (await (await page.request.get(`${origin}/api/v1/admin/supplier-product-mappings/${mappingId}`)).json()).data
+  expect(restoredA).toMatchObject({ productId, skuId, status: 'draft' })
+
+  await selectA()
+  const reverseRefresh = responseBarrier()
+  const reverseRefreshUrl = `${formRoot}/refresh`
+  await holdOneResponse(page, reverseRefreshUrl, 'POST', reverseRefresh)
+  await refreshButton().click()
+  await reverseRefresh.entered
+  await selectB()
+  await selectA()
+  await expect(reviewButton()).toBeEnabled()
+  await reviewButton().click()
+  await expect(page.getByRole('status')).toContainText('结构映射审核版本已追加并冻结')
+  const newestRevision = (await (await page.request.get(`${origin}/api/v1/admin/supplier-product-mappings/${mappingId}`)).json()).data.revision as number
+  await reverseRefresh.release()
+  await reverseRefresh.completed
+  await expect(page.getByText('映射状态：已审核')).toBeVisible()
+  await expect(page.getByRole('status')).toContainText('结构映射审核版本已追加并冻结')
+  persistedMapping = (await (await page.request.get(`${origin}/api/v1/admin/supplier-product-mappings/${mappingId}`)).json()).data
+  expect(persistedMapping.revision).toBe(newestRevision)
+  await page.unroute(reverseRefreshUrl)
 
   await page.setViewportSize({ width: 390, height: 844 })
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
