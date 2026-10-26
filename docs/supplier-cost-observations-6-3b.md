@@ -48,7 +48,9 @@ API 使用真实 PostgreSQL 和受控卡易信 V3 HTTP 夹具；浏览器验收�
 
 最终本地 `pnpm verify` 结果：金额单测 16/16；API/PostgreSQL 23 个测试文件、393/393；生产构建通过；主 Chromium 88/88；辅助浏览器 6/6（替代品牌 1、SSR 错误/安全 3、开发预览 1、生产品牌 1）。本地这些套件均无跳过和 flaky。Lint 0 error，保留 7 条未修改的顾客商品详情页面既存 warning。Nuxt Google Fonts 元数据请求超时，构建和浏览器套件均使用 provider fallback 并通过。
 
-最终提交 SHA 和对应 GitHub Actions/Compose 结果将在推送后补记。Compose 与 GitHub Actions 仅报告实际执行结果；未运行或跳过的项目会分开列出。
+实现提交 `0a960eb978462f3d40a78e8b128aa54a94710036` 的 [GitHub Actions](https://github.com/YYKX682436/AiKayun/actions/runs/40379643370) 已完成并通过：金额 16 项、API/PostgreSQL 393 项、主 Chromium 88 项及辅助浏览器 6 项通过；Compose 浏览器 79 项通过、9 项跳过，跳过原因是外部 Compose 栈不包含隔离供应商夹具。Compose 重建持久化、隔离恢复、备份恢复和不可信 TLS 拒绝均通过。最终后续提交的 CI 状态以交付时的实际运行结果为准。
+
+补充验证中发现：预览请求发出后修改草稿会使旧结果失效，但原加载状态未随旧请求结束而释放。现在分别跟踪请求归属与草稿代际；确认成本请求期间禁止关闭确认框或切换价格页，直至响应完成。缺成本或计算溢出时也不再误显示为手动模式。新增真实 Chromium 迟到响应回归，以及在真实 PostgreSQL 和受控只读 HTTP 夹具上切换连接、配置版本及上游 SKU 后的不可比较回归。各项最终验证数字和后续提交的 Actions 结果以交付回复记录。
 
 ## 未验证与不在本阶段范围
 

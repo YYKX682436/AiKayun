@@ -522,6 +522,26 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
     expect(restoredStructure.statusCode, restoredStructure.body).toBe(200)
     expect(restoredStructure.json().data.structureChanged).toBe(true)
 
+    const originalObservation = await createObservation('201001', 1, 'cn-member')
+    expect(originalObservation.statusCode, originalObservation.body).toBe(200)
+    const originalDraft = await inject({ method: 'PUT', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders,
+      payload: { expectedRevision: restoredStructure.json().data.mapping.revision, productId, skuId,
+        observationId: originalObservation.json().data.id, templateVersionId: alternateTemplateVersionId, rules } })
+    expect(originalDraft.statusCode, originalDraft.body).toBe(200)
+    const originalReview = await inject({ method: 'POST', url: `/api/v1/admin/supplier-product-mappings/${mappingId}/review`, headers: adminHeaders,
+      payload: { expectedRevision: originalDraft.json().data.revision } })
+    expect(originalReview.json().data.reviewed).toBe(true)
+    const observeReviewedQuote = async (mappingRevision: number) => {
+      const target = await db.selectFrom('products').innerJoin('product_variants', 'product_variants.product_id', 'products.id')
+        .select(['products.revision as product_revision', 'product_variants.revision as sku_revision'])
+        .where('products.id', '=', productId).where('product_variants.id', '=', skuId).executeTakeFirstOrThrow()
+      return inject({ method: 'POST', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes/observe`, headers: adminHeaders,
+        payload: { expectedProductRevision: target.product_revision, expectedSkuRevision: target.sku_revision, expectedMappingRevision: mappingRevision } })
+    }
+    const originalQuote = await observeReviewedQuote(originalReview.json().data.mapping.revision)
+    expect(originalQuote.statusCode, originalQuote.body).toBe(200)
+    expect(originalQuote.json().data.outcome).toBe('observed')
+
     const alternateConnectionResponse = await inject({ method: 'POST', url: '/api/v1/admin/supplier-connections', headers: adminHeaders,
       payload: { name: '第二个只读映射连接', providerType: 'kayixin_customer_v3', baseUrl: fixture.baseUrl, credentials: fixtureKayixinCredentials } })
     expect(alternateConnectionResponse.statusCode).toBe(201)
@@ -537,10 +557,46 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
     const switchedReview = await inject({ method: 'POST', url: `/api/v1/admin/supplier-product-mappings/${mappingId}/review`, headers: adminHeaders,
       payload: { expectedRevision: switched.json().data.revision } })
     expect(switchedReview.json().data.reviewed).toBe(true)
+    const switchedQuote = await observeReviewedQuote(switchedReview.json().data.mapping.revision)
+    expect(switchedQuote.statusCode, switchedQuote.body).toBe(200)
+    expect(switchedQuote.json().data).toMatchObject({ outcome: 'observed', comparison: {
+      comparable: false, reason: 'different_connection', rawReferenceDelta: null } })
+
+    const rotatedAlternate = await inject({ method: 'PUT', url: `/api/v1/admin/supplier-connections/${alternateConnectionId}`, headers: adminHeaders,
+      payload: { name: '第二个只读连接配置轮换', baseUrl: fixture.baseUrl, providerType: 'kayixin_customer_v3', credentials: fixtureKayixinCredentials } })
+    expect(rotatedAlternate.statusCode, rotatedAlternate.body).toBe(200)
+    const rotatedObservation = await createObservation('201001', 1, 'cn-member', alternateConnectionId)
+    expect(rotatedObservation.statusCode, rotatedObservation.body).toBe(200)
+    const currentAfterRotation = (await inject({ method: 'GET', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders })).json().data
+    const rotatedDraft = await inject({ method: 'PUT', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders,
+      payload: { expectedRevision: currentAfterRotation.revision, productId, skuId, observationId: rotatedObservation.json().data.id,
+        templateVersionId: alternateTemplateVersionId, rules } })
+    expect(rotatedDraft.statusCode, rotatedDraft.body).toBe(200)
+    const rotatedReview = await inject({ method: 'POST', url: `/api/v1/admin/supplier-product-mappings/${mappingId}/review`, headers: adminHeaders,
+      payload: { expectedRevision: rotatedDraft.json().data.revision } })
+    expect(rotatedReview.json().data.reviewed).toBe(true)
+    const rotatedQuote = await observeReviewedQuote(rotatedReview.json().data.mapping.revision)
+    expect(rotatedQuote.statusCode, rotatedQuote.body).toBe(200)
+    expect(rotatedQuote.json().data).toMatchObject({ outcome: 'observed', comparison: {
+      comparable: false, reason: 'different_configuration', rawReferenceDelta: null } })
+
+    const otherSkuObservation = await createObservation('201001', 1, 'global-member', alternateConnectionId)
+    expect(otherSkuObservation.statusCode, otherSkuObservation.body).toBe(200)
+    const otherSkuDraft = await inject({ method: 'PUT', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders,
+      payload: { expectedRevision: rotatedReview.json().data.mapping.revision, productId, skuId, observationId: otherSkuObservation.json().data.id,
+        templateVersionId: alternateTemplateVersionId, rules } })
+    expect(otherSkuDraft.statusCode, otherSkuDraft.body).toBe(200)
+    const otherSkuReview = await inject({ method: 'POST', url: `/api/v1/admin/supplier-product-mappings/${mappingId}/review`, headers: adminHeaders,
+      payload: { expectedRevision: otherSkuDraft.json().data.revision } })
+    expect(otherSkuReview.json().data.reviewed).toBe(true)
+    const otherSkuQuote = await observeReviewedQuote(otherSkuReview.json().data.mapping.revision)
+    expect(otherSkuQuote.statusCode, otherSkuQuote.body).toBe(200)
+    expect(otherSkuQuote.json().data).toMatchObject({ outcome: 'observed', upstreamSkuCode: 'global-member', comparison: {
+      comparable: false, reason: 'different_sku', rawReferenceDelta: null } })
     const switchedHistory = await inject({ method: 'GET', url: `/api/v1/admin/supplier-product-mappings/${mappingId}/history`, headers: adminHeaders })
     expect(switchedHistory.json().data.items.some((item: { connectionId: string }) => item.connectionId === alternateConnectionId)).toBe(true)
     expect(switchedHistory.json().data.items.some((item: { connectionId: string }) => item.connectionId === connectionId)).toBe(true)
-  }, 45_000)
+  }, 90_000)
 
   it('lets the existing safe product delete cascade the mutable mapping head without deleting audit history', async () => {
     const currentProduct = await db.selectFrom('products').select(['revision']).where('id', '=', productId).executeTakeFirstOrThrow()

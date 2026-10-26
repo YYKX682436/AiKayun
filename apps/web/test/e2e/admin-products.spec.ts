@@ -123,6 +123,69 @@ test('管理员可在移动端预览并确认应用按成本计算的加价率',
   await runPricingRuleFlow(page, { width: 390, height: 844 }, 'percentage_markup', '12.65')
 })
 
+test('成本预览迟到时释放加载状态，确认进行中保留当前目标', async ({ page }) => {
+  await signIn(page)
+  await page.goto('/admin/products/new')
+  await page.getByLabel('商品名称').fill(`D6-3B 成本响应隔离 ${randomUUID().slice(0, 8)}`)
+  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByRole('button', { name: '保存为草稿' }).click()
+  await continueToCreatedProduct(page)
+
+  const prices = page.locator('#prices')
+  const cost = prices.locator('article').first().getByLabel('人工确认成本（CNY/件）')
+  const previewButton = prices.getByRole('button', { name: '预览成本变更' })
+  let releasePreview!: () => void
+  let previewReached!: () => void
+  const heldPreview = new Promise<void>(resolve => { releasePreview = resolve })
+  const previewArrived = new Promise<void>(resolve => { previewReached = resolve })
+  await page.route('**/cost-preview', async (route) => {
+    const response = await route.fetch()
+    previewReached()
+    await heldPreview
+    await route.fulfill({ response })
+  })
+  try {
+    await cost.fill('10')
+    await previewButton.click()
+    await previewArrived
+    await cost.fill('11')
+    releasePreview()
+    await expect(previewButton).toBeEnabled()
+    await expect(page.getByRole('dialog', { name: '成本变更预览' })).toHaveCount(0)
+  } finally {
+    releasePreview()
+    await page.unroute('**/cost-preview')
+  }
+
+  await previewButton.click()
+  const confirmation = page.getByRole('dialog', { name: '成本变更预览' })
+  await expect(confirmation.getByText(/→ ¥11\.00000/)).toBeVisible()
+  await confirmation.getByLabel(/我确认这些是以 CNY\/件人工核定/).check()
+  let releaseConfirm!: () => void
+  let confirmReached!: () => void
+  const heldConfirm = new Promise<void>(resolve => { releaseConfirm = resolve })
+  const confirmArrived = new Promise<void>(resolve => { confirmReached = resolve })
+  await page.route('**/prices/batch', async (route) => {
+    const response = await route.fetch()
+    confirmReached()
+    await heldConfirm
+    await route.fulfill({ response })
+  })
+  try {
+    await confirmation.getByRole('button', { name: '确认内部成本（不调整售价）' }).click()
+    await confirmArrived
+    await expect(confirmation.getByRole('button', { name: '返回检查' })).toBeDisabled()
+    await page.keyboard.press('Escape')
+    await expect(confirmation).toBeVisible()
+    releaseConfirm()
+    await expect(prices.getByRole('status')).toContainText('人工 CNY 内部单位成本')
+    await expect(cost).toHaveValue('11.00000')
+  } finally {
+    releaseConfirm()
+    await page.unroute('**/prices/batch')
+  }
+})
+
 test('未保存的规则不能预览旧建议，确认内容绑定当前 SKU 与规则版本', async ({ page }) => {
   await signIn(page)
   const productName = `D6-3A R1 预览一致性 ${randomUUID().slice(0, 8)}`

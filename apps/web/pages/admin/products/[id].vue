@@ -101,6 +101,7 @@ const costPreview = shallowRef<AdminProductCostPreview | null>(null)
 const costPreviewOpen = ref(false)
 const confirmManualCost = ref(false)
 let costOperationSequence = 0
+let activeCostOperation: number | null = null
 
 const inventorySummary = shallowRef<AdminProductInventorySummary | null>(null)
 const manualFulfillment = ref<ManualFulfillmentConfigPage>([])
@@ -1480,7 +1481,7 @@ async function savePrices() {
 function costPreviewRiskLabel(risk: string) {
   return ({
     MANUAL_MODE: '手动模式不生成售价建议', COST_MISSING: '原成本或新成本缺失', NEGATIVE_PROFIT: '按当前售价计算为负毛利润',
-    FREE_PRICE: '当前售价为免费价', ZERO_COST: '新成本为零', ROUNDING_TO_CENT: '建议售价按分四舍五入',
+    FREE_PRICE: '当前售价或建议售价为免费价', ZERO_COST: '新成本为零', ROUNDING_TO_CENT: '建议售价按分四舍五入',
     ROUNDING_TO_ZERO: '建议售价舍入为 ¥0.00', PRICE_OVERFLOW: '建议售价超过金额上限', INVALID_PRECISION: '金额精度无效',
     SKU_RETIRED: 'SKU 已退役', SKU_DISABLED: 'SKU 已停用', COMPARE_AT_PRICE_CONFLICT: '建议售价不低于划线价',
   } as Record<string, string>)[risk] ?? risk
@@ -1502,6 +1503,7 @@ async function previewCostChanges() {
     edits: costRows.map(row => ({ skuId: row.skuId, value: priceDraft[row.skuId]!.costPrice.trim() })),
   }
   saving.value = 'cost-preview'
+  activeCostOperation = owner.sequence
   clearSectionStatus('prices')
   try {
     const result = await request<AdminProductCostPreview>(`/api/v1/admin/products/${owner.productId}/cost-preview`, {
@@ -1526,7 +1528,10 @@ async function previewCostChanges() {
       sectionErrors.prices = error instanceof Error ? error.message : '成本预览失败，请刷新商品后重试。'
     }
   } finally {
-    if (owner.sequence === costOperationSequence) saving.value = ''
+    if (activeCostOperation === owner.sequence) {
+      activeCostOperation = null
+      if (saving.value === 'cost-preview') saving.value = ''
+    }
   }
 }
 
@@ -1537,6 +1542,7 @@ async function confirmCostChanges() {
     || preview.items.some(item => !item.canConfirm)) return
   const owner = { sequence: ++costOperationSequence, productId: productId.value, page: pricePageNumber.value }
   saving.value = 'cost-confirm'
+  activeCostOperation = owner.sequence
   clearSectionStatus('prices')
   try {
     const result = await request<{ productId: string; productRevision: number; items: AdminProductVariantPrices[] }>(`/api/v1/admin/products/${owner.productId}/prices/batch`, {
@@ -1572,7 +1578,10 @@ async function confirmCostChanges() {
       confirmManualCost.value = false
     }
   } finally {
-    if (owner.sequence === costOperationSequence) saving.value = ''
+    if (activeCostOperation === owner.sequence) {
+      activeCostOperation = null
+      if (saving.value === 'cost-confirm') saving.value = ''
+    }
   }
 }
 
@@ -3266,7 +3275,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                           v-model="priceDraft[row.skuId]!.salePrice"
                           inputmode="decimal"
                           class="w-full"
-                          :disabled="isArchived || Boolean(row.retiredAt)"
+                          :disabled="isArchived || Boolean(row.retiredAt) || saving === 'cost-confirm'"
                           @update:model-value="markPriceDirty"
                         />
                       </UFormField>
@@ -3278,7 +3287,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                           v-model="priceDraft[row.skuId]!.compareAtPrice"
                           inputmode="decimal"
                           class="w-full"
-                          :disabled="isArchived || Boolean(row.retiredAt)"
+                          :disabled="isArchived || Boolean(row.retiredAt) || saving === 'cost-confirm'"
                           @update:model-value="markPriceDirty"
                         />
                       </UFormField>
@@ -3290,7 +3299,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                           v-model="priceDraft[row.skuId]!.costPrice"
                           inputmode="decimal"
                           class="w-full"
-                          :disabled="isArchived || Boolean(row.retiredAt)"
+                          :disabled="isArchived || Boolean(row.retiredAt) || saving === 'cost-confirm'"
                           @update:model-value="markPriceDirty"
                         />
                       </UFormField>
@@ -3305,7 +3314,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     color="neutral"
                     variant="outline"
                     size="sm"
-                    :disabled="pricePageNumber <= 1"
+                    :disabled="pricePageNumber <= 1 || saving === 'cost-confirm'"
                     @click="changePricePage(pricePageNumber - 1)"
                   >
                     上一页
@@ -3315,7 +3324,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     color="neutral"
                     variant="outline"
                     size="sm"
-                    :disabled="pricePageNumber >= pricePage.totalPages"
+                    :disabled="pricePageNumber >= pricePage.totalPages || saving === 'cost-confirm'"
                     @click="changePricePage(pricePageNumber + 1)"
                   >
                     下一页
@@ -4756,6 +4765,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
             title="成本变更预览"
             description="以下是人工确认的内部 CNY 单位成本变化。参考报价不会写入成本或售价。"
             :scrollable="true"
+            :dismissible="saving !== 'cost-confirm'"
             :ui="{ content: 'max-w-5xl' }"
           >
             <template #body>
@@ -4850,7 +4860,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                       v-else
                       class="mt-1 text-muted"
                     >
-                      手动模式保留当前售价，不生成需要执行的调价结果。
+                      {{ item.mode === 'manual' ? '手动模式保留当前售价，不生成需要执行的调价结果。' : '无法计算建议售价，请检查成本及下方风险提示。' }}
                     </p>
                     <p
                       v-if="item.suggestedSalePrice !== null"
@@ -4885,6 +4895,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 <UButton
                   color="neutral"
                   variant="outline"
+                  :disabled="saving === 'cost-confirm'"
                   @click="costPreviewOpen = false"
                 >
                   返回检查
