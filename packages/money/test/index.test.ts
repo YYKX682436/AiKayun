@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { addSettlementAmounts, addUnitAmounts, allocateWalletOrderPayment, allocateWalletSpend, calculateWithdrawalFee, multiplyUnitAmount, normalizeWithdrawalPercent, parseUnitAmount, settleAmount } from '../src/index.ts'
+import { addSettlementAmounts, addUnitAmounts, allocateWalletOrderPayment, allocateWalletSpend, calculateSuggestedSalePrice, calculateSuggestedSalePriceDetailed, calculateUnitProfitMetrics, calculateWithdrawalFee, multiplyUnitAmount, normalizeWithdrawalPercent, parseUnitAmount, settleAmount } from '../src/index.ts'
 
 describe('decimal monetary helpers', () => {
   it('adds decimal strings without binary floating point drift', () => {
@@ -83,5 +83,32 @@ describe('decimal monetary helpers', () => {
       giftAmount: '10.00', cashAmount: '20.00', externalAmount: '70.00',
     })
     expect(() => allocateWalletOrderPayment('10.00', '10.01', '1.00', '1.00')).toThrow(RangeError)
+  })
+
+  it('calculates fixed-profit and cost-markup prices with exact half-up cent settlement', () => {
+    expect(calculateSuggestedSalePrice('10.12345', { mode: 'fixed_profit', fixedProfit: '1.23455' })).toBe('11.36')
+    expect(calculateSuggestedSalePrice('10.12345', { mode: 'percentage_markup', markupRate: '12.5000' })).toBe('11.39')
+    expect(calculateSuggestedSalePrice('0.00500', { mode: 'fixed_profit', fixedProfit: '0' })).toBe('0.01')
+    expect(calculateSuggestedSalePrice('0.00499', { mode: 'fixed_profit', fixedProfit: '0' })).toBe('0.00')
+    expect(calculateSuggestedSalePriceDetailed('0.00499', { mode: 'fixed_profit', fixedProfit: '0' })).toEqual({
+      salePrice: '0.00', unroundedPrice: '0.00499', roundedToCents: true,
+    })
+  })
+
+  it('accepts zero cost and profit, rejects excess rule precision, and guards NUMERIC bounds', () => {
+    expect(calculateSuggestedSalePrice('0', { mode: 'fixed_profit', fixedProfit: '0' })).toBe('0.00')
+    expect(calculateSuggestedSalePrice('0', { mode: 'percentage_markup', markupRate: '999999.9999' })).toBe('0.00')
+    expect(() => calculateSuggestedSalePrice('1.000001', { mode: 'fixed_profit', fixedProfit: '0' })).toThrow(TypeError)
+    expect(() => calculateSuggestedSalePrice('1', { mode: 'percentage_markup', markupRate: '1.12345' })).toThrow(TypeError)
+    expect(() => calculateSuggestedSalePrice('9999999999999.99999', { mode: 'fixed_profit', fixedProfit: '0.00001' })).toThrow(RangeError)
+    expect(() => calculateSuggestedSalePrice('9999999999999.99999', { mode: 'percentage_markup', markupRate: '0.0001' })).toThrow(RangeError)
+  })
+
+  it('distinguishes markup from gross margin and reports free-price margin as undefined', () => {
+    expect(calculateUnitProfitMetrics('12.50', '10.00000')).toEqual({ grossProfit: '2.50000', grossMarginRate: '20.0000' })
+    expect(calculateUnitProfitMetrics('12.00', '10.00000').grossProfit).toBe('2.00000')
+    expect(calculateUnitProfitMetrics('12.00', '10.00000').grossMarginRate).toBe('16.6667')
+    expect(calculateUnitProfitMetrics('0', '0').grossMarginRate).toBeNull()
+    expect(calculateUnitProfitMetrics('0.00', '0.00499').grossProfit).toBe('-0.00499')
   })
 })

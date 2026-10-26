@@ -51,6 +51,11 @@ const legacyRetiredInventorySentinel = {
   adjustmentId: '00000000-0000-4000-8000-000000000303',
   operationId: '00000000-0000-4000-8000-000000000304',
 }
+const pricingMigrationSentinel = {
+  productId: '00000000-0000-4000-8000-000000000401',
+  variantId: '00000000-0000-4000-8000-000000000402',
+  skuCode: 'SKU-PRICING-MIGRATION-SENTINEL',
+}
 
 const productIdentityFactory: ProductIdentityFactory = {
   ...defaultProductIdentityFactory,
@@ -500,8 +505,36 @@ beforeAll(async () => {
       .where('id', '=', legacyRetiredInventorySentinel.variantId).execute()
   })
 
+  await db.transaction().execute(async (trx) => {
+    await trx.insertInto('products').values({
+      id: pricingMigrationSentinel.productId,
+      name: '定价规则升级前商品',
+      description: '售价、成本和划线价必须原样保留',
+      product_type: 'digital',
+      status: 'draft',
+    }).execute()
+    await sql`INSERT INTO product_variants
+      (id, product_id, sku_code, combination_key, sale_price, compare_at_price, cost_price)
+      VALUES (${pricingMigrationSentinel.variantId}::uuid, ${pricingMigrationSentinel.productId}::uuid,
+        ${pricingMigrationSentinel.skuCode}, '', 19.90, 29.90, 12.34567)`.execute(trx)
+  })
+  const pricingMigrationBefore = await sql<{ sale_price: string; compare_at_price: string; cost_price: string }>`
+    SELECT sale_price::text AS sale_price, compare_at_price::text AS compare_at_price, cost_price::text AS cost_price
+    FROM product_variants WHERE id = ${pricingMigrationSentinel.variantId}::uuid
+  `.execute(db)
+
   const upgradedSchema = await migrator.migrateToLatest()
   if (upgradedSchema.error) throw upgradedSchema.error
+  expect(upgradedSchema.results?.map((result) => result.migrationName)).toContain('202610260002_product_pricing_rules')
+  const pricingMigrationAfter = await db.selectFrom('product_variants').select([
+    'sale_price', 'compare_at_price', 'cost_price', 'pricing_mode', 'pricing_rule_revision', 'pricing_rule_status',
+  ]).where('id', '=', pricingMigrationSentinel.variantId).executeTakeFirstOrThrow()
+  expect(pricingMigrationAfter).toMatchObject({
+    sale_price: pricingMigrationBefore.rows[0]!.sale_price,
+    compare_at_price: pricingMigrationBefore.rows[0]!.compare_at_price,
+    cost_price: pricingMigrationBefore.rows[0]!.cost_price,
+    pricing_mode: 'manual', pricing_rule_revision: 0, pricing_rule_status: 'manual',
+  })
   const repeatedUpgrade = await migrator.migrateToLatest()
   if (repeatedUpgrade.error) throw repeatedUpgrade.error
 
@@ -942,6 +975,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       'product_option_groups', 'product_option_values',
       'product_purchase_form_settings',
       'product_variant_fulfillment', 'product_variant_fulfillment_versions', 'product_variant_inventory_adjustments', 'product_variant_option_values',
+      'product_variant_pricing_rule_versions',
       'product_variant_quantity_inventory', 'product_variants', 'products',
       'purchase_draft_attachment_references', 'purchase_draft_attachments', 'purchase_drafts',
       'purchase_form_audit_events', 'purchase_form_template_identities', 'purchase_form_template_versions', 'purchase_form_templates',
@@ -5210,5 +5244,307 @@ describe('D8 cross-module PostgreSQL concurrency acceptance', () => {
       expect(copy.json().error.code).toBe('PRODUCT_REVISION_CONFLICT')
       expect(await db.selectFrom('products').select('id').where('name', '=', source.name).execute()).toHaveLength(1)
     }
+  }, 30_000)
+
+  it('previews, confirms and audits exact versioned SKU pricing without touching compare prices', async () => {
+    const auth = await loginAdmin()
+    const created = await createTestProduct(auth, '⑥-3A 精确定价规则真实 PostgreSQL')
+    const groupId = randomUUID()
+    const valueIds = [randomUUID(), randomUUID()]
+    const matrix = await saveMatrix(auth, created.id, {
+      expectedRevision: created.revision,
+      mode: 'selected',
+      groups: [optionGroup('定价规格', groupId, [
+        { id: valueIds[0]!, name: '固定利润 SKU' }, { id: valueIds[1]!, name: '成本加价 SKU' },
+      ])],
+      combinations: [
+        { optionValueIds: [valueIds[0]!], salePrice: '5.00', enabled: true },
+        { optionValueIds: [valueIds[1]!], salePrice: '20.00', enabled: true },
+      ],
+    })
+    const product = matrix.json<{ data: { product: ProductDetail } }>().data.product
+    expect(product.variants).toHaveLength(2)
+    const fixedSku = product.variants.find(variant => variant.options.some(option => option.valueName === '固定利润 SKU'))
+    const markupSku = product.variants.find(variant => variant.options.some(option => option.valueName === '成本加价 SKU'))
+    const seedCosts = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/prices/batch`, headers: productHeaders(auth),
+      payload: {
+        expectedRevision: product.revision,
+        updates: [
+          { skuId: fixedSku!.id, expectedSkuRevision: fixedSku!.revision, costPrice: '10.12345', compareAtPrice: '15.00' },
+          { skuId: markupSku!.id, expectedSkuRevision: markupSku!.revision, costPrice: '10.00001', compareAtPrice: '30.00' },
+        ],
+      },
+    })
+    expect(seedCosts.statusCode, seedCosts.body).toBe(200)
+
+    const getRules = async () => {
+      const response = await app.inject({
+      method: 'GET', url: `/api/v1/admin/products/${product.id}/pricing-rules?page=1&pageSize=50`,
+      headers: { cookie: auth.sessionCookie },
+      })
+      expect(response.statusCode, response.body).toBe(200)
+      return response.json<{ data: { productRevision: number; items: Array<{
+      skuId: string; skuRevision: number; ruleRevision: number; mode: string; ruleStatus: string;
+      salePrice: string; costPrice: string | null; compareAtPrice: string | null; retiredAt: string | null;
+      }> } }>().data
+    }
+
+    const originalRules = await getRules()
+    expect(originalRules.items.every(item => item.mode === 'manual' && item.ruleRevision === 0 && item.ruleStatus === 'manual')).toBe(true)
+    const saveRuleResponse = await app.inject({
+      method: 'PUT', url: `/api/v1/admin/products/${product.id}/pricing-rules/batch`, headers: productHeaders(auth),
+      payload: {
+        expectedRevision: originalRules.productRevision,
+        updates: [
+          { skuId: fixedSku!.id, expectedSkuRevision: originalRules.items.find(item => item.skuId === fixedSku!.id)!.skuRevision,
+            expectedRuleRevision: 0, mode: 'fixed_profit', fixedProfit: '0.87655' },
+          { skuId: markupSku!.id, expectedSkuRevision: originalRules.items.find(item => item.skuId === markupSku!.id)!.skuRevision,
+            expectedRuleRevision: 0, mode: 'percentage_markup', markupRate: '25' },
+        ],
+      },
+    })
+    expect(saveRuleResponse.statusCode, saveRuleResponse.body).toBe(200)
+    const configured = saveRuleResponse.json<{ data: { productRevision: number; items: Array<{ skuId: string; ruleRevision: number; ruleStatus: string }> } }>().data
+    expect(configured.items.map(item => item.ruleRevision)).toEqual([1, 1])
+    expect(configured.items.every(item => item.ruleStatus === 'pending')).toBe(true)
+
+    const previewResponse = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`, headers: productHeaders(auth),
+      payload: { skuIds: [fixedSku!.id, markupSku!.id] },
+    })
+    expect(previewResponse.statusCode, previewResponse.body).toBe(200)
+    const preview = previewResponse.json<{ data: { productRevision: number; items: Array<{
+      skuId: string; inputDigest: string; currentSalePrice: string; compareAtPrice: string | null;
+      costPrice: string | null; suggestedSalePrice: string | null; suggestedGrossProfit: string | null;
+      suggestedGrossMarginRate: string | null; salePriceDelta: string | null; risks: string[]; canApply: boolean;
+    }> } }>().data
+    const fixedPreview = preview.items.find(item => item.skuId === fixedSku!.id)!
+    const markupPreview = preview.items.find(item => item.skuId === markupSku!.id)!
+    expect(fixedPreview).toMatchObject({ currentSalePrice: '5.00', compareAtPrice: '15.00', costPrice: '10.12345', suggestedSalePrice: '11.00', suggestedGrossProfit: '0.87655', canApply: true })
+    expect(markupPreview).toMatchObject({ currentSalePrice: '20.00', compareAtPrice: '30.00', costPrice: '10.00001', suggestedSalePrice: '12.50', suggestedGrossProfit: '2.49999', suggestedGrossMarginRate: '19.9999', canApply: true })
+    expect(fixedPreview.inputDigest).toMatch(/^[a-f0-9]{64}$/u)
+    expect(markupPreview.risks).toContain('ROUNDING_TO_CENT')
+    const beforeApplyPrices = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=50`, headers: { cookie: auth.sessionCookie } })
+    expect(beforeApplyPrices.json<{ data: { items: Array<{ skuId: string; salePrice: string }> } }>().data.items.map(item => item.salePrice).sort())
+      .toEqual(['20.00', '5.00'])
+
+    const wrongDigest = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/apply`, headers: productHeaders(auth),
+      payload: {
+        expectedRevision: preview.productRevision, confirmLossAndFreePrice: false,
+        items: preview.items.map(item => ({ skuId: item.skuId, expectedSkuRevision: item.skuRevision,
+          expectedRuleRevision: 1, inputDigest: item.skuId === markupSku!.id ? '0'.repeat(64) : item.inputDigest })),
+      },
+    })
+    expect(wrongDigest.statusCode).toBe(409)
+    const noPartialApply = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=50`, headers: { cookie: auth.sessionCookie } })
+    expect(noPartialApply.json<{ data: { items: Array<{ salePrice: string }> } }>().data.items.map(item => item.salePrice).sort())
+      .toEqual(['20.00', '5.00'])
+
+    const apply = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/apply`, headers: productHeaders(auth),
+      payload: {
+        expectedRevision: preview.productRevision, confirmLossAndFreePrice: false,
+        items: preview.items.map(item => ({ skuId: item.skuId, expectedSkuRevision: item.skuRevision,
+          expectedRuleRevision: item.ruleRevision, inputDigest: item.inputDigest })),
+      },
+    })
+    expect(apply.statusCode, apply.body).toBe(200)
+    const applied = apply.json<{ data: { productRevision: number; items: Array<{ skuId: string; salePrice: string; costPrice: string | null; compareAtPrice: string | null; ruleStatus: string }> } }>().data
+    expect(applied.items.find(item => item.skuId === fixedSku!.id)).toMatchObject({ salePrice: '11.00', costPrice: '10.12345', compareAtPrice: '15.00', ruleStatus: 'applied' })
+    expect(applied.items.find(item => item.skuId === markupSku!.id)).toMatchObject({ salePrice: '12.50', costPrice: '10.00001', compareAtPrice: '30.00', ruleStatus: 'applied' })
+
+    const historyUrl = `/api/v1/admin/products/${product.id}/variants/${fixedSku!.id}/pricing-rules/history`
+    const historyBeforeRestore = await app.inject({ method: 'GET', url: historyUrl, headers: { cookie: auth.sessionCookie } })
+    expect(historyBeforeRestore.json<{ data: { items: Array<{ revision: number; mode: string; fixedProfit: string | null }> } }>().data.items)
+      .toEqual([expect.objectContaining({ revision: 1, mode: 'fixed_profit', fixedProfit: '0.87655' })])
+
+    const rulesBeforeChange = await getRules()
+    const fixedCurrent = rulesBeforeChange.items.find(item => item.skuId === fixedSku!.id)!
+    const savedV2 = await app.inject({
+      method: 'PUT', url: `/api/v1/admin/products/${product.id}/pricing-rules/batch`, headers: productHeaders(auth),
+      payload: { expectedRevision: rulesBeforeChange.productRevision, updates: [{ skuId: fixedSku!.id,
+        expectedSkuRevision: fixedCurrent.skuRevision, expectedRuleRevision: fixedCurrent.ruleRevision,
+        mode: 'fixed_profit', fixedProfit: '0.50000' }] },
+    })
+    expect(savedV2.statusCode, savedV2.body).toBe(200)
+    const afterV2 = await getRules()
+    const fixedAfterV2 = afterV2.items.find(item => item.skuId === fixedSku!.id)!
+    const restore = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/variants/${fixedSku!.id}/pricing-rules/restore`, headers: productHeaders(auth),
+      payload: { expectedRevision: afterV2.productRevision, expectedSkuRevision: fixedAfterV2.skuRevision,
+        expectedRuleRevision: fixedAfterV2.ruleRevision, sourceRevision: 1 },
+    })
+    expect(restore.statusCode, restore.body).toBe(200)
+    expect(restore.json<{ data: { restoredFromRevision: number; item: { ruleRevision: number; fixedProfit: string | null; ruleStatus: string } } }>().data)
+      .toMatchObject({ restoredFromRevision: 1, item: { ruleRevision: 3, fixedProfit: '0.87655', ruleStatus: 'pending' } })
+    const historyAfterRestore = await app.inject({ method: 'GET', url: historyUrl, headers: { cookie: auth.sessionCookie } })
+    expect(historyAfterRestore.json<{ data: { items: Array<{ revision: number; changeType: string; restoredFromRevision: number | null }> } }>().data.items)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ revision: 1, changeType: 'configured', restoredFromRevision: null }),
+        expect.objectContaining({ revision: 2, changeType: 'configured', restoredFromRevision: null }),
+        expect.objectContaining({ revision: 3, changeType: 'restored', restoredFromRevision: 1 }),
+      ]))
+    await expect(db.updateTable('product_variant_pricing_rule_versions').set({ fixed_profit: '99.00000' })
+      .where('product_variant_id', '=', fixedSku!.id).where('revision', '=', 1).execute())
+      .rejects.toMatchObject({ constraint: 'product_pricing_rule_history_immutable' })
+
+    const freshPreviewResponse = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`, headers: productHeaders(auth),
+      payload: { skuIds: [fixedSku!.id, markupSku!.id] },
+    })
+    const freshPreview = freshPreviewResponse.json<{ data: typeof preview }>().data
+    const currentPrices = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=50`, headers: { cookie: auth.sessionCookie } })
+    const firstCurrentPrice = currentPrices.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number; salePrice: string }> } }>().data
+      .items.find(item => item.skuId === fixedSku!.id)!
+    const directPrice = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${fixedSku!.id}/prices`, headers: productHeaders(auth),
+      payload: { expectedRevision: firstCurrentPrice.productRevision, expectedSkuRevision: firstCurrentPrice.skuRevision,
+        salePrice: '12.00', costPrice: '11.00000' },
+    })
+    expect(directPrice.statusCode, directPrice.body).toBe(200)
+    const staleApply = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/apply`, headers: productHeaders(auth),
+      payload: { expectedRevision: freshPreview.productRevision, confirmLossAndFreePrice: false,
+        items: freshPreview.items.map(item => ({ skuId: item.skuId, expectedSkuRevision: item.skuRevision,
+          expectedRuleRevision: item.ruleRevision, inputDigest: item.inputDigest })) },
+    })
+    expect(staleApply.statusCode).toBe(409)
+    expect(staleApply.json().error.code).toBe('PRICING_PREVIEW_STALE')
+    const staleRules = await getRules()
+    expect(staleRules.items.find(item => item.skuId === fixedSku!.id)?.ruleStatus).toBe('stale')
+    const staleAudit = await db.selectFrom('product_management_audit_events').select('operation')
+      .where('product_id', '=', product.id).where('operation', 'in', ['rule_saved', 'rule_restored', 'rule_applied', 'price_updated']).execute()
+    expect(staleAudit.map(row => row.operation)).toEqual(expect.arrayContaining(['rule_saved', 'rule_restored', 'rule_applied', 'price_updated']))
+
+    const markupRulePage = await getRules()
+    const markupRuleBeforeConcurrentChange = markupRulePage.items.find(item => item.skuId === markupSku!.id)!
+    const staleRulePreviewResponse = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`, headers: productHeaders(auth),
+      payload: { skuIds: [markupSku!.id] },
+    })
+    const staleRulePreview = staleRulePreviewResponse.json<{ data: { productRevision: number; items: Array<{
+      skuId: string; skuRevision: number; ruleRevision: number; inputDigest: string;
+    }> } }>().data
+    const concurrentRuleSave = await app.inject({
+      method: 'PUT', url: `/api/v1/admin/products/${product.id}/pricing-rules/batch`, headers: productHeaders(auth),
+      payload: { expectedRevision: markupRulePage.productRevision, updates: [{ skuId: markupSku!.id,
+        expectedSkuRevision: markupRuleBeforeConcurrentChange.skuRevision,
+        expectedRuleRevision: markupRuleBeforeConcurrentChange.ruleRevision,
+        mode: 'percentage_markup', markupRate: '26' }] },
+    })
+    expect(concurrentRuleSave.statusCode, concurrentRuleSave.body).toBe(200)
+    const staleRuleApply = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/apply`, headers: productHeaders(auth),
+      payload: { expectedRevision: staleRulePreview.productRevision, confirmLossAndFreePrice: false,
+        items: staleRulePreview.items.map(item => ({ skuId: item.skuId, expectedSkuRevision: item.skuRevision,
+          expectedRuleRevision: item.ruleRevision, inputDigest: item.inputDigest })) },
+    })
+    expect(staleRuleApply.statusCode).toBe(409)
+    expect(staleRuleApply.json().error.code).toBe('PRICING_PREVIEW_STALE')
+
+    const changedCostPreviewResponse = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`, headers: productHeaders(auth),
+      payload: { skuIds: [fixedSku!.id] },
+    })
+    expect(changedCostPreviewResponse.json<{ data: { items: Array<{ suggestedSalePrice: string; suggestedGrossProfit: string }> } }>().data.items[0])
+      .toMatchObject({ suggestedSalePrice: '11.88', suggestedGrossProfit: '0.88000' })
+
+    let latestPrices = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=50`, headers: { cookie: auth.sessionCookie } })
+    let pricePage = latestPrices.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> } }>().data
+    const markupCurrentPrice = pricePage.items.find(item => item.skuId === markupSku!.id)!
+    const clearCost = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${markupSku!.id}/prices`, headers: productHeaders(auth),
+      payload: { expectedRevision: pricePage.productRevision, expectedSkuRevision: markupCurrentPrice.skuRevision, costPrice: null },
+    })
+    expect(clearCost.statusCode).toBe(200)
+    const missingCost = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`, headers: productHeaders(auth),
+      payload: { skuIds: [markupSku!.id] },
+    })
+    expect(missingCost.json<{ data: { items: Array<{ suggestedSalePrice: string | null; canApply: boolean; risks: string[] }> } }>().data.items[0])
+      .toMatchObject({ suggestedSalePrice: null, canApply: false, risks: expect.arrayContaining(['COST_MISSING']) })
+
+    latestPrices = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=50`, headers: { cookie: auth.sessionCookie } })
+    pricePage = latestPrices.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> } }>().data
+    const zeroCostSku = pricePage.items.find(item => item.skuId === markupSku!.id)!
+    const setZeroCost = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${markupSku!.id}/prices`, headers: productHeaders(auth),
+      payload: { expectedRevision: pricePage.productRevision, expectedSkuRevision: zeroCostSku.skuRevision, costPrice: '0.00000' },
+    })
+    expect(setZeroCost.statusCode).toBe(200)
+    const freePreview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`, headers: productHeaders(auth),
+      payload: { skuIds: [markupSku!.id] },
+    })
+    const freePricing = freePreview.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number; ruleRevision: number; inputDigest: string; suggestedSalePrice: string; risks: string[] }> } }>().data
+    expect(freePricing.items[0]).toMatchObject({ suggestedSalePrice: '0.00', risks: expect.arrayContaining(['FREE_PRICE']) })
+    const freeApplyBody = { expectedRevision: freePricing.productRevision, items: freePricing.items.map(item => ({
+      skuId: item.skuId, expectedSkuRevision: item.skuRevision, expectedRuleRevision: item.ruleRevision, inputDigest: item.inputDigest,
+    })) }
+    const unconfirmedFree = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/apply`, headers: productHeaders(auth),
+      payload: { ...freeApplyBody, confirmLossAndFreePrice: false },
+    })
+    expect(unconfirmedFree.statusCode).toBe(400)
+    expect(unconfirmedFree.json().error.code).toBe('PRICING_RISK_CONFIRMATION_REQUIRED')
+    const confirmedFree = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/apply`, headers: productHeaders(auth),
+      payload: { ...freeApplyBody, confirmLossAndFreePrice: true },
+    })
+    expect(confirmedFree.statusCode, confirmedFree.body).toBe(200)
+    expect(confirmedFree.json<{ data: { items: Array<{ skuId: string; salePrice: string; costPrice: string | null; compareAtPrice: string | null }> } }>().data.items[0])
+      .toMatchObject({ skuId: markupSku!.id, salePrice: '0.00', costPrice: '0.00000', compareAtPrice: '30.00' })
+
+    latestPrices = await app.inject({ method: 'GET', url: `/api/v1/admin/products/${product.id}/prices?page=1&pageSize=50`, headers: { cookie: auth.sessionCookie } })
+    pricePage = latestPrices.json<{ data: { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> } }>().data
+    const precisionSku = pricePage.items.find(item => item.skuId === fixedSku!.id)!
+    const excessivePrecision = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${fixedSku!.id}/prices`, headers: productHeaders(auth),
+      payload: { expectedRevision: pricePage.productRevision, expectedSkuRevision: precisionSku.skuRevision, costPrice: '0.123456' },
+    })
+    expect(excessivePrecision.statusCode).toBe(400)
+
+    const ruleRowsBeforeOverflow = await getRules()
+    const overflowSku = ruleRowsBeforeOverflow.items.find(item => item.skuId === markupSku!.id)!
+    const setMaxCost = await app.inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${markupSku!.id}/prices`, headers: productHeaders(auth),
+      payload: { expectedRevision: ruleRowsBeforeOverflow.productRevision, expectedSkuRevision: overflowSku.skuRevision,
+        costPrice: '9999999999999.99999' },
+    })
+    expect(setMaxCost.statusCode).toBe(200)
+    const overflowPreview = await app.inject({
+      method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`, headers: productHeaders(auth),
+      payload: { skuIds: [markupSku!.id] },
+    })
+    expect(overflowPreview.json<{ data: { items: Array<{ suggestedSalePrice: string | null; canApply: boolean; risks: string[] }> } }>().data.items[0])
+      .toMatchObject({ suggestedSalePrice: null, canApply: false, risks: expect.arrayContaining(['PRICE_OVERFLOW']) })
+
+    await db.updateTable('product_variants').set({ enabled: false, retired_at: new Date() })
+      .where('product_id', '=', product.id).where('id', '=', markupSku!.id).execute()
+    const retiredRows = await getRules()
+    const retiredSku = retiredRows.items.find(item => item.skuId === markupSku!.id)!
+    expect(retiredSku.retiredAt).not.toBeNull()
+    const retiredRuleChange = await app.inject({
+      method: 'PUT', url: `/api/v1/admin/products/${product.id}/pricing-rules/batch`, headers: productHeaders(auth),
+      payload: { expectedRevision: retiredRows.productRevision, updates: [{ skuId: retiredSku.skuId,
+        expectedSkuRevision: retiredSku.skuRevision, expectedRuleRevision: retiredSku.ruleRevision, mode: 'manual' }] },
+    })
+    expect(retiredRuleChange.statusCode).toBe(409)
+    expect(retiredRuleChange.json().error.code).toBe('SKU_PERMANENTLY_RETIRED')
+
+    const currentProduct = (await getAdminProduct(auth, product.id)).json<{ data: ProductDetail }>().data
+    const archived = await changeProductLifecycle(auth, product.id, { expectedRevision: currentProduct.revision, status: 'archived' })
+    expect(archived.statusCode).toBe(200)
+    const archivedRules = await getRules()
+    const activeRule = archivedRules.items.find(item => item.skuId === fixedSku!.id)!
+    const archivedRuleChange = await app.inject({
+      method: 'PUT', url: `/api/v1/admin/products/${product.id}/pricing-rules/batch`, headers: productHeaders(auth),
+      payload: { expectedRevision: archivedRules.productRevision, updates: [{ skuId: activeRule.skuId,
+        expectedSkuRevision: activeRule.skuRevision, expectedRuleRevision: activeRule.ruleRevision, mode: 'manual' }] },
+    })
+    expect(archivedRuleChange.statusCode).toBe(409)
+    expect(archivedRuleChange.json().error.code).toBe('PRODUCT_ARCHIVED')
   }, 30_000)
 })

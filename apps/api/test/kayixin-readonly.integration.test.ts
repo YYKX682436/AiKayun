@@ -63,6 +63,7 @@ beforeAll(async () => {
     '202610250003_purchase_form_activation_state',
     '202610250004_cart_replacement_drafts',
     '202610260001_supplier_product_mappings',
+    '202610260002_product_pricing_rules',
   ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])

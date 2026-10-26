@@ -1130,6 +1130,11 @@ export interface ProductVariantsTable {
   sale_price: ColumnType<string, string, string>
   compare_at_price: ColumnType<string | null, string | null, string | null>
   cost_price: ColumnType<string | null, string | null, string | null>
+  pricing_mode: Generated<ProductPricingMode>
+  pricing_fixed_profit: ColumnType<string | null, string | null, string | null>
+  pricing_markup_rate: ColumnType<string | null, string | null, string | null>
+  pricing_rule_revision: Generated<number>
+  pricing_rule_status: Generated<ProductPricingRuleStatus>
   enabled: Generated<boolean>
   retired_at: Generated<Date | null>
   inventory_mode: ProductInventoryMode | null
@@ -1140,6 +1145,25 @@ export interface ProductVariantsTable {
   purchase_limit_24h: Generated<number | null>
   created_at: Generated<Date>
   updated_at: Generated<Date>
+}
+
+export type ProductPricingMode = 'manual' | 'fixed_profit' | 'percentage_markup'
+export type ProductPricingRuleStatus = 'manual' | 'pending' | 'applied' | 'stale'
+
+export type ProductPricingRuleChangeType = 'configured' | 'restored'
+
+export interface ProductVariantPricingRuleVersionsTable {
+  id: string
+  product_id: string
+  product_variant_id: string
+  revision: number
+  mode: ProductPricingMode
+  fixed_profit: string | null
+  markup_rate: string | null
+  change_type: ProductPricingRuleChangeType
+  restored_from_revision: number | null
+  administrator_id: string
+  created_at: Generated<Date>
 }
 
 export interface ProductVariantQuantityInventoryTable {
@@ -1230,7 +1254,7 @@ export interface ProductVariantOptionValuesTable {
 
 export type ProductManagementOperation =
   | 'created' | 'updated' | 'published' | 'paused' | 'relisted' | 'archived' | 'restored' | 'copied' | 'deleted'
-  | 'gallery_updated' | 'rich_content_updated'
+  | 'gallery_updated' | 'rich_content_updated' | 'rule_saved' | 'rule_restored' | 'rule_applied' | 'price_updated'
 
 export interface ProductManagementAuditEventsTable {
   id: string
@@ -1248,6 +1272,7 @@ export interface Database {
   admin_product_creation_requests: AdminProductCreationRequestsTable
   products: ProductsTable
   product_variants: ProductVariantsTable
+  product_variant_pricing_rule_versions: ProductVariantPricingRuleVersionsTable
   product_variant_quantity_inventory: ProductVariantQuantityInventoryTable
   product_variant_inventory_adjustments: ProductVariantInventoryAdjustmentsTable
   product_categories: ProductCategoriesTable

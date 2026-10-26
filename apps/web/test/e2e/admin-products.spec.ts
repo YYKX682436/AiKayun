@@ -34,15 +34,88 @@ async function continueToCreatedProduct(page: import('@playwright/test').Page) {
     return await page.getByRole('link', { name: '继续编辑商品' }).count() > 0
   }).toBe(true)
   if (/\/admin\/products\/new(?:\?.*)?$/.test(page.url())) {
-    await page.getByRole('link', { name: '继续编辑商品' }).click({ timeout: 1500 }).catch(() => undefined)
+    await expect.poll(async () => {
+      if (/\/admin\/products\/[0-9a-f-]+$/.test(page.url())) return true
+      return await page.getByRole('button', { name: '继续编辑商品' }).isEnabled().catch(() => false)
+    }, { timeout: 30_000 }).toBe(true)
+    if (/\/admin\/products\/new(?:\?.*)?$/.test(page.url())) {
+      await page.getByRole('link', { name: '继续编辑商品' }).click({ timeout: 3000 }).catch(() => undefined)
+    }
   }
-  await expect(page).toHaveURL(/\/admin\/products\/[0-9a-f-]+$/, { timeout: 10000 })
+  await expect(page).toHaveURL(/\/admin\/products\/[0-9a-f-]+$/, { timeout: 30000 })
   await expect.poll(() => page.evaluate(() => sessionStorage.getItem('aikayun-admin-product-create-v1'))).toBeNull()
 }
 
 function skuListRow(matrix: import('@playwright/test').Locator, skuCode: string) {
   return matrix.getByText(skuCode, { exact: true }).locator('xpath=ancestor::li[1]')
 }
+
+async function runPricingRuleFlow(
+  page: import('@playwright/test').Page,
+  viewport: { width: number; height: number },
+  mode: 'fixed_profit' | 'percentage_markup',
+  expectedSalePrice: string,
+) {
+  await page.setViewportSize(viewport)
+  await signIn(page)
+  const productName = `D6-3A 定价规则 ${randomUUID().slice(0, 8)}`
+  await page.goto('/admin/products/new')
+  await expect(page.getByLabel('商品名称')).toBeEnabled()
+  await page.getByLabel('商品名称').fill(productName)
+  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByRole('button', { name: '保存为草稿' }).click()
+  await continueToCreatedProduct(page)
+
+  const prices = page.locator('#prices')
+  const priceRow = prices.locator('article').first()
+  await priceRow.getByLabel('划线价（¥）').fill('30.00')
+  await priceRow.getByLabel('成本价（¥）').fill('10.12345')
+  await prices.getByRole('button', { name: '原子保存本页价格' }).click()
+  await expect(prices.getByRole('status')).toContainText('已原子保存')
+
+  const pricing = page.locator('#pricing-rules')
+  await expect(pricing.getByText('精确定价规则')).toBeVisible()
+  await pricing.getByLabel('定价模式').click()
+  await page.getByRole('option', { name: mode === 'fixed_profit' ? '成本 + 固定利润' : '按成本加价率' }).click()
+  if (mode === 'fixed_profit') {
+    await pricing.getByLabel('每件固定利润（¥）').fill('0.87655')
+  } else {
+    await pricing.getByLabel('按成本加价率（%）').fill('25')
+  }
+  await pricing.getByRole('button', { name: '保存本页规则版本' }).click()
+  await expect(pricing.getByRole('status')).toContainText('售价尚未更改')
+  await pricing.getByRole('button', { name: '预览所选 SKU（1）' }).click()
+  await expect(pricing.getByRole('heading', { name: '调价预览' })).toBeVisible()
+  await expect(pricing.getByText(`建议 ¥${expectedSalePrice}`, { exact: true })).toBeVisible()
+  await expect(pricing.getByText('成本：¥10.12345', { exact: true })).toBeVisible()
+  await expect(pricing.getByText('当前毛利润 / 毛利率：¥4.87655 / 32.5103%')).toBeVisible()
+
+  await pricing.getByRole('button', { name: '确认应用本批建议售价' }).click()
+  const confirmation = page.getByRole('dialog', { name: '确认应用调价建议' })
+  await confirmation.getByLabel('我已逐项核对当前售价、建议售价、毛利润和毛利率，并确认应用此批结果。').check()
+  const applyResponsePromise = page.waitForResponse(response =>
+    response.url().endsWith('/pricing-rules/apply') && response.request().method() === 'POST',
+  )
+  await confirmation.getByRole('button', { name: '确认并原子应用' }).click()
+  const applyResponse = await applyResponsePromise
+  expect(applyResponse.status()).toBe(200)
+  const applyBody = await applyResponse.json() as { data: { items: Array<{ salePrice: string; costPrice: string; compareAtPrice: string }> } }
+  expect(applyBody.data.items).toEqual([expect.objectContaining({
+    salePrice: expectedSalePrice, costPrice: '10.12345', compareAtPrice: '30.00',
+  })])
+  await expect(pricing.getByRole('status')).toContainText('已确认应用 1 个 SKU')
+  await expect(priceRow.getByLabel('销售价（¥）')).toHaveValue(expectedSalePrice)
+  await expect(priceRow.getByLabel('成本价（¥）')).toHaveValue('10.12345')
+  await expect(priceRow.getByLabel('划线价（¥）')).toHaveValue('30.00')
+}
+
+test('管理员可在桌面端预览并确认应用固定利润定价', async ({ page }) => {
+  await runPricingRuleFlow(page, { width: 1440, height: 1000 }, 'fixed_profit', '11.00')
+})
+
+test('管理员可在移动端预览并确认应用按成本计算的加价率', async ({ page }) => {
+  await runPricingRuleFlow(page, { width: 390, height: 844 }, 'percentage_markup', '12.65')
+})
 
 test('admin manages a real product through category, SKU, price, media, rich text, stock and lifecycle', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })

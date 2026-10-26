@@ -14,6 +14,9 @@ const intermediateAmountPattern = /^-?(?:0|[1-9]\d{0,28})(?:\.\d{1,5})?$/
 const maxSettledIntegerDigits = 16
 const walletAmountPattern = /^(?:0|[1-9]\d{0,15})(?:\.\d{1,2})?$/
 const percentagePattern = /^(?:0|[1-9]\d{0,2})(?:\.\d{1,4})?$/
+const pricingMarkupPattern = /^(?:0|[1-9]\d{0,5})(?:\.\d{1,4})?$/
+const databaseUnitAmountMax = new ExactDecimal('9999999999999.99999')
+const databaseSalePriceMax = new ExactDecimal('9999999999999.99')
 
 function parseWalletAmount(value: string): Decimal {
   if (!walletAmountPattern.test(value)) {
@@ -163,4 +166,77 @@ export function preserveSupplierReferenceAmount(value: string): string {
   const amount = new ExactDecimal(value)
   if (!amount.isFinite() || amount.isNegative()) throw new TypeError('Invalid supplier reference amount')
   return value
+}
+
+export type UnitPricingRule =
+  | { mode: 'fixed_profit'; fixedProfit: string }
+  | { mode: 'percentage_markup'; markupRate: string }
+
+export function calculateSuggestedSalePriceDetailed(costPrice: string, rule: UnitPricingRule): {
+  salePrice: string
+  unroundedPrice: string
+  roundedToCents: boolean
+} {
+  const cost = parseUnitAmount(costPrice)
+  if (cost.isNegative() || cost.decimalPlaces() > 5 || cost.gt(databaseUnitAmountMax)) {
+    throw new RangeError('Cost price is outside NUMERIC(18,5) bounds')
+  }
+
+  let unrounded: Decimal
+  if (rule.mode === 'fixed_profit') {
+    const profit = parseUnitAmount(rule.fixedProfit)
+    if (profit.isNegative() || profit.decimalPlaces() > 5 || profit.gt(databaseUnitAmountMax)) {
+      throw new RangeError('Fixed profit is outside NUMERIC(18,5) bounds')
+    }
+    unrounded = cost.plus(profit)
+  } else {
+    if (!pricingMarkupPattern.test(rule.markupRate)) {
+      throw new TypeError('Cost markup must be a non-negative decimal percentage with at most 6 integer and 4 fractional digits')
+    }
+    const rate = new ExactDecimal(rule.markupRate)
+    unrounded = cost.times(new ExactDecimal(100).plus(rate)).div(100)
+  }
+
+  if (!unrounded.isFinite() || unrounded.isNegative() || unrounded.gt(databaseUnitAmountMax)) {
+    throw new RangeError('Unrounded suggested price exceeds NUMERIC(18,5) bounds')
+  }
+  const rounded = unrounded.toDecimalPlaces(2, Decimal.ROUND_HALF_UP)
+  if (rounded.gt(databaseSalePriceMax)) {
+    throw new RangeError('Suggested sale price exceeds NUMERIC(18,5) with two fractional digits')
+  }
+  return {
+    salePrice: rounded.toFixed(2),
+    unroundedPrice: unrounded.toFixed(),
+    roundedToCents: unrounded.decimalPlaces() > 2,
+  }
+}
+
+/**
+ * Suggests a SKU sale price from an explicitly configured rule and a manual
+ * unit cost. Markup is a percentage of cost (not gross margin). Inputs retain
+ * their full supported decimal precision; only the suggested sale price is
+ * rounded, once, to cents with ROUND_HALF_UP.
+ */
+export function calculateSuggestedSalePrice(costPrice: string, rule: UnitPricingRule): string {
+  return calculateSuggestedSalePriceDetailed(costPrice, rule).salePrice
+}
+
+/** Computes per-unit gross profit and margin without binary floating point. */
+export function calculateUnitProfitMetrics(salePrice: string, costPrice: string): {
+  grossProfit: string
+  grossMarginRate: string | null
+} {
+  const sale = parseUnitAmount(salePrice)
+  const cost = parseUnitAmount(costPrice)
+  if (sale.isNegative() || sale.decimalPlaces() > 2 || sale.gt(databaseSalePriceMax)) {
+    throw new RangeError('Sale price is outside its NUMERIC(18,5) two-decimal bounds')
+  }
+  if (cost.isNegative() || cost.decimalPlaces() > 5 || cost.gt(databaseUnitAmountMax)) {
+    throw new RangeError('Cost price is outside NUMERIC(18,5) bounds')
+  }
+  const grossProfit = sale.minus(cost).toFixed(5)
+  const grossMarginRate = sale.isZero()
+    ? null
+    : sale.minus(cost).div(sale).times(100).toDecimalPlaces(4, Decimal.ROUND_HALF_UP).toFixed(4)
+  return { grossProfit, grossMarginRate }
 }

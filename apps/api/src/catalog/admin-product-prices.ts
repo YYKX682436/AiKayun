@@ -27,6 +27,7 @@ import { requireAdmin, verifyCsrf } from '../auth/admin.js'
 import type { Database } from '../db/types.js'
 import { CatalogError, sendCatalogError } from './errors.js'
 import { assertProductNotArchived, lockProductAtRevision } from './admin-product-guards.js'
+import { appendProductAudit } from './product-audit.js'
 
 const salePricePattern = /^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?(?![\s\S])/u
 const costPricePattern = /^(?:0|[1-9]\d{0,12})(?:\.\d{1,5})?(?![\s\S])/u
@@ -65,6 +66,11 @@ type PriceRow = {
   cost_price: string | null
   retired_at: Date | null
   updated_at: Date
+  pricing_mode: 'manual' | 'fixed_profit' | 'percentage_markup'
+  pricing_fixed_profit: string | null
+  pricing_markup_rate: string | null
+  pricing_rule_revision: number
+  pricing_rule_status: 'manual' | 'pending' | 'applied' | 'stale'
 }
 
 async function selectPriceRow(db: Kysely<Database>, productId: string, skuId: string): Promise<PriceRow | undefined> {
@@ -75,10 +81,28 @@ async function selectPriceRow(db: Kysely<Database>, productId: string, skuId: st
       'variant.id as sku_id', 'variant.sku_code', 'variant.revision as sku_revision',
       'variant.sale_price', 'variant.compare_at_price', 'variant.cost_price',
       'variant.retired_at', 'variant.updated_at',
+      'variant.pricing_mode', 'variant.pricing_fixed_profit', 'variant.pricing_markup_rate',
+      'variant.pricing_rule_revision', 'variant.pricing_rule_status',
     ])
     .where('variant.product_id', '=', productId)
     .where('variant.id', '=', skuId)
     .executeTakeFirst()
+}
+
+function priceAuditState(row: Pick<PriceRow, 'sku_id' | 'sku_code' | 'sku_revision' | 'sale_price' | 'compare_at_price' | 'cost_price' | 'pricing_mode' | 'pricing_fixed_profit' | 'pricing_markup_rate' | 'pricing_rule_revision' | 'pricing_rule_status'>) {
+  return {
+    skuId: row.sku_id,
+    skuCode: row.sku_code,
+    skuRevision: row.sku_revision,
+    salePrice: parseUnitAmount(row.sale_price).toFixed(2),
+    compareAtPrice: row.compare_at_price === null ? null : parseUnitAmount(row.compare_at_price).toFixed(2),
+    costPrice: row.cost_price === null ? null : parseUnitAmount(row.cost_price).toFixed(5),
+    pricingMode: row.pricing_mode,
+    pricingRuleRevision: row.pricing_rule_revision,
+    pricingRuleStatus: row.pricing_rule_status,
+    fixedProfit: row.pricing_fixed_profit === null ? null : parseUnitAmount(row.pricing_fixed_profit).toFixed(5),
+    markupRate: row.pricing_markup_rate === null ? null : parseUnitAmount(row.pricing_markup_rate).toFixed(4),
+  }
 }
 
 function toPriceContract(row: PriceRow): AdminProductVariantPrices {
@@ -143,6 +167,9 @@ export function registerAdminProductPriceRoutes(app: FastifyInstance, db: Kysely
           variant.id AS sku_id, variant.sku_code, variant.revision AS sku_revision,
           variant.sale_price::text AS sale_price, variant.compare_at_price::text AS compare_at_price,
           variant.cost_price::text AS cost_price, variant.retired_at, variant.updated_at
+          , variant.pricing_mode, variant.pricing_fixed_profit::text AS pricing_fixed_profit,
+          variant.pricing_markup_rate::text AS pricing_markup_rate,
+          variant.pricing_rule_revision, variant.pricing_rule_status
         FROM product_variants AS variant
         INNER JOIN products AS product ON product.id = variant.product_id
         WHERE variant.product_id = ${productId}::uuid ${filter}
@@ -213,7 +240,19 @@ export function registerAdminProductPriceRoutes(app: FastifyInstance, db: Kysely
           if (compareAtPrice !== null && !parseUnitAmount(compareAtPrice).greaterThan(parseUnitAmount(salePrice))) {
             throw new CatalogError(400, 'INVALID_COMPARE_AT_PRICE', `Compare-at price for SKU ${variant.sku_code} must be greater than its sale price`)
           }
-          return { variantId: variant.id, salePrice, compareAtPrice, costPrice }
+          return {
+            variantId: variant.id, salePrice, compareAtPrice, costPrice,
+            before: priceAuditState({
+              sku_id: variant.id, sku_code: variant.sku_code, sku_revision: variant.revision,
+              sale_price: variant.sale_price, compare_at_price: variant.compare_at_price,
+              cost_price: variant.cost_price, pricing_mode: variant.pricing_mode,
+              pricing_fixed_profit: variant.pricing_fixed_profit, pricing_markup_rate: variant.pricing_markup_rate,
+              pricing_rule_revision: variant.pricing_rule_revision, pricing_rule_status: variant.pricing_rule_status,
+            }),
+            changed: salePrice !== parseUnitAmount(variant.sale_price).toFixed(2)
+              || compareAtPrice !== (variant.compare_at_price === null ? null : parseUnitAmount(variant.compare_at_price).toFixed(2))
+              || costPrice !== (variant.cost_price === null ? null : parseUnitAmount(variant.cost_price).toFixed(5)),
+          }
         })
 
         for (const update of normalized) {
@@ -226,6 +265,15 @@ export function registerAdminProductPriceRoutes(app: FastifyInstance, db: Kysely
         const updatedRows = await Promise.all(normalized.map((update) => selectPriceRow(trx, productId, update.variantId)))
         if (updatedRows.some((row) => !row)) throw new Error('Batch price updates could not be read inside the transaction')
         const items = updatedRows.map((row) => toPriceContract(row!))
+        for (const update of normalized) {
+          if (!update.changed) continue
+          const updated = updatedRows.find((row) => row?.sku_id === update.variantId)
+          if (!updated) throw new Error('Updated SKU price audit row is missing')
+          await appendProductAudit(trx, {
+            productId, administratorId: request.admin!.id, operation: 'price_updated',
+            before: update.before, after: priceAuditState(updated),
+          })
+        }
         return {
           productId,
           productRevision: items[0]!.productRevision,
@@ -304,6 +352,17 @@ export function registerAdminProductPriceRoutes(app: FastifyInstance, db: Kysely
           throw new CatalogError(400, 'INVALID_COMPARE_AT_PRICE', 'Compare-at price must be greater than the sale price')
         }
 
+        const before = priceAuditState({
+          sku_id: variant.id, sku_code: variant.sku_code, sku_revision: variant.revision,
+          sale_price: variant.sale_price, compare_at_price: variant.compare_at_price,
+          cost_price: variant.cost_price, pricing_mode: variant.pricing_mode,
+          pricing_fixed_profit: variant.pricing_fixed_profit, pricing_markup_rate: variant.pricing_markup_rate,
+          pricing_rule_revision: variant.pricing_rule_revision, pricing_rule_status: variant.pricing_rule_status,
+        })
+        const changed = salePrice !== parseUnitAmount(variant.sale_price).toFixed(2)
+          || compareAtPrice !== (variant.compare_at_price === null ? null : parseUnitAmount(variant.compare_at_price).toFixed(2))
+          || costPrice !== (variant.cost_price === null ? null : parseUnitAmount(variant.cost_price).toFixed(5))
+
         await trx.updateTable('product_variants').set({
           sale_price: salePrice,
           compare_at_price: compareAtPrice,
@@ -312,6 +371,12 @@ export function registerAdminProductPriceRoutes(app: FastifyInstance, db: Kysely
 
         const updated = await selectPriceRow(trx, productId, variantId)
         if (!updated) throw new Error('Updated SKU pricing could not be read inside its transaction')
+        if (changed) {
+          await appendProductAudit(trx, {
+            productId, administratorId: request.admin!.id, operation: 'price_updated',
+            before, after: priceAuditState(updated),
+          })
+        }
         return toPriceContract(updated)
       })
       return reply.send(success(result, request.id))

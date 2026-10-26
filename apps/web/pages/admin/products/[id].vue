@@ -431,6 +431,15 @@ async function loadPricePage(page = pricePageNumber.value) {
   }
 }
 
+async function refreshPricesAfterPricingApply() {
+  await loadPricePage(1)
+  if (!dirty.prices && pricePage.value) {
+    for (const row of pricePage.value.items) {
+      priceDraft[row.skuId] = { salePrice: row.salePrice, compareAtPrice: row.compareAtPrice ?? '', costPrice: row.costPrice ?? '' }
+    }
+  }
+}
+
 async function loadInventory() {
   inventorySummary.value = await request<AdminProductInventorySummary>(`/api/v1/admin/products/${productId.value}/inventory`)
 }
@@ -3185,6 +3194,13 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     原子保存本页价格
                   </UButton>
                 </div>
+                <AdminProductPricingRulesPanel
+                  :product-id="product.id"
+                  :product-revision="product.revision"
+                  :archived="isArchived"
+                  @revision-changed="setProductRevision"
+                  @prices-changed="refreshPricesAfterPricingApply"
+                />
               </section>
 
               <section

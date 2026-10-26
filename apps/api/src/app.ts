@@ -33,6 +33,7 @@ import { registerAdminPurchaseFormRoutes } from './catalog/admin-purchase-forms.
 import { registerAdminPurchaseFormLifecycleRoutes } from './catalog/admin-purchase-form-lifecycle.js'
 import { registerAdminVariantMatrixRoutes } from './catalog/admin-variant-matrix.js'
 import { registerAdminProductPriceRoutes } from './catalog/admin-product-prices.js'
+import { registerAdminProductPricingRuleRoutes } from './catalog/admin-product-pricing-rules.js'
 import { registerAdminInventoryRoutes } from './catalog/admin-inventory.js'
 import { registerAdminCodePoolRoutes } from './catalog/admin-code-pool.js'
 import { registerAdminFixedDeliveryRoutes } from './catalog/admin-fixed-delivery.js'
@@ -206,6 +207,7 @@ export async function createApp(options: {
   registerAdminPurchaseFormLifecycleRoutes(app, db, config)
   registerAdminVariantMatrixRoutes(app, db, config, identityFactory)
   registerAdminProductPriceRoutes(app, db, config)
+  registerAdminProductPricingRuleRoutes(app, db, config)
   registerAdminInventoryRoutes(app, db, config)
   registerAdminCodePoolRoutes(app, db, config)
   registerAdminFixedDeliveryRoutes(app, db, config)

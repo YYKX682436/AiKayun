@@ -1658,6 +1658,94 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     expect(await db.selectFrom('orders').select('id').where('idempotency_key', 'in', staleKeys).execute()).toHaveLength(0)
   })
 
+  it('invalidates old checkout quotes after a confirmed pricing rule and preserves replayed order amounts', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'unlimited' })
+    await enableManual(catalog, admin)
+
+    const initialPrices = await inject({
+      method: 'GET', url: `/api/v1/admin/products/${catalog.productId}/prices?page=1&pageSize=50`,
+      headers: { cookie: admin.cookie },
+    })
+    expect(initialPrices.statusCode).toBe(200)
+    const initialPricePage = initialPrices.json().data as {
+      productRevision: number; items: Array<{ skuId: string; skuRevision: number }>;
+    }
+    const initialPrice = initialPricePage.items.find(item => item.skuId === catalog.skuId)!
+    const savedCost = await inject({
+      method: 'PATCH', url: `/api/v1/admin/products/${catalog.productId}/prices/batch`, headers: adminHeaders(admin),
+      payload: { expectedRevision: initialPricePage.productRevision, updates: [{
+        skuId: catalog.skuId, expectedSkuRevision: initialPrice.skuRevision, costPrice: '1.00000',
+      }] },
+    })
+    expect(savedCost.statusCode, savedCost.body).toBe(200)
+
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const oldQuote = await quote(items, customer)
+    expect(oldQuote.json().data.items[0].unitPrice).toBe('1.20')
+    const oldKey = randomUUID()
+    const originalOrder = await createOrder(items, oldQuote.json().data.quoteToken, customer, oldKey)
+    expect(originalOrder.statusCode).toBe(201)
+    const originalOrderId = originalOrder.json().data.order.id as string
+
+    const currentRules = await inject({
+      method: 'GET', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules?page=1&pageSize=50`,
+      headers: { cookie: admin.cookie },
+    })
+    expect(currentRules.statusCode, currentRules.body).toBe(200)
+    const rulePage = currentRules.json().data as {
+      productRevision: number; items: Array<{ skuId: string; skuRevision: number; ruleRevision: number }>;
+    }
+    const ruleRow = rulePage.items.find(item => item.skuId === catalog.skuId)!
+    const ruleSave = await inject({
+      method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/batch`, headers: adminHeaders(admin),
+      payload: { expectedRevision: rulePage.productRevision, updates: [{
+        skuId: catalog.skuId, expectedSkuRevision: ruleRow.skuRevision,
+        expectedRuleRevision: ruleRow.ruleRevision, mode: 'fixed_profit', fixedProfit: '1.00000',
+      }] },
+    })
+    expect(ruleSave.statusCode, ruleSave.body).toBe(200)
+    const previewResponse = await inject({
+      method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/preview`, headers: adminHeaders(admin),
+      payload: { skuIds: [catalog.skuId] },
+    })
+    expect(previewResponse.statusCode, previewResponse.body).toBe(200)
+    const preview = previewResponse.json().data as {
+      productRevision: number; items: Array<{
+        skuId: string; skuRevision: number; ruleRevision: number; inputDigest: string; suggestedSalePrice: string;
+      }>;
+    }
+    expect(preview.items[0]?.suggestedSalePrice).toBe('2.00')
+    const applyResponse = await inject({
+      method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/apply`, headers: adminHeaders(admin),
+      payload: { expectedRevision: preview.productRevision, confirmLossAndFreePrice: false,
+        items: preview.items.map(item => ({ skuId: item.skuId, expectedSkuRevision: item.skuRevision,
+          expectedRuleRevision: item.ruleRevision, inputDigest: item.inputDigest })) },
+    })
+    expect(applyResponse.statusCode, applyResponse.body).toBe(200)
+
+    const staleKey = randomUUID()
+    const staleCheckout = await createOrder(items, oldQuote.json().data.quoteToken, customer, staleKey)
+    expect(staleCheckout.statusCode).toBe(409)
+    expect(staleCheckout.json().error).toMatchObject({
+      code: 'CHECKOUT_QUOTE_CHANGED', currentQuote: { items: [{ unitPrice: '2.00' }] },
+    })
+    expect(await db.selectFrom('orders').select('id').where('idempotency_key', '=', staleKey).execute()).toHaveLength(0)
+
+    const replay = await createOrder(items, '0'.repeat(64), customer, oldKey)
+    expect(replay.statusCode).toBe(200)
+    expect(replay.json().data).toMatchObject({ created: false, order: { id: originalOrderId, totalAmount: '1.20' } })
+    expect((await db.selectFrom('orders').select('total_amount').where('id', '=', originalOrderId).executeTakeFirstOrThrow()).total_amount).toBe('1.20')
+    expect((await db.selectFrom('order_items').select('unit_price').where('order_id', '=', originalOrderId).executeTakeFirstOrThrow()).unit_price).toBe('1.20')
+
+    const renewedQuote = await quote(items, customer)
+    expect(renewedQuote.json().data.items[0].unitPrice).toBe('2.00')
+    const renewedOrder = await createOrder(items, renewedQuote.json().data.quoteToken, customer)
+    expect(renewedOrder.statusCode).toBe(201)
+    expect(renewedOrder.json().data.order.totalAmount).toBe('2.00')
+  })
+
   it('enforces guest policy, isolates secure guest sessions, completes zero-value manual delivery once, and protects content', async () => {
     const admin = await createAdmin()
     const customer = await createCustomer()
