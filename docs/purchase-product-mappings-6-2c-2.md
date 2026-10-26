@@ -84,7 +84,14 @@ V3读取模型支持上游类型：`0` 文本、`13` 数字字符、`15` 多行�
 - 服务端 PostgreSQL 集成：6项通过；重复级联目标的真实审核API返回 `reviewed=false` 和 `UPSTREAM_OPTION_TARGET_REUSED`，数据库中的审核版本行数不变。
 - 定向 Chromium 场景：1项通过。该场景调用真实 Fastify API、卡易信只读HTTP夹具及隔离 PostgreSQL；涵盖 A 商品列表/详情迟到、草稿保存、刷新、审核、恢复迟到，实际数据库目标归属，以及同一映射刷新旧结果晚于审核新结果时修订和提示不回退。
 - 请求门闩是**模拟时序**：Playwright路由先将请求交给真实API (`route.fetch`)，待服务端处理后暂停响应，再切换当前 SKU 或反序释放响应。它验证浏览器归属，不代表真实商户响应、真实字段语义或采购成功。
-- 完整 `pnpm verify` 通过：lint、类型检查、12项金额单测、23个 API 测试文件共390项测试、主 Chromium 81项、替代品牌1项、SSR错误页3项、开发预览1项及生产品牌1项；各 Playwright 汇总均无跳过。Lint 报告商品详情页既有7条格式警告、0个错误。CI 精确提交SHA和Compose阶段仍待推送后的Actions结果核实。
+- 完整 `pnpm verify` 通过：lint、类型检查、12项金额单测、23个 API 测试文件共390项测试、主 Chromium 81项、替代品牌1项、SSR错误页3项、开发预览1项及生产品牌1项；本地各 Playwright 汇总均无跳过。Lint 报告商品详情页既有7条格式警告、0个错误。
+
+**GitHub Actions 与 Compose 实际证据：**
+
+- R1代码提交 `2546a5fcfb211bc0b96c569caa60fe796fb97cfc` 的 Actions run `40299961126` 成功；作业 `verify` 在 `ubuntu-24.04`（工作流标签 `ubuntu-latest`，runner group `GitHub Actions`）上完成，runner name 为 `GitHub Actions 1000001601`。
+- 该run的 `pnpm test` 为12项金额单测和23个 API 测试文件共390项测试通过；真实 PostgreSQL 浏览器主套件81项通过，另有辅助套件1、3、1项及生产品牌1项通过。浏览器端映射异步回归位于主套件，并使用真实 API、PostgreSQL 与受控只读夹具；没有真实商户接入。
+- Compose Web/API/管理员流程实际运行81项，其中72项通过、9项跳过。9项跳过来自 `PLAYWRIGHT_EXTERNAL_SERVER=true` 模式缺少隔离的V3/供应商夹具；新映射回归在前一个非外部服务的81项浏览器套件中实际通过。Compose构建启动、管理员流程、PostgreSQL重建持久性、数字履约SIGKILL/备份恢复/不可信TLS步骤和CI容器/卷清理均为成功。
+- run中lint仍为商品详情页既有7条格式警告、0个错误。上述CI结果是该代码提交的真实GitHub Actions证据；加入本次CI记录的文档提交后，仍需以新最终SHA对应的Actions结果完成最终SHA核对。
 
 本次测试 PostgreSQL 使用单独的临时容器和 `_test` 数据库，卡易信仅访问受控V3只读夹具。没有操作现有部署数据库、私有卷或历史密钥；最终仅停止本轮容器并清理本轮产生的浏览器测试输出。
 
