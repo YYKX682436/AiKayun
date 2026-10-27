@@ -312,7 +312,11 @@ describe('⑥-2B R1 ordered purchase snapshot manifest gates', () => {
       db.updateTable('order_item_purchase_attachments').set({ ordinal: 2 }).where('order_item_id', '=', fixture.itemId),
       db.deleteFrom('order_item_purchase_attachments').where('order_item_id', '=', fixture.itemId),
     ]) await expect(query.execute()).rejects.toMatchObject({ constraint: 'order_purchase_data_immutable' })
-    await expect(sql`TRUNCATE order_item_purchase_snapshots`.execute(db)).rejects.toMatchObject({ constraint: 'order_purchase_data_immutable' })
+    // The procurement source's RESTRICT reference rejects a bare TRUNCATE
+    // before PostgreSQL invokes the existing immutable-history trigger.
+    await expect(sql`TRUNCATE order_item_purchase_snapshots`.execute(db)).rejects.toMatchObject({ code: '0A000' })
+    await expect(sql`TRUNCATE order_item_purchase_snapshots CASCADE`.execute(db))
+      .rejects.toMatchObject({ constraint: 'order_purchase_data_immutable' })
     await expect(sql`TRUNCATE order_item_purchase_attachments`.execute(db)).rejects.toMatchObject({ constraint: 'order_purchase_data_immutable' })
     await expect(db.insertInto('order_item_purchase_snapshots').values({
       order_item_id: fixture.itemId, template_version_id: null, normalization_version: null,
@@ -349,6 +353,8 @@ describe('⑥-2B R1 ordered purchase snapshot manifest gates', () => {
       migrationName: '202610270001_supplier_quote_observations', status: 'Success',
     }), expect.objectContaining({
       migrationName: '202610270002_supplier_quote_source_consistency', status: 'Success',
+    }), expect.objectContaining({
+      migrationName: '202610270003_procurement_identity', status: 'Success',
     })])
     expect(await durableRows()).toEqual(before)
     const repeated = await migrator.migrateToLatest()

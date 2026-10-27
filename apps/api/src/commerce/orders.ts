@@ -64,6 +64,8 @@ import { PurchaseOrderAttachmentStorage } from '../media/purchase-order-attachme
 import { readAdminOrderPurchaseAttachment, readOrderPurchaseSnapshot, readOwnedOrderPurchaseAttachment } from './purchase-order-attachments.js'
 import { validatePurchaseFormDefinition } from '@aikayun/contracts'
 import { PurchaseOrderDecryptionError, PurchaseOrderKeyUnavailableError } from './purchase-form-crypto.js'
+import { selectCheckoutProcurementSources } from './procurement-source-selection.js'
+import { lockCheckoutProcurementSources, persistCheckoutProcurementSource } from './procurement-identity.js'
 import { preparePurchaseOrderAttachments, persistOrderPurchaseSnapshotInTransaction,
   type PreparedPurchaseOrderAttachment } from './purchase-order-attachments.js'
 import { CodePoolDecryptionError, CodePoolKeyUnavailableError, decryptCodePoolContent } from './code-pool-crypto.js'
@@ -142,6 +144,9 @@ function handleOrderError(error: unknown, reply: FastifyReply, requestId: string
     return reply.code(error.status).send(failure(error.code, error.message, requestId))
   }
   const constraint = postgresConstraint(error)
+  if (constraint === 'procurement_source_version_mismatch') {
+    return reply.code(409).send(failure('CHECKOUT_SOURCE_CHANGED', '商品配置已变化，请刷新报价后重试。', requestId))
+  }
   if (constraint === 'order_inventory_insufficient_code_pool') {
     return reply.code(409).send(failure('INSUFFICIENT_CODE_POOL', '卡密池可售数量已变化，请刷新报价后重试。', requestId))
   }
@@ -607,6 +612,11 @@ async function createOrderTransaction(
     throw new CheckoutConflict('ORDER_NOT_ELIGIBLE', '所选商品当前不满足下单条件，请查看新的报价信息。', currentQuote)
   }
 
+  // This release's production selector always returns no sources. A future
+  // eligible selector must remain inside this transaction and after replay.
+  const procurementSources = await lockCheckoutProcurementSources(trx,
+    selectCheckoutProcurementSources(), currentQuote.items.map(item => item.skuId))
+
   const orderId = randomUUID()
   await trx.insertInto('orders').values({
     id: orderId,
@@ -661,6 +671,8 @@ async function createOrderTransaction(
       draft: resolved?.validatedDraft ?? null,
       preparedAttachments: item.lineId ? (preparedByLine.get(item.lineId) ?? []) : [],
     })
+    const procurementSource = procurementSources.get(item.skuId)
+    if (procurementSource) await persistCheckoutProcurementSource(trx, orderId, orderItemId, procurementSource)
     if (inventoryMode === 'quantity') {
       await trx.insertInto('order_inventory_reservations').values({
         id: randomUUID(),

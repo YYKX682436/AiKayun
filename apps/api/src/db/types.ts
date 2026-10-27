@@ -412,6 +412,66 @@ export interface SupplierProductMappingHeadsTable {
   updated_at: Generated<Date>
 }
 
+export interface OrderItemProcurementSourcesTable {
+  id: string
+  order_id: string
+  order_item_id: string
+  product_id: string
+  product_variant_id: string
+  mapping_version_id: string
+  supplier_connection_id: string
+  supplier_connection_version_id: string
+  credential_version: number
+  provider_type: Generated<'kayixin_customer_v3'>
+  template_version_id: string
+  template_sha256: string
+  normalization_version: number
+  content_identity: string
+  rules_sha256: string
+  structure_sha256: string
+  upstream_product_id: string
+  upstream_sku_type: number
+  upstream_sku_code: string | null
+  upstream_combination: ColumnType<Array<{ title: string; value: string }>, string, string>
+  created_at: Generated<Date>
+}
+
+export type ProcurementOperationState = 'prepared' | 'submit_in_flight' | 'accepted_pending' | 'unknown'
+  | 'manual_review' | 'rejected' | 'success_pending_finalize' | 'completed'
+export type ProcurementUnitState = 'allocated' | 'unknown' | 'manual_review' | 'rejected'
+  | 'success_pending_finalize' | 'completed'
+
+export interface ProcurementOperationsTable {
+  id: string
+  local_business_number: string
+  source_id: string
+  order_item_id: string
+  state: Generated<ProcurementOperationState>
+  allocations_sealed: Generated<boolean>
+  revision: Generated<number>
+  supplier_order_number: Generated<string | null>
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+}
+
+export interface ProcurementOperationUnitsTable {
+  operation_id: string
+  order_item_id: string
+  unit_index: number
+  state: Generated<ProcurementUnitState>
+  created_at: Generated<Date>
+}
+
+export interface ProcurementOperationEventsTable {
+  id: Generated<string>
+  operation_id: string
+  previous_state: ProcurementOperationState | null
+  next_state: ProcurementOperationState
+  revision: number
+  supplier_order_number: string | null
+  created_at: Generated<Date>
+}
+
 export interface SupplierProductMappingObservationsTable {
   id: string
   administrator_id: string
@@ -1364,6 +1424,10 @@ export interface Database {
   order_item_purchase_snapshots: OrderItemPurchaseSnapshotsTable
   purchase_order_attachment_objects: PurchaseOrderAttachmentObjectsTable
   order_item_purchase_attachments: OrderItemPurchaseAttachmentsTable
+  order_item_procurement_sources: OrderItemProcurementSourcesTable
+  procurement_operations: ProcurementOperationsTable
+  procurement_operation_units: ProcurementOperationUnitsTable
+  procurement_operation_events: ProcurementOperationEventsTable
   order_inventory_reservations: OrderInventoryReservationsTable
   order_inventory_events: OrderInventoryEventsTable
   code_pool_batches: CodePoolBatchesTable

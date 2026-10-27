@@ -364,6 +364,7 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
     const created = await createOrder(customer, catalog, 1, earlierQuote.json().data.quoteToken as string)
     expect(created.statusCode, created.body).toBe(201)
     const orderId = created.json().data.order.id as string
+    expect(await db.selectFrom('order_item_procurement_sources').selectAll().where('order_id', '=', orderId).execute()).toEqual([])
     const itemId = created.json().data.order.items[0].id as string
     expect(created.json().data.order.status).toBe('processing')
     const snapshot = await db.selectFrom('order_items').select('fulfillment_content_version_id').where('id', '=', itemId).executeTakeFirstOrThrow()
@@ -403,6 +404,7 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
     await runDigitalDeliveryRecoveryPass(db, config)
     await runDigitalDeliveryRecoveryPass(db, config)
     await assertItemDelivered(orderId, itemId, 1)
+    expect(await db.selectFrom('procurement_operations').selectAll().where('order_item_id', '=', itemId).execute()).toEqual([])
     expect(supplierFixture.stats().createRequests).toBe(1)
     expect(supplierFixture.stats().executions).toBe(1)
     const delivery = (await db.selectFrom('order_item_fulfillment_deliveries as delivery')

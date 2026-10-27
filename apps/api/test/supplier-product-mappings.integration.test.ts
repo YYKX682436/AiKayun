@@ -9,6 +9,7 @@ import { hashToken } from '../src/auth/security.js'
 import { readConfig, type AppConfig } from '../src/config.js'
 import { createDatabase } from '../src/db/pool.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
+import { procurementPreparationEligibility } from '../src/commerce/procurement-identity.js'
 import type { Database } from '../src/db/types.js'
 import { fixtureKayixinCredentials, fixtureProduct, startKayixinV3Fixture } from './fixtures/kayixin-v3-server.js'
 import type { PurchaseFormDefinition, SupplierMappingRules } from '@aikayun/contracts'
@@ -449,6 +450,11 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
     expect(created.statusCode, created.body).toBe(201)
     expect(fixture.requests.length).toBe(supplierCallsBeforeCheckout)
     const orderId = created.json().data.order.id as string
+    const orderItemId = created.json().data.order.items[0].id as string
+    // This suite uses the actual production selector, not the synthetic mock.
+    expect(await db.selectFrom('order_item_procurement_sources').selectAll().where('order_id', '=', orderId).execute()).toEqual([])
+    expect(await db.transaction().execute(trx => procurementPreparationEligibility(trx, orderId, orderItemId)))
+      .toEqual({ eligible: false, reason: 'source_missing' })
 
     const current = (await inject({ method: 'GET', url: `/api/v1/admin/supplier-product-mappings/${targetMappingId}`,
       headers: adminHeaders })).json().data
@@ -465,6 +471,8 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
     expect(replay.json().data).toMatchObject({ created: false, order: { id: orderId, totalAmount: '1.00' } })
     expect(fixture.requests.length).toBe(supplierCallsBeforeReplay)
     expect(await db.selectFrom('orders').select('id').where('idempotency_key', '=', orderBody.idempotencyKey).execute()).toHaveLength(1)
+    expect(await db.selectFrom('order_item_procurement_sources').selectAll().where('order_id', '=', orderId).execute()).toEqual([])
+    expect(await db.selectFrom('procurement_operations').selectAll().where('order_item_id', '=', orderItemId).execute()).toEqual([])
     expect(await db.selectFrom('order_items').select(['unit_price', 'line_amount']).where('order_id', '=', orderId).execute())
       .toEqual([{ unit_price: '1.00', line_amount: '1.00' }])
     const publicProduct = await inject({ method: 'GET', url: `/api/v1/public/products/${targetProductId}` })

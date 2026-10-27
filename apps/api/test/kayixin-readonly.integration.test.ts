@@ -66,6 +66,7 @@ beforeAll(async () => {
     '202610260002_product_pricing_rules',
     '202610270001_supplier_quote_observations',
     '202610270002_supplier_quote_source_consistency',
+    '202610270003_procurement_identity',
   ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])
