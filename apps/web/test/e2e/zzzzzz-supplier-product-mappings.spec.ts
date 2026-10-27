@@ -378,6 +378,19 @@ test('prepares, previews, reviews and restores a supplier product mapping with t
   await expect(page.getByRole('status').filter({ hasText: '连接配置 v1' })).toBeVisible()
   await expect(page.getByText('1.23456', { exact: true }).first()).toBeVisible()
   await expect(page.getByText('币种未声明 · 单位未验证 · 非实际扣费', { exact: true })).toBeVisible()
+  // A legacy failure response must not display its stale amount as the latest quote.
+  await page.route(quoteObserveUrl, async (route) => {
+    const response = await route.fetch()
+    const payload = await response.json()
+    payload.data.outcome = 'sku_changed'
+    payload.data.failureCode = 'LOCAL_SKU_REVISION_CHANGED'
+    await route.fulfill({ response, json: payload })
+  })
+  await page.getByRole('button', { name: '读取当前映射报价', exact: true }).click()
+  const quoteSection = page.getByRole('heading', { name: '上游参考报价观察' }).locator('xpath=ancestor::section[1]')
+  await expect(quoteSection.getByText('本次没有可用报价', { exact: true }).first()).toBeVisible()
+  await expect(quoteSection.getByText('1.23456', { exact: true })).toHaveCount(0)
+  await page.unroute(quoteObserveUrl)
   const quoteStatsAfter = await (await page.request.get('http://127.0.0.1:3102/__fixture/stats')).json()
   expect(quoteStatsAfter.paths.length).toBeGreaterThan(quoteStatsBefore.paths.length)
   expect(quoteStatsAfter.paths.every((path: string) => ['/api/v3/user/getAccount', '/api/v3/goods/getList', '/api/v3/goods/getDetail'].includes(path))).toBe(true)

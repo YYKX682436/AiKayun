@@ -437,6 +437,7 @@ export type SupplierReferenceQuoteComparisonReason = 'comparable_same_source_and
   | 'different_sku' | 'different_quote_scope' | 'structure_changed' | 'quote_missing'
 
 export interface SupplierReferenceQuoteObservationsTable {
+  source_snapshot_consistent: Generated<boolean>
   id: string
   administrator_id: string
   product_id: string

@@ -299,6 +299,7 @@ const SupplierQuoteComparisonReasonSchema = Type.Union([
 ])
 
 export const SupplierReferenceQuoteObservationSchema = Type.Object({
+  sourceSnapshotConsistent: Type.Boolean(),
   id: Uuid,
   productId: Uuid,
   skuId: Uuid,

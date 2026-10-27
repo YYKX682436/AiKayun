@@ -1217,13 +1217,19 @@ onBeforeUnmount(() => { generation++; skuGeneration++; quoteOperation++; activeR
                   {{ latestQuoteObservation.mappingStatus === 'reviewed' ? '映射已审核' : latestQuoteObservation.mappingStatus === 'stale' ? '映射已过期' : latestQuoteObservation.mappingStatus === 'draft' ? '映射草稿' : '无映射' }}
                 </UBadge>
               </div>
+              <p
+                v-if="!latestQuoteObservation.sourceSnapshotConsistent"
+                class="mt-3 text-sm text-muted"
+              >
+                旧版失败记录的来源无法确认；历史记录保持不变，请主动重新读取。
+              </p>
               <dl class="mt-4 grid gap-3 text-sm sm:grid-cols-2 xl:grid-cols-4">
                 <div class="rounded-lg bg-elevated p-3">
                   <dt class="text-muted">
                     上游原始参考报价
                   </dt>
                   <dd class="mt-1 break-all font-mono text-lg font-semibold tabular-nums text-highlighted">
-                    {{ latestQuoteObservation.quoteAmount ?? '未提供' }}
+                    {{ latestQuoteObservation.outcome === 'observed' && latestQuoteObservation.quoteAmount !== null ? latestQuoteObservation.quoteAmount : '本次没有可用报价' }}
                   </dd>
                   <dd class="mt-1 text-xs text-muted">
                     币种未声明 · 单位未验证 · 非实际扣费
@@ -1309,7 +1315,7 @@ onBeforeUnmount(() => { generation++; skuGeneration++; quoteOperation++; activeR
                 :key="item.id"
                 class="flex flex-col gap-1 rounded-lg border border-default p-3 text-sm sm:flex-row sm:items-center sm:justify-between"
               >
-                <span class="min-w-0 break-words text-highlighted">{{ formatDate(item.observedAt) }} · {{ quoteOutcomeLabel(item.outcome) }} · 原值 {{ item.quoteAmount ?? '缺失' }}</span>
+                <span class="min-w-0 break-words text-highlighted">{{ formatDate(item.observedAt) }} · {{ quoteOutcomeLabel(item.outcome) }} · {{ item.outcome === 'observed' && item.quoteAmount !== null ? `原值 ${item.quoteAmount}` : '本次没有可用报价' }}</span>
                 <span class="shrink-0 text-xs text-muted">配置 v{{ item.source?.configurationVersionNumber ?? '—' }} · {{ item.mappingStatus === 'reviewed' ? '审核映射' : '不可用映射' }}</span>
               </li>
             </ul>

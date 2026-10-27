@@ -371,21 +371,23 @@ type QuoteAttempt = {
 }
 
 function quoteObservationFromRow(row: QuoteObservationRow): SupplierReferenceQuoteObservation {
+  const sourceSnapshotConsistent = row.source_snapshot_consistent || row.outcome === 'observed' || row.outcome === 'quote_missing'
   return {
+    sourceSnapshotConsistent,
     id: row.id, productId: row.product_id, skuId: row.product_variant_id,
-    mappingId: row.mapping_id, mappingVersionId: row.mapping_version_id,
-    mappingRevision: row.mapping_revision, mappingStatus: row.mapping_status,
-    source: row.supplier_connection_id && row.supplier_connection_version_id && row.configuration_version_number
+    mappingId: sourceSnapshotConsistent ? row.mapping_id : null, mappingVersionId: sourceSnapshotConsistent ? row.mapping_version_id : null,
+    mappingRevision: sourceSnapshotConsistent ? row.mapping_revision : null, mappingStatus: sourceSnapshotConsistent ? row.mapping_status : 'none',
+    source: sourceSnapshotConsistent && row.supplier_connection_id && row.supplier_connection_version_id && row.configuration_version_number
       ? { connectionId: row.supplier_connection_id, configurationVersionId: row.supplier_connection_version_id,
           configurationVersionNumber: row.configuration_version_number, protocol: 'kayixin_customer_v3' }
       : null,
-    upstreamProductId: row.upstream_product_id, upstreamSkuType: row.upstream_sku_type,
-    upstreamSkuCode: row.upstream_sku_code, upstreamCombination: row.upstream_combination,
-    quoteScope: row.quote_scope, quoteAmount: row.quote_amount, quoteCurrency: null,
-    currencyStatus: 'unspecified', quoteBasis: row.quote_basis,
+    upstreamProductId: sourceSnapshotConsistent ? row.upstream_product_id : null, upstreamSkuType: sourceSnapshotConsistent ? row.upstream_sku_type : null,
+    upstreamSkuCode: sourceSnapshotConsistent ? row.upstream_sku_code : null, upstreamCombination: sourceSnapshotConsistent ? row.upstream_combination : [],
+    quoteScope: sourceSnapshotConsistent ? row.quote_scope : null, quoteAmount: row.outcome === 'observed' ? row.quote_amount : null, quoteCurrency: null,
+    currencyStatus: 'unspecified', quoteBasis: sourceSnapshotConsistent ? row.quote_basis : null,
     quoteUnitStatus: 'unverified', actualDebitVerified: false, outcome: row.outcome,
-    observedAt: row.observed_at.toISOString(), sourceReadAt: row.source_read_at?.toISOString() ?? null,
-    structureFingerprint: row.structure_fingerprint, failureCode: row.failure_code,
+    observedAt: row.observed_at.toISOString(), sourceReadAt: sourceSnapshotConsistent ? row.source_read_at?.toISOString() ?? null : null,
+    structureFingerprint: sourceSnapshotConsistent ? row.structure_fingerprint : null, failureCode: row.failure_code,
     comparison: {
       comparable: row.comparable_to_previous, reason: row.comparison_reason,
       previousObservationId: row.previous_observation_id, previousAmount: row.previous_amount,
@@ -426,7 +428,7 @@ async function insertQuoteObservation(db: MappingDb, administratorId: string, pr
   const observedAt = new Date()
   const mapping = attempt.mapping
   const row = await db.insertInto('supplier_reference_quote_observations').values({
-    id, administrator_id: administratorId, product_id: productId, product_variant_id: skuId,
+    id, administrator_id: administratorId, product_id: productId, product_variant_id: skuId, source_snapshot_consistent: true,
     mapping_id: mapping?.id ?? null, mapping_version_id: mapping?.reviewedVersionId ?? null,
     mapping_revision: mapping?.revision ?? null, mapping_status: mapping?.status ?? 'none',
     supplier_connection_id: mapping?.connectionId ?? null,
@@ -681,6 +683,12 @@ export function registerAdminSupplierProductMappingRoutes(app: FastifyInstance, 
         throw new MappingAdminError(409, 'QUOTE_OBSERVATION_MAPPING_CHANGED', '供应商映射已变化，请重新读取后再观察报价。')
       }
       mapping = head ? await loadMapping(db, head.id) : null
+      if (mapping && mapping.revision !== body.expectedMappingRevision) {
+        throw new MappingAdminError(409, 'QUOTE_OBSERVATION_MAPPING_CHANGED', '供应商映射已变化，请重新读取后再观察报价。')
+      }
+      // This snapshot is the source selected before the upstream request. Never
+      // replace it with the mapping found after an in-flight read.
+      const sourceMapping = mapping
       if (!mapping) {
         attempt = failedQuoteAttempt(null, 'mapping_missing', 'SUPPLIER_MAPPING_MISSING')
       } else if (mapping.status === 'stale') {
@@ -800,8 +808,10 @@ export function registerAdminSupplierProductMappingRoutes(app: FastifyInstance, 
             attempt.mapping = mapping
           }
         }
-        if (mapping) attempt.mapping = mapping
-        return insertQuoteObservation(trx, request.admin!.id, productId, skuId, attempt)
+        const finalAttempt = attempt.outcome === 'observed' || attempt.outcome === 'quote_missing'
+          ? { ...attempt, mapping: sourceMapping }
+          : { ...failedQuoteAttempt(sourceMapping, attempt.outcome, attempt.failureCode), sourceReadAt: attempt.sourceReadAt }
+        return insertQuoteObservation(trx, request.admin!.id, productId, skuId, finalAttempt)
       })
       return reply.send(success(observation, request.id))
     } catch (error) { return sendError(reply, error, request.id) }

@@ -598,6 +598,164 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
     expect(switchedHistory.json().data.items.some((item: { connectionId: string }) => item.connectionId === connectionId)).toBe(true)
   }, 90_000)
 
+  async function startRacingQuote() {
+    const mapping = (await inject({ method: 'GET', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders })).json().data
+    const target = await db.selectFrom('products').innerJoin('product_variants', 'product_variants.product_id', 'products.id')
+      .select(['products.revision as product_revision', 'product_variants.revision as sku_revision'])
+      .where('products.id', '=', productId).where('product_variants.id', '=', skuId).executeTakeFirstOrThrow()
+    const pause = fixture.pauseNextGoodDetail()
+    const response = inject({ method: 'POST', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes/observe`,
+      headers: adminHeaders, payload: { expectedProductRevision: target.product_revision, expectedSkuRevision: target.sku_revision,
+        expectedMappingRevision: mapping.revision } })
+    await pause.received
+    return { mapping, pause, response }
+  }
+
+  it('R1 rejects a delayed A quote when another administrator reviews a B mapping', async () => {
+    const secondId = randomUUID()
+    const secondEmail = `quote-race-${secondId.slice(0, 8)}@example.test`
+    await db.insertInto('admin_users').values({ id: secondId, email: secondEmail, password_hash: await hashPassword(adminPassword) }).execute()
+    const csrf = await inject({ method: 'GET', url: '/api/v1/admin/auth/csrf' })
+    const csrfCookie = cookie(csrf, 'aikayun_admin_csrf')
+    const login = await inject({ method: 'POST', url: '/api/v1/admin/auth/login', headers: { origin, cookie: csrfCookie,
+      'x-csrf-token': csrf.json().data.csrfToken }, payload: { email: secondEmail, password: adminPassword } })
+    expect(login.statusCode, login.body).toBe(200)
+    const otherHeaders = { origin, cookie: `${csrfCookie}; ${cookie(login, 'aikayun_admin_session')}`,
+      'x-csrf-token': csrf.json().data.csrfToken }
+    const created = await inject({ method: 'POST', url: '/api/v1/admin/supplier-connections', headers: otherHeaders,
+      payload: { name: 'R1 供应商 B', providerType: 'kayixin_customer_v3', baseUrl: fixture.baseUrl, credentials: fixtureKayixinCredentials } })
+    expect(created.statusCode, created.body).toBe(201)
+    const sourceB = created.json().data[0]
+    const bObservation = await inject({ method: 'POST', url: '/api/v1/admin/supplier-product-mappings/observe', headers: otherHeaders,
+      payload: { connectionId: sourceB.id, expectedConfigurationVersionId: sourceB.currentVersion.id,
+        upstreamProductId: '201001', upstreamSkuType: 1, upstreamSkuCode: 'cn-member' } })
+    expect(bObservation.statusCode, bObservation.body).toBe(200)
+    const pricesBefore = await db.selectFrom('product_variants').select(['cost_price', 'sale_price', 'compare_at_price']).where('id', '=', skuId).executeTakeFirstOrThrow()
+    const ordersBefore = await db.selectFrom('orders').select(sql<string>`count(*)::text`.as('count')).executeTakeFirstOrThrow()
+    const race = await startRacingQuote()
+    try {
+      const saved = await inject({ method: 'PUT', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: otherHeaders,
+        payload: { expectedRevision: race.mapping.revision, productId, skuId, observationId: bObservation.json().data.id,
+          templateVersionId: race.mapping.templateVersion.id, rules } })
+      expect(saved.statusCode, saved.body).toBe(200)
+      const reviewed = await inject({ method: 'POST', url: `/api/v1/admin/supplier-product-mappings/${mappingId}/review`, headers: otherHeaders,
+        payload: { expectedRevision: saved.json().data.revision } })
+      expect(reviewed.statusCode, reviewed.body).toBe(200)
+      expect(reviewed.json().data.reviewed).toBe(true)
+    } finally { race.pause.release() }
+    const result = await race.response
+    expect(result.statusCode, result.body).toBe(200)
+    expect(result.json().data).toMatchObject({ outcome: 'mapping_changed', quoteAmount: null,
+      source: { connectionId: race.mapping.connectionId }, upstreamSkuCode: race.mapping.upstreamSkuCode,
+      comparison: { comparable: false, rawReferenceDelta: null } })
+    const history = await inject({ method: 'GET', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes`, headers: adminHeaders })
+    expect(history.json().data.items[0]).toMatchObject({ id: result.json().data.id, quoteAmount: null })
+    expect(history.body).not.toContain(fixtureKayixinCredentials.appSecret)
+    expect(await db.selectFrom('product_variants').select(['cost_price', 'sale_price', 'compare_at_price']).where('id', '=', skuId).executeTakeFirstOrThrow()).toEqual(pricesBefore)
+    expect(await db.selectFrom('orders').select(sql<string>`count(*)::text`.as('count')).executeTakeFirstOrThrow()).toEqual(ordersBefore)
+    const current = (await inject({ method: 'GET', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders })).json().data
+    const revisions = await db.selectFrom('products').innerJoin('product_variants', 'product_variants.product_id', 'products.id')
+      .select(['products.revision as product_revision', 'product_variants.revision as sku_revision'])
+      .where('products.id', '=', productId).where('product_variants.id', '=', skuId).executeTakeFirstOrThrow()
+    const next = await inject({ method: 'POST', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes/observe`, headers: adminHeaders,
+      payload: { expectedProductRevision: revisions.product_revision, expectedSkuRevision: revisions.sku_revision, expectedMappingRevision: current.revision } })
+    expect(next.statusCode, next.body).toBe(200)
+    expect(next.json().data).toMatchObject({ outcome: 'observed', comparison: { comparable: false,
+      reason: 'previous_observation_unusable', rawReferenceDelta: null } })
+    expect(fixture.requests.every(request => ['/api/v3/user/getAccount', '/api/v3/goods/getList', '/api/v3/goods/getDetail'].includes(request.path))).toBe(true)
+  })
+
+  it('R1 discards a delayed quote when the local SKU revision changes', async () => {
+    const race = await startRacingQuote()
+    try {
+      await db.updateTable('product_variants').set({ sku_code: `R1-${skuId.slice(0, 8)}` }).where('id', '=', skuId).execute()
+    } finally { race.pause.release() }
+    const result = await race.response
+    expect(result.statusCode, result.body).toBe(200)
+    expect(result.json().data).toMatchObject({ outcome: 'sku_changed', quoteAmount: null,
+      source: { connectionId: race.mapping.connectionId }, comparison: { comparable: false, rawReferenceDelta: null } })
+  })
+
+  it('R1 discards a delayed quote when the same mapping receives a new revision', async () => {
+    const mapping = (await inject({ method: 'GET', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders })).json().data
+    const observation = await createObservation(mapping.upstreamProductId, mapping.upstreamSkuType, mapping.upstreamSkuCode, mapping.connectionId)
+    expect(observation.statusCode, observation.body).toBe(200)
+    const race = await startRacingQuote()
+    try {
+      const saved = await inject({ method: 'PUT', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders,
+        payload: { expectedRevision: race.mapping.revision, productId, skuId, observationId: observation.json().data.id,
+          templateVersionId: race.mapping.templateVersion.id, rules } })
+      expect(saved.statusCode, saved.body).toBe(200)
+    } finally { race.pause.release() }
+    const result = await race.response
+    expect(result.statusCode, result.body).toBe(200)
+    expect(result.json().data).toMatchObject({ outcome: 'mapping_changed', quoteAmount: null,
+      mappingRevision: race.mapping.revision, comparison: { comparable: false, rawReferenceDelta: null } })
+  })
+
+  it('R1 records a changed upstream structure without a comparable quote', async () => {
+    const mapping = (await inject({ method: 'GET', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders })).json().data
+    const reviewed = await inject({ method: 'POST', url: `/api/v1/admin/supplier-product-mappings/${mappingId}/review`, headers: adminHeaders,
+      payload: { expectedRevision: mapping.revision } })
+    expect(reviewed.statusCode, reviewed.body).toBe(200)
+    expect(reviewed.json().data.reviewed).toBe(true)
+    fixture.setData((path, body) => {
+      if (!path.endsWith('/getDetail')) return { balance: '1.00' }
+      const product = fixtureProduct(Number(body.goodsId)) as FixtureProductData
+      const deep = product.rechargeTemplates?.[5]?.options?.[0]?.expand?.[0]?.options?.[0]?.expand?.[0]
+      if (deep) deep.required = 1
+      ensureAlternateCascadeOption(product)
+      return product
+    })
+    try {
+      const target = await db.selectFrom('products').innerJoin('product_variants', 'product_variants.product_id', 'products.id')
+        .select(['products.revision as product_revision', 'product_variants.revision as sku_revision'])
+        .where('products.id', '=', productId).where('product_variants.id', '=', skuId).executeTakeFirstOrThrow()
+      const result = await inject({ method: 'POST', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes/observe`, headers: adminHeaders,
+        payload: { expectedProductRevision: target.product_revision, expectedSkuRevision: target.sku_revision,
+          expectedMappingRevision: reviewed.json().data.mapping.revision } })
+      expect(result.statusCode, result.body).toBe(200)
+      expect(result.json().data).toMatchObject({ outcome: 'structure_changed', quoteAmount: null,
+        comparison: { comparable: false, rawReferenceDelta: null } })
+      const latestMapping = await inject({ method: 'GET', url: `/api/v1/admin/supplier-product-mappings/${mappingId}`, headers: adminHeaders })
+      expect(latestMapping.json().data.status).toBe('stale')
+    } finally { setProductOverride() }
+  })
+
+  it('R1 upgrades immutable legacy failures without presenting their uncertain source or amount', async () => {
+    const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
+    const down = await migrator.migrateTo('202610270001_supplier_quote_observations')
+    if (down.error) throw down.error
+    const legacyId = randomUUID()
+    await sql`
+      INSERT INTO supplier_reference_quote_observations (
+        id, administrator_id, product_id, product_variant_id, mapping_id, mapping_version_id, mapping_revision, mapping_status,
+        supplier_connection_id, supplier_connection_version_id, configuration_version_number, upstream_product_id, upstream_sku_type,
+        upstream_sku_code, upstream_combination, quote_scope, quote_amount, quote_currency, currency_status, quote_basis,
+        quote_unit_status, actual_debit_verified, outcome, observed_at, source_read_at, structure_fingerprint, failure_code,
+        comparable_to_previous, comparison_reason, previous_observation_id, previous_amount, raw_reference_delta
+      ) SELECT ${legacyId}::uuid, administrator_id, product_id, product_variant_id, mapping_id, mapping_version_id, mapping_revision, mapping_status,
+        supplier_connection_id, supplier_connection_version_id, configuration_version_number, upstream_product_id, upstream_sku_type,
+        upstream_sku_code, upstream_combination, quote_scope, quote_amount, quote_currency, currency_status, quote_basis,
+        quote_unit_status, actual_debit_verified, 'mapping_changed', clock_timestamp(), source_read_at, structure_fingerprint, 'LEGACY_RACE',
+        false, 'previous_observation_unusable', NULL, NULL, NULL
+      FROM supplier_reference_quote_observations WHERE product_id = ${productId}::uuid AND outcome = 'observed' LIMIT 1
+    `.execute(db)
+    const up = await migrator.migrateToLatest()
+    if (up.error) throw up.error
+    const raw = await db.selectFrom('supplier_reference_quote_observations').selectAll().where('id', '=', legacyId).executeTakeFirstOrThrow()
+    expect(raw.quote_amount).not.toBeNull()
+    expect(raw.source_snapshot_consistent).toBe(false)
+    const history = await inject({ method: 'GET', url: `/api/v1/admin/products/${productId}/variants/${skuId}/reference-quotes`, headers: adminHeaders })
+    const legacy = history.json().data.items.find((item: { id: string }) => item.id === legacyId)
+    expect(legacy).toMatchObject({ outcome: 'mapping_changed', sourceSnapshotConsistent: false,
+      source: null, mappingId: null, upstreamProductId: null, upstreamSkuCode: null, quoteAmount: null })
+    await expect(db.updateTable('supplier_reference_quote_observations').set({ quote_amount: null }).where('id', '=', legacyId).execute()).rejects.toThrow()
+    await expect(sql`INSERT INTO supplier_reference_quote_observations
+      (id, administrator_id, product_id, product_variant_id, mapping_status, outcome, quote_amount, comparison_reason)
+      VALUES (${randomUUID()}::uuid, ${adminId}::uuid, ${productId}::uuid, ${skuId}::uuid, 'none', 'sku_changed', '1.00', 'first_observation')`.execute(db)).rejects.toThrow()
+  })
+
   it('lets the existing safe product delete cascade the mutable mapping head without deleting audit history', async () => {
     const currentProduct = await db.selectFrom('products').select(['revision']).where('id', '=', productId).executeTakeFirstOrThrow()
     const deleted = await inject({ method: 'DELETE', url: `/api/v1/admin/products/${productId}`, headers: adminHeaders,

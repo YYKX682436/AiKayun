@@ -265,7 +265,7 @@ test('configures and safely delivers an encrypted fixed Markdown version through
   expect(await publicHtml.text()).not.toContain(secretText)
   await page.context().grantPermissions(['clipboard-read', 'clipboard-write'])
   await page.getByRole('button', { name: '复制第 1 件交付内容' }).click()
-  await expect(page.getByRole('status')).toContainText('交付内容已复制')
+  await expect(page.getByRole('status').filter({ hasText: '交付内容已复制到剪贴板。' })).toBeVisible()
   expect(await page.evaluate(() => navigator.clipboard.readText())).toContain(secretText)
   const detailResponse = await page.reload()
   expect(detailResponse?.headers()['cache-control']).toContain('private')
