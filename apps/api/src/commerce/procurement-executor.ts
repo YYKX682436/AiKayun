@@ -81,14 +81,6 @@ async function claim(db: Kysely<Database>, id: string, leaseMs: number): Promise
     await sql`SELECT id FROM order_items WHERE id = ${initial.order_item_id}::uuid FOR UPDATE`.execute(trx)
     const current = await operationRow(trx, id)
     if (!current || !['prepared', 'submit_in_flight', 'accepted_pending', 'unknown', 'success_pending_finalize'].includes(current.state)) return undefined
-    if (current.state === 'success_pending_finalize') {
-      const remaining = await sql<{ exists: boolean }>`SELECT EXISTS (SELECT 1 FROM procurement_operation_units
-        WHERE operation_id=${id}::uuid AND (state IN ('allocated','unknown','manual_review')
-          OR (state='success_pending_finalize' AND NOT EXISTS (SELECT 1 FROM procurement_execution_evidence e
-            WHERE e.operation_id=procurement_operation_units.operation_id AND e.kind='delivery_confirmed'
-              AND procurement_operation_units.unit_index=ANY(e.unit_indices))))) AS exists`.execute(trx)
-      if (!remaining.rows[0]!.exists) return undefined
-    }
     if (current.state === 'prepared') {
       const conflict = await sql<{ exists: boolean }>`SELECT procurement_unit_has_prior_execution(${id}::uuid) AS exists`.execute(trx)
       if (conflict.rows[0]!.exists) {
@@ -102,7 +94,10 @@ async function claim(db: Kysely<Database>, id: string, leaseMs: number): Promise
         if (error instanceof ProcurementRiskError) return undefined
         throw error
       }
-    } else if (!await readProcurementRisk(trx, id)) return undefined
+    } else {
+      if (!await readProcurementRisk(trx, id)) return undefined
+      await lockProcurementRiskPolicy(trx, id)
+    }
     await sql`SELECT id FROM procurement_operations WHERE id = ${id}::uuid FOR UPDATE`.execute(trx)
     await sql`INSERT INTO procurement_execution_leases(operation_id) VALUES (${id}::uuid) ON CONFLICT DO NOTHING`.execute(trx)
     const lease = (await sql<Lease>`SELECT lease_token, lease_expires_at, request_generation, next_action_at
@@ -116,18 +111,27 @@ async function claim(db: Kysely<Database>, id: string, leaseMs: number): Promise
       await sql`UPDATE procurement_operation_units SET state = 'unknown' WHERE operation_id = ${id}::uuid AND state = 'allocated'`.execute(trx)
       state = 'unknown'
     }
-    const action = state === 'prepared' ? 'submit' : 'query'
-    const observedNumbers = (await sql<{ supplier_order_number: string }>`SELECT DISTINCT supplier_order_number
-      FROM procurement_execution_evidence WHERE operation_id=${id}::uuid AND supplier_order_number IS NOT NULL`.execute(trx)).rows
-    if (observedNumbers.length > 1) {
-      if (state !== 'manual_review') {
-        await sql`UPDATE procurement_operations SET state='manual_review',revision=revision+1 WHERE id=${id}::uuid`.execute(trx)
-        await sql`UPDATE procurement_operation_units SET state='manual_review' WHERE operation_id=${id}::uuid
-          AND state IN ('allocated','unknown','success_pending_finalize')`.execute(trx)
-      }
+    const facts = (await sql<{ supplier_order_number: string | null; kind: string }>`SELECT DISTINCT supplier_order_number,kind
+      FROM procurement_execution_evidence WHERE operation_id=${id}::uuid
+        AND (supplier_order_number IS NOT NULL OR kind='identity_conflict')`.execute(trx)).rows
+    const observedNumbers = [...new Set(facts.filter(fact => fact.kind !== 'identity_conflict' && fact.supplier_order_number !== null)
+      .map(fact => fact.supplier_order_number!))]
+    if (facts.some(fact => fact.kind === 'identity_conflict') || observedNumbers.length > 1) {
+      await sql`UPDATE procurement_operations SET state='manual_review',revision=revision+1 WHERE id=${id}::uuid`.execute(trx)
+      await sql`UPDATE procurement_operation_units SET state='manual_review' WHERE operation_id=${id}::uuid
+        AND state IN ('allocated','unknown','success_pending_finalize')`.execute(trx)
       return undefined
     }
-    const knownNumber = current.supplier_order_number ?? observedNumbers[0]?.supplier_order_number ?? null
+    if (current.state === 'success_pending_finalize') {
+      const remaining = await sql<{ exists: boolean }>`SELECT EXISTS (SELECT 1 FROM procurement_operation_units
+        WHERE operation_id=${id}::uuid AND (state IN ('allocated','unknown','manual_review')
+          OR (state='success_pending_finalize' AND NOT EXISTS (SELECT 1 FROM procurement_execution_evidence e
+            WHERE e.operation_id=procurement_operation_units.operation_id AND e.kind='delivery_confirmed'
+              AND procurement_operation_units.unit_index=ANY(e.unit_indices))))) AS exists`.execute(trx)
+      if (!remaining.rows[0]!.exists) return undefined
+    }
+    const action = state === 'prepared' ? 'submit' : 'query'
+    const knownNumber = current.supplier_order_number ?? observedNumbers[0] ?? null
     const token = randomUUID()
     const generation = Number(lease.request_generation) + 1
     if (!Number.isSafeInteger(generation)) throw new Error('Procurement generation exhausted')
@@ -172,9 +176,12 @@ async function record(db: Kysely<Database>, claimed: Claim, raw: ProcurementFixt
     await lockProcurementRiskPolicy(trx, op.id)
     if (result.supplierOrderNumber) await sql`SELECT pg_advisory_xact_lock(hashtextextended(
       ${'procurement-number:' + op.supplier_connection_id + ':' + result.supplierOrderNumber}, 0))`.execute(trx)
-    const historicalNumbers = (await sql<{ supplier_order_number: string }>`SELECT DISTINCT supplier_order_number
-      FROM procurement_execution_evidence WHERE operation_id=${op.id}::uuid AND supplier_order_number IS NOT NULL`.execute(trx)).rows
-      .map(row => row.supplier_order_number)
+    const historicalFacts = (await sql<{ supplier_order_number: string | null; kind: string }>`SELECT DISTINCT supplier_order_number,kind
+      FROM procurement_execution_evidence WHERE operation_id=${op.id}::uuid
+        AND (supplier_order_number IS NOT NULL OR kind='identity_conflict')`.execute(trx)).rows
+    const priorConflict = historicalFacts.some(fact => fact.kind === 'identity_conflict')
+    const historicalNumbers = [...new Set(historicalFacts.filter(fact => fact.kind !== 'identity_conflict' && fact.supplier_order_number !== null)
+      .map(fact => fact.supplier_order_number!))]
     const numberConflict = historicalNumbers.length > 1 || (result.supplierOrderNumber !== null
       && ((op.supplier_order_number !== null && result.supplierOrderNumber !== op.supplier_order_number)
         || historicalNumbers.some(number => number !== result.supplierOrderNumber)))
@@ -210,13 +217,13 @@ async function record(db: Kysely<Database>, claimed: Claim, raw: ProcurementFixt
     const current = await operationRow(trx, op.id)
     if (!current || ['completed', 'rejected'].includes(current.state)) return
     // A rejection is retained for manual adjudication; no implicit budget release occurs.
-    let next = kind === 'identity_conflict' || collision || kind === 'rejected'
+    let next = kind === 'identity_conflict' || priorConflict || collision || kind === 'rejected'
       || (kind === 'not_found' && (current.supplier_order_number !== null || claimed.supplierOrderNumber !== null)) ? 'manual_review'
       : kind === 'success' ? 'success_pending_finalize'
         : kind === 'accepted' || kind === 'pending' ? 'accepted_pending' : 'unknown'
-    if (current.state === 'success_pending_finalize' && !collision
+    if (current.state === 'success_pending_finalize' && !collision && !priorConflict
       && kind !== 'identity_conflict' && kind !== 'rejected') next = 'success_pending_finalize'
-    const number = current.supplier_order_number ?? (kind === 'identity_conflict' ? null : result.supplierOrderNumber ?? claimed.supplierOrderNumber)
+    const number = current.supplier_order_number ?? (kind === 'identity_conflict' || priorConflict ? null : result.supplierOrderNumber ?? claimed.supplierOrderNumber)
     if (next !== current.state || number !== current.supplier_order_number) {
       await sql`UPDATE procurement_operations SET state = ${next}, supplier_order_number = ${number}, revision = revision + 1
         WHERE id = ${op.id}::uuid`.execute(trx)

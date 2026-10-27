@@ -69,6 +69,7 @@ beforeAll(async () => {
     '202610270003_procurement_identity',
     '202610270004_procurement_risk_budget',
     '202610270005_procurement_execution',
+    '202610270006_procurement_identity_conflict_guard',
   ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])

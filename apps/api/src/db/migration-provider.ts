@@ -41,6 +41,7 @@ import { supplierQuoteSourceConsistencyMigration } from './migrations/2026102700
 import { procurementIdentityMigration } from './migrations/202610270003_procurement_identity.js'
 import { procurementRiskBudgetMigration } from './migrations/202610270004_procurement_risk_budget.js'
 import { procurementExecutionMigration } from './migrations/202610270005_procurement_execution.js'
+import { procurementIdentityConflictGuardMigration } from './migrations/202610270006_procurement_identity_conflict_guard.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -86,6 +87,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610270003_procurement_identity': procurementIdentityMigration,
       '202610270004_procurement_risk_budget': procurementRiskBudgetMigration,
       '202610270005_procurement_execution': procurementExecutionMigration,
+      '202610270006_procurement_identity_conflict_guard': procurementIdentityConflictGuardMigration,
     }
   }
 }

@@ -75,6 +75,9 @@ export async function finalizeProcurementUnit(
     const conflicts = await sql<{ conflict: boolean }>`
       SELECT EXISTS (
         SELECT 1 FROM procurement_execution_evidence evidence
+        WHERE evidence.operation_id = ${operationId}::uuid AND evidence.kind = 'identity_conflict'
+      ) OR EXISTS (
+        SELECT 1 FROM procurement_execution_evidence evidence
         JOIN procurement_operations other ON other.id = evidence.operation_id
         JOIN order_item_procurement_sources source ON source.id = other.source_id
         WHERE evidence.supplier_order_number = ${provider.supplier_order_number}

@@ -660,6 +660,335 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
     } finally { release.open(); await server.close() }
   })
 
+
+  it('does not query by an unowned number from a late identity conflict', async () => {
+    const op = await readyOperation(), entered = gate(), release = gate(), requests: ProcurementFixtureRequest[] = []
+    const server = await fixtureServer(async request => {
+      requests.push(request); entered.open(); await release.promise
+      return { requestIdentity: 'wrong-synthetic-identity', kind: 'accepted', supplierOrderNumber: 'unowned-late-number', responseDigest: digest }
+    })
+    try {
+      const pending = runProcurementFixturePass(db, op.id, server.transport, async () => true)
+      await entered.promise
+      await sql`UPDATE procurement_execution_leases SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE operation_id=${op.id}::uuid`.execute(db)
+      release.open(); await pending
+      expect(await runProcurementFixturePass(secondDb, op.id, server.transport, async () => true)).toBe(false)
+      expect(requests.map(request => request.action)).toEqual(['submit'])
+      expect(await db.selectFrom('procurement_operations').select(['state','supplier_order_number']).where('id', '=', op.id).executeTakeFirstOrThrow())
+        .toEqual({ state: 'manual_review', supplier_order_number: null })
+      const facts = await sql<{ kind: string; supplier_order_number: string }>`SELECT kind,supplier_order_number FROM procurement_execution_evidence
+        WHERE operation_id=${op.id}::uuid`.execute(db)
+      expect(facts.rows).toEqual([{ kind: 'identity_conflict', supplier_order_number: 'unowned-late-number' }])
+    } finally { release.open(); await server.close() }
+  })
+
+  it('records a later attributable number but routes an in-flight query to review after an old identity conflict', async () => {
+    const op = await readyOperation(), submitEntered = gate(), submitRelease = gate(), queryEntered = gate(), queryRelease = gate()
+    const requests: ProcurementFixtureRequest[] = []
+    const server = await fixtureServer(async request => {
+      requests.push(request)
+      if (request.action === 'submit') {
+        submitEntered.open(); await submitRelease.promise
+        return { requestIdentity: 'wrong-synthetic-identity', kind: 'accepted', supplierOrderNumber: 'unowned-old-number', responseDigest: digest }
+      }
+      queryEntered.open(); await queryRelease.promise
+      return { requestIdentity: request.requestIdentity, kind: 'accepted', supplierOrderNumber: 'attributable-new-number', responseDigest: digest }
+    })
+    try {
+      const first = runProcurementFixturePass(db, op.id, server.transport, async () => true)
+      await submitEntered.promise
+      await sql`UPDATE procurement_execution_leases SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE operation_id=${op.id}::uuid`.execute(db)
+      const second = runProcurementFixturePass(secondDb, op.id, server.transport, async () => true)
+      await queryEntered.promise
+      expect(requests[1]!.supplierOrderNumber).toBeNull()
+      submitRelease.open(); await first
+      queryRelease.open(); await second
+      expect(await db.selectFrom('procurement_operations').select(['state','supplier_order_number']).where('id', '=', op.id).executeTakeFirstOrThrow())
+        .toEqual({ state: 'manual_review', supplier_order_number: null })
+      const facts = await sql<{ kind: string; supplier_order_number: string }>`SELECT kind,supplier_order_number FROM procurement_execution_evidence
+        WHERE operation_id=${op.id}::uuid ORDER BY observed_at`.execute(db)
+      expect(facts.rows).toEqual([{ kind: 'identity_conflict', supplier_order_number: 'unowned-old-number' },
+        { kind: 'accepted', supplier_order_number: 'attributable-new-number' }])
+      await expect(sql`UPDATE procurement_operations SET supplier_order_number='attributable-new-number',revision=revision+1
+        WHERE id=${op.id}::uuid`.execute(db)).rejects.toMatchObject({ constraint: 'procurement_number_evidence_conflict' })
+    } finally { submitRelease.open(); queryRelease.open(); await server.close() }
+  })
+
+
+  it.each(['same', 'missing'] as const)('blocks finalization after a late identity conflict with %s supplier number', async numberKind => {
+    const op = await readyOperation(), entered = gate(), release = gate()
+    const server = await fixtureServer(async request => {
+      if (request.action === 'submit') {
+        entered.open(); await release.promise
+        return { requestIdentity: 'wrong-synthetic-identity', kind: 'accepted',
+          supplierOrderNumber: numberKind === 'same' ? 'trusted-known-number' : null, responseDigest: digest }
+      }
+      return { requestIdentity: request.requestIdentity, kind: 'success', supplierOrderNumber: 'trusted-known-number',
+        unitIndices: [1], deliveryConfirmed: true, responseDigest: digest }
+    })
+    try {
+      const pending = runProcurementFixturePass(db, op.id, server.transport, async () => true)
+      await entered.promise
+      await sql`UPDATE procurement_execution_leases SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE operation_id=${op.id}::uuid`.execute(db)
+      await runProcurementFixturePass(secondDb, op.id, server.transport, async () => true)
+      release.open(); await pending
+      expect(await finalizeProcurementUnit(db, op.id, 1)).toBe('not_ready')
+      const row = await db.selectFrom('procurement_operations').select('order_item_id').where('id', '=', op.id).executeTakeFirstOrThrow()
+      await expect(sql`INSERT INTO order_item_fulfillment_attempts
+        (id,order_item_id,operation_id,quantity,status,delivery_source,started_by_admin_id,procurement_operation_id,procurement_unit_index)
+        VALUES (${randomUUID()}::uuid,${row.order_item_id}::uuid,${randomUUID()}::uuid,1,'processing','procurement',NULL,${op.id}::uuid,1)`.execute(db)).rejects.toThrow()
+      expect(await db.selectFrom('order_item_fulfillment_attempts').select('id').where('order_item_id', '=', row.order_item_id).execute()).toEqual([])
+    } finally { release.open(); await server.close() }
+  })
+
+
+  it('rejects direct submission specifically on unresolved identity conflict', async () => {
+    const op = await readyOperation()
+    const source = (await sql<{ order_id: string; order_item_id: string; local_business_number: string }>`
+      SELECT s.order_id,o.order_item_id,o.local_business_number FROM procurement_operations o
+      JOIN order_item_procurement_sources s ON s.id=o.source_id WHERE o.id=${op.id}::uuid`.execute(db)).rows[0]!
+    await db.transaction().execute(async trx => {
+      await sql`SELECT id FROM orders WHERE id=${source.order_id}::uuid FOR UPDATE`.execute(trx)
+      await sql`SELECT id FROM order_items WHERE id=${source.order_item_id}::uuid FOR UPDATE`.execute(trx)
+      await lockProcurementRiskPolicy(trx, op.id)
+      await sql`INSERT INTO procurement_execution_leases(operation_id,lease_token,lease_expires_at,request_generation)
+        VALUES (${op.id}::uuid,${randomUUID()}::uuid,clock_timestamp()+interval '1 minute',1)`.execute(trx)
+      await sql`INSERT INTO procurement_request_intents(id,operation_id,generation,action,request_identity)
+        VALUES (${randomUUID()}::uuid,${op.id}::uuid,1,'submit',${source.local_business_number})`.execute(trx)
+      // A savepoint proves the exact same update is legal before the conflict.
+      await sql`SAVEPOINT before_conflict`.execute(trx)
+      await sql`UPDATE procurement_operations SET state='submit_in_flight',revision=revision+1 WHERE id=${op.id}::uuid`.execute(trx)
+      await sql`SET CONSTRAINTS ALL IMMEDIATE`.execute(trx)
+      await sql`ROLLBACK TO SAVEPOINT before_conflict`.execute(trx)
+      await sql`INSERT INTO procurement_execution_evidence(id,operation_id,generation,action,kind,request_identity,response_digest)
+        VALUES (${randomUUID()}::uuid,${op.id}::uuid,1,'submit','identity_conflict',${source.local_business_number},${digest})`.execute(trx)
+    })
+    await expect(sql`UPDATE procurement_operations SET state='submit_in_flight',revision=revision+1 WHERE id=${op.id}::uuid`.execute(db))
+      .rejects.toMatchObject({ constraint: 'procurement_identity_conflict_unresolved' })
+  })
+
+  it('rejects direct completion specifically on unresolved identity conflict after all units are delivered', async () => {
+    const op = await readyOperation(2)
+    const server = await fixtureServer(async request => ({ requestIdentity: request.requestIdentity, kind: 'success',
+      supplierOrderNumber: 'completion-guard-number', unitIndices: [1,2], deliveryConfirmed: true, responseDigest: digest }))
+    try {
+      await runProcurementFixturePass(db, op.id, server.transport, async () => true)
+      expect(await finalizeProcurementUnit(db, op.id, 1)).toBe('completed')
+      const source = (await sql<{ order_id: string; order_item_id: string; local_business_number: string }>`
+        SELECT s.order_id,o.order_item_id,o.local_business_number FROM procurement_operations o
+        JOIN order_item_procurement_sources s ON s.id=o.source_id WHERE o.id=${op.id}::uuid`.execute(db)).rows[0]!
+      const attemptId = randomUUID()
+      await db.transaction().execute(async trx => {
+        await sql`SELECT id FROM orders WHERE id=${source.order_id}::uuid FOR UPDATE`.execute(trx)
+        await sql`SELECT id FROM order_items WHERE id=${source.order_item_id}::uuid FOR UPDATE`.execute(trx)
+        await sql`INSERT INTO order_item_fulfillment_attempts
+          (id,order_item_id,operation_id,quantity,status,delivery_source,started_by_admin_id,procurement_operation_id,procurement_unit_index)
+          VALUES (${attemptId}::uuid,${source.order_item_id}::uuid,${randomUUID()}::uuid,1,'processing','procurement',NULL,${op.id}::uuid,2)`.execute(trx)
+        await sql`INSERT INTO order_item_fulfillment_deliveries(id,fulfillment_attempt_id,started_by_admin_id,unit_index,content,content_sha256,delivery_source)
+          VALUES (${randomUUID()}::uuid,${attemptId}::uuid,NULL,2,NULL,${digest},'procurement')`.execute(trx)
+        await trx.updateTable('order_item_fulfillment_attempts').set({ status: 'succeeded', result_sha256: digest }).where('id', '=', attemptId).execute()
+        await trx.updateTable('procurement_operation_units').set({ state: 'completed' }).where('operation_id', '=', op.id).where('unit_index', '=', 2).execute()
+        // All units are complete; absent conflict, completion is valid including deferred checks.
+        await sql`SAVEPOINT before_conflict`.execute(trx)
+        await sql`UPDATE procurement_operations SET state='completed',revision=revision+1 WHERE id=${op.id}::uuid`.execute(trx)
+        await sql`SET CONSTRAINTS ALL IMMEDIATE`.execute(trx)
+        await sql`ROLLBACK TO SAVEPOINT before_conflict`.execute(trx)
+        await sql`INSERT INTO procurement_execution_evidence(id,operation_id,generation,action,kind,request_identity,response_digest)
+          VALUES (${randomUUID()}::uuid,${op.id}::uuid,1,'submit','identity_conflict',${source.local_business_number},${digest})`.execute(trx)
+      })
+      await expect(sql`UPDATE procurement_operations SET state='completed',revision=revision+1 WHERE id=${op.id}::uuid`.execute(db))
+        .rejects.toMatchObject({ constraint: 'procurement_identity_conflict_unresolved' })
+      expect((await db.selectFrom('procurement_operation_units').select('state').where('operation_id', '=', op.id).execute()).every(unit => unit.state === 'completed')).toBe(true)
+    } finally { await server.close() }
+  })
+
+
+  it('reinstates risk and blocks refund, manual delivery and replacement after late identity conflict', async () => {
+    const old = await readyOperation(), entered = gate(), release = gate(), requests: ProcurementFixtureRequest[] = []
+    const server = await fixtureServer(async request => {
+      requests.push(request)
+      if (request.operationId === old.id && request.action === 'submit') {
+        entered.open(); await release.promise
+        return { requestIdentity: 'unowned-late-identity', kind: 'accepted', supplierOrderNumber: null, responseDigest: digest }
+      }
+      return { requestIdentity: request.requestIdentity, kind: 'rejected', supplierOrderNumber: null, responseDigest: digest }
+    })
+    try {
+      const pending = runProcurementFixturePass(db, old.id, server.transport, async () => true)
+      await entered.promise
+      await sql`UPDATE procurement_execution_leases SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE operation_id=${old.id}::uuid`.execute(db)
+      await runProcurementFixturePass(secondDb, old.id, server.transport, async () => true)
+      const source = (await sql<{ order_id: string; order_item_id: string; local_business_number: string }>`
+        SELECT s.order_id,o.order_item_id,o.local_business_number FROM procurement_operations o
+        JOIN order_item_procurement_sources s ON s.id=o.source_id WHERE o.id=${old.id}::uuid`.execute(db)).rows[0]!
+      const evidenceId = randomUUID()
+      await db.transaction().execute(async trx => {
+        await sql`SELECT id FROM orders WHERE id=${source.order_id}::uuid FOR UPDATE`.execute(trx)
+        await sql`SELECT id FROM order_items WHERE id=${source.order_item_id}::uuid FOR UPDATE`.execute(trx)
+        await lockProcurementRiskPolicy(trx, old.id)
+        await sql`INSERT INTO procurement_execution_evidence(id,operation_id,generation,action,kind,request_identity,response_digest,amount_minor,currency)
+          VALUES (${evidenceId}::uuid,${old.id}::uuid,2,'query','rejected',${source.local_business_number},${digest},10,'TST')`.execute(trx)
+        await recordProcurementRiskFact(trx, { operationId: old.id, factId: randomUUID(), kind: 'release', amountMinor: '10', evidenceId })
+        await sql`UPDATE procurement_operations SET state='rejected',revision=revision+1 WHERE id=${old.id}::uuid`.execute(trx)
+        await sql`UPDATE procurement_operation_units SET state='rejected' WHERE operation_id=${old.id}::uuid`.execute(trx)
+      })
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, old.id)))?.outstandingMinor).toBe('0')
+      const replacement = await db.transaction().execute(trx => prepareProcurementWithRisk(trx, { requestId: randomUUID(), orderId: source.order_id,
+        orderItemId: source.order_item_id, unitIndices: [1], currency: 'TST', maxAmountMinor: '10' }))
+      const dailyGross = async () => (await sql<{ scope_kind: string; gross_minor: string }>`
+        SELECT daily.scope_kind,daily.gross_minor::text FROM procurement_risk_daily daily
+        JOIN procurement_risk_reservations reservation ON reservation.operation_id=${old.id}::uuid
+          AND daily.currency=reservation.currency AND daily.utc_day=reservation.utc_day
+        WHERE (daily.scope_kind='global' AND daily.scope_key='*')
+          OR (daily.scope_kind='supplier' AND daily.scope_key=reservation.supplier_connection_id::text)
+          OR (daily.scope_kind='sku' AND daily.scope_key=reservation.product_variant_id::text)
+        ORDER BY daily.scope_kind`.execute(db)).rows
+      const grossBeforeConflict = await dailyGross()
+      expect(grossBeforeConflict.map(row => row.scope_kind)).toEqual(['global','sku','supplier'])
+      release.open(); await pending
+      expect(await dailyGross()).toEqual(grossBeforeConflict)
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, old.id)))?.outstandingMinor).toBe('10')
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', old.id).executeTakeFirstOrThrow()).state).toBe('rejected')
+      const unresolved = await sql<{ unresolved: boolean }>`SELECT order_has_unresolved_fulfillment(${source.order_id}::uuid) AS unresolved`.execute(db)
+      expect(unresolved.rows[0]!.unresolved).toBe(true)
+      const conflicts = await sql<{ operation_id: string }>`SELECT DISTINCT operation_id FROM procurement_execution_conflicts
+        WHERE reason='prior_unit_execution' AND operation_id IN (${old.id}::uuid,${replacement.id}::uuid)`.execute(db)
+      expect(new Set(conflicts.rows.map(row => row.operation_id))).toEqual(new Set([old.id, replacement.id]))
+      const refund = await secondApp.inject({ method: 'POST', url: `/api/v1/customer/orders/${source.order_id}/refunds`, headers,
+        payload: { idempotencyKey: randomUUID(), amount: '1.00', reason: 'identity conflict fixture' } })
+      expect(refund.statusCode).toBe(409)
+      await expect(db.insertInto('order_refunds').values({ id: randomUUID(),order_id: source.order_id,idempotency_key: randomUUID(),
+        request_sha256: digest,amount: '1.00',status: 'requested',reason: 'identity conflict fixture' }).execute())
+        .rejects.toMatchObject({ constraint: 'order_refund_fulfillment_unresolved' })
+      await expect(sql`INSERT INTO order_item_fulfillment_attempts(id,order_item_id,operation_id,quantity,status,delivery_source,started_by_admin_id)
+        VALUES (${randomUUID()}::uuid,${source.order_item_id}::uuid,${randomUUID()}::uuid,1,'processing','manual',${adminId}::uuid)`.execute(db))
+        .rejects.toMatchObject({ constraint: 'procurement_fulfillment_conflict' })
+      const token = randomBytes(32).toString('base64url')
+      await db.insertInto('admin_sessions').values({ id: randomUUID(), admin_user_id: adminId, token_hash: hashToken(token),
+        expires_at: new Date(Date.now() + 60_000), revoked_at: null }).execute()
+      const csrf = await app.inject({ method: 'GET', url: '/api/v1/admin/auth/csrf' })
+      const manual = await app.inject({ method: 'POST', url: `/api/v1/admin/orders/${source.order_id}/items/${source.order_item_id}/fulfillments`,
+        headers: { origin, cookie: `aikayun_admin_session=${token}; ${cookie(csrf, 'aikayun_admin_csrf')}`,
+          'x-csrf-token': csrf.json().data.csrfToken as string },
+        payload: { operationId: randomUUID(), deliveries: [{ content: 'must-not-be-delivered' }] } })
+      expect(manual.statusCode).toBe(409)
+      await db.transaction().execute(async trx => {
+        await sql`SELECT id FROM orders WHERE id=${source.order_id}::uuid FOR UPDATE`.execute(trx)
+        await sql`SELECT id FROM order_items WHERE id=${source.order_item_id}::uuid FOR UPDATE`.execute(trx)
+        await lockProcurementRiskPolicy(trx, replacement.id)
+        await sql`INSERT INTO procurement_execution_leases(operation_id,lease_token,lease_expires_at,request_generation)
+          VALUES (${replacement.id}::uuid,${randomUUID()}::uuid,clock_timestamp()+interval '1 minute',1)`.execute(trx)
+        await sql`INSERT INTO procurement_request_intents(id,operation_id,generation,action,request_identity)
+          VALUES (${randomUUID()}::uuid,${replacement.id}::uuid,1,'submit',${replacement.localBusinessNumber})`.execute(trx)
+      })
+      await expect(sql`UPDATE procurement_operations SET state='submit_in_flight',revision=revision+1 WHERE id=${replacement.id}::uuid`.execute(db))
+        .rejects.toMatchObject({ constraint: 'procurement_prior_execution_conflict' })
+      expect(await runProcurementFixturePass(secondDb, replacement.id, server.transport, async () => true)).toBe(false)
+      expect(requests.map(row => row.action)).toEqual(['submit','query'])
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', replacement.id).executeTakeFirstOrThrow()).state).toBe('manual_review')
+      expect(await finalizeProcurementUnit(db, replacement.id, 1)).toBe('not_ready')
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, replacement.id)))?.outstandingMinor).toBe('10')
+    } finally { release.open(); await server.close() }
+  })
+
+  it('refuses a forged later rejection and release after an identity conflict', async () => {
+    const op = await readyOperation()
+    const server = await fixtureServer(async () => ({ requestIdentity: 'unowned-identity', kind: 'accepted',
+      supplierOrderNumber: null, responseDigest: digest }))
+    try {
+      await runProcurementFixturePass(db, op.id, server.transport, async () => true)
+      const row = await db.selectFrom('procurement_operations').select(['state','local_business_number']).where('id', '=', op.id).executeTakeFirstOrThrow()
+      expect(row.state).toBe('manual_review')
+      const evidenceId = randomUUID()
+      await sql`INSERT INTO procurement_execution_evidence(id,operation_id,generation,action,kind,request_identity,response_digest,amount_minor,currency)
+        VALUES (${evidenceId}::uuid,${op.id}::uuid,1,'submit','rejected',${row.local_business_number},${digest},10,'TST')`.execute(db)
+      await expect(db.transaction().execute(trx => recordProcurementRiskFact(trx, { operationId: op.id, factId: randomUUID(),
+        kind: 'release', amountMinor: '10', evidenceId }))).rejects.toMatchObject({ constraint: 'procurement_identity_conflict_unresolved' })
+      await expect(sql`UPDATE procurement_operations SET state='rejected',revision=revision+1 WHERE id=${op.id}::uuid`.execute(db))
+        .rejects.toMatchObject({ constraint: 'procurement_identity_conflict_unresolved' })
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, op.id)))?.outstandingMinor).toBe('10')
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', op.id).executeTakeFirstOrThrow()).state).toBe('manual_review')
+    } finally { await server.close() }
+  })
+
+
+  it('rechecks a committed identity conflict after waiting on the actual order lock', async () => {
+    const op = await readyOperation(), entered = gate(), networkRelease = gate()
+    const server = await fixtureServer(async request => {
+      if (request.action === 'submit') {
+        entered.open(); await networkRelease.promise
+        return { requestIdentity: 'unowned-identity', kind: 'accepted', supplierOrderNumber: null, responseDigest: digest }
+      }
+      return { requestIdentity: request.requestIdentity, kind: 'rejected', supplierOrderNumber: null, responseDigest: digest }
+    })
+    try {
+      const pending = runProcurementFixturePass(db, op.id, server.transport, async () => true)
+      await entered.promise
+      await sql`UPDATE procurement_execution_leases SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE operation_id=${op.id}::uuid`.execute(db)
+      await runProcurementFixturePass(secondDb, op.id, server.transport, async () => true)
+      const source = (await sql<{ order_id: string; order_item_id: string; local_business_number: string }>`
+        SELECT s.order_id,o.order_item_id,o.local_business_number FROM procurement_operations o
+        JOIN order_item_procurement_sources s ON s.id=o.source_id WHERE o.id=${op.id}::uuid`.execute(db)).rows[0]!
+      const evidenceId = randomUUID()
+      await db.transaction().execute(async trx => {
+        await sql`SELECT id FROM orders WHERE id=${source.order_id}::uuid FOR UPDATE`.execute(trx)
+        await sql`SELECT id FROM order_items WHERE id=${source.order_item_id}::uuid FOR UPDATE`.execute(trx)
+        await lockProcurementRiskPolicy(trx, op.id)
+        await sql`INSERT INTO procurement_execution_evidence(id,operation_id,generation,action,kind,request_identity,response_digest,amount_minor,currency)
+          VALUES (${evidenceId}::uuid,${op.id}::uuid,2,'query','rejected',${source.local_business_number},${digest},10,'TST')`.execute(trx)
+        await recordProcurementRiskFact(trx, { operationId: op.id, factId: randomUUID(), kind: 'release', amountMinor: '10', evidenceId })
+        await sql`UPDATE procurement_operations SET state='rejected',revision=revision+1 WHERE id=${op.id}::uuid`.execute(trx)
+        await sql`UPDATE procurement_operation_units SET state='rejected' WHERE operation_id=${op.id}::uuid`.execute(trx)
+      })
+      const token = randomBytes(32).toString('base64url')
+      await db.insertInto('admin_sessions').values({ id: randomUUID(), admin_user_id: adminId, token_hash: hashToken(token),
+        expires_at: new Date(Date.now() + 60_000), revoked_at: null }).execute()
+      const csrf = await app.inject({ method: 'GET', url: '/api/v1/admin/auth/csrf' })
+      const admin = { origin, cookie: `aikayun_admin_session=${token}; ${cookie(csrf, 'aikayun_admin_csrf')}`,
+        'x-csrf-token': csrf.json().data.csrfToken as string }
+      const held = gate(), unlock = gate()
+      let blockerPid = 0
+      const holder = db.transaction().execute(async trx => {
+        blockerPid = (await sql<{ pid: number }>`SELECT pg_backend_pid() AS pid`.execute(trx)).rows[0]!.pid
+        await sql`SELECT id FROM orders WHERE id=${source.order_id}::uuid FOR UPDATE`.execute(trx)
+        await sql`SELECT id FROM order_items WHERE id=${source.order_item_id}::uuid FOR UPDATE`.execute(trx)
+        await lockProcurementRiskPolicy(trx, op.id)
+        await sql`INSERT INTO procurement_execution_evidence(id,operation_id,generation,action,kind,request_identity,response_digest)
+          VALUES (${randomUUID()}::uuid,${op.id}::uuid,1,'submit','identity_conflict',${source.local_business_number},${digest})`.execute(trx)
+        held.open(); await unlock.promise
+      })
+      await held.promise
+      const directRefund = secondDb.insertInto('order_refunds').values({ id: randomUUID(),order_id: source.order_id,idempotency_key: randomUUID(),
+        request_sha256: digest,amount: '1.00',status: 'requested',reason: 'conflict lock fixture' }).execute().then(() => null, error => error)
+      const directManual = sql`INSERT INTO order_item_fulfillment_attempts(id,order_item_id,operation_id,quantity,status,delivery_source,started_by_admin_id)
+        VALUES (${randomUUID()}::uuid,${source.order_item_id}::uuid,${randomUUID()}::uuid,1,'processing','manual',${adminId}::uuid)`.execute(secondDb).then(() => null, error => error)
+      const refund = secondApp.inject({ method: 'POST', url: `/api/v1/customer/orders/${source.order_id}/refunds`, headers,
+        payload: { idempotencyKey: randomUUID(), amount: '1.00', reason: 'conflict lock fixture' } })
+      const manual = app.inject({ method: 'POST', url: `/api/v1/admin/orders/${source.order_id}/items/${source.order_item_id}/fulfillments`,
+        headers: admin, payload: { operationId: randomUUID(), deliveries: [{ content: 'must-not-be-delivered' }] } })
+      try {
+        const deadline = Date.now() + 10_000
+        let blocked = 0
+        while (blocked < 4 && Date.now() < deadline) {
+          blocked = (await sql<{ count: number }>`WITH RECURSIVE blocked(pid) AS (
+            SELECT ${blockerPid}::integer UNION SELECT activity.pid FROM pg_stat_activity activity
+              JOIN blocked parent ON parent.pid=ANY(pg_blocking_pids(activity.pid)))
+            SELECT (count(*)-1)::integer AS count FROM blocked`.execute(db)).rows[0]!.count
+          if (blocked < 4) await new Promise<void>(resolve => setImmediate(resolve))
+        }
+        expect(blocked).toBeGreaterThanOrEqual(4)
+      } finally { unlock.open() }
+      await holder
+      const [refundError, manualError, refundResponse, manualResponse] = await Promise.all([directRefund,directManual,refund,manual])
+      expect(refundError).toMatchObject({ constraint: 'order_refund_fulfillment_unresolved' })
+      expect(manualError).toMatchObject({ constraint: 'procurement_fulfillment_conflict' })
+      expect(refundResponse.statusCode).toBe(409); expect(manualResponse.statusCode).toBe(409)
+      networkRelease.open(); await pending
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, op.id)))?.outstandingMinor).toBe('10')
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', op.id).executeTakeFirstOrThrow()).state).toBe('rejected')
+    } finally { networkRelease.open(); await server.close() }
+  })
+
   it('fails closed on unavailable historic key and recovers using the frozen version after rotation', async () => {
     const op = await readyOperation(), version2 = randomUUID()
     const envelope = encryptSupplierCredentials(config, connectionId, 2, credentials)
