@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -15,10 +15,11 @@ import { createDatabase } from '../src/db/pool.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
 import type { Database } from '../src/db/types.js'
 import { createPurchaseDraft, savePurchaseDraft, uploadPurchaseDraftAttachment } from '../src/commerce/purchase-forms.js'
-import { readOwnedOrderPurchaseAttachment } from '../src/commerce/purchase-order-attachments.js'
+import { readOrderPurchaseSnapshot, readOwnedOrderPurchaseAttachment, reconcilePurchaseOrderAttachments } from '../src/commerce/purchase-order-attachments.js'
 import { encryptPurchaseOrderValues } from '../src/commerce/purchase-form-crypto.js'
 import { PurchaseAttachmentStorage } from '../src/media/purchase-attachment-storage.js'
 import { PurchaseOrderAttachmentStorage } from '../src/media/purchase-order-attachment-storage.js'
+import { startPurchaseArchiveCrashApi } from './fixtures/procurement-crash-tools.js'
 import { allocateProcurementIdentity, procurementPreparationEligibility } from '../src/commerce/procurement-identity.js'
 import { decryptSupplierCredentials, encryptSupplierCredentials } from '../src/commerce/supplier-api-crypto.js'
 import { recordWalletOrderPayment } from '../src/finance/wallet.js'
@@ -566,5 +567,90 @@ describe('⑥-4B-1 isolated procurement identities', () => {
     await expect(db.updateTable('supplier_connections').set({ enabled: true, tested_version_id: current.current_version_id })
       .where('id', '=', connectionId).execute())
       .rejects.toMatchObject({ constraint: 'supplier_protocol_readonly' })
+  })
+
+  it.each([
+    { checkpoint: 'archive_partial_copy', committed: false },
+    { checkpoint: 'archive_object_registered', committed: false },
+    { checkpoint: 'attachment_binding_uncommitted', committed: false },
+    { checkpoint: 'checkout_committed', committed: true },
+  ])('recovers purchase archive at real SIGKILL boundary $checkpoint', async ({ checkpoint, committed }) => {
+    selected.rows = []
+    const saved = await draft('archive-crash-account', true)
+    const items = [line(skuA, saved)]
+    const quote = await app.inject({ method: 'POST', url: '/api/v1/checkout/quote', headers, payload: { version: 2, items } })
+    expect(quote.statusCode, quote.body).toBe(200)
+    const body = { version: 2, items, idempotencyKey: randomUUID(), quoteToken: quote.json().data.quoteToken as string }
+    const killed = await startPurchaseArchiveCrashApi(config, checkpoint)
+    const originalRequest = fetch(killed.ready.url + '/api/v1/checkout/orders', { method: 'POST', headers: {
+      ...headers, 'content-type': 'application/json',
+    }, body: JSON.stringify(body) }).then(async response => ({ status: response.status, text: await response.text() }),
+    error => ({ status: 0, text: String(error) }))
+    await killed.waitFor('checkpoint')
+    expect(await killed.kill()).toBe('SIGKILL')
+    await originalRequest
+
+    const beforeRestart = await db.selectFrom('orders').select(['id', 'idempotency_key'])
+      .where('idempotency_key', '=', body.idempotencyKey).execute()
+    expect(beforeRestart).toHaveLength(committed ? 1 : 0)
+    const archiveStorage = new PurchaseOrderAttachmentStorage(privateRoot)
+    if (checkpoint === 'archive_partial_copy') {
+      const staging = (await archiveStorage.scanFiles()).filter(file => file.location === 'staging')
+      expect(staging).toHaveLength(1)
+      expect((await stat(staging[0]!.path)).size).toBeGreaterThan(0)
+      expect(await db.selectFrom('purchase_order_attachment_objects').select('id')
+        .where('source_draft_id', '=', saved.id).execute()).toHaveLength(0)
+    }
+    if (checkpoint === 'archive_object_registered' || checkpoint === 'attachment_binding_uncommitted') {
+      expect(await db.selectFrom('purchase_order_attachment_objects').select('status')
+        .where('source_draft_id', '=', saved.id).execute()).toEqual([{ status: 'prepared' }])
+      expect(await db.selectFrom('order_item_purchase_attachments').select('source_attachment_id')
+        .where('source_attachment_id', '=', saved.attachmentId!).execute()).toHaveLength(0)
+      const snapshotRefs = await sql<{ count: string }>`SELECT count(*)::text AS count FROM order_item_purchase_snapshots
+        WHERE ${saved.attachmentId}::uuid=ANY(attachment_ids)`.execute(db)
+      expect(snapshotRefs.rows[0]!.count).toBe('0')
+    }
+
+    const restarted = await startPurchaseArchiveCrashApi(config)
+    expect(restarted.ready.pid).not.toBe(killed.ready.pid)
+    expect(restarted.ready.backendPid).not.toBe(killed.ready.backendPid)
+    const response = await fetch(restarted.ready.url + '/api/v1/checkout/orders', { method: 'POST', headers: {
+      ...headers, 'content-type': 'application/json',
+    }, body: JSON.stringify(body) })
+    const responseText = await response.text()
+    expect(response.status, responseText).toBe(committed ? 200 : 201)
+    const replay = JSON.parse(responseText).data.order as { id: string; items: Array<{ id: string }> }
+    if (committed) expect(replay.id).toBe(beforeRestart[0]!.id)
+    const orderRows = await db.selectFrom('orders').select('id').where('idempotency_key', '=', body.idempotencyKey).execute()
+    expect(orderRows).toHaveLength(1)
+    expect(await db.selectFrom('order_item_purchase_snapshots as snapshot')
+      .innerJoin('order_items as item', 'item.id', 'snapshot.order_item_id').where('item.order_id', '=', replay.id).execute())
+      .toHaveLength(1)
+    expect(await db.selectFrom('order_item_purchase_attachments as attachment')
+      .innerJoin('order_items as item', 'item.id', 'attachment.order_item_id').where('item.order_id', '=', replay.id).execute())
+      .toHaveLength(1)
+    const itemId = replay.items[0]!.id
+    const snapshot = await readOrderPurchaseSnapshot(db, config, itemId)
+    expect(snapshot.state).toBe('filled')
+    expect(snapshot.values?.[accountField]).toBe('archive-crash-account')
+    expect(snapshot.attachments).toHaveLength(1)
+    const archived = await readOwnedOrderPurchaseAttachment(db, archiveStorage, owner, itemId, saved.attachmentId!, replay.id)
+    expect(createHash('sha256').update(archived.bytes).digest('hex')).toBe(snapshot.attachments[0]!.sha256)
+    const object = await db.selectFrom('order_item_purchase_attachments as reference')
+      .innerJoin('purchase_order_attachment_objects as object', 'object.id', 'reference.archive_object_id')
+      .select(['reference.sha256 as referenceSha256', 'object.sha256 as objectSha256', 'object.status', 'object.byte_size'])
+      .where('reference.order_item_id', '=', itemId).executeTakeFirstOrThrow()
+    expect(object).toMatchObject({ referenceSha256: snapshot.attachments[0]!.sha256,
+      objectSha256: snapshot.attachments[0]!.sha256, status: 'retained', byte_size: archived.byteSize })
+
+    const cleanup = await reconcilePurchaseOrderAttachments(db, archiveStorage, {
+      repair: true, now: new Date(Date.now() + 26 * 60 * 60 * 1000), graceHours: 24,
+    })
+    expect(cleanup).toMatchObject({ prepared: 0, deleting: 0, missingRetained: 0 })
+    expect(await db.selectFrom('purchase_order_attachment_objects').select('status')
+      .where('status', '=', 'retained').where('source_attachment_id', '=', saved.attachmentId!).execute()).toHaveLength(1)
+    expect(createHash('sha256').update((await readOwnedOrderPurchaseAttachment(db, archiveStorage, owner,
+      itemId, saved.attachmentId!, replay.id)).bytes).digest('hex')).toBe(snapshot.attachments[0]!.sha256)
+    expect(await restarted.kill()).toBe('SIGKILL')
   })
 })

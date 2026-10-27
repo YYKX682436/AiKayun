@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -12,6 +12,9 @@ import { fileURLToPath } from 'node:url'
 
 const workspace = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const directory = await mkdtemp(join(tmpdir(), 'aikayun-digital-recovery-test-'))
+const supplierDirectory = join(directory, 'supplier-fixture-data')
+await mkdir(supplierDirectory, { recursive: true, mode: 0o777 })
+await chmod(supplierDirectory, 0o777)
 const project = `aikayun-digital-recovery-test-${process.pid}`
 const port = async () => {
   const server = createServer()
@@ -23,11 +26,22 @@ const port = async () => {
 const httpPort = await port()
 const supplierPort = await port()
 const origin = `http://localhost:${httpPort}`
-const ring = JSON.stringify({ activeKeyId: 'recovery-test', keys: { 'recovery-test': randomBytes(32).toString('base64') } })
+const ring = JSON.stringify({ activeKeyId: 'current-test', keys: {
+  'current-test': randomBytes(32).toString('base64'), 'legacy-test': randomBytes(32).toString('base64'),
+} })
 const overridePath = join(directory, 'supplier-fixture.json')
+await chmod(directory, 0o777)
 await writeFile(overridePath, JSON.stringify({ services: { api: {
-  environment: { SUPPLIER_HTTP_TEST_ALLOWLIST: 'http://127.0.0.1:3101' },
-  volumes: [`${join(workspace, 'apps/api/test/fixtures/http-json-v1-server.ts')}:/test/http-json-v1-server.ts:ro`],
+  environment: { SUPPLIER_HTTP_TEST_ALLOWLIST: 'http://127.0.0.1:3101,http://127.0.0.1:3102' },
+  volumes: [
+    `${join(workspace, 'apps/api/test/fixtures/http-json-v1-server.ts')}:/test/http-json-v1-server.ts:ro`,
+    `${join(workspace, 'apps/api/test/fixtures/procurement-supplier-process.mjs')}:/test/procurement-supplier-process.mjs:ro`,
+    `${join(workspace, 'scripts/fixtures/register-procurement-selection-loader.mjs')}:/test/register-procurement-selection-loader.mjs:ro`,
+    `${join(workspace, 'scripts/fixtures/procurement-selection-loader.mjs')}:/test/procurement-selection-loader.mjs:ro`,
+    `${join(workspace, 'scripts/fixtures/seed-procurement-recovery.mjs')}:/test/seed-procurement-recovery.mjs:ro`,
+    `${join(workspace, 'scripts/fixtures/verify-procurement-recovery.mjs')}:/test/verify-procurement-recovery.mjs:ro`,
+    `${supplierDirectory}:/test-output`,
+  ],
 } } }))
 const env = {
   ...process.env,
@@ -69,11 +83,18 @@ async function request(path, { cookies, token, body, method = 'GET', expected = 
   return JSON.parse(text).data
 }
 const historyTables = ['orders', 'order_items', 'order_inventory_reservations', 'order_inventory_events', 'payment_attempts',
-  'payment_receipts', 'payment_provider_events', 'order_item_fulfillment_attempts', 'order_item_fulfillment_deliveries',
+  'payment_receipts', 'payment_provider_events', 'product_variant_inventory_adjustments',
+  'order_item_fulfillment_attempts', 'order_item_fulfillment_deliveries',
   'product_variant_fulfillment_versions', 'private_file_objects', 'code_pool_batches', 'code_pool_entries',
-  'supplier_api_delivery_operations', 'supplier_api_delivery_events', 'supplier_connection_versions', 'wallet_operations', 'wallet_ledger_entries']
-const snapshot = () => database(historyTables.map(table => `SELECT '${table}' AS table_name, count(*)::text, md5(COALESCE(string_agg(to_jsonb(row)::text, '' ORDER BY id), '')) FROM ${table} AS row`).join(' UNION ALL '))
-const proof = { project, database: env.POSTGRES_DB, sigkill: [], backupRestore: false, tlsRejected: false }
+  'supplier_api_delivery_operations', 'supplier_api_delivery_events', 'supplier_connection_versions', 'supplier_connection_credentials',
+  'supplier_product_mapping_heads', 'supplier_product_mapping_versions', 'wallet_operations', 'wallet_ledger_entries',
+  'order_item_procurement_sources', 'procurement_operations', 'procurement_operation_units', 'procurement_operation_events',
+  'procurement_unit_events', 'procurement_execution_leases', 'procurement_request_intents', 'procurement_execution_evidence',
+  'procurement_preparation_requests', 'procurement_execution_conflicts', 'procurement_risk_policies', 'procurement_risk_buckets',
+  'procurement_risk_daily', 'procurement_risk_reservations', 'procurement_risk_events', 'order_item_purchase_snapshots',
+  'purchase_order_attachment_objects', 'order_item_purchase_attachments']
+const snapshot = () => database(historyTables.map(table => `SELECT '${table}' AS table_name, count(*)::text, md5(COALESCE(string_agg(to_jsonb(row)::text, '' ORDER BY to_jsonb(row)::text), '')) FROM ${table} AS row`).join(' UNION ALL '))
+const proof = { project, database: env.POSTGRES_DB, sigkill: [], backupRestore: false, procurementBackupRestore: null, tlsRejected: false }
 try {
   console.log('Starting isolated recovery Compose project')
   compose('up', '-d', '--build')
@@ -193,12 +214,34 @@ try {
     assert.equal(JSON.stringify(await request(`/api/v1/customer/orders/${orderId}`, { cookies: customer })), authorizedView)
   }
   await verifyDownload()
+  compose('exec', '-d', 'api', 'node', '/test/procurement-supplier-process.mjs', '/test-output/procurement-supplier', '3102')
+  await until(async () => {
+    compose('exec', '-T', 'api', 'node', '-e', "fetch('http://127.0.0.1:3102/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))")
+    return true
+  }, 'independent procurement supplier fixture')
+  console.log('Seed isolated procurement operations, cross-operation conflict, historical key, and private purchase archive')
+  const seedOutput = compose('exec', '-T', '-e', 'AIKAYUN_RECOVERY_SUPPLIER_URL=http://127.0.0.1:3102',
+    'api', 'node', '--import', '/test/register-procurement-selection-loader.mjs', '/test/seed-procurement-recovery.mjs')
+  const seedLine = seedOutput.split('\n').find(line => line.startsWith('PROCUREMENT_RECOVERY_SEED='))
+  assert.ok(seedLine, `isolated procurement seed did not emit metadata: ${seedOutput}`)
+  const seed = JSON.parse(seedLine.slice('PROCUREMENT_RECOVERY_SEED='.length))
+  assert.equal(seed.counts.procurement_operations, '4')
+  assert.equal(seed.counts.request_intents, '4')
+  assert.equal(seed.counts.evidence, '6')
+  assert.equal(seed.counts.conflicts, '2')
+  assert.equal(seed.counts.reinstatements, '1')
+  assert.equal(seed.counts.procurement_deliveries, '1')
+  assert.equal(seed.counts.inventory_consumes, '1')
+  assert.equal(seed.counts.retained_purchase_attachments, '1')
   const facts = snapshot()
   const reconciliationSql = await readFile(join(workspace, 'scripts/reconcile-digital-fulfillment.sql'), 'utf8')
   const reconcile = () => database(`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n${reconciliationSql}\nCOMMIT;`)
   assert.equal(reconcile(), '')
-  assert.equal(database('SELECT count(*) FROM payment_receipts'), '1')
-  assert.equal(database('SELECT count(*) FROM product_variant_quantity_inventory WHERE stocked <> 1 OR reserved <> 0'), '0')
+  assert.equal(database('SELECT count(*) FROM payment_receipts'), '5')
+  assert.equal(database(`SELECT count(*) FROM product_variant_quantity_inventory
+    WHERE product_variant_id <> '${seed.productVariantId}' AND (stocked <> 1 OR reserved <> 0)`), '0')
+  assert.equal(database(`SELECT stocked::text || ':' || reserved::text FROM product_variant_quantity_inventory
+    WHERE product_variant_id='${seed.productVariantId}'`), '9:3')
   for (const service of ['api', 'db']) {
     console.log(`SIGKILL and replace isolated ${service} container`)
     const oldId = compose('ps', '-q', service).trim()
@@ -222,6 +265,11 @@ try {
   assert.equal(missing.status, 410)
   command('bash', ['scripts/restore-test-compose-data.sh', join(directory, 'backup', backups[0])], { env: { ...env, ALLOW_TEST_DATABASE_RESTORE: 'YES' } })
   await ready()
+  compose('exec', '-d', 'api', 'node', '/test/procurement-supplier-process.mjs', '/test-output/procurement-supplier', '3102')
+  await until(async () => {
+    compose('exec', '-T', 'api', 'node', '-e', "fetch('http://127.0.0.1:3102/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))")
+    return true
+  }, 'restored independent procurement supplier fixture')
   await verifyDownload()
   assert.equal(snapshot(), facts)
   assert.equal(reconcile(), '')
@@ -230,11 +278,19 @@ try {
   assert.equal(reconciliation.verifiedObjects, 1)
   proof.backupRestore = true
   proof.fileSha256 = digest
-  proof.paymentReceipts = 1
+  proof.paymentReceipts = 5
+  proof.procurementPaymentReceipts = 4
   proof.deliveredUnits = 12
   proof.methods = detail.items.map(item => item.fulfillmentMethod).sort()
   proof.authorizedAllMethodsRestored = true
   proof.reconciliationDifferences = 0
+
+  console.log('Verify restored procurement budget, historical key, purchase archive, and query-only recovery')
+  const verifyOutput = compose('exec', '-T', '-e', `AIKAYUN_PROCUREMENT_RECOVERY_METADATA=${JSON.stringify(seed)}`,
+    'api', 'node', '/test/verify-procurement-recovery.mjs')
+  const verifyLine = verifyOutput.split('\n').find(line => line.startsWith('PROCUREMENT_RECOVERY_VERIFY='))
+  assert.ok(verifyLine, `isolated procurement restore verification did not emit proof: ${verifyOutput}`)
+  proof.procurementBackupRestore = JSON.parse(verifyLine.slice('PROCUREMENT_RECOVERY_VERIFY='.length))
 
   console.log('Verify a real untrusted TLS handshake in an isolated network namespace')
   command('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', join(directory, 'key.pem'), '-out', join(directory, 'cert.pem'),

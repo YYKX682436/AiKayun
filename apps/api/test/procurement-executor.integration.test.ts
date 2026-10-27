@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { sql, type Kysely } from 'kysely'
 import { Migrator } from 'kysely/migration'
 import type { FastifyInstance } from 'fastify'
@@ -43,6 +43,8 @@ let db: Kysely<Database>, secondDb: Kysely<Database>, config: AppConfig
 let app: FastifyInstance, secondApp: FastifyInstance, thirdApp: FastifyInstance, privateRoot: string
 let headers: Record<string, string>
 let skuA: Catalog
+let trackCrashFixtureDrafts = false
+const crashFixtureDraftIds: string[] = []
 
 type Catalog = { productId: string; skuId: string; mappingId: string; versionId: string; price: string }
 
@@ -94,6 +96,7 @@ async function catalog(price: string, quantityStock = false, supplier = { id: co
 
 async function draft(account: string, withImage = false) {
   const created = await createPurchaseDraft(db, config, owner, templateVersionId)
+  if (trackCrashFixtureDrafts) crashFixtureDraftIds.push(created.id)
   let attachmentId: string | null = null
   if (withImage) {
     const storage = new PurchaseAttachmentStorage(privateRoot)
@@ -107,6 +110,10 @@ async function draft(account: string, withImage = false) {
   const saved = await savePurchaseDraft(db, config, owner, { draftId: created.id,
     expectedRevision: created.revision, values: { [accountField]: account, [imageField]: attachmentId ? [attachmentId] : [] } })
   return { id: created.id, revision: saved.revision, attachmentId }
+}
+
+function beginCrashFixtureDraftTracking(): void {
+  trackCrashFixtureDrafts = true
 }
 
 type Line = { lineId: string; skuId: string; quantity: number; draftId: string; draftRevision: number }
@@ -145,6 +152,41 @@ function gate() {
   return { promise, open }
 }
 
+
+async function waitForSupplierStats(
+  supplier: Awaited<ReturnType<typeof startProcurementSupplierProcess>>,
+  predicate: (stats: Awaited<ReturnType<typeof supplier.stats>>) => boolean,
+) {
+  const deadline = Date.now() + 15_000
+  let stats = await supplier.stats()
+  while (!predicate(stats) && Date.now() < deadline) {
+    await new Promise<void>(resolve => setTimeout(resolve, 20))
+    stats = await supplier.stats()
+  }
+  if (!predicate(stats)) throw new Error('Timed out waiting for supplier fixture event: ' + JSON.stringify(stats))
+  return stats
+}
+
+async function paidProcurementOrder(quantity = 1, sku = skuA) {
+  selected.rows = [{ skuId: sku.skuId, mappingVersionId: sku.versionId }]
+  const result = await checkout([line(sku, await draft(randomUUID()), quantity)])
+  await pay(result.order.id)
+  return { order: result.order, item: result.order.items[0]! }
+}
+
+async function ensureTestRiskPolicy() {
+  await db.transaction().execute(trx => initializeSyntheticProcurementRiskPolicy(trx, { currency: 'TST', limits: {
+    perOperationMinor: '100', globalDailyMinor: '10000', globalOutstandingMinor: '10000',
+    supplierDailyMinor: '10000', supplierOutstandingMinor: '10000', skuDailyMinor: '10000', skuOutstandingMinor: '10000',
+  } }))
+}
+
+async function currentCatalog(quantityStock = false): Promise<Catalog> {
+  const connection = await db.selectFrom('supplier_connections').select('current_version_id')
+    .where('id', '=', connectionId).executeTakeFirstOrThrow()
+  if (!connection.current_version_id) throw new Error('Synthetic supplier has no current credential version')
+  return catalog('1.00', quantityStock, { id: connectionId, versionId: connection.current_version_id })
+}
 
 beforeAll(async () => {
   if (!testDatabaseUrl || !new URL(testDatabaseUrl).pathname.endsWith('_test')) throw new Error('Requires isolated _test database')
@@ -200,11 +242,21 @@ afterAll(async () => {
   if (privateRoot) await rm(privateRoot, { recursive: true, force: true })
 })
 
+afterEach(async () => {
+  if (!trackCrashFixtureDrafts) return
+  trackCrashFixtureDrafts = false
+  const ids = crashFixtureDraftIds.splice(0)
+  if (!ids.length) return
+  await sql`UPDATE purchase_drafts SET expires_at=created_at+interval '1 microsecond'
+    WHERE id=ANY(${ids}::uuid[]) AND status='active'`.execute(db)
+})
+
 
 import { createServer, type Server } from 'node:http'
 import { prepareProcurementWithRisk, runProcurementFixturePass, type ProcurementFixtureRequest, type ProcurementFixtureResult } from '../src/commerce/procurement-executor.js'
 import { initializeSyntheticProcurementRiskPolicy, readProcurementRisk, recordProcurementRiskFact, lockProcurementRiskPolicy, reserveProcurementRisk } from '../src/commerce/procurement-risk-budget.js'
 import { finalizeProcurementUnit } from '../src/commerce/procurement-finalization.js'
+import { startProcurementCrashProcess, startProcurementSupplierProcess } from './fixtures/procurement-crash-tools.js'
 
 async function readyOperation(quantity = 1, sku = skuA, utcDay?: string) {
   selected.rows = [{ skuId: sku.skuId, mappingVersionId: sku.versionId }]
@@ -1213,6 +1265,373 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
     } finally { await server.close() }
   })
 
+  it('rolls back a real killed preparation transaction, then recreates the same paid order identity in a fresh process', async () => {
+    beginCrashFixtureDraftTracking()
+    await ensureTestRiskPolicy()
+    const { order, item } = await paidProcurementOrder(1, await currentCatalog())
+    const requestId = randomUUID()
+    const input = { requestId, orderId: order.id, orderItemId: item.id, unitIndices: [1], currency: 'TST', maxAmountMinor: '10' }
+    const killed = await startProcurementCrashProcess(config, 'preparation_uncommitted')
+    killed.child.send({ action: 'prepare', input })
+    await killed.waitFor('checkpoint')
+    expect(await killed.kill()).toBe('SIGKILL')
+
+    const rolledBack = await sql<{ operations: string; units: string; reservations: string; events: string; requests: string }>`
+      SELECT (SELECT count(*)::text FROM procurement_operations WHERE order_item_id=${item.id}::uuid) AS operations,
+        (SELECT count(*)::text FROM procurement_operation_units WHERE order_item_id=${item.id}::uuid) AS units,
+        (SELECT count(*)::text FROM procurement_risk_reservations reservation JOIN procurement_operations operation
+          ON operation.id=reservation.operation_id WHERE operation.order_item_id=${item.id}::uuid) AS reservations,
+        (SELECT count(*)::text FROM procurement_risk_events event JOIN procurement_operations operation
+          ON operation.id=event.operation_id WHERE operation.order_item_id=${item.id}::uuid) AS events,
+        (SELECT count(*)::text FROM procurement_preparation_requests WHERE request_id=${requestId}::uuid) AS requests
+    `.execute(db)
+    expect(rolledBack.rows[0]).toEqual({ operations: '0', units: '0', reservations: '0', events: '0', requests: '0' })
+    expect((await db.selectFrom('orders').select('status').where('id', '=', order.id).executeTakeFirstOrThrow()).status).toBe('processing')
+    expect(await db.selectFrom('payment_receipts as receipt').innerJoin('payment_attempts as attempt', 'attempt.id', 'receipt.payment_attempt_id')
+      .select('receipt.id').where('attempt.order_id', '=', order.id).execute()).toHaveLength(1)
+
+    const restarted = await startProcurementCrashProcess(config)
+    expect(restarted.ready.pid).not.toBe(killed.ready.pid)
+    expect(restarted.ready.backendPid).not.toBe(killed.ready.backendPid)
+    const prepared = await restarted.run({ action: 'prepare', input }) as { id: string; localBusinessNumber: string; repeated: boolean }
+    expect(prepared.repeated).toBe(false)
+    expect((await db.selectFrom('procurement_preparation_requests').select('request_id').where('request_id', '=', requestId).execute()))
+      .toHaveLength(1)
+    expect((await db.selectFrom('procurement_operation_units').select('unit_index').where('operation_id', '=', prepared.id).execute()))
+      .toEqual([{ unit_index: 1 }])
+  })
+
+  it('commits submit intent before HTTP, then only queries after SIGKILL, not_found and query error', async () => {
+    beginCrashFixtureDraftTracking()
+    await ensureTestRiskPolicy()
+    const op = await readyOperation(1, await currentCatalog())
+    const supplier = await startProcurementSupplierProcess()
+    await supplier.control({ kind: 'not_found', execute: false })
+    try {
+      const killed = await startProcurementCrashProcess(config, 'intent_committed')
+      killed.child.send({ action: 'pass', operationId: op.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      await killed.waitFor('checkpoint')
+      expect(await killed.kill()).toBe('SIGKILL')
+      expect(await supplier.stats()).toMatchObject({ submitRequests: 0, queryRequests: 0, executions: 0 })
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', op.id).executeTakeFirstOrThrow()).state)
+        .toBe('submit_in_flight')
+      expect((await db.selectFrom('procurement_request_intents').select(['action', 'request_identity'])
+        .where('operation_id', '=', op.id).execute())).toEqual([{ action: 'submit', request_identity: op.localBusinessNumber }])
+
+      await new Promise<void>(resolve => setTimeout(resolve, 1_100))
+      const restarted = await startProcurementCrashProcess(config)
+      expect(restarted.ready.pid).not.toBe(killed.ready.pid)
+      expect(restarted.ready.backendPid).not.toBe(killed.ready.backendPid)
+      await restarted.run({ action: 'pass', operationId: op.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', op.id).executeTakeFirstOrThrow()).state)
+        .toBe('unknown')
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, op.id)))?.outstandingMinor).toBe('10')
+      expect((await supplier.stats())).toMatchObject({ submitRequests: 0, queryRequests: 1, executions: 0 })
+      expect((await db.selectFrom('procurement_request_intents').select('action').where('operation_id', '=', op.id)
+        .orderBy('generation').execute()).map(row => row.action)).toEqual(['submit', 'query'])
+
+      await supplier.control({ queryError: true })
+      await sql`UPDATE procurement_execution_leases SET next_action_at=clock_timestamp()-interval '1 second'
+        WHERE operation_id=${op.id}::uuid`.execute(db)
+      const afterError = await startProcurementCrashProcess(config)
+      await afterError.run({ action: 'pass', operationId: op.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', op.id).executeTakeFirstOrThrow()).state)
+        .toBe('unknown')
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, op.id)))?.outstandingMinor).toBe('10')
+      expect(await supplier.stats()).toMatchObject({ submitRequests: 0, queryRequests: 2, executions: 0 })
+      expect((await db.selectFrom('procurement_request_intents').select('action').where('operation_id', '=', op.id)
+        .orderBy('generation').execute()).map(row => row.action)).toEqual(['submit', 'query', 'query'])
+    } finally { await supplier.close() }
+  })
+
+  it('recovers a supplier execution after the response is lost with the killed process', async () => {
+    beginCrashFixtureDraftTracking()
+    await ensureTestRiskPolicy()
+    const op = await readyOperation(1, await currentCatalog())
+    const supplier = await startProcurementSupplierProcess()
+    await supplier.control({ kind: 'success', execute: true, holdSubmit: true, unitIndices: [1] })
+    try {
+      const killed = await startProcurementCrashProcess(config)
+      killed.child.send({ action: 'pass', operationId: op.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      const stats = await waitForSupplierStats(supplier, value => value.executions === 1)
+      expect(stats.submitRequests).toBe(1)
+      expect(stats.queryRequests).toBe(0)
+      expect(await killed.kill()).toBe('SIGKILL')
+      await supplier.release()
+      await new Promise<void>(resolve => setTimeout(resolve, 1_100))
+
+      const restarted = await startProcurementCrashProcess(config)
+      expect(restarted.ready.pid).not.toBe(killed.ready.pid)
+      expect(restarted.ready.backendPid).not.toBe(killed.ready.backendPid)
+      await restarted.run({ action: 'pass', operationId: op.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      expect(await supplier.stats()).toMatchObject({ submitRequests: 1, queryRequests: 1, executions: 1 })
+      expect((await db.selectFrom('procurement_operations').select(['state', 'supplier_order_number'])
+        .where('id', '=', op.id).executeTakeFirstOrThrow()).state).toBe('success_pending_finalize')
+      expect((await db.selectFrom('procurement_operations').select('local_business_number').where('id', '=', op.id)
+        .executeTakeFirstOrThrow()).local_business_number).toBe(op.localBusinessNumber)
+      expect((await db.selectFrom('procurement_request_intents').select(['action', 'request_identity'])
+        .where('operation_id', '=', op.id).orderBy('generation').execute()).map(row => row)).toEqual([
+        { action: 'submit', request_identity: op.localBusinessNumber },
+        { action: 'query', request_identity: op.localBusinessNumber },
+      ])
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, op.id)))?.outstandingMinor).toBe('10')
+    } finally { await supplier.release(); await supplier.close() }
+  })
+
+  it('discards parsed-but-uncommitted supplier response after SIGKILL and reconstructs only from a fresh identity query', async () => {
+    beginCrashFixtureDraftTracking()
+    await ensureTestRiskPolicy()
+    const op = await readyOperation(1, await currentCatalog())
+    const supplier = await startProcurementSupplierProcess()
+    await supplier.control({ kind: 'success', execute: true, unitIndices: [1] })
+    try {
+      const killed = await startProcurementCrashProcess(config, 'response_parsed')
+      killed.child.send({ action: 'pass', operationId: op.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      await killed.waitFor('checkpoint')
+      expect(await killed.kill()).toBe('SIGKILL')
+      expect((await supplier.stats())).toMatchObject({ submitRequests: 1, queryRequests: 0, executions: 1 })
+      expect(await db.selectFrom('procurement_execution_evidence').select('id').where('operation_id', '=', op.id).execute())
+        .toHaveLength(0)
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', op.id).executeTakeFirstOrThrow()).state)
+        .toBe('submit_in_flight')
+
+      await new Promise<void>(resolve => setTimeout(resolve, 1_100))
+      const restarted = await startProcurementCrashProcess(config)
+      expect(restarted.ready.pid).not.toBe(killed.ready.pid)
+      expect(restarted.ready.backendPid).not.toBe(killed.ready.backendPid)
+      await restarted.run({ action: 'pass', operationId: op.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      expect(await supplier.stats()).toMatchObject({ submitRequests: 1, queryRequests: 1, executions: 1 })
+      expect((await db.selectFrom('procurement_execution_evidence').select('kind').where('operation_id', '=', op.id)
+        .orderBy('observed_at').execute()).map(row => row.kind)).toEqual(['success', 'delivery_confirmed'])
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', op.id).executeTakeFirstOrThrow()).state)
+        .toBe('success_pending_finalize')
+    } finally { await supplier.close() }
+  })
+
+  it('recovers committed success and finalization after two distinct SIGKILLs without double delivery or consume', async () => {
+    beginCrashFixtureDraftTracking()
+    await ensureTestRiskPolicy()
+    const sku = await currentCatalog(true)
+    const op = await readyOperation(2, sku)
+    const supplier = await startProcurementSupplierProcess()
+    await supplier.control({ kind: 'success', execute: true, unitIndices: [1] })
+    try {
+      const evidenceWorker = await startProcurementCrashProcess(config, 'evidence_committed')
+      evidenceWorker.child.send({ action: 'pass', operationId: op.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      await evidenceWorker.waitFor('checkpoint')
+      expect(await evidenceWorker.kill()).toBe('SIGKILL')
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', op.id).executeTakeFirstOrThrow()).state)
+        .toBe('success_pending_finalize')
+      expect((await db.selectFrom('procurement_execution_evidence').select('kind').where('operation_id', '=', op.id)
+        .orderBy('observed_at').execute()).map(row => row.kind)).toEqual(['success', 'delivery_confirmed'])
+      expect(await db.selectFrom('order_item_fulfillment_deliveries as delivery')
+        .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'delivery.fulfillment_attempt_id')
+        .select('delivery.id').where('attempt.procurement_operation_id', '=', op.id).execute()).toHaveLength(0)
+
+      const finalizeWorker = await startProcurementCrashProcess(config, 'finalization_committed')
+      finalizeWorker.child.send({ action: 'finalize', operationId: op.id, unitIndex: 1 })
+      await finalizeWorker.waitFor('checkpoint')
+      expect(await finalizeWorker.kill()).toBe('SIGKILL')
+      const beforeRetry = await sql<{ attempts: string; deliveries: string; consume: string }>`
+        SELECT (SELECT count(*)::text FROM order_item_fulfillment_attempts WHERE procurement_operation_id=${op.id}::uuid) AS attempts,
+          (SELECT count(*)::text FROM order_item_fulfillment_deliveries delivery JOIN order_item_fulfillment_attempts attempt
+            ON attempt.id=delivery.fulfillment_attempt_id WHERE attempt.procurement_operation_id=${op.id}::uuid) AS deliveries,
+          (SELECT count(*)::text FROM order_inventory_events event JOIN order_inventory_reservations reservation
+            ON reservation.id=event.reservation_id WHERE reservation.order_item_id=(SELECT order_item_id FROM procurement_operations WHERE id=${op.id}::uuid)
+              AND event.action='consume') AS consume
+      `.execute(db)
+      expect(beforeRetry.rows[0]).toEqual({ attempts: '1', deliveries: '1', consume: '1' })
+
+      const restarted = await startProcurementCrashProcess(config)
+      expect(restarted.ready.pid).not.toBe(finalizeWorker.ready.pid)
+      expect(restarted.ready.backendPid).not.toBe(finalizeWorker.ready.backendPid)
+      expect(await restarted.run({ action: 'finalize', operationId: op.id, unitIndex: 1 })).toBe('already_completed')
+      expect(await finalizeProcurementUnit(secondDb, op.id, 1)).toBe('already_completed')
+      const afterRetry = await sql<{ attempts: string; deliveries: string; consume: string; stocked: number; reserved: number;
+        fulfilled: number; quantity: number; item_state: string; unit_one: string; unit_two: string; operation_state: string }>`
+        SELECT (SELECT count(*)::text FROM order_item_fulfillment_attempts WHERE procurement_operation_id=${op.id}::uuid) AS attempts,
+          (SELECT count(*)::text FROM order_item_fulfillment_deliveries delivery JOIN order_item_fulfillment_attempts attempt
+            ON attempt.id=delivery.fulfillment_attempt_id WHERE attempt.procurement_operation_id=${op.id}::uuid) AS deliveries,
+          (SELECT count(*)::text FROM order_inventory_events event JOIN order_inventory_reservations reservation
+            ON reservation.id=event.reservation_id WHERE reservation.order_item_id=item.id AND event.action='consume') AS consume,
+          inventory.stocked,inventory.reserved,item.fulfilled_quantity AS fulfilled,item.quantity,item.fulfillment_status AS item_state,
+          (SELECT state FROM procurement_operation_units WHERE operation_id=${op.id}::uuid AND unit_index=1) AS unit_one,
+          (SELECT state FROM procurement_operation_units WHERE operation_id=${op.id}::uuid AND unit_index=2) AS unit_two,
+          operation.state AS operation_state
+        FROM procurement_operations operation JOIN order_items item ON item.id=operation.order_item_id
+        JOIN product_variant_quantity_inventory inventory ON inventory.product_variant_id=item.product_variant_id WHERE operation.id=${op.id}::uuid
+      `.execute(db)
+      expect(afterRetry.rows[0]).toMatchObject({ attempts: '1', deliveries: '1', consume: '1', stocked: 9, reserved: 1,
+        fulfilled: 1, quantity: 2, item_state: 'partially_fulfilled', unit_one: 'completed', unit_two: 'allocated',
+        operation_state: 'success_pending_finalize' })
+      expect(await finalizeProcurementUnit(db, op.id, 2)).toBe('not_ready')
+      expect(await supplier.stats()).toMatchObject({ submitRequests: 1, queryRequests: 0, executions: 1 })
+    } finally { await supplier.close() }
+  })
+
+  it.each(['accepted', 'completed'] as const)('rolls back and rebuilds a global supplier-number conflict after A is %s', async mode => {
+    beginCrashFixtureDraftTracking()
+    await ensureTestRiskPolicy()
+    const sku = await currentCatalog()
+    const a = await readyOperation(1, sku)
+    const supplier = await startProcurementSupplierProcess()
+    const number = 'global-conflict-' + randomUUID()
+    try {
+      await supplier.control({ kind: mode === 'completed' ? 'success' : 'accepted', execute: true,
+        supplierOrderNumber: number, unitIndices: [1] })
+      const aWorker = await startProcurementCrashProcess(config)
+      await aWorker.run({ action: 'pass', operationId: a.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      if (mode === 'completed') expect(await finalizeProcurementUnit(db, a.id, 1)).toBe('completed')
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', a.id).executeTakeFirstOrThrow()).state)
+        .toBe(mode === 'completed' ? 'completed' : 'accepted_pending')
+      const b = await readyOperation(1, sku)
+      const grossBefore = await sql<{ gross: string }>`SELECT COALESCE(sum(gross_minor),0)::text AS gross
+        FROM procurement_risk_daily WHERE currency='TST' AND scope_kind='global'`.execute(db)
+      const bucketBefore = await sql<{ global: string; supplier: string; sku: string }>`SELECT
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets WHERE currency='TST' AND scope_kind='global' AND scope_key='*') AS global,
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets bucket JOIN procurement_risk_reservations r
+          ON bucket.scope_kind='supplier' AND bucket.scope_key=r.supplier_connection_id::text
+          WHERE r.operation_id=${a.id}::uuid AND bucket.currency='TST') AS supplier,
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets bucket JOIN procurement_risk_reservations r
+          ON bucket.scope_kind='sku' AND bucket.scope_key=r.product_variant_id::text
+          WHERE r.operation_id=${a.id}::uuid AND bucket.currency='TST') AS sku`.execute(db)
+      await supplier.control({ kind: 'accepted', execute: true, supplierOrderNumber: number })
+      const killed = await startProcurementCrashProcess(config, 'evidence_uncommitted')
+      killed.child.send({ action: 'pass', operationId: b.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      await killed.waitFor('checkpoint')
+      expect(await killed.kill()).toBe('SIGKILL')
+      expect((await sql<{ count: string }>`SELECT count(*)::text AS count FROM procurement_execution_conflicts
+        WHERE operation_id IN (${a.id}::uuid,${b.id}::uuid)`.execute(db)).rows[0]!.count).toBe('0')
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, a.id)))?.outstandingMinor).toBe('10')
+      expect((await supplier.stats())).toMatchObject({ submitRequests: 2, queryRequests: 0, executions: 2 })
+
+      await new Promise<void>(resolve => setTimeout(resolve, 1_100))
+      const restarted = await startProcurementCrashProcess(config)
+      expect(restarted.ready.pid).not.toBe(killed.ready.pid)
+      expect(restarted.ready.backendPid).not.toBe(killed.ready.backendPid)
+      await restarted.run({ action: 'pass', operationId: b.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      const conflictRows = await sql<{ operation_id: string; other_operation_id: string }>`SELECT operation_id,other_operation_id
+        FROM procurement_execution_conflicts WHERE reason='supplier_number'
+          AND operation_id IN (${a.id}::uuid,${b.id}::uuid) ORDER BY operation_id`.execute(db)
+      expect(conflictRows.rows.map(row => row.operation_id)).toEqual([a.id, b.id].sort())
+      expect((await db.selectFrom('procurement_execution_evidence').select('supplier_order_number')
+        .where('operation_id', '=', b.id).where('supplier_order_number', '=', number).execute())).toHaveLength(1)
+      expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', b.id).executeTakeFirstOrThrow()).state)
+        .toBe('manual_review')
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, a.id)))?.outstandingMinor).toBe('10')
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, b.id)))?.outstandingMinor).toBe('10')
+      const bucketAfter = await sql<{ global: string; supplier: string; sku: string }>`SELECT
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets WHERE currency='TST' AND scope_kind='global' AND scope_key='*') AS global,
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets bucket JOIN procurement_risk_reservations r
+          ON bucket.scope_kind='supplier' AND bucket.scope_key=r.supplier_connection_id::text
+          WHERE r.operation_id=${a.id}::uuid AND bucket.currency='TST') AS supplier,
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets bucket JOIN procurement_risk_reservations r
+          ON bucket.scope_kind='sku' AND bucket.scope_key=r.product_variant_id::text
+          WHERE r.operation_id=${a.id}::uuid AND bucket.currency='TST') AS sku`.execute(db)
+      expect(bucketAfter.rows[0]).toEqual(bucketBefore.rows[0])
+      expect((await sql<{ gross: string }>`SELECT COALESCE(sum(gross_minor),0)::text AS gross
+        FROM procurement_risk_daily WHERE currency='TST' AND scope_kind='global'`.execute(db)).rows[0]!.gross).toBe(grossBefore.rows[0]!.gross)
+
+      const beforeBlockedPass = await supplier.stats()
+      const repeated = await startProcurementCrashProcess(config)
+      expect(await repeated.run({ action: 'pass', operationId: b.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 }))
+        .toBe(false)
+      expect(await supplier.stats()).toMatchObject({ submitRequests: beforeBlockedPass.submitRequests,
+        queryRequests: beforeBlockedPass.queryRequests, executions: beforeBlockedPass.executions })
+      expect((await sql<{ count: string }>`SELECT count(*)::text AS count FROM procurement_risk_events
+        WHERE operation_id=${a.id}::uuid AND kind='reinstate'`.execute(db)).rows[0]!.count).toBe('0')
+      if (mode === 'completed') expect(await finalizeProcurementUnit(secondDb, a.id, 1)).toBe('already_completed')
+      expect(await supplier.stats()).toMatchObject({ submitRequests: 2, queryRequests: 1, executions: 2 })
+    } finally { await supplier.close() }
+  })
+
+  it('rolls back a killed rejected-operation number collision and reinstates released risk once after recovery', async () => {
+    beginCrashFixtureDraftTracking()
+    await ensureTestRiskPolicy()
+    const sku = await currentCatalog()
+    const a = await readyOperation(1, sku, '2000-01-01')
+    const supplier = await startProcurementSupplierProcess()
+    const number = 'released-risk-conflict-' + randomUUID()
+    try {
+      await supplier.control({ kind: 'rejected', execute: true, supplierOrderNumber: number })
+      const rejected = await startProcurementCrashProcess(config)
+      await rejected.run({ action: 'pass', operationId: a.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      const rejectionIntent = await db.selectFrom('procurement_request_intents').select(['generation', 'request_identity'])
+        .where('operation_id', '=', a.id).where('action', '=', 'submit').executeTakeFirstOrThrow()
+      const rejectionEvidence = randomUUID()
+      await db.transaction().execute(async trx => {
+        await lockProcurementRiskPolicy(trx, a.id)
+        await sql`INSERT INTO procurement_execution_evidence(id,operation_id,generation,action,kind,request_identity,
+          supplier_order_number,response_digest,amount_minor,currency)
+          VALUES (${rejectionEvidence}::uuid,${a.id}::uuid,${rejectionIntent.generation},'submit','rejected',
+            ${rejectionIntent.request_identity},${number},${digest},10,'TST')`.execute(trx)
+        await recordProcurementRiskFact(trx, { operationId: a.id, factId: randomUUID(), kind: 'release',
+          amountMinor: '10', evidenceId: rejectionEvidence })
+        await sql`UPDATE procurement_operations SET state='rejected',revision=revision+1 WHERE id=${a.id}::uuid`.execute(trx)
+        await sql`UPDATE procurement_operation_units SET state='rejected' WHERE operation_id=${a.id}::uuid`.execute(trx)
+      })
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, a.id)))?.outstandingMinor).toBe('0')
+      const source = await db.selectFrom('procurement_operations as operation')
+        .innerJoin('order_item_procurement_sources as source', 'source.id', 'operation.source_id')
+        .select(['source.order_id', 'operation.order_item_id']).where('operation.id', '=', a.id).executeTakeFirstOrThrow()
+      const replacement = await db.transaction().execute(trx => prepareProcurementWithRisk(trx, { requestId: randomUUID(),
+        orderId: source.order_id, orderItemId: source.order_item_id, unitIndices: [1], currency: 'TST', maxAmountMinor: '10' }))
+      const b = await readyOperation(1, sku)
+      const grossBefore = await sql<{ gross: string }>`SELECT COALESCE(sum(gross_minor),0)::text AS gross
+        FROM procurement_risk_daily WHERE currency='TST' AND scope_kind='global'`.execute(db)
+      const bucketBefore = await sql<{ global: string; supplier: string; sku: string }>`SELECT
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets WHERE currency='TST' AND scope_kind='global' AND scope_key='*') AS global,
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets bucket JOIN procurement_risk_reservations r
+          ON bucket.scope_kind='supplier' AND bucket.scope_key=r.supplier_connection_id::text
+          WHERE r.operation_id=${a.id}::uuid AND bucket.currency='TST') AS supplier,
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets bucket JOIN procurement_risk_reservations r
+          ON bucket.scope_kind='sku' AND bucket.scope_key=r.product_variant_id::text
+          WHERE r.operation_id=${a.id}::uuid AND bucket.currency='TST') AS sku`.execute(db)
+      await supplier.control({ kind: 'accepted', execute: true, supplierOrderNumber: number })
+      const killed = await startProcurementCrashProcess(config, 'evidence_uncommitted')
+      killed.child.send({ action: 'pass', operationId: b.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      await killed.waitFor('checkpoint')
+      expect(await killed.kill()).toBe('SIGKILL')
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, a.id)))?.outstandingMinor).toBe('0')
+      expect((await sql<{ count: string }>`SELECT count(*)::text AS count FROM procurement_execution_conflicts
+        WHERE operation_id IN (${a.id}::uuid,${b.id}::uuid)`.execute(db)).rows[0]!.count).toBe('0')
+
+      await new Promise<void>(resolve => setTimeout(resolve, 1_100))
+      const restarted = await startProcurementCrashProcess(config)
+      await restarted.run({ action: 'pass', operationId: b.id, fixtureUrl: supplier.url, leaseMs: 1_000, requestTimeoutMs: 900 })
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, a.id)))?.outstandingMinor).toBe('10')
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, replacement.id)))?.outstandingMinor).toBe('10')
+      expect((await sql<{ count: string }>`SELECT count(*)::text AS count FROM procurement_risk_events
+        WHERE operation_id=${a.id}::uuid AND kind='reinstate'`.execute(db)).rows[0]!.count).toBe('1')
+      const bucketAfter = (await sql<{ global: string; supplier: string; sku: string }>`SELECT
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets WHERE currency='TST' AND scope_kind='global' AND scope_key='*') AS global,
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets bucket JOIN procurement_risk_reservations r
+          ON bucket.scope_kind='supplier' AND bucket.scope_key=r.supplier_connection_id::text
+          WHERE r.operation_id=${a.id}::uuid AND bucket.currency='TST') AS supplier,
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets bucket JOIN procurement_risk_reservations r
+          ON bucket.scope_kind='sku' AND bucket.scope_key=r.product_variant_id::text
+          WHERE r.operation_id=${a.id}::uuid AND bucket.currency='TST') AS sku`.execute(db)).rows[0]!
+      for (const scope of ['global', 'supplier', 'sku'] as const) {
+        expect(BigInt(bucketAfter[scope])).toBe(BigInt(bucketBefore.rows[0]![scope]) + 10n)
+      }
+      expect((await sql<{ gross: string }>`SELECT COALESCE(sum(gross_minor),0)::text AS gross FROM procurement_risk_daily
+        WHERE currency='TST' AND scope_kind='global'`.execute(db)).rows[0]!.gross).toBe(grossBefore.rows[0]!.gross)
+      const orderUnresolved = await sql<{ unresolved: boolean }>`SELECT order_has_unresolved_fulfillment(${source.order_id}::uuid) AS unresolved`.execute(db)
+      expect(orderUnresolved.rows[0]!.unresolved).toBe(true)
+      await expect(db.transaction().execute(trx => prepareProcurementWithRisk(trx, { requestId: randomUUID(), orderId: source.order_id,
+        orderItemId: source.order_item_id, unitIndices: [1], currency: 'TST', maxAmountMinor: '10' }))).rejects.toThrow()
+      expect(await finalizeProcurementUnit(db, replacement.id, 1)).toBe('not_ready')
+      const beforeBlockedPass = await supplier.stats()
+      const blocked = await startProcurementCrashProcess(config)
+      expect(await blocked.run({ action: 'pass', operationId: replacement.id, fixtureUrl: supplier.url,
+        leaseMs: 1_000, requestTimeoutMs: 900 })).toBe(false)
+      expect(await supplier.stats()).toMatchObject({ submitRequests: beforeBlockedPass.submitRequests,
+        queryRequests: beforeBlockedPass.queryRequests, executions: beforeBlockedPass.executions })
+      expect((await sql<{ count: string }>`SELECT count(*)::text AS count FROM procurement_risk_events
+        WHERE operation_id=${a.id}::uuid AND kind='reinstate'`.execute(db)).rows[0]!.count).toBe('1')
+    } finally { await supplier.close() }
+  })
+
   it('R1 restores released cross-day exposure above the cap without duplicating daily gross', async () => {
     await db.transaction().execute(trx => initializeSyntheticProcurementRiskPolicy(trx, { currency: 'TST', limits: {
       perOperationMinor: '100', globalDailyMinor: '10000', globalOutstandingMinor: '10000',
@@ -1275,6 +1694,8 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
       expect(requests.map(row => row.action)).toEqual(['submit','query','submit'])
     } finally { await server.close() }
   }, 60000)
+
+
 
 
 })
