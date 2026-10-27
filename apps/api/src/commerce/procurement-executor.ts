@@ -98,7 +98,16 @@ async function claim(db: Kysely<Database>, id: string, leaseMs: number): Promise
       if (!await readProcurementRisk(trx, id)) return undefined
       await lockProcurementRiskPolicy(trx, id)
     }
+    if (current.supplier_order_number) await sql`SELECT pg_advisory_xact_lock(hashtextextended(
+      ${'procurement-number:' + current.supplier_connection_id + ':' + current.supplier_order_number}, 0))`.execute(trx)
     await sql`SELECT id FROM procurement_operations WHERE id = ${id}::uuid FOR UPDATE`.execute(trx)
+    const globalConflict = (await sql<{ value: boolean }>`SELECT procurement_has_unresolved_conflict(${id}::uuid) AS value`.execute(trx)).rows[0]!.value
+    if (globalConflict) {
+      await sql`UPDATE procurement_operations SET state='manual_review',revision=revision+1 WHERE id=${id}::uuid`.execute(trx)
+      await sql`UPDATE procurement_operation_units SET state='manual_review' WHERE operation_id=${id}::uuid
+        AND state IN ('allocated','unknown','success_pending_finalize')`.execute(trx)
+      return undefined
+    }
     await sql`INSERT INTO procurement_execution_leases(operation_id) VALUES (${id}::uuid) ON CONFLICT DO NOTHING`.execute(trx)
     const lease = (await sql<Lease>`SELECT lease_token, lease_expires_at, request_generation, next_action_at
       FROM procurement_execution_leases WHERE operation_id = ${id}::uuid FOR UPDATE`.execute(trx)).rows[0]!
@@ -208,6 +217,7 @@ async function record(db: Kysely<Database>, claimed: Claim, raw: ProcurementFixt
       JOIN order_item_procurement_sources s ON s.id = other.source_id
       WHERE s.supplier_connection_id = ${op.supplier_connection_id}::uuid AND e.supplier_order_number = ${result.supplierOrderNumber}
         AND e.operation_id <> ${op.id}::uuid) AS collision`.execute(trx)).rows[0]!.collision : false
+    const globalConflict = (await sql<{ value: boolean }>`SELECT procurement_has_unresolved_conflict(${op.id}::uuid) AS value`.execute(trx)).rows[0]!.value
     await sql`SELECT id FROM procurement_operations WHERE id = ${op.id}::uuid FOR UPDATE`.execute(trx)
     const lease = (await sql<Lease>`SELECT lease_token, lease_expires_at, request_generation, next_action_at
       FROM procurement_execution_leases WHERE operation_id = ${op.id}::uuid FOR UPDATE`.execute(trx)).rows[0]
@@ -217,11 +227,11 @@ async function record(db: Kysely<Database>, claimed: Claim, raw: ProcurementFixt
     const current = await operationRow(trx, op.id)
     if (!current || ['completed', 'rejected'].includes(current.state)) return
     // A rejection is retained for manual adjudication; no implicit budget release occurs.
-    let next = kind === 'identity_conflict' || priorConflict || collision || kind === 'rejected'
+    let next = kind === 'identity_conflict' || priorConflict || globalConflict || collision || kind === 'rejected'
       || (kind === 'not_found' && (current.supplier_order_number !== null || claimed.supplierOrderNumber !== null)) ? 'manual_review'
       : kind === 'success' ? 'success_pending_finalize'
         : kind === 'accepted' || kind === 'pending' ? 'accepted_pending' : 'unknown'
-    if (current.state === 'success_pending_finalize' && !collision && !priorConflict
+    if (current.state === 'success_pending_finalize' && !collision && !priorConflict && !globalConflict
       && kind !== 'identity_conflict' && kind !== 'rejected') next = 'success_pending_finalize'
     const number = current.supplier_order_number ?? (kind === 'identity_conflict' || priorConflict ? null : result.supplierOrderNumber ?? claimed.supplierOrderNumber)
     if (next !== current.state || number !== current.supplier_order_number) {

@@ -72,19 +72,7 @@ export async function finalizeProcurementUnit(
     `.execute(trx)
     const digest = evidence.rows[0]?.response_digest
     if (!digest) return 'not_ready'
-    const conflicts = await sql<{ conflict: boolean }>`
-      SELECT EXISTS (
-        SELECT 1 FROM procurement_execution_evidence evidence
-        WHERE evidence.operation_id = ${operationId}::uuid AND evidence.kind = 'identity_conflict'
-      ) OR EXISTS (
-        SELECT 1 FROM procurement_execution_evidence evidence
-        JOIN procurement_operations other ON other.id = evidence.operation_id
-        JOIN order_item_procurement_sources source ON source.id = other.source_id
-        WHERE evidence.supplier_order_number = ${provider.supplier_order_number}
-          AND source.supplier_connection_id = ${provider.supplier_connection_id}::uuid
-          AND other.id <> ${operationId}::uuid
-      ) AS conflict
-    `.execute(trx)
+    const conflicts = await sql<{ conflict: boolean }>`SELECT procurement_has_unresolved_conflict(${operationId}::uuid) AS conflict`.execute(trx)
     if (conflicts.rows[0]?.conflict) return 'not_ready'
     const attemptId = randomUUID()
     await sql`INSERT INTO order_item_fulfillment_attempts

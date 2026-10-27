@@ -18,6 +18,7 @@ import { createPurchaseDraft, savePurchaseDraft, uploadPurchaseDraftAttachment }
 import { PurchaseAttachmentStorage } from '../src/media/purchase-attachment-storage.js'
 import { encryptSupplierCredentials } from '../src/commerce/supplier-api-crypto.js'
 import { recordWalletOrderPayment } from '../src/finance/wallet.js'
+import { allocateProcurementIdentity } from '../src/commerce/procurement-identity.js'
 
 const selected = vi.hoisted(() => ({ rows: [] as Array<{ skuId: string; mappingVersionId: string }>, fail: false }))
 vi.mock('../src/commerce/procurement-source-selection.js', () => ({
@@ -39,7 +40,7 @@ const digest = 'd'.repeat(64)
 const credentials = { providerType: 'kayixin_customer_v3' as const, appId: '12345', appSecret: 'synthetic-only-secret' }
 const owner = { kind: 'customer' as const, customer: { id: customerId, sessionId } }
 let db: Kysely<Database>, secondDb: Kysely<Database>, config: AppConfig
-let app: FastifyInstance, secondApp: FastifyInstance, privateRoot: string
+let app: FastifyInstance, secondApp: FastifyInstance, thirdApp: FastifyInstance, privateRoot: string
 let headers: Record<string, string>
 let skuA: Catalog
 
@@ -51,7 +52,7 @@ function cookie(response: { headers: Record<string, string | string[] | undefine
   return rows.find(row => row.startsWith(`${name}=`))!.split(';')[0]!
 }
 
-async function catalog(price: string, quantityStock = false): Promise<Catalog> {
+async function catalog(price: string, quantityStock = false, supplier = { id: connectionId, versionId: connectionVersionId }): Promise<Catalog> {
   const productId = randomUUID(), skuId = randomUUID(), mappingId = randomUUID(), versionId = randomUUID()
   const code = `PROC-${skuId.slice(0, 8)}`
   await db.transaction().execute(async trx => {
@@ -71,7 +72,7 @@ async function catalog(price: string, quantityStock = false): Promise<Catalog> {
        upstream_product_id, upstream_product_name, upstream_sku_type, upstream_sku_code, upstream_combination,
        upstream_structure_snapshot, upstream_structure_sha256, upstream_observed_at, template_id, template_version_id,
        template_sha256, normalization_version, rules, rules_sha256, created_by_admin_id, updated_by_admin_id)
-      VALUES (${mappingId}::uuid, ${productId}::uuid, ${skuId}::uuid, ${connectionId}::uuid, ${connectionVersionId}::uuid,
+      VALUES (${mappingId}::uuid, ${productId}::uuid, ${skuId}::uuid, ${supplier.id}::uuid, ${supplier.versionId}::uuid,
         '123456', 'synthetic good', 0, NULL, '[]'::jsonb, '{}'::jsonb, ${structureHash}, now(),
         ${templateId}::uuid, ${templateVersionId}::uuid, ${templateHash}, 1, '{"version":1,"fields":[]}'::jsonb,
         ${rulesHash}, ${adminId}::uuid, ${adminId}::uuid)`.execute(trx)
@@ -114,7 +115,7 @@ function line(sku: Catalog, saved: Awaited<ReturnType<typeof draft>>, quantity =
 }
 let checkoutSequence = 0
 async function checkout(items: Line[]) {
-  const checkoutApp = checkoutSequence++ % 2 === 0 ? app : secondApp
+  const checkoutApp = [app, secondApp, thirdApp][checkoutSequence++ % 3]!
   const quote = await checkoutApp.inject({ method: 'POST', url: '/api/v1/checkout/quote', headers, payload: { version: 2, items } })
   expect(quote.statusCode, quote.body).toBe(200)
   expect(quote.json().data.canContinue, quote.body).toBe(true)
@@ -188,30 +189,39 @@ beforeAll(async () => {
   app = await createApp({ db, config, logger: false }); await app.ready()
   secondDb = createDatabase()
   secondApp = await createApp({ db: secondDb, config, logger: false }); await secondApp.ready()
+  thirdApp = await createApp({ db, config, logger: false }); await thirdApp.ready()
   const csrf = await app.inject({ method: 'GET', url: '/api/v1/customer/auth/csrf' })
   headers = { origin, cookie: `aikayun_customer_session=${customerToken}; ${cookie(csrf, 'aikayun_customer_csrf')}`,
     'x-csrf-token': csrf.json().data.csrfToken as string }
 })
 
 afterAll(async () => {
-  await secondApp?.close(); await app?.close(); await secondDb?.destroy(); await db?.destroy()
+  await thirdApp?.close(); await secondApp?.close(); await app?.close(); await secondDb?.destroy(); await db?.destroy()
   if (privateRoot) await rm(privateRoot, { recursive: true, force: true })
 })
 
 
 import { createServer, type Server } from 'node:http'
 import { prepareProcurementWithRisk, runProcurementFixturePass, type ProcurementFixtureRequest, type ProcurementFixtureResult } from '../src/commerce/procurement-executor.js'
-import { initializeSyntheticProcurementRiskPolicy, readProcurementRisk, recordProcurementRiskFact, lockProcurementRiskPolicy } from '../src/commerce/procurement-risk-budget.js'
+import { initializeSyntheticProcurementRiskPolicy, readProcurementRisk, recordProcurementRiskFact, lockProcurementRiskPolicy, reserveProcurementRisk } from '../src/commerce/procurement-risk-budget.js'
 import { finalizeProcurementUnit } from '../src/commerce/procurement-finalization.js'
 
-async function readyOperation(quantity = 1, sku = skuA) {
+async function readyOperation(quantity = 1, sku = skuA, utcDay?: string) {
   selected.rows = [{ skuId: sku.skuId, mappingVersionId: sku.versionId }]
   const result = await checkout([line(sku, await draft(randomUUID()), quantity)])
   await pay(result.order.id)
   const item = result.order.items[0]!
   const requestId = randomUUID()
-  const operation = await db.transaction().execute(trx => prepareProcurementWithRisk(trx, { requestId, orderId: result.order.id,
-    orderItemId: item.id, unitIndices: Array.from({ length: quantity }, (_, i) => i + 1), currency: 'TST', maxAmountMinor: '10' }))
+  const unitIndices = Array.from({ length: quantity }, (_, i) => i + 1)
+  const operation = await db.transaction().execute(async trx => {
+    if (!utcDay) return prepareProcurementWithRisk(trx, { requestId, orderId: result.order.id,
+      orderItemId: item.id, unitIndices, currency: 'TST', maxAmountMinor: '10' })
+    const identity = await allocateProcurementIdentity(trx, result.order.id, item.id, unitIndices)
+    await reserveProcurementRisk(trx, { operationId: identity.id, currency: 'TST', maxAmountMinor: '10', utcDay })
+    await sql`INSERT INTO procurement_preparation_requests(request_id,operation_id,order_id,order_item_id,unit_indices,currency,max_amount_minor)
+      VALUES (${requestId}::uuid,${identity.id}::uuid,${result.order.id}::uuid,${item.id}::uuid,${unitIndices}::integer[],'TST',10)`.execute(trx)
+    return identity
+  })
   return { ...operation, requestId }
 }
 
@@ -238,6 +248,193 @@ async function fixtureServer(handler: (request: ProcurementFixtureRequest) => Pr
 }
 
 describe('⑥-4B-2 isolated procurement fixture', () => {
+  it.each(['accepted', 'completed', 'rejected'] as const)('R1 prevents cross-operation supplier number collision after A is %s', async mode => {
+    await db.transaction().execute(trx => initializeSyntheticProcurementRiskPolicy(trx, { currency: 'TST', limits: {
+      perOperationMinor: '100', globalDailyMinor: '10000', globalOutstandingMinor: '10000',
+      supplierDailyMinor: '10000', supplierOutstandingMinor: '10000', skuDailyMinor: '10000', skuOutstandingMinor: '10000',
+    } }))
+    const a = await readyOperation(1, skuA, mode === 'rejected' ? '2000-01-01' : undefined), b = await readyOperation(), requests: ProcurementFixtureRequest[] = []
+    const number = `collision-${randomUUID()}`, bEntered = gate(), bResponse = gate()
+    let concurrentReplacement: Awaited<ReturnType<typeof prepareProcurementWithRisk>> | undefined
+    const server = await fixtureServer(async request => {
+      requests.push(request)
+      if (mode === 'rejected' && request.operationId === b.id) { bEntered.open(); await bResponse.promise }
+      if (request.operationId === a.id && mode === 'completed') return { requestIdentity: request.requestIdentity, kind: 'success',
+        supplierOrderNumber: number, unitIndices: [1], deliveryConfirmed: true, responseDigest: digest }
+      if (request.operationId === a.id && mode === 'rejected' && request.action === 'query') return {
+        requestIdentity: request.requestIdentity, kind: 'rejected', supplierOrderNumber: number, responseDigest: digest }
+      return { requestIdentity: request.requestIdentity, kind: 'accepted', supplierOrderNumber: number, responseDigest: digest }
+    })
+    try {
+      await runProcurementFixturePass(db, a.id, server.transport, async () => true)
+      if (mode === 'completed') expect(await finalizeProcurementUnit(db, a.id, 1)).toBe('completed')
+      if (mode === 'rejected') {
+        await sql`UPDATE procurement_execution_leases SET next_action_at=clock_timestamp()-interval '1 second' WHERE operation_id=${a.id}::uuid`.execute(db)
+        await runProcurementFixturePass(db, a.id, server.transport, async () => true)
+        const evidenceId = randomUUID()
+        await db.transaction().execute(async trx => {
+          const source = (await sql<{ order_id: string; order_item_id: string; local_business_number: string }>`
+            SELECT s.order_id,o.order_item_id,o.local_business_number FROM procurement_operations o
+            JOIN order_item_procurement_sources s ON s.id=o.source_id WHERE o.id=${a.id}::uuid`.execute(trx)).rows[0]!
+          await sql`SELECT id FROM orders WHERE id=${source.order_id}::uuid FOR UPDATE`.execute(trx)
+          await sql`SELECT id FROM order_items WHERE id=${source.order_item_id}::uuid FOR UPDATE`.execute(trx)
+          await lockProcurementRiskPolicy(trx, a.id)
+          await sql`INSERT INTO procurement_execution_evidence(id,operation_id,generation,action,kind,request_identity,response_digest,supplier_order_number,amount_minor,currency)
+            VALUES (${evidenceId}::uuid,${a.id}::uuid,2,'query','rejected',${source.local_business_number},${digest},${number},10,'TST')`.execute(trx)
+          await recordProcurementRiskFact(trx, { operationId: a.id, factId: randomUUID(), kind: 'release', amountMinor: '10', evidenceId })
+          await sql`UPDATE procurement_operations SET state='rejected',revision=revision+1 WHERE id=${a.id}::uuid`.execute(trx)
+          await sql`UPDATE procurement_operation_units SET state='rejected' WHERE operation_id=${a.id}::uuid`.execute(trx)
+        })
+      }
+      if (mode === 'rejected') {
+        const pending = runProcurementFixturePass(secondDb, b.id, server.transport, async () => true)
+        await bEntered.promise
+        const held = gate(), release = gate()
+        let blockerPid = 0
+        const collision = db.transaction().execute(async trx => {
+          const info = (await sql<{ order_id: string; order_item_id: string; local_business_number: string }>`
+            SELECT s.order_id,o.order_item_id,o.local_business_number FROM procurement_operations o
+            JOIN order_item_procurement_sources s ON s.id=o.source_id WHERE o.id=${b.id}::uuid`.execute(trx)).rows[0]!
+          await sql`SELECT id FROM orders WHERE id=${info.order_id}::uuid FOR UPDATE`.execute(trx)
+          await sql`SELECT id FROM order_items WHERE id=${info.order_item_id}::uuid FOR UPDATE`.execute(trx)
+          await lockProcurementRiskPolicy(trx, b.id)
+          blockerPid = (await sql<{ pid: number }>`SELECT pg_backend_pid() AS pid`.execute(trx)).rows[0]!.pid
+          await sql`INSERT INTO procurement_execution_evidence(id,operation_id,generation,action,kind,request_identity,supplier_order_number,response_digest)
+            VALUES (${randomUUID()}::uuid,${b.id}::uuid,1,'submit','accepted',${info.local_business_number},${number},${digest})`.execute(trx)
+          held.open(); await release.promise
+        })
+        await held.promise
+        const aOrder = (await sql<{ order_id: string }>`SELECT s.order_id FROM procurement_operations o
+          JOIN order_item_procurement_sources s ON s.id=o.source_id WHERE o.id=${a.id}::uuid`.execute(db)).rows[0]!.order_id
+        const aItem = (await sql<{ order_item_id: string }>`SELECT order_item_id FROM procurement_operations WHERE id=${a.id}::uuid`.execute(db)).rows[0]!.order_item_id
+        const token = randomBytes(32).toString('base64url')
+        await db.insertInto('admin_sessions').values({ id: randomUUID(), admin_user_id: adminId, token_hash: hashToken(token),
+          expires_at: new Date(Date.now() + 60_000), revoked_at: null }).execute()
+        const csrf = await app.inject({ method: 'GET', url: '/api/v1/admin/auth/csrf' })
+        const admin = { origin, cookie: `aikayun_admin_session=${token}; ${cookie(csrf, 'aikayun_admin_csrf')}`,
+          'x-csrf-token': csrf.json().data.csrfToken as string }
+        const refund = app.inject({ method: 'POST', url: `/api/v1/customer/orders/${aOrder}/refunds`, headers,
+          payload: { idempotencyKey: randomUUID(), amount: '1.00', reason: 'concurrent supplier collision' } })
+        const manual = secondApp.inject({ method: 'POST', url: `/api/v1/admin/orders/${aOrder}/items/${aItem}/fulfillments`, headers: admin,
+          payload: { operationId: randomUUID(), deliveries: [{ content: 'must-not-be-delivered' }] } })
+        const replacement = secondDb.transaction().execute(trx => prepareProcurementWithRisk(trx, { requestId: randomUUID(),
+          orderId: aOrder, orderItemId: aItem, unitIndices: [1], currency: 'TST', maxAmountMinor: '10' }))
+        let blocked = 0
+        const deadline = Date.now() + 10000
+        while (blocked < 3 && Date.now() < deadline) {
+          blocked = (await sql<{ count: number }>`WITH RECURSIVE blocked(pid) AS (
+            SELECT ${blockerPid}::integer UNION SELECT activity.pid FROM pg_stat_activity activity
+            JOIN blocked parent ON parent.pid=ANY(pg_blocking_pids(activity.pid)))
+            SELECT (count(*)-1)::integer AS count FROM blocked`.execute(db)).rows[0]!.count
+          if (blocked < 3) await new Promise<void>(resolve => setImmediate(resolve))
+        }
+        release.open(); await collision
+        const [refundResponse, manualResponse, replacementResult] = await Promise.all([refund, manual, replacement])
+        concurrentReplacement = replacementResult
+        expect(blocked).toBeGreaterThanOrEqual(3)
+        expect(refundResponse.statusCode).toBe(409); expect(manualResponse.statusCode).toBe(409)
+        bResponse.open(); await pending
+      } else await runProcurementFixturePass(secondDb, b.id, server.transport, async () => true)
+      if (mode === 'accepted') {
+        await sql`UPDATE procurement_execution_leases SET next_action_at=clock_timestamp()-interval '1 second' WHERE operation_id=${a.id}::uuid`.execute(db)
+        await runProcurementFixturePass(db, a.id, server.transport, async () => true)
+      }
+      const state = await sql<{ id: string; state: string; supplier_order_number: string | null }>`SELECT id,state,supplier_order_number
+        FROM procurement_operations WHERE id IN (${a.id}::uuid,${b.id}::uuid)`.execute(db)
+      const aState = state.rows.find(row => row.id === a.id)!, bState = state.rows.find(row => row.id === b.id)!
+      const source = (await sql<{ order_id: string }>`SELECT order_id FROM order_item_procurement_sources s
+        JOIN procurement_operations o ON o.source_id=s.id WHERE o.id=${a.id}::uuid`.execute(db)).rows[0]!
+      const unresolved = (await sql<{ value: boolean }>`SELECT order_has_unresolved_fulfillment(${source.order_id}::uuid) AS value`.execute(db)).rows[0]!.value
+      const conflicts = (await sql<{ operation_id: string }>`SELECT DISTINCT operation_id FROM procurement_execution_conflicts
+        WHERE reason='supplier_number' AND operation_id IN (${a.id}::uuid,${b.id}::uuid)`.execute(db)).rows
+      const evidence = (await sql<{ operation_id: string }>`SELECT DISTINCT operation_id FROM procurement_execution_evidence
+        WHERE supplier_order_number=${number} AND operation_id IN (${a.id}::uuid,${b.id}::uuid)`.execute(db)).rows
+      expect(new Set(evidence.map(row => row.operation_id))).toEqual(new Set([a.id,b.id]))
+      const risk = await db.transaction().execute(trx => readProcurementRisk(trx, a.id))
+      if (mode === 'accepted') {
+        await expect(db.transaction().execute(async trx => {
+          await sql`UPDATE procurement_execution_leases SET lease_token=${randomUUID()}::uuid,
+            lease_expires_at=clock_timestamp()+interval '1 minute',request_generation=request_generation+1
+            WHERE operation_id=${a.id}::uuid`.execute(trx)
+          await sql`INSERT INTO procurement_request_intents(id,operation_id,generation,action,request_identity)
+            SELECT ${randomUUID()}::uuid,operation_id,request_generation,'query',${a.localBusinessNumber}
+            FROM procurement_execution_leases WHERE operation_id=${a.id}::uuid`.execute(trx)
+        })).rejects.toMatchObject({ constraint: 'procurement_global_conflict' })
+      }
+      if (mode !== 'accepted') {
+        const refund = await app.inject({ method: 'POST', url: `/api/v1/customer/orders/${source.order_id}/refunds`, headers,
+          payload: { idempotencyKey: randomUUID(), amount: '1.00', reason: 'supplier number conflict' } })
+        expect(refund.statusCode).toBe(409)
+        const bEvidence = (await sql<{ request_identity: string }>`SELECT request_identity FROM procurement_request_intents
+          WHERE operation_id=${b.id}::uuid AND action='submit'`.execute(db)).rows[0]!
+        await sql`INSERT INTO procurement_execution_evidence(id,operation_id,generation,action,kind,request_identity,supplier_order_number,response_digest)
+          VALUES (${randomUUID()}::uuid,${b.id}::uuid,1,'submit','accepted',${bEvidence.request_identity},${number},${digest})`.execute(db)
+        const ledger = await sql<{ kind: string }>`SELECT kind FROM procurement_risk_events WHERE operation_id=${a.id}::uuid`.execute(db)
+        expect(ledger.rows.filter(row => row.kind === 'reinstate')).toHaveLength(mode === 'rejected' ? 1 : 0)
+        expect(ledger.rows.filter(row => row.kind === 'debit')).toHaveLength(0)
+        if (mode === 'completed') {
+          expect(await finalizeProcurementUnit(db, a.id, 1)).toBe('already_completed')
+          const delivered = await sql<{ count: string }>`SELECT count(*)::text AS count FROM order_item_fulfillment_deliveries d
+            JOIN order_item_fulfillment_attempts attempt ON attempt.id=d.fulfillment_attempt_id
+            WHERE attempt.procurement_operation_id=${a.id}::uuid AND attempt.status='succeeded'`.execute(db)
+          expect(delivered.rows[0]!.count).toBe('1')
+          expect((await db.selectFrom('orders').select('status').where('id', '=', source.order_id).executeTakeFirstOrThrow()).status).toBe('completed')
+        }
+        if (mode === 'rejected') {
+          const item = (await sql<{ order_item_id: string }>`SELECT order_item_id FROM procurement_operations WHERE id=${a.id}::uuid`.execute(db)).rows[0]!
+          await expect(sql`INSERT INTO order_item_fulfillment_attempts(id,order_item_id,operation_id,quantity,status,delivery_source,started_by_admin_id)
+            VALUES (${randomUUID()}::uuid,${item.order_item_id}::uuid,${randomUUID()}::uuid,1,'processing','manual',${adminId}::uuid)`.execute(db))
+            .rejects.toMatchObject({ constraint: 'procurement_fulfillment_conflict' })
+          expect(concurrentReplacement).toBeDefined()
+          expect(await runProcurementFixturePass(db, concurrentReplacement!.id, server.transport, async () => true)).toBe(false)
+        }
+      }
+      const expectedRequests = mode === 'rejected' ? ['submit', 'query', 'submit'] : ['submit', 'submit']
+      expect({ actions: requests.map(r => r.action), requestNumbers: requests.map(r => r.supplierOrderNumber), aState: aState.state,
+        aNumber: aState.supplier_order_number, bState: bState.state, unresolved, risk: risk?.outstandingMinor,
+        conflicts: new Set(conflicts.map(row => row.operation_id)).size }).toEqual({
+        actions: expectedRequests, requestNumbers: mode === 'rejected' ? [null, number, null] : [null, null],
+        aState: mode === 'accepted' ? 'manual_review' : mode, aNumber: number, bState: 'manual_review',
+        unresolved: true, risk: '10', conflicts: 2,
+      })
+    } finally { bResponse.open(); await server.close() }
+  })
+  it('R1 permits the same number in different supplier connections and normal repeated lookup', async () => {
+    const id = randomUUID(), versionId = randomUUID()
+    const envelope = encryptSupplierCredentials(config, id, 1, credentials)
+    await db.transaction().execute(async trx => {
+      await trx.insertInto('supplier_connections').values({ id, display_name: 'Independent synthetic supplier', provider_type: 'kayixin_customer_v3',
+        enabled: false, current_version_id: null, tested_version_id: null, created_by_admin_id: adminId }).execute()
+      await trx.insertInto('supplier_connection_credentials').values({ supplier_connection_id: id, credential_version: 1,
+        provider_type: 'kayixin_customer_v3', auth_scheme: 'app_signature_v3', key_id: envelope.keyId,
+        nonce: envelope.nonce, ciphertext: envelope.ciphertext, auth_tag: envelope.authTag }).execute()
+      await trx.insertInto('supplier_connection_versions').values({ id: versionId, supplier_connection_id: id, version_number: 1,
+        display_name: 'Independent synthetic supplier', provider_type: 'kayixin_customer_v3', auth_scheme: 'app_signature_v3',
+        base_url: 'https://another-synthetic.example.test', credential_version: 1, created_by_admin_id: adminId }).execute()
+      await trx.updateTable('supplier_connections').set({ current_version_id: versionId }).where('id', '=', id).execute()
+    })
+    const a = await readyOperation(), b = await readyOperation(1, await catalog('1.00', false, { id, versionId }))
+    const number = `independent-${randomUUID()}`, requests: ProcurementFixtureRequest[] = []
+    const server = await fixtureServer(async request => {
+      requests.push(request)
+      return request.action === 'query' ? { requestIdentity: request.requestIdentity, kind: 'success', supplierOrderNumber: number,
+        unitIndices: [1], deliveryConfirmed: true, responseDigest: digest }
+        : { requestIdentity: request.requestIdentity, kind: 'accepted', supplierOrderNumber: number, responseDigest: digest }
+    })
+    try {
+      await runProcurementFixturePass(db, a.id, server.transport, async () => true)
+      await runProcurementFixturePass(secondDb, b.id, server.transport, async () => true)
+      await sql`UPDATE procurement_execution_leases SET next_action_at=clock_timestamp()-interval '1 second'
+        WHERE operation_id IN (${a.id}::uuid,${b.id}::uuid)`.execute(db)
+      expect(await runProcurementFixturePass(db, a.id, server.transport, async () => true)).toBe(true)
+      expect(await runProcurementFixturePass(secondDb, b.id, server.transport, async () => true)).toBe(true)
+      expect(requests.map(r => [r.action, r.supplierOrderNumber])).toEqual([['submit',null],['submit',null],['query',number],['query',number]])
+      expect(await finalizeProcurementUnit(db, a.id, 1)).toBe('completed')
+      expect(await finalizeProcurementUnit(db, b.id, 1)).toBe('completed')
+      const rows = await sql`SELECT 1 FROM procurement_execution_conflicts WHERE operation_id IN (${a.id}::uuid,${b.id}::uuid)`.execute(db)
+      expect(rows.rows).toEqual([])
+    } finally { await server.close() }
+  })
   it('serializes two workers while the controlled supplier request is in flight', async () => {
     await db.transaction().execute(trx => initializeSyntheticProcurementRiskPolicy(trx, { currency: 'TST', limits: {
       perOperationMinor: '100', globalDailyMinor: '10000', globalOutstandingMinor: '10000',
@@ -872,7 +1069,7 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
           'x-csrf-token': csrf.json().data.csrfToken as string },
         payload: { operationId: randomUUID(), deliveries: [{ content: 'must-not-be-delivered' }] } })
       expect(manual.statusCode).toBe(409)
-      await db.transaction().execute(async trx => {
+      await expect(db.transaction().execute(async trx => {
         await sql`SELECT id FROM orders WHERE id=${source.order_id}::uuid FOR UPDATE`.execute(trx)
         await sql`SELECT id FROM order_items WHERE id=${source.order_item_id}::uuid FOR UPDATE`.execute(trx)
         await lockProcurementRiskPolicy(trx, replacement.id)
@@ -880,9 +1077,9 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
           VALUES (${replacement.id}::uuid,${randomUUID()}::uuid,clock_timestamp()+interval '1 minute',1)`.execute(trx)
         await sql`INSERT INTO procurement_request_intents(id,operation_id,generation,action,request_identity)
           VALUES (${randomUUID()}::uuid,${replacement.id}::uuid,1,'submit',${replacement.localBusinessNumber})`.execute(trx)
-      })
+      })).rejects.toMatchObject({ constraint: 'procurement_global_conflict' })
       await expect(sql`UPDATE procurement_operations SET state='submit_in_flight',revision=revision+1 WHERE id=${replacement.id}::uuid`.execute(db))
-        .rejects.toMatchObject({ constraint: 'procurement_prior_execution_conflict' })
+        .rejects.toMatchObject({ constraint: 'procurement_identity_conflict_unresolved' })
       expect(await runProcurementFixturePass(secondDb, replacement.id, server.transport, async () => true)).toBe(false)
       expect(requests.map(row => row.action)).toEqual(['submit','query'])
       expect((await db.selectFrom('procurement_operations').select('state').where('id', '=', replacement.id).executeTakeFirstOrThrow()).state).toBe('manual_review')
@@ -1015,6 +1212,69 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
       expect(calls).toBe(1)
     } finally { await server.close() }
   })
+
+  it('R1 restores released cross-day exposure above the cap without duplicating daily gross', async () => {
+    await db.transaction().execute(trx => initializeSyntheticProcurementRiskPolicy(trx, { currency: 'TST', limits: {
+      perOperationMinor: '100', globalDailyMinor: '10000', globalOutstandingMinor: '10000',
+      supplierDailyMinor: '10000', supplierOutstandingMinor: '10000', skuDailyMinor: '10000', skuOutstandingMinor: '10000',
+    } }))
+    const versionId = (await db.selectFrom('supplier_connections').select('current_version_id').where('id', '=', connectionId).executeTakeFirstOrThrow()).current_version_id!
+    const sku = await catalog('1.00', false, { id: connectionId, versionId })
+    const a = await readyOperation(1, sku, '2000-01-01'), b = await readyOperation(1, sku)
+    const number = `cap-${randomUUID()}`, requests: ProcurementFixtureRequest[] = []
+    const server = await fixtureServer(async request => {
+      requests.push(request)
+      return { requestIdentity: request.requestIdentity, kind: request.operationId === a.id && request.action === 'query' ? 'rejected' : 'accepted',
+        supplierOrderNumber: number, responseDigest: digest }
+    })
+    try {
+      await runProcurementFixturePass(db, a.id, server.transport, async () => true)
+      await sql`UPDATE procurement_execution_leases SET next_action_at=clock_timestamp()-interval '1 second' WHERE operation_id=${a.id}::uuid`.execute(db)
+      await runProcurementFixturePass(db, a.id, server.transport, async () => true)
+      const evidenceId = randomUUID()
+      await db.transaction().execute(async trx => {
+        const source = (await sql<{ order_id: string; order_item_id: string }>`SELECT s.order_id,o.order_item_id FROM procurement_operations o
+          JOIN order_item_procurement_sources s ON s.id=o.source_id WHERE o.id=${a.id}::uuid`.execute(trx)).rows[0]!
+        await sql`SELECT id FROM orders WHERE id=${source.order_id}::uuid FOR UPDATE`.execute(trx)
+        await sql`SELECT id FROM order_items WHERE id=${source.order_item_id}::uuid FOR UPDATE`.execute(trx)
+        await lockProcurementRiskPolicy(trx, a.id)
+        await sql`INSERT INTO procurement_execution_evidence(id,operation_id,generation,action,kind,request_identity,response_digest,supplier_order_number,amount_minor,currency)
+          VALUES (${evidenceId}::uuid,${a.id}::uuid,2,'query','rejected',${a.localBusinessNumber},${digest},${number},10,'TST')`.execute(trx)
+        await recordProcurementRiskFact(trx, { operationId: a.id, factId: randomUUID(), kind: 'release', amountMinor: '10', evidenceId })
+        await sql`UPDATE procurement_operations SET state='rejected',revision=revision+1 WHERE id=${a.id}::uuid`.execute(trx)
+        await sql`UPDATE procurement_operation_units SET state='rejected' WHERE operation_id=${a.id}::uuid`.execute(trx)
+      })
+      const current = Number((await sql<{ outstanding: string }>`SELECT outstanding_minor::text AS outstanding FROM procurement_risk_buckets
+        WHERE currency='TST' AND scope_kind='global' AND scope_key='*'`.execute(db)).rows[0]!.outstanding)
+      let remaining = 10000 - current
+      while (remaining > 0) {
+        const count = Math.min(99, Math.ceil(remaining / 100))
+        selected.rows = [{ skuId: sku.skuId, mappingVersionId: sku.versionId }]
+        const result = await checkout([line(sku, await draft(randomUUID()), count)])
+        await pay(result.order.id)
+        const item = result.order.items[0]!
+        await db.transaction().execute(async trx => {
+          for (let index = 1; index <= count; index++) {
+            const amount = Math.min(100, remaining)
+            const op = await allocateProcurementIdentity(trx, result.order.id, item.id, [index])
+            await reserveProcurementRisk(trx, { operationId: op.id, currency: 'TST', maxAmountMinor: String(amount), utcDay: '2000-01-02' })
+            remaining -= amount
+          }
+        })
+      }
+      const before = (await sql<{ total: string; gross: string }>`SELECT
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets WHERE currency='TST' AND scope_kind='global' AND scope_key='*') AS total,
+        (SELECT sum(gross_minor)::text FROM procurement_risk_daily WHERE currency='TST' AND scope_kind='global') AS gross`.execute(db)).rows[0]!
+      expect(before.total).toBe('10000')
+      await runProcurementFixturePass(secondDb, b.id, server.transport, async () => true)
+      const after = (await sql<{ total: string; gross: string }>`SELECT
+        (SELECT outstanding_minor::text FROM procurement_risk_buckets WHERE currency='TST' AND scope_kind='global' AND scope_key='*') AS total,
+        (SELECT sum(gross_minor)::text FROM procurement_risk_daily WHERE currency='TST' AND scope_kind='global') AS gross`.execute(db)).rows[0]!
+      expect(after).toEqual({ total: '10010', gross: before.gross })
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, a.id)))?.outstandingMinor).toBe('10')
+      expect(requests.map(row => row.action)).toEqual(['submit','query','submit'])
+    } finally { await server.close() }
+  }, 60000)
 
 
 })
