@@ -5,7 +5,10 @@ import { join } from 'node:path'
 
 const root = process.argv[2]
 if (!root) throw new Error('A private fixture directory is required')
-await mkdir(root, { recursive: true, mode: 0o700 })
+// The fixture may write to a host bind mount from a non-root container user.
+// Keep the temporary directory removable by the owning test runner; journal
+// and control files remain owner-only.
+await mkdir(root, { recursive: true, mode: 0o777 })
 const journal = join(root, 'supplier-events.jsonl')
 const controlPath = join(root, 'supplier-control.json')
 let control = { kind: 'success', execute: true, holdSubmit: false, queryError: false }
