@@ -72,14 +72,17 @@
 | Chromium 主套件 | 93/93 |
 | 辅助浏览器套件 | 替代品牌 1/1、SSR 错误 3/3、开发预览 1/1、生产品牌运行时 1/1；共 6/6 |
 | 构建 | Nuxt/Nitro 生产构建通过 |
-| skip / flaky / retry | 本次输出无跳过、flaky 或失败重试项 |
+| 本地 skip / flaky / retry | `pnpm verify` 的 93 项主套件和 6 项辅助套件全部通过；没有 skip、flaky 或失败重试 |
+| 最终 SHA GitHub Actions | 运行 `40556991833`（实现代码 SHA `3309f38cde568b6e6570a739fc3a457c957f8ca3`）整体通过。单元 16/16、API/PostgreSQL 27 文件 469/469、生产构建通过；Compose 浏览器管理流程 84 passed、9 skipped（见下方原因）；生产品牌、Compose 栈、PostgreSQL 重建持久性、隔离 SIGKILL/备份恢复、不可信 TLS 和清理均通过 |
 | Compose 恢复专项 | 独立 `verify-digital-recovery.mjs` 通过；独立 API/DB 容器 SIGKILL 替换和数据库/私有文件备份恢复均通过 |
+
+Actions Compose 浏览器套件中的 9 项 skip 是 `PLAYWRIGHT_EXTERNAL_SERVER=true` 下的显式夹具隔离：`kayixin-r1.spec.ts` 的 6 项、`external-api-delivery.spec.ts` 1 项、`kayixin-readonly.spec.ts` 1 项及 `zzzzzz-supplier-product-mappings.spec.ts` 1 项。这些测试需要该外部 Compose 项目没有挂载的隔离供应商/V3 HTTP 夹具；它们在本地 `pnpm verify` 的独立浏览器服务器与夹具环境中均运行并通过。最终 Actions 日志未报告 flaky 或失败重试。
 
 构建过程中 Google Fonts/Icons metadata 请求超时，Nuxt 使用可用的本地回退继续构建；没有因该网络告警跳过构建或测试。初轮全量 API 运行发现新增子进程测试沿用旧供应商版本、并挤占后续合成草稿容量；测试已改为读取当前映射版本并仅清理本轮测试草稿。指定 `procurement-executor.integration.test.ts` 随后通过 44/44，全量 PostgreSQL 套件最终通过 469/469。该问题属于新增测试夹具隔离，不是正式执行器缺陷；本轮没有复现到需要改动正式业务代码的生产缺陷。
 
-首次推送 SHA `853fbd8c1a732a01e93f84b30025eb0259064c3f` 的 GitHub Actions 中，Compose 采购/文件恢复证据、历史密钥解密、API/DB 容器 SIGKILL 替换、备份恢复和对账均已成功；清理时报 `EACCES scandir`。首次修复将宿主 bind mount 设为 `0777`，但 SHA `eb7adbdb5c9db3eab068341f6600e6fdef1d4f21` 的恢复证明虽然完整通过，清理仍报 `EACCES unlink supplier-events.jsonl`。根因是容器内 `mkdir` 创建的嵌套 `procurement-supplier` 目录受 umask 影响为 `0755`；宿主 runner 有权进入外层目录，但无权从内层目录删除 `0600` 日志。现在夹具在 `mkdir` 后显式 `chmod` 该临时子目录为 `0777`，合成日志和控制文件仍为 `0600`。本地再次运行独立 Compose 恢复脚本后以退出码 0 完成，采购/文件恢复证明与资源清理均通过；最终修复前 SHA 的 Actions run `40549541040` 仍记录为清理失败。该改动只影响可回收的隔离测试夹具，不影响产品代码、真实数据或正式目录权限；修复后的完整本地 `pnpm verify` 已重跑通过，最终推送 SHA 的 Actions 正在重新执行。
+首次推送 SHA `853fbd8c1a732a01e93f84b30025eb0259064c3f` 的 GitHub Actions 中，Compose 采购/文件恢复证据、历史密钥解密、API/DB 容器 SIGKILL 替换、备份恢复和对账均已成功；清理时报 `EACCES scandir`。首次修复将宿主 bind mount 设为 `0777`，但 SHA `eb7adbdb5c9db3eab068341f6600e6fdef1d4f21` 的恢复证明虽然完整通过，清理仍报 `EACCES unlink supplier-events.jsonl`。根因是容器内 `mkdir` 创建的嵌套 `procurement-supplier` 目录受 umask 影响为 `0755`；宿主 runner 有权进入外层目录，但无权从内层目录删除 `0600` 日志。现在夹具在 `mkdir` 后显式 `chmod` 该临时子目录为 `0777`，合成日志和控制文件仍为 `0600`。本地再次运行独立 Compose 恢复脚本后以退出码 0 完成，采购/文件恢复证明与资源清理均通过；修复后的完整本地 `pnpm verify` 通过。最终实现代码 SHA `3309f38cde568b6e6570a739fc3a457c957f8ca3` 的 Actions run `40556991833` 全部通过，包括恢复专项结束时成功删除隔离临时目录和卷。该改动只影响可回收的隔离测试夹具，不影响产品代码、真实数据或正式目录权限。
 
-`pnpm verify` 不包含 GitHub Actions 中完整 Compose Web/API 冒烟、重建持久化步骤；这些步骤及本 SHA Actions 状态以本轮最终推送后的实际 workflow 结果记录。独立 Compose 恢复专项则已按上节执行而非跳过。
+`pnpm verify` 不包含 GitHub Actions 中完整 Compose Web/API 冒烟、重建持久化步骤；这些步骤已在上列最终实现 SHA 的 Actions run 中通过。实现代码验证后只更新了验收文档中的 CI 计数和 skip 说明；该文档记录的实现 SHA 不变，最终交付 SHA 的 GitHub Actions 仍单独核对并会在最终摘要中给出。独立 Compose 恢复专项已按上节执行，而非跳过。
 
 ## 未验证边界与安全结论
 
