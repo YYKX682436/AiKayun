@@ -13,6 +13,16 @@ export class AdminApiError extends Error {
 
 type ApiErrorBody = { error?: { code?: string; message?: string } }
 type RequestOptions = Parameters<typeof $fetch>[1]
+const csrfRequests = new WeakMap<object, Promise<string>>()
+
+function currentCsrfCookie(): string | undefined {
+  if (!import.meta.client) return undefined
+  const value = document.cookie.split(';').map(part => part.trim())
+    .find(part => part.startsWith('aikayun_admin_csrf='))?.slice('aikayun_admin_csrf='.length)
+  if (!value) return undefined
+  try { return decodeURIComponent(value) } catch { return undefined }
+}
+
 const conflictMessages: Record<string, string> = {
   USERNAME_TAKEN: '该用户名已被其他顾客使用，请调整后重试。',
   CUSTOMER_DELETED: '该顾客身份已删除，不能再修改或恢复。',
@@ -78,17 +88,23 @@ function normalizeError(error: unknown): AdminApiError {
 
 export function useAdminApi() {
   const route = useRoute()
-  let csrfToken: string | undefined
-  let csrfPromise: Promise<string> | undefined
+  const nuxtApp = useNuxtApp()
 
-  async function getCsrfToken(force = false): Promise<string> {
-    if (!force && csrfToken) return csrfToken
-    if (!csrfPromise || force) {
-      csrfPromise = $fetch<ApiSuccess<CsrfToken>>('/api/v1/admin/auth/csrf')
-        .then(result => (csrfToken = result.data.csrfToken))
-        .finally(() => { csrfPromise = undefined })
+  async function getCsrfToken(): Promise<string> {
+    const current = currentCsrfCookie()
+    if (current) return current
+    let pending = csrfRequests.get(nuxtApp)
+    if (!pending) {
+      pending = $fetch<ApiSuccess<CsrfToken>>('/api/v1/admin/auth/csrf')
+        .then(result => result.data.csrfToken)
+      csrfRequests.set(nuxtApp, pending)
     }
-    return csrfPromise
+    try {
+      const issued = await pending
+      return currentCsrfCookie() ?? issued
+    } finally {
+      if (csrfRequests.get(nuxtApp) === pending) csrfRequests.delete(nuxtApp)
+    }
   }
 
   async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {

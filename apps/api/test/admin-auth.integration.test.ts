@@ -3882,7 +3882,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       expect(await db.selectFrom('product_variant_inventory_adjustments').select('id')
         .where('product_variant_id', '=', clonedSku.id).execute()).toEqual([])
       if (sourceSku.id === monthSku.id) {
-        expect(clonedInventory).toMatchObject({ compare_at_price: '15.00000', cost_price: '1.23456' })
+        expect(clonedInventory).toMatchObject({ compare_at_price: '15.00000', cost_price: null })
       }
     }
     const copiedHistory = await app.inject({
@@ -3914,6 +3914,10 @@ describe('Fastify API with PostgreSQL 18', () => {
 
     const allRetired = await createTestProduct(auth, '全部 SKU 退役的复制源')
     const retiredOnlySku = allRetired.variants[0]!
+    const retiredCost = await confirmCostChanges(auth, allRetired.id, allRetired.revision, [{
+      skuId: retiredOnlySku.id, expectedSkuRevision: retiredOnlySku.revision, costPrice: '9.87654',
+    }])
+    expect(retiredCost.statusCode, retiredCost.body).toBe(200)
     await db.updateTable('product_variants').set({ enabled: false, retired_at: new Date() })
       .where('id', '=', retiredOnlySku.id).execute()
     const retiredSourceRevision = await db.selectFrom('products').select('revision')
@@ -3928,9 +3932,9 @@ describe('Fastify API with PostgreSQL 18', () => {
     })
     expect(fallback.variants[0]!.id).not.toBe(retiredOnlySku.id)
     expect(fallback.variants[0]!.skuCode).not.toBe(retiredOnlySku.skuCode)
-    expect(await db.selectFrom('product_variants').select(['inventory_mode', 'inventory_revision'])
+    expect(await db.selectFrom('product_variants').select(['inventory_mode', 'inventory_revision', 'cost_price'])
       .where('id', '=', fallback.variants[0]!.id).executeTakeFirstOrThrow())
-      .toEqual({ inventory_mode: null, inventory_revision: 0 })
+      .toEqual({ inventory_mode: null, inventory_revision: 0, cost_price: null })
   })
 
   it('permanently deletes a safe product atomically and preserves product, SKU, stock, and retirement references', async () => {
@@ -4686,6 +4690,100 @@ describe('D6 product management API additions', () => {
     })
     expect(afterConflict.json<{ data: { items: Array<{ salePrice: string }> } }>().data.items.map(item => item.salePrice).sort())
       .toEqual(['18.80', '38.80'])
+  })
+
+  it('⑥-3C keeps pricing identities and history isolated through matrix edits, copy and safe deletion', async () => {
+    const auth = await loginAdmin()
+    const created = await createTestProduct(auth, '⑥-3C 规格与规则身份')
+    const groupId = randomUUID()
+    const firstValue = { id: randomUUID(), name: '原规格' }
+    const secondValue = { id: randomUUID(), name: '新规格' }
+    const firstMatrix = await saveMatrix(auth, created.id, { expectedRevision: created.revision, mode: 'selected',
+      groups: [optionGroup('授权规格', groupId, [firstValue])],
+      combinations: [{ optionValueIds: [firstValue.id], salePrice: '20.00', enabled: true }] })
+    expect(firstMatrix.statusCode, firstMatrix.body).toBe(200)
+    const product = firstMatrix.json<{ data: { product: ProductDetail } }>().data.product
+    const original = product.variants[0]!
+    const confirmed = await confirmCostChanges(auth, product.id, product.revision, [{
+      skuId: original.id, expectedSkuRevision: original.revision, costPrice: '12.34567',
+    }])
+    expect(confirmed.statusCode, confirmed.body).toBe(200)
+    const prices = confirmed.json().data as { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> }
+    const saved = await app.inject({ method: 'PUT', url: `/api/v1/admin/products/${product.id}/pricing-rules/batch`,
+      headers: productHeaders(auth), payload: { expectedRevision: prices.productRevision, updates: [{
+        skuId: original.id, expectedSkuRevision: prices.items[0]!.skuRevision, expectedRuleRevision: 0,
+        mode: 'fixed_profit', fixedProfit: '1.00000',
+      }] } })
+    expect(saved.statusCode, saved.body).toBe(200)
+    const previewResponse = await app.inject({ method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/preview`,
+      headers: productHeaders(auth), payload: { skuIds: [original.id] } })
+    const preview = previewResponse.json().data as { productRevision: number; items: Array<{
+      skuId: string; skuRevision: number; ruleRevision: number; inputDigest: string;
+    }> }
+    const applied = await app.inject({ method: 'POST', url: `/api/v1/admin/products/${product.id}/pricing-rules/apply`,
+      headers: productHeaders(auth), payload: { expectedRevision: preview.productRevision, confirmLossAndFreePrice: false,
+        items: preview.items.map(item => ({ skuId: item.skuId, expectedSkuRevision: item.skuRevision,
+          expectedRuleRevision: item.ruleRevision, inputDigest: item.inputDigest })) } })
+    expect(applied.statusCode, applied.body).toBe(200)
+    const appliedData = applied.json().data as { productRevision: number; items: Array<{ skuRevision: number }> }
+    const compare = await app.inject({ method: 'PATCH', url: `/api/v1/admin/products/${product.id}/variants/${original.id}/prices`,
+      headers: productHeaders(auth), payload: { expectedRevision: appliedData.productRevision,
+        expectedSkuRevision: appliedData.items[0]!.skuRevision, compareAtPrice: '30.00' } })
+    expect(compare.statusCode, compare.body).toBe(200)
+    const afterCompare = await db.selectFrom('product_variants').select(['sale_price', 'cost_price', 'pricing_rule_status'])
+      .where('id', '=', original.id).executeTakeFirstOrThrow()
+    expect(afterCompare).toEqual({ sale_price: '13.35000', cost_price: '12.34567', pricing_rule_status: 'applied' })
+
+    const groups = [optionGroup('授权规格', groupId, [firstValue, secondValue])]
+    const expanded = await saveMatrix(auth, product.id, { expectedRevision: compare.json().data.productRevision,
+      mode: 'all', groups, newSkuDefaults: { salePrice: '7.00', enabled: false } })
+    expect(expanded.statusCode, expanded.body).toBe(200)
+    const expandedProduct = expanded.json<{ data: { product: ProductDetail } }>().data.product
+    const newSku = expandedProduct.variants.find(item => item.options[0]?.valueId === secondValue.id)!
+    const rows = await db.selectFrom('product_variants').select(['id', 'sale_price', 'cost_price', 'pricing_mode',
+      'pricing_rule_revision', 'pricing_rule_status']).where('product_id', '=', product.id).execute()
+    expect(rows.find(row => row.id === original.id)).toMatchObject({ cost_price: '12.34567', pricing_mode: 'fixed_profit',
+      pricing_rule_revision: 1, pricing_rule_status: 'applied' })
+    expect(rows.find(row => row.id === newSku.id)).toMatchObject({ sale_price: '7.00000', cost_price: null,
+      pricing_mode: 'manual', pricing_rule_revision: 0, pricing_rule_status: 'manual' })
+    const matrixReprice = await saveMatrix(auth, product.id, { expectedRevision: expandedProduct.revision, mode: 'selected', groups,
+      combinations: [
+        { skuId: original.id, optionValueIds: [firstValue.id], salePrice: '14.00', enabled: true },
+        { skuId: newSku.id, optionValueIds: [secondValue.id], salePrice: '7.00', enabled: false },
+      ] })
+    expect(matrixReprice.statusCode, matrixReprice.body).toBe(200)
+    expect((await db.selectFrom('product_variants').select('pricing_rule_status')
+      .where('id', '=', original.id).executeTakeFirstOrThrow()).pricing_rule_status).toBe('stale')
+    const latest = matrixReprice.json<{ data: { product: ProductDetail } }>().data.product
+    const copied = await copyProduct(auth, product.id, latest.revision)
+    expect(copied.statusCode, copied.body).toBe(201)
+    const copy = copied.json<{ data: ProductDetail }>().data
+    const copiedRows = await db.selectFrom('product_variants').select(['id', 'cost_price', 'pricing_mode', 'pricing_rule_revision'])
+      .where('product_id', '=', copy.id).execute()
+    expect(copiedRows).toHaveLength(2)
+    expect(copiedRows.every(row => row.pricing_mode === 'manual' && row.pricing_rule_revision === 0)).toBe(true)
+    expect(copiedRows.every(row => row.cost_price === null)).toBe(true)
+    const historyBefore = await db.selectFrom('product_variant_pricing_rule_versions').selectAll()
+      .where('product_id', '=', product.id).where('product_variant_id', '=', original.id).execute()
+    expect(historyBefore).toHaveLength(1)
+    expect(await db.selectFrom('product_variant_pricing_rule_versions').select('id').where('product_id', '=', copy.id).execute()).toHaveLength(0)
+    const deleted = await deleteProduct(auth, product.id, latest.revision)
+    expect(deleted.statusCode, deleted.body).toBe(200)
+    expect(await db.selectFrom('product_variant_pricing_rule_versions').selectAll()
+      .where('product_id', '=', product.id).where('product_variant_id', '=', original.id).execute()).toEqual(historyBefore)
+    const retainedHistory = await app.inject({ method: 'GET',
+      url: `/api/v1/admin/products/${product.id}/variants/${original.id}/pricing-rules/history`,
+      headers: { cookie: auth.sessionCookie } })
+    expect(retainedHistory.statusCode, retainedHistory.body).toBe(200)
+    expect(retainedHistory.json().data.items).toEqual([expect.objectContaining({ revision: 1, mode: 'fixed_profit',
+      fixedProfit: '1.00000' })])
+    expect((await app.inject({ method: 'GET',
+      url: `/api/v1/admin/products/${product.id}/variants/${original.id}/pricing-rules/history` })).statusCode).toBe(401)
+    const unknownHistory = await app.inject({ method: 'GET',
+      url: `/api/v1/admin/products/${product.id}/variants/${randomUUID()}/pricing-rules/history`,
+      headers: { cookie: auth.sessionCookie } })
+    expect(unknownHistory.statusCode).toBe(404)
+    expect(await db.selectFrom('product_variants').select('id').where('product_id', '=', copy.id).execute()).toHaveLength(2)
   })
 
   it('previews confirmed CNY costs against the sole price source and rejects stale or duplicate batch confirmation', async () => {

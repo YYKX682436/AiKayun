@@ -113,6 +113,56 @@ async function runPricingRuleFlow(
   await expect(priceRow.getByLabel('销售价（¥）')).toHaveValue(expectedSalePrice)
   await expect(priceRow.getByLabel('人工确认成本（CNY/件）')).toHaveValue('10.12345')
   await expect(priceRow.getByLabel('划线价（¥）')).toHaveValue('30.00')
+  if (mode === 'fixed_profit') {
+    const sourceId = page.url().split('/').at(-1)!
+    // A second tab or component may issue a fresh token after this page's
+    // earlier writes; subsequent writes must use the current cookie.
+    expect((await page.request.get('/api/v1/admin/auth/csrf')).status()).toBe(200)
+    let copyAttempts = 0
+    let rejectedStatus = 0
+    let rejectedCode = ''
+    await page.route('**/copy', async route => {
+      copyAttempts++
+      if (copyAttempts !== 1) {
+        await route.continue()
+        return
+      }
+      // Rotate after the client captured its header, then ask the real API
+      // to process that stale header alongside the newly issued cookie.
+      await page.request.get('/api/v1/admin/auth/csrf')
+      const cookies = await page.context().cookies()
+      const response = await route.fetch({ headers: { ...route.request().headers(),
+        cookie: cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ') } })
+      rejectedStatus = response.status()
+      rejectedCode = ((await response.json()) as { error?: { code?: string } }).error?.code ?? ''
+      await route.fulfill({ response })
+    })
+    try {
+      const rejected = page.waitForResponse(response => response.url().includes(`/api/v1/admin/products/${sourceId}/copy`)
+        && response.request().method() === 'POST' && response.status() === 403)
+      await page.locator('#advanced').getByRole('button', { name: '复制商品' }).click()
+      await rejected
+      await expect(page.locator('#advanced').getByRole('alert')).toContainText('请求未通过权限或安全校验')
+      const copied = page.waitForResponse(response => response.url().includes(`/api/v1/admin/products/${sourceId}/copy`)
+        && response.request().method() === 'POST' && response.status() === 201)
+      await page.locator('#advanced').getByRole('button', { name: '复制商品' }).click()
+      expect((await copied).status()).toBe(201)
+    } finally {
+      await page.unroute('**/copy')
+    }
+    expect({ rejectedStatus, rejectedCode, copyAttempts }).toEqual({ rejectedStatus: 403, rejectedCode: 'CSRF_INVALID', copyAttempts: 2 })
+    await expect(page).toHaveURL(url => url.pathname.startsWith('/admin/products/') && !url.pathname.endsWith(sourceId))
+    await expect(page.locator('#advanced').getByRole('alert')).toHaveCount(0)
+    const copyPrices = page.locator('#prices')
+    await expect(copyPrices.getByText('复制商品不会复制成本，新 SKU 需重新确认。', { exact: false })).toBeVisible()
+    await expect(copyPrices.locator('article').first().getByLabel('销售价（¥）')).toHaveValue(expectedSalePrice)
+    await expect(copyPrices.locator('article').first().getByLabel('人工确认成本（CNY/件）')).toHaveValue('')
+    const source = await page.request.get(`/api/v1/admin/products/${sourceId}/prices`)
+    expect((await source.json()).data.items[0]).toMatchObject({ costPrice: '10.12345', salePrice: expectedSalePrice })
+    const productList = await page.request.get(`/api/v1/admin/products?search=${encodeURIComponent(productName)}`)
+    const matchingProducts = (await productList.json()).data.items as Array<{ name: string }>
+    expect(matchingProducts.filter(item => item.name === productName)).toHaveLength(2)
+  }
 }
 
 test('管理员可在桌面端预览并确认应用固定利润定价', async ({ page }) => {
@@ -184,6 +234,80 @@ test('成本预览迟到时释放加载状态，确认进行中保留当前目�
     releaseConfirm()
     await page.unroute('**/prices/batch')
   }
+})
+
+test('成本确认提交成功但响应丢失时提示结果未知并保留输入', async ({ page, browser }) => {
+  await signIn(page)
+  await page.goto('/admin/products/new')
+  await page.getByLabel('商品名称').fill(`D6-3C 成本结果未知 ${randomUUID().slice(0, 8)}`)
+  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByRole('button', { name: '保存为草稿' }).click()
+  await continueToCreatedProduct(page)
+  const productId = page.url().split('/').at(-1)!
+  const unsavedName = `尚未保存的商品名称 ${randomUUID().slice(0, 8)}`
+  await page.getByLabel('商品名称').fill(unsavedName)
+  const prices = page.locator('#prices')
+  const row = prices.locator('article').first()
+  const costInput = row.getByLabel('人工确认成本（CNY/件）')
+  await costInput.fill('10.12345')
+  await prices.getByRole('button', { name: '预览成本变更' }).click()
+  const confirmation = page.getByRole('dialog', { name: '成本变更预览' })
+  await confirmation.getByLabel(/我确认这些是以 CNY\/件人工核定/).check()
+  let submitted: unknown
+  let committedStatus = 0
+  await page.route('**/prices/batch', async route => {
+    submitted = route.request().postDataJSON()
+    const response = await route.fetch()
+    committedStatus = response.status()
+    await route.abort('failed')
+  })
+  try {
+    await confirmation.getByRole('button', { name: '确认内部成本（不调整售价）' }).click()
+    await expect(prices.getByRole('alert')).toContainText('结果未知')
+    await expect(prices.getByRole('alert')).toContainText('重新读取')
+    await expect(costInput).toHaveValue('10.12345')
+    await expect(prices.getByRole('button', { name: '预览成本变更' })).toBeDisabled()
+    await expect(page.getByText(/服务器当前成本 ¥10\.12345/)).toBeVisible()
+    await page.getByRole('button', { name: '保留本地输入，确认后再保存' }).click()
+    await expect(costInput).toHaveValue('10.12345')
+    await expect(page.getByLabel('商品名称')).toHaveValue(unsavedName)
+    await expect(prices.getByRole('status')).toContainText('保留的本地输入与当前值一致')
+    await expect(prices.getByRole('button', { name: '预览成本变更' })).toBeDisabled()
+    expect(committedStatus).toBe(200)
+  } finally {
+    await page.unroute('**/prices/batch')
+  }
+  const current = await page.request.get(`/api/v1/admin/products/${productId}/prices`)
+  expect(current.status()).toBe(200)
+  expect((await current.json()).data.items[0]).toMatchObject({ salePrice: '15.00', costPrice: '10.12345' })
+  const otherAdmin = await browser.newContext({ baseURL: new URL(page.url()).origin, storageState: await page.context().storageState() })
+  const csrf = await otherAdmin.request.get('/api/v1/admin/auth/csrf')
+  const retry = await otherAdmin.request.patch(`/api/v1/admin/products/${productId}/prices/batch`, {
+    headers: { origin: new URL(page.url()).origin, 'x-csrf-token': (await csrf.json()).data.csrfToken },
+    data: submitted,
+  })
+  expect(retry.status()).toBe(409)
+
+  // A definite revision conflict is different from the lost-response case:
+  // the server rejects this second cost change and the UI must say so.
+  await costInput.fill('11.23456')
+  await prices.getByRole('button', { name: '预览成本变更' }).click()
+  const secondConfirmation = page.getByRole('dialog', { name: '成本变更预览' })
+  await secondConfirmation.getByLabel(/我确认这些是以 CNY\/件人工核定/).check()
+  const latestPrices = await page.request.get(`/api/v1/admin/products/${productId}/prices`)
+  const latest = (await latestPrices.json()).data as { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> }
+  const concurrentEdit = await otherAdmin.request.patch(`/api/v1/admin/products/${productId}/variants/${latest.items[0]!.skuId}/prices`, {
+    headers: { origin: new URL(page.url()).origin, 'x-csrf-token': (await csrf.json()).data.csrfToken },
+    data: { expectedRevision: latest.productRevision, expectedSkuRevision: latest.items[0]!.skuRevision, compareAtPrice: '30.00' },
+  })
+  expect(concurrentEdit.status()).toBe(200)
+  await secondConfirmation.getByRole('button', { name: '确认内部成本（不调整售价）' }).click()
+  await expect(prices.getByRole('alert')).toContainText('商品已被其他管理员修改')
+  await expect(prices.getByRole('alert')).not.toContainText('结果未知')
+  await expect(costInput).toHaveValue('11.23456')
+  const afterConflict = await page.request.get(`/api/v1/admin/products/${productId}/prices`)
+  expect((await afterConflict.json()).data.items[0]).toMatchObject({ salePrice: '15.00', costPrice: '10.12345', compareAtPrice: '30.00' })
+  await otherAdmin.close()
 })
 
 test('未保存的规则不能预览旧建议，确认内容绑定当前 SKU 与规则版本', async ({ page }) => {
@@ -495,6 +619,134 @@ test('商品 A 的迟到规则读取不能接管当前商品 B 的编辑状态',
   } finally {
     releaseA()
     await page.unroute('**/pricing-rules?page=*')
+  }
+})
+
+test('商品 A 的迟到成本预览不能接管商品 B', async ({ page }) => {
+  test.setTimeout(60_000)
+  await signIn(page)
+  const makeDraft = async (name: string, price: string) => {
+    await page.goto('/admin/products/new')
+    await page.getByLabel('商品名称').fill(name)
+    await page.getByLabel('默认 SKU 销售价（人民币）').fill(price)
+    await page.getByRole('button', { name: '保存为草稿' }).click()
+    await continueToCreatedProduct(page)
+    return page.url().split('/').at(-1)!
+  }
+  const labelB = `D6-3C 成本归属 B ${randomUUID().slice(0, 8)}`
+  const productB = await makeDraft(labelB, '21.00')
+  const productA = await makeDraft(`D6-3C 成本归属 A ${randomUUID().slice(0, 8)}`, '15.00')
+  const prices = page.locator('#prices')
+  await prices.locator('article').first().getByLabel('人工确认成本（CNY/件）').fill('10.00000')
+  let release!: () => void
+  let reached!: () => void
+  let delivered!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const arrived = new Promise<void>(resolve => { reached = resolve })
+  const returned = new Promise<void>(resolve => { delivered = resolve })
+  let previewStatus = 0
+  await page.route('**/cost-preview', async route => {
+    const response = await route.fetch()
+    previewStatus = response.status()
+    reached()
+    await gate
+    await route.fulfill({ response }).catch(() => undefined)
+    delivered()
+  })
+  try {
+    await prices.getByRole('button', { name: '预览成本变更' }).click()
+    await arrived
+    expect(previewStatus).toBe(200)
+    page.once('dialog', dialog => dialog.accept())
+    await page.getByRole('navigation', { name: '面包屑' }).getByRole('link', { name: '商品管理' }).click()
+    await page.getByRole('row').filter({ hasText: labelB }).getByRole('link', { name: '编辑' }).click()
+    await expect(page.getByRole('heading', { name: labelB })).toBeVisible()
+    release()
+    await returned
+    await expect(page.getByRole('dialog', { name: '成本变更预览' })).toHaveCount(0)
+    await expect(page.locator('#prices article').first().getByLabel('人工确认成本（CNY/件）')).toHaveValue('')
+    const [aPrices, bPrices] = await Promise.all([
+      page.request.get(`/api/v1/admin/products/${productA}/prices`),
+      page.request.get(`/api/v1/admin/products/${productB}/prices`),
+    ])
+    expect((await aPrices.json()).data.items[0]).toMatchObject({ salePrice: '15.00', costPrice: null })
+    expect((await bPrices.json()).data.items[0]).toMatchObject({ salePrice: '21.00', costPrice: null })
+  } finally {
+    release()
+    await page.unroute('**/cost-preview')
+  }
+})
+
+test('商品 A 的迟到调价确认不能接管商品 B 的后台状态', async ({ page }) => {
+  test.setTimeout(60_000)
+  await signIn(page)
+  const makeDraft = async (name: string, salePrice: string) => {
+    await page.goto('/admin/products/new')
+    await page.getByLabel('商品名称').fill(name)
+    await page.getByLabel('默认 SKU 销售价（人民币）').fill(salePrice)
+    await page.getByRole('button', { name: '保存为草稿' }).click()
+    await continueToCreatedProduct(page)
+    return page.url().split('/').at(-1)!
+  }
+  const labelB = `D6-3C 调价归属 B ${randomUUID().slice(0, 8)}`
+  const productB = await makeDraft(labelB, '21.00')
+  const productA = await makeDraft(`D6-3C 调价归属 A ${randomUUID().slice(0, 8)}`, '15.00')
+  const prices = page.locator('#prices')
+  await prices.locator('article').first().getByLabel('人工确认成本（CNY/件）').fill('10.00000')
+  await prices.getByRole('button', { name: '预览成本变更' }).click()
+  const costConfirmation = page.getByRole('dialog', { name: '成本变更预览' })
+  await costConfirmation.getByLabel(/我确认这些是以 CNY\/件人工核定/).check()
+  await costConfirmation.getByRole('button', { name: '确认内部成本（不调整售价）' }).click()
+  await expect(prices.getByRole('status')).toContainText('人工 CNY 内部单位成本')
+  const pricing = page.locator('#pricing-rules')
+  await pricing.getByLabel('定价模式').click()
+  await page.getByRole('option', { name: '成本 + 固定利润' }).click()
+  await pricing.getByLabel('每件固定利润（¥）').fill('1')
+  await pricing.getByRole('button', { name: '保存本页规则版本' }).click()
+  await expect(pricing.getByRole('status')).toContainText('售价尚未更改')
+  await pricing.getByRole('button', { name: '预览所选 SKU（1）' }).click()
+  await pricing.getByRole('button', { name: '确认应用本批建议售价' }).click()
+  const confirmation = page.getByRole('dialog', { name: '确认应用调价建议' })
+  await confirmation.getByLabel('我已逐项核对当前售价、建议售价、毛利润和毛利率，并确认应用此批结果。').check()
+  let release!: () => void
+  let reached!: () => void
+  let delivered!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const arrived = new Promise<void>(resolve => { reached = resolve })
+  const returned = new Promise<void>(resolve => { delivered = resolve })
+  let appliedStatus = 0
+  await page.route('**/pricing-rules/apply', async route => {
+    const response = await route.fetch()
+    appliedStatus = response.status()
+    reached()
+    await gate
+    await route.fulfill({ response }).catch(() => undefined)
+    delivered()
+  })
+  try {
+    await confirmation.getByRole('button', { name: '确认并原子应用' }).click()
+    await arrived
+    expect(appliedStatus).toBe(200)
+    // The persistent confirmation dialog blocks page clicks while the request
+    // is pending; browser history can still navigate away from that page.
+    await page.goBack()
+    await page.goBack()
+    await expect(page.getByRole('heading', { name: labelB })).toBeVisible()
+    const currentPrice = page.locator('#prices article').first().getByLabel('销售价（¥）')
+    await expect(currentPrice).toHaveValue('21.00')
+    release()
+    await returned
+    await expect(currentPrice).toHaveValue('21.00')
+    await expect(page.locator('#pricing-rules').getByText('已确认应用 1 个 SKU')).toHaveCount(0)
+    const [aPrices, bPrices] = await Promise.all([
+      page.request.get(`/api/v1/admin/products/${productA}/prices`),
+      page.request.get(`/api/v1/admin/products/${productB}/prices`),
+    ])
+    expect((await aPrices.json()).data.items[0].salePrice).toBe('11.00')
+    expect((await bPrices.json()).data.items[0].salePrice).toBe('21.00')
+  } finally {
+    release()
+    await page.unroute('**/pricing-rules/apply')
   }
 })
 

@@ -212,6 +212,19 @@ async function createPayment(orderId: string, owner: Owner, options: {
   })
 }
 
+async function changeOrderCatalogSale(orderId: string, salePrice: string): Promise<void> {
+  const row = await db.selectFrom('order_items as item')
+    .innerJoin('products as product', 'product.id', 'item.product_id')
+    .innerJoin('product_variants as variant', 'variant.id', 'item.product_variant_id')
+    .select(['product.id as product_id', 'product.revision as product_revision',
+      'variant.id as sku_id', 'variant.revision as sku_revision'])
+    .where('item.order_id', '=', orderId).executeTakeFirstOrThrow()
+  const response = await inject({ method: 'PATCH',
+    url: `/api/v1/admin/products/${row.product_id}/variants/${row.sku_id}/prices`, headers: adminHeaders(),
+    payload: { expectedRevision: row.product_revision, expectedSkuRevision: row.sku_revision, salePrice } })
+  expect(response.statusCode, response.body).toBe(200)
+}
+
 async function createWalletTopUp(owner: Customer, options: {
   amount: string
   idempotencyKey?: string
@@ -375,6 +388,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
   it('uses server-owned order facts and reuses an active attempt on repeated clicks', async () => {
     const customer = await createCustomer()
     const orderId = await createOrder(customer)
+    await changeOrderCatalogSale(orderId, '9.00')
     const requestKey = randomUUID()
     const first = await createPayment(orderId, customer, { idempotencyKey: requestKey, paymentMethod: 'wechat' })
     expect(first.statusCode).toBe(201)
@@ -993,11 +1007,12 @@ describe('online payment settlement through a real local HTTP provider and Postg
     const created = await createPayment(orderId, customer, { idempotencyKey })
     expect(created.statusCode).toBe(201)
     expect(created.json().data.attempt).toMatchObject({ status: 'created', providerState: 'unknown', action: null })
+    await changeOrderCatalogSale(orderId, '9.00')
 
     const retry = await createPayment(orderId, customer, { idempotencyKey })
     expect(retry.statusCode).toBe(200)
     expect(retry.json().data.attempt.id).toBe(created.json().data.attempt.id)
-    expect(retry.json().data.attempt.status).toBe('created')
+    expect(retry.json().data.attempt).toMatchObject({ status: 'created', amount: '5.00' })
     expect(await db.selectFrom('payment_attempts').select('id').where('order_id', '=', orderId).execute()).toHaveLength(1)
     expect(fixture.stats().creates).toBe(createCountBefore + 1)
   })
@@ -1565,6 +1580,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
     const orderId = await createOrder(customer, `组合支付完成后退款-${randomUUID().slice(0, 8)}`, {
       amount: '10.00', quantityStock: 2,
     })
+    await changeOrderCatalogSale(orderId, '12.00')
     const payment = await createPayment(orderId, customer, { walletAmount: '5.00' })
     expect(payment.statusCode).toBe(201)
     expect(payment.json().data.attempt).toMatchObject({ amount: '5.00', walletGiftAmount: '2.00', walletCashAmount: '3.00' })
@@ -1572,6 +1588,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
     const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
       .where('id', '=', paymentAttemptId).executeTakeFirstOrThrow()).merchant_order_no!
     expect((await inject({ method: 'GET', url: callbackUrl(fixture.setPaid(merchantNo)) })).body).toBe('success')
+    await changeOrderCatalogSale(orderId, '4.00')
 
     const orderItemId = (await db.selectFrom('order_items').select('id').where('order_id', '=', orderId).executeTakeFirstOrThrow()).id
     const delivered = await inject({
@@ -1703,6 +1720,11 @@ describe('online payment settlement through a real local HTTP provider and Postg
       .toBe('refunded')
     expect((await inject({ method: 'GET', url: `/api/v1/admin/orders/${orderId}/refunds`, headers: adminHeaders() })).json().data)
       .toMatchObject({ refundStatus: 'refunded', refundedAmount: '10.00', refundableAmount: '0.00' })
+    await changeOrderCatalogSale(orderId, '40.00')
+    expect((await inject({ method: 'GET', url: `/api/v1/admin/orders/${orderId}/refunds`, headers: adminHeaders() })).json().data)
+      .toMatchObject({ refundStatus: 'refunded', refundedAmount: '10.00', refundableAmount: '0.00' })
+    expect(await db.selectFrom('order_items').select(['unit_price', 'line_amount']).where('id', '=', orderItemId).executeTakeFirstOrThrow())
+      .toEqual({ unit_price: '10.00', line_amount: '10.00' })
   })
 
   it('serializes a refund credit against a concurrent wallet-only purchase without a negative balance', async () => {

@@ -630,19 +630,34 @@ async function waitForLockWaitCount(applicationName: string, expectedCount: numb
   throw new Error(`Expected ${expectedCount} PostgreSQL lock waits for ${queryFragment}`)
 }
 
-async function waitForQueryBlockedBy(queryFragment: string, blockerPid: number): Promise<void> {
+async function waitForQueryBlockedBy(queryFragment: string, blockerPid: number): Promise<number> {
   const deadline = Date.now() + 5_000
   while (Date.now() < deadline) {
-    const activity = await sql<{ blocker_pids: number[] }>`
-      SELECT pg_blocking_pids(pid) AS blocker_pids
+    const activity = await sql<{ pid: number; blocker_pids: number[] }>`
+      SELECT pid, pg_blocking_pids(pid) AS blocker_pids
       FROM pg_stat_activity
       WHERE datname = current_database() AND application_name = 'aikayun-api'
         AND state = 'active' AND wait_event_type = 'Lock' AND query ILIKE ${`%${queryFragment}%`}
     `.execute(db)
-    if (activity.rows.some(row => row.blocker_pids.includes(blockerPid))) return
+    const waiting = activity.rows.find(row => row.blocker_pids.includes(blockerPid))
+    if (waiting) return waiting.pid
     await new Promise(resolve => setTimeout(resolve, 10))
   }
   throw new Error(`PostgreSQL query containing ${queryFragment} did not block on PID ${blockerPid}`)
+}
+
+async function holdSkuLock(skuId: string) {
+  let release!: () => void
+  let signalLocked!: (pid: number) => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const locked = new Promise<number>(resolve => { signalLocked = resolve })
+  const transaction = db.transaction().execute(async trx => {
+    const pid = (await sql<{ pid: number }>`SELECT pg_backend_pid() AS pid`.execute(trx)).rows[0]!.pid
+    await sql`SELECT id FROM product_variants WHERE id = ${skuId}::uuid FOR UPDATE`.execute(trx)
+    signalLocked(pid)
+    await gate
+  })
+  return { pid: await locked, release, transaction }
 }
 
 async function waitForOrderAdvisoryLockWait(): Promise<void> {
@@ -1656,6 +1671,329 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     expect(changedStock.statusCode).toBe(409)
     expect(changedStock.json().error.currentQuote.items[0]).toMatchObject({ availableQuantity: 3, canPurchase: true })
     expect(await db.selectFrom('orders').select('id').where('idempotency_key', 'in', staleKeys).execute()).toHaveLength(0)
+  })
+
+  it('⑥-3C separates cost-only edits from price changes for mixed free and paid orders', async () => {
+    const admin = await createAdmin()
+    const firstCustomer = await createCustomer()
+    const secondCustomer = await createCustomer()
+    const paid = await createCatalog({ price: '5.00', mode: 'quantity', stock: 8 })
+    const free = await createCatalog({ price: '0.00', mode: 'quantity', stock: 4 })
+    await enableManual(paid, admin)
+    await enableManual(free, admin)
+    await setSkuPurchaseLimits(paid.skuId, { lifetime: 2 })
+    const items = [{ skuId: paid.skuId, quantity: 2 }, { skuId: free.skuId, quantity: 1 }]
+
+    const prices = async () => {
+      const response = await inject({ method: 'GET', url: `/api/v1/admin/products/${paid.productId}/prices?page=1&pageSize=50`,
+        headers: { cookie: admin.cookie } })
+      expect(response.statusCode, response.body).toBe(200)
+      return response.json().data as { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> }
+    }
+    const quoteBeforeCost = await quote(items, firstCustomer)
+    expect(quoteBeforeCost.statusCode).toBe(200)
+    expect(quoteBeforeCost.json().data).toMatchObject({ canContinue: true, totalAmount: '10.00' })
+    expect(quoteBeforeCost.json().data.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ skuId: paid.skuId, unitPrice: '5.00', lineTotal: '10.00' }),
+      expect.objectContaining({ skuId: free.skuId, unitPrice: '0.00', lineTotal: '0.00' }),
+    ]))
+    let page = await prices()
+    let row = page.items.find(item => item.skuId === paid.skuId)!
+    const costPreview = await inject({ method: 'POST', url: `/api/v1/admin/products/${paid.productId}/cost-preview`,
+      headers: adminHeaders(admin), payload: { expectedRevision: page.productRevision,
+        updates: [{ skuId: paid.skuId, expectedSkuRevision: row.skuRevision, costPrice: '2.34567' }] } })
+    expect(costPreview.statusCode, costPreview.body).toBe(200)
+    const cost = costPreview.json().data.items[0] as { skuRevision: number; inputDigest: string; newCostPrice: string }
+    const confirmed = await inject({ method: 'PATCH', url: `/api/v1/admin/products/${paid.productId}/prices/batch`,
+      headers: adminHeaders(admin), payload: { expectedRevision: page.productRevision,
+        updates: [{ skuId: paid.skuId, expectedSkuRevision: cost.skuRevision,
+          costPrice: cost.newCostPrice, costPreviewDigest: cost.inputDigest }] } })
+    expect(confirmed.statusCode, confirmed.body).toBe(200)
+    const quoteAfterCost = await quote(items, firstCustomer)
+    expect(quoteAfterCost.json().data.quoteToken).toBe(quoteBeforeCost.json().data.quoteToken)
+    expect(JSON.stringify(quoteAfterCost.json().data)).not.toMatch(/costPrice|fixedProfit|markupRate|2\.34567/u)
+    const publicProduct = await inject({ method: 'GET', url: `/api/v1/public/products/${paid.productId}` })
+    expect(publicProduct.statusCode).toBe(200)
+    expect(publicProduct.body).not.toMatch(/costPrice|fixedProfit|markupRate|2\.34567/u)
+
+    const firstKey = randomUUID()
+    const first = await createOrder(items, quoteBeforeCost.json().data.quoteToken, firstCustomer, firstKey)
+    expect(first.statusCode, first.body).toBe(201)
+    expect(first.json().data.order).toMatchObject({ totalAmount: '10.00', status: 'pending_payment', paymentStatus: 'unpaid' })
+    const firstId = first.json().data.order.id as string
+
+    const beforeIncrease = await quote(items, secondCustomer)
+    page = await prices()
+    row = page.items.find(item => item.skuId === paid.skuId)!
+    const increase = await inject({ method: 'PATCH', url: `/api/v1/admin/products/${paid.productId}/variants/${paid.skuId}/prices`,
+      headers: adminHeaders(admin), payload: { expectedRevision: page.productRevision,
+        expectedSkuRevision: row.skuRevision, salePrice: '8.00' } })
+    expect(increase.statusCode, increase.body).toBe(200)
+    const rejectedIncrease = await createOrder(items, beforeIncrease.json().data.quoteToken, secondCustomer)
+    expect(rejectedIncrease.statusCode).toBe(409)
+    expect(rejectedIncrease.json().error).toMatchObject({ code: 'CHECKOUT_QUOTE_CHANGED', currentQuote: { totalAmount: '16.00' } })
+    const beforeDecrease = await quote(items, secondCustomer)
+    page = await prices()
+    row = page.items.find(item => item.skuId === paid.skuId)!
+    const decrease = await inject({ method: 'PATCH', url: `/api/v1/admin/products/${paid.productId}/variants/${paid.skuId}/prices`,
+      headers: adminHeaders(admin), payload: { expectedRevision: page.productRevision,
+        expectedSkuRevision: row.skuRevision, salePrice: '3.00' } })
+    expect(decrease.statusCode, decrease.body).toBe(200)
+    const rejectedDecrease = await createOrder(items, beforeDecrease.json().data.quoteToken, secondCustomer)
+    expect(rejectedDecrease.statusCode).toBe(409)
+    expect(rejectedDecrease.json().error).toMatchObject({ code: 'CHECKOUT_QUOTE_CHANGED', currentQuote: { totalAmount: '6.00' } })
+
+    const current = await quote(items, secondCustomer)
+    const second = await createOrder(items, current.json().data.quoteToken, secondCustomer)
+    expect(second.statusCode, second.body).toBe(201)
+    expect(second.json().data.order.totalAmount).toBe('6.00')
+    const replay = await createOrder(items, '0'.repeat(64), firstCustomer, firstKey)
+    expect(replay.statusCode).toBe(200)
+    expect(replay.json().data).toMatchObject({ created: false, order: { id: firstId, totalAmount: '10.00' } })
+    const snapshots = await db.selectFrom('order_items').select(['product_variant_id', 'unit_price', 'line_amount'])
+      .where('order_id', '=', firstId).execute()
+    expect(snapshots).toEqual(expect.arrayContaining([
+      { product_variant_id: paid.skuId, unit_price: '5.00', line_amount: '10.00' },
+      { product_variant_id: free.skuId, unit_price: '0.00', line_amount: '0.00' },
+    ]))
+    const reservations = await db.selectFrom('order_inventory_reservations').select(['product_variant_id', 'quantity'])
+      .where('order_item_id', 'in', (await db.selectFrom('order_items').select('id').where('order_id', '=', firstId).execute()).map(item => item.id)).execute()
+    expect(reservations).toHaveLength(2)
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', paid.skuId).executeTakeFirstOrThrow()).reserved).toBe(4)
+    const limitQuote = await quote([{ skuId: paid.skuId, quantity: 1 }], firstCustomer)
+    expect(limitQuote.json().data.items[0].purchaseLimits.sku).toMatchObject({ lifetimePurchased: 2, exceeded: true })
+    expect(await db.selectFrom('wallet_ledger_entries').select('id').where('customer_id', '=', firstCustomer.id).execute()).toHaveLength(0)
+
+    const creditOperationId = randomUUID()
+    await db.transaction().execute(async trx => {
+      await trx.insertInto('wallet_operations').values({ id: creditOperationId, customer_id: firstCustomer.id,
+        order_id: null, resolves_operation_id: null, operation_type: 'gift', request_sha256: digest,
+        actor_admin_id: admin.id }).execute()
+      await trx.insertInto('wallet_ledger_entries').values({ id: randomUUID(), wallet_operation_id: creditOperationId,
+        line_no: 1, customer_id: firstCustomer.id, bucket: 'gift', action: 'credit_available', amount: '10.00',
+        payment_attempt_id: null, refund_allocation_id: null, withdrawal_id: null }).execute()
+    })
+    const paymentKey = randomUUID()
+    const pay = () => inject({ method: 'POST', url: `/api/v1/orders/${firstId}/payments`,
+      headers: customerHeaders(firstCustomer), payload: { idempotencyKey: paymentKey, walletAmount: '10.00' } })
+    const payment = await pay()
+    expect(payment.statusCode, payment.body).toBe(201)
+    expect(payment.json().data).toMatchObject({ totalAmount: '10.00', attempt: { source: 'wallet', amount: '10.00', status: 'succeeded' } })
+    const attemptId = payment.json().data.attempt.id as string
+    const paymentReplay = await pay()
+    expect(paymentReplay.statusCode, paymentReplay.body).toBe(200)
+    expect(paymentReplay.json().data.attempt.id).toBe(attemptId)
+    expect(await db.selectFrom('payment_receipts').select('amount').where('payment_attempt_id', '=', attemptId).execute())
+      .toEqual([{ amount: '10.00' }])
+    expect(await db.selectFrom('wallet_ledger_entries').select(['bucket', 'action', 'amount'])
+      .where('payment_attempt_id', '=', attemptId).execute()).toEqual([{ bucket: 'gift', action: 'debit_available', amount: '10.00' }])
+    expect((await db.selectFrom('orders').select(['total_amount', 'status']).where('id', '=', firstId).executeTakeFirstOrThrow()))
+      .toEqual({ total_amount: '10.00', status: 'processing' })
+  })
+
+  it('⑥-3C serializes cost confirmation, rule edits and SKU state with observed PostgreSQL blockers', async () => {
+    const adminA = await createAdmin()
+    const adminB = await createAdmin()
+    const catalog = await createCatalog({ price: '5.00', mode: 'unlimited' })
+    const priceResponse = await inject({ method: 'GET', url: `/api/v1/admin/products/${catalog.productId}/prices`,
+      headers: { cookie: adminA.cookie } })
+    const pricePage = priceResponse.json().data as { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> }
+    const priceRow = pricePage.items.find(item => item.skuId === catalog.skuId)!
+    const costPreview = await inject({ method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/cost-preview`,
+      headers: adminHeaders(adminA), payload: { expectedRevision: pricePage.productRevision,
+        updates: [{ skuId: catalog.skuId, expectedSkuRevision: priceRow.skuRevision, costPrice: '2.00000' }] } })
+    expect(costPreview.statusCode, costPreview.body).toBe(200)
+    const cost = costPreview.json().data.items[0] as { skuRevision: number; inputDigest: string; newCostPrice: string }
+    const costPayload = { expectedRevision: pricePage.productRevision,
+      updates: [{ skuId: catalog.skuId, expectedSkuRevision: cost.skuRevision,
+        costPrice: cost.newCostPrice, costPreviewDigest: cost.inputDigest }] }
+    const rulePayload = { expectedRevision: pricePage.productRevision, updates: [{
+      skuId: catalog.skuId, expectedSkuRevision: priceRow.skuRevision, expectedRuleRevision: 0,
+      mode: 'fixed_profit', fixedProfit: '1.00000',
+    }] }
+
+    const firstGate = await holdSkuLock(catalog.skuId)
+    const confirmation = inject({ method: 'PATCH', url: `/api/v1/admin/products/${catalog.productId}/prices/batch`,
+      headers: adminHeaders(adminA), payload: costPayload })
+    let saveRule!: ReturnType<typeof inject>
+    try {
+      const confirmationPid = await waitForQueryBlockedBy('product_variants', firstGate.pid)
+      saveRule = inject({ method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/batch`,
+        headers: adminHeaders(adminB), payload: rulePayload })
+      await waitForQueryBlockedBy('products', confirmationPid)
+    } finally {
+      firstGate.release()
+    }
+    await firstGate.transaction
+    const confirmed = await confirmation
+    const rejectedRule = await saveRule
+    expect(confirmed.statusCode, confirmed.body).toBe(200)
+    expect(rejectedRule.statusCode, rejectedRule.body).toBe(409)
+    expect(rejectedRule.json().error.code).toBe('PRODUCT_REVISION_CONFLICT')
+    expect(await db.selectFrom('product_variant_pricing_rule_versions').select('id')
+      .where('product_variant_id', '=', catalog.skuId).execute()).toHaveLength(0)
+    // A lost successful response followed by the identical request must not
+    // create another cost audit or silently confirm a different revision.
+    const retry = await inject({ method: 'PATCH', url: `/api/v1/admin/products/${catalog.productId}/prices/batch`,
+      headers: adminHeaders(adminA), payload: costPayload })
+    expect(retry.statusCode).toBe(409)
+    expect(await db.selectFrom('product_management_audit_events').select('id').where('product_id', '=', catalog.productId)
+      .where('operation', '=', 'price_updated').execute()).toHaveLength(1)
+
+    const rules = await inject({ method: 'GET', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules`,
+      headers: { cookie: adminB.cookie } })
+    const rulePage = rules.json().data as { productRevision: number; items: Array<{ skuId: string; skuRevision: number; ruleRevision: number }> }
+    const current = rulePage.items.find(item => item.skuId === catalog.skuId)!
+    const saved = await inject({ method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/batch`,
+      headers: adminHeaders(adminB), payload: { expectedRevision: rulePage.productRevision, updates: [{
+        skuId: catalog.skuId, expectedSkuRevision: current.skuRevision, expectedRuleRevision: current.ruleRevision,
+        mode: 'fixed_profit', fixedProfit: '1.00000',
+      }] } })
+    expect(saved.statusCode, saved.body).toBe(200)
+    const previewResponse = await inject({ method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/preview`,
+      headers: adminHeaders(adminA), payload: { skuIds: [catalog.skuId] } })
+    expect(previewResponse.statusCode, previewResponse.body).toBe(200)
+    const preview = previewResponse.json().data as { productRevision: number; items: Array<{
+      skuId: string; skuRevision: number; ruleRevision: number; inputDigest: string; suggestedSalePrice: string;
+    }> }
+    expect(preview.items[0]!.suggestedSalePrice).toBe('3.00')
+    const applyPayload = { expectedRevision: preview.productRevision, confirmLossAndFreePrice: false,
+      items: preview.items.map(item => ({ skuId: item.skuId, expectedSkuRevision: item.skuRevision,
+        expectedRuleRevision: item.ruleRevision, inputDigest: item.inputDigest })) }
+    const secondGate = await holdSkuLock(catalog.skuId)
+    const applying = inject({ method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/apply`,
+      headers: adminHeaders(adminA), payload: applyPayload })
+    let disabling!: ReturnType<typeof inject>
+    try {
+      const applyPid = await waitForQueryBlockedBy('product_variants', secondGate.pid)
+      disabling = inject({ method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/variant-matrix`,
+        headers: adminHeaders(adminB), payload: { expectedRevision: preview.productRevision, mode: 'selected', groups: [],
+          combinations: [{ skuId: catalog.skuId, optionValueIds: [], enabled: false }] } })
+      await waitForQueryBlockedBy('products', applyPid)
+    } finally {
+      secondGate.release()
+    }
+    await secondGate.transaction
+    const applied = await applying
+    const rejectedDisable = await disabling
+    expect(applied.statusCode, applied.body).toBe(200)
+    expect(rejectedDisable.statusCode, rejectedDisable.body).toBe(409)
+    expect(rejectedDisable.json().error.code).toBe('PRODUCT_REVISION_CONFLICT')
+    expect(await db.selectFrom('product_variants').select(['sale_price', 'cost_price', 'pricing_rule_status', 'enabled'])
+      .where('id', '=', catalog.skuId).executeTakeFirstOrThrow()).toEqual({
+      sale_price: '3.00000', cost_price: '2.00000', pricing_rule_status: 'applied', enabled: true,
+    })
+    const latest = await db.selectFrom('products').select('revision').where('id', '=', catalog.productId).executeTakeFirstOrThrow()
+    const disabled = await inject({ method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/variant-matrix`,
+      headers: adminHeaders(adminB), payload: { expectedRevision: latest.revision, mode: 'selected', groups: [],
+        combinations: [{ skuId: catalog.skuId, optionValueIds: [], enabled: false }] } })
+    expect(disabled.statusCode, disabled.body).toBe(200)
+    const staleApply = await inject({ method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/apply`,
+      headers: adminHeaders(adminA), payload: applyPayload })
+    expect(staleApply.statusCode).toBe(409)
+    expect((await db.selectFrom('product_variants').select('enabled').where('id', '=', catalog.skuId).executeTakeFirstOrThrow()).enabled).toBe(false)
+  })
+
+  it('⑥-3C settles the catalog lock race between checkout and confirmed repricing in both orders', async () => {
+    const admin = await createAdmin()
+    const firstCustomer = await createCustomer()
+    const secondCustomer = await createCustomer()
+    const catalog = await createCatalog({ price: '4.00', mode: 'quantity', stock: 5 })
+    await enableManual(catalog, admin)
+    await setSkuPurchaseLimits(catalog.skuId, { lifetime: 1 })
+    const priceResponse = await inject({ method: 'GET', url: `/api/v1/admin/products/${catalog.productId}/prices`,
+      headers: { cookie: admin.cookie } })
+    const pricePage = priceResponse.json().data as { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> }
+    const priceRow = pricePage.items.find(item => item.skuId === catalog.skuId)!
+    const costPreview = await inject({ method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/cost-preview`,
+      headers: adminHeaders(admin), payload: { expectedRevision: pricePage.productRevision,
+        updates: [{ skuId: catalog.skuId, expectedSkuRevision: priceRow.skuRevision, costPrice: '1.00000' }] } })
+    expect(costPreview.statusCode, costPreview.body).toBe(200)
+    const cost = costPreview.json().data.items[0] as { skuRevision: number; inputDigest: string; newCostPrice: string }
+    const confirmed = await inject({ method: 'PATCH', url: `/api/v1/admin/products/${catalog.productId}/prices/batch`,
+      headers: adminHeaders(admin), payload: { expectedRevision: pricePage.productRevision, updates: [{
+        skuId: catalog.skuId, expectedSkuRevision: cost.skuRevision,
+        costPrice: cost.newCostPrice, costPreviewDigest: cost.inputDigest,
+      }] } })
+    expect(confirmed.statusCode, confirmed.body).toBe(200)
+    const configureAndPreview = async (fixedProfit: string) => {
+      const response = await inject({ method: 'GET', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules`,
+        headers: { cookie: admin.cookie } })
+      const page = response.json().data as { productRevision: number; items: Array<{ skuId: string; skuRevision: number; ruleRevision: number }> }
+      const row = page.items.find(item => item.skuId === catalog.skuId)!
+      const saved = await inject({ method: 'PUT', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/batch`,
+        headers: adminHeaders(admin), payload: { expectedRevision: page.productRevision, updates: [{
+          skuId: catalog.skuId, expectedSkuRevision: row.skuRevision, expectedRuleRevision: row.ruleRevision,
+          mode: 'fixed_profit', fixedProfit,
+        }] } })
+      expect(saved.statusCode, saved.body).toBe(200)
+      const previewResponse = await inject({ method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/preview`,
+        headers: adminHeaders(admin), payload: { skuIds: [catalog.skuId] } })
+      expect(previewResponse.statusCode, previewResponse.body).toBe(200)
+      const preview = previewResponse.json().data as { productRevision: number; items: Array<{
+        skuId: string; skuRevision: number; ruleRevision: number; inputDigest: string;
+      }> }
+      return { expectedRevision: preview.productRevision, confirmLossAndFreePrice: false,
+        items: preview.items.map(item => ({ skuId: item.skuId, expectedSkuRevision: item.skuRevision,
+          expectedRuleRevision: item.ruleRevision, inputDigest: item.inputDigest })) }
+    }
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const firstApplyPayload = await configureAndPreview('1.00000')
+    const oldQuote = await quote(items, firstCustomer)
+    const firstGate = await holdSkuLock(catalog.skuId)
+    const applyingFirst = inject({ method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/apply`,
+      headers: adminHeaders(admin), payload: firstApplyPayload })
+    let staleCheckout!: ReturnType<typeof createOrder>
+    try {
+      const applyPid = await waitForQueryBlockedBy('product_variants', firstGate.pid)
+      staleCheckout = createOrder(items, oldQuote.json().data.quoteToken, firstCustomer)
+      await waitForQueryBlockedBy('products', applyPid)
+    } finally {
+      firstGate.release()
+    }
+    await firstGate.transaction
+    expect((await applyingFirst).statusCode).toBe(200)
+    const rejected = await staleCheckout
+    expect(rejected.statusCode, rejected.body).toBe(409)
+    expect(rejected.json().error).toMatchObject({ code: 'CHECKOUT_QUOTE_CHANGED', currentQuote: { totalAmount: '2.00' } })
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(0)
+
+    const firstQuote = await quote(items, firstCustomer)
+    const firstOrder = await createOrder(items, firstQuote.json().data.quoteToken, firstCustomer)
+    expect(firstOrder.statusCode, firstOrder.body).toBe(201)
+    const secondApplyPayload = await configureAndPreview('2.00000')
+    const secondQuote = await quote(items, secondCustomer)
+    expect(secondQuote.json().data.totalAmount).toBe('2.00')
+    const secondKey = randomUUID()
+    const secondGate = await holdSkuLock(catalog.skuId)
+    const ordering = createOrder(items, secondQuote.json().data.quoteToken, secondCustomer, secondKey)
+    let applyingSecond!: ReturnType<typeof inject>
+    try {
+      const orderPid = await waitForQueryBlockedBy('product_variants', secondGate.pid)
+      applyingSecond = inject({ method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/pricing-rules/apply`,
+        headers: adminHeaders(admin), payload: secondApplyPayload })
+      await waitForQueryBlockedBy('products', orderPid)
+    } finally {
+      secondGate.release()
+    }
+    await secondGate.transaction
+    const ordered = await ordering
+    const appliedAfterOrder = await applyingSecond
+    expect(ordered.statusCode, ordered.body).toBe(201)
+    expect(ordered.json().data.order.totalAmount).toBe('2.00')
+    expect(appliedAfterOrder.statusCode, appliedAfterOrder.body).toBe(200)
+    expect((await db.selectFrom('product_variants').select('sale_price').where('id', '=', catalog.skuId).executeTakeFirstOrThrow()).sale_price).toBe('3.00000')
+    const replay = await createOrder(items, '0'.repeat(64), secondCustomer, secondKey)
+    expect(replay.statusCode).toBe(200)
+    expect(replay.json().data).toMatchObject({ created: false, order: { id: ordered.json().data.order.id, totalAmount: '2.00' } })
+    expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(2)
+    expect(await db.selectFrom('order_inventory_reservations').select('id')
+      .where('product_variant_id', '=', catalog.skuId).execute()).toHaveLength(2)
+    const quota = await quote(items, secondCustomer)
+    expect(quota.json().data.items[0].purchaseLimits.sku).toMatchObject({ lifetimePurchased: 1, exceeded: true })
   })
 
   it('invalidates old checkout quotes after a confirmed pricing rule and preserves replayed order amounts', async () => {

@@ -676,7 +676,9 @@ async function copyProduct(
         combination_key: copiedVariants.length === 0 ? '' : copiedCombinationKey(optionValueIds),
         sale_price: sourceVariant.sale_price,
         compare_at_price: sourceVariant.compare_at_price,
-        cost_price: sourceVariant.cost_price,
+        // A copied SKU has a new identity; its internal CNY cost must be
+        // previewed and explicitly confirmed for that SKU.
+        cost_price: null,
         // A copy stays a draft and starts with every SKU explicitly disabled.
         // Inventory, fulfillment readiness, and private delivery versions are
         // intentionally not copied from the source product.

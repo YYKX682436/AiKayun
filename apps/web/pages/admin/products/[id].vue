@@ -82,6 +82,9 @@ const conflictPrices = ref<AdminProductVariantPricesPage | null>(null)
 const conflictInventory = ref<AdminProductInventorySummary | null>(null)
 const conflictLoading = ref(false)
 const conflictError = ref('')
+const costOutcomeUnknown = ref(false)
+const costOutcomeSkuIds = ref<string[]>([])
+let conflictRequestSequence = 0
 
 const name = ref('')
 const clientReady = ref(false)
@@ -940,22 +943,30 @@ function clearSectionStatus(section: string) {
 }
 
 async function refreshConflict(section: string) {
+  const owner = { sequence: ++conflictRequestSequence, productId: productId.value, page: pricePageNumber.value }
   conflictSection.value = section
+  conflictLatest.value = null
+  conflictPrices.value = null
+  conflictInventory.value = null
   conflictLoading.value = true
   conflictError.value = ''
   try {
     const [latest, prices, inventory] = await Promise.all([
-      request<ProductDetail>(`/api/v1/admin/products/${productId.value}`),
-      request<AdminProductVariantPricesPage>(`/api/v1/admin/products/${productId.value}/prices?page=${pricePageNumber.value}&pageSize=50`),
-      request<AdminProductInventorySummary>(`/api/v1/admin/products/${productId.value}/inventory`),
+      request<ProductDetail>(`/api/v1/admin/products/${owner.productId}`),
+      request<AdminProductVariantPricesPage>(`/api/v1/admin/products/${owner.productId}/prices?page=${owner.page}&pageSize=50`),
+      request<AdminProductInventorySummary>(`/api/v1/admin/products/${owner.productId}/inventory`),
     ])
+    if (owner.sequence !== conflictRequestSequence || owner.productId !== productId.value || owner.page !== pricePageNumber.value) return
+    if (latest.revision !== prices.productRevision) throw new Error('读取期间商品再次变化，请重新读取服务器。')
     conflictLatest.value = latest
     conflictPrices.value = prices
     conflictInventory.value = inventory
   } catch (error) {
-    conflictError.value = error instanceof Error ? error.message : '无法读取服务器上的最新版本。'
+    if (owner.sequence === conflictRequestSequence && owner.productId === productId.value && owner.page === pricePageNumber.value) {
+      conflictError.value = error instanceof Error ? error.message : '无法读取服务器上的最新版本。'
+    }
   } finally {
-    conflictLoading.value = false
+    if (owner.sequence === conflictRequestSequence) conflictLoading.value = false
   }
 }
 
@@ -978,12 +989,23 @@ function resolveConflict(choice: 'discard' | 'keep') {
     matrixPreview.value = null
     matrixPreviewBody.value = null
     confirmMatrixChanges.value = false
+    if (conflictSection.value === 'prices') dirty.prices = currentPriceItems.value.some(priceChanged)
   }
   conflictLatest.value = null
   conflictPrices.value = null
   conflictInventory.value = null
   sectionErrors[conflictSection.value] = ''
-  if (choice === 'keep') sectionErrors[conflictSection.value] = '本地输入已保留。再次保存会以服务器最新修订号提交，请先确认上方差异。'
+  if (choice === 'keep') {
+    if (conflictSection.value === 'prices' && !dirty.prices) {
+      sectionSuccess.prices = '已读取服务器当前价格与成本；保留的本地输入与当前值一致。'
+    } else {
+      sectionErrors[conflictSection.value] = '本地输入已保留。再次保存会以服务器最新修订号提交，请先确认上方差异。'
+    }
+  }
+  if (conflictSection.value === 'prices') {
+    costOutcomeUnknown.value = false
+    costOutcomeSkuIds.value = []
+  }
   conflictSection.value = ''
 }
 
@@ -1488,7 +1510,7 @@ function costPreviewRiskLabel(risk: string) {
 }
 
 async function previewCostChanges() {
-  if (!product.value || !pricePage.value || isArchived.value || saving.value) return
+  if (!product.value || !pricePage.value || isArchived.value || saving.value || costOutcomeUnknown.value) return
   const costRows = pricePage.value.items.filter(costChanged)
   if (!costRows.length) return
   if (pricePage.value.items.some(priceFieldsChanged)) {
@@ -1572,10 +1594,17 @@ async function confirmCostChanges() {
     sectionSuccess.prices = `已确认并保存 ${result.items.length} 个 SKU 的人工 CNY 内部单位成本。售价与划线价未更改；适用的定价策略已过期，需重新预览后另行确认售价。`
   } catch (error) {
     if (owner.sequence === costOperationSequence && owner.productId === productId.value) {
-      sectionErrors.prices = error instanceof Error ? error.message : '成本确认失败，请刷新商品后检查当前修订。'
       costPreview.value = null
       costPreviewOpen.value = false
       confirmManualCost.value = false
+      if (error instanceof AdminApiError && (error.status === 0 || error.status >= 500)) {
+        costOutcomeUnknown.value = true
+        costOutcomeSkuIds.value = preview.items.map(item => item.skuId)
+        sectionErrors.prices = '成本确认结果未知。请重新读取服务器并核对当前成本后再操作；本地输入会保留。'
+        await refreshConflict('prices')
+      } else {
+        await handleSectionError('prices', error)
+      }
     }
   } finally {
     if (activeCostOperation === owner.sequence) {
@@ -1587,6 +1616,14 @@ async function confirmCostChanges() {
 
 watch(productId, () => {
   costOperationSequence++
+  conflictRequestSequence++
+  costOutcomeUnknown.value = false
+  costOutcomeSkuIds.value = []
+  conflictSection.value = ''
+  conflictLatest.value = null
+  conflictPrices.value = null
+  conflictInventory.value = null
+  conflictLoading.value = false
   costPreview.value = null
   costPreviewOpen.value = false
   confirmManualCost.value = false
@@ -2005,7 +2042,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                   id="conflict-title"
                   class="font-semibold text-highlighted"
                 >
-                  商品数据已变化，需要你决定如何处理
+                  {{ costOutcomeUnknown ? '成本确认结果未知，请核对服务器当前数据' : '商品数据已变化，需要你决定如何处理' }}
                 </h2>
                 <p class="mt-1 text-sm text-muted">
                   当前本地修改来自“{{ conflictSection }}”。不会自动覆盖服务器内容。
@@ -2022,6 +2059,18 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 >
                   {{ conflictError }}
                 </p>
+                <ul
+                  v-if="costOutcomeUnknown && conflictPrices"
+                  class="mt-2 space-y-1 text-sm text-default"
+                >
+                  <li
+                    v-for="row in conflictPrices.items.filter(item => costOutcomeSkuIds.includes(item.skuId))"
+                    :key="row.skuId"
+                  >
+                    {{ row.skuCode }}：服务器当前成本 {{ row.costPrice === null ? '未填写' : `¥${row.costPrice}` }}；
+                    本地输入 {{ priceDraft[row.skuId]?.costPrice || '未填写' }}
+                  </li>
+                </ul>
               </div>
               <UButton
                 v-if="!conflictLatest"
@@ -3178,7 +3227,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                       价格
                     </h2>
                     <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
-                      售价和划线价可单独保存。成本按 CNY/件人工确认，最多五位小数；先预览成本与利润影响，再单独确认，不代表供应商实际扣费。
+                      售价和划线价可单独保存。成本按 CNY/件人工确认，最多五位小数；先预览成本与利润影响，再单独确认，不代表供应商实际扣费。复制商品不会复制成本，新 SKU 需重新确认。
                     </p>
                   </div>
                   <UBadge
@@ -3314,7 +3363,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     color="neutral"
                     variant="outline"
                     size="sm"
-                    :disabled="pricePageNumber <= 1 || saving === 'cost-confirm'"
+                    :disabled="pricePageNumber <= 1 || saving === 'cost-confirm' || costOutcomeUnknown"
                     @click="changePricePage(pricePageNumber - 1)"
                   >
                     上一页
@@ -3324,7 +3373,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     color="neutral"
                     variant="outline"
                     size="sm"
-                    :disabled="pricePageNumber >= pricePage.totalPages || saving === 'cost-confirm'"
+                    :disabled="pricePageNumber >= pricePage.totalPages || saving === 'cost-confirm' || costOutcomeUnknown"
                     @click="changePricePage(pricePageNumber + 1)"
                   >
                     下一页
@@ -3336,14 +3385,14 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                       color="neutral"
                       variant="outline"
                       :loading="saving === 'cost-preview'"
-                      :disabled="isArchived || saving !== '' || !pricePage?.items.some(costChanged)"
+                      :disabled="isArchived || saving !== '' || costOutcomeUnknown || !pricePage?.items.some(costChanged)"
                       @click="previewCostChanges"
                     >
                       预览成本变更
                     </UButton>
                     <UButton
                       :loading="saving === 'prices'"
-                      :disabled="isArchived || saving !== '' || !pricePage?.items.some(priceFieldsChanged)"
+                      :disabled="isArchived || saving !== '' || costOutcomeUnknown || !pricePage?.items.some(priceFieldsChanged)"
                       @click="savePrices"
                     >
                       保存本页售价与划线价

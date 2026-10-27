@@ -386,6 +386,92 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
       .toEqual(beforeDuplicateAttempt)
   }, 45_000)
 
+  it('⑥-3C replays a filled order after a mapping change without consulting the supplier during checkout', async () => {
+    setProductOverride()
+    const targetProductId = randomUUID()
+    const targetSkuId = randomUUID()
+    await db.transaction().execute(async trx => {
+      await trx.insertInto('products').values({ id: targetProductId, name: '映射订单隔离商品', description: '',
+        product_type: 'digital', status: 'active' }).execute()
+      await trx.insertInto('product_variants').values({ id: targetSkuId, product_id: targetProductId,
+        sku_code: `MAP-ORDER-${targetSkuId.slice(0, 8)}`, combination_key: '', sale_price: '1.00',
+        enabled: true, retired_at: null, inventory_mode: 'unlimited' }).execute()
+      await trx.insertInto('product_variant_fulfillment').values({ product_variant_id: targetSkuId,
+        method: 'manual', manual_delivery_ready: true }).execute()
+      await trx.insertInto('product_purchase_form_settings').values({ product_id: targetProductId,
+        mode: 'template', template_version_id: templateVersionId, applied_mode: 'template',
+        applied_template_version_id: templateVersionId, updated_by_admin_id: adminId }).execute()
+    })
+    const initialObservation = await createObservation('201001', 1, 'cn-member')
+    expect(initialObservation.statusCode, initialObservation.body).toBe(200)
+    const createdMapping = await inject({ method: 'POST', url: '/api/v1/admin/supplier-product-mappings', headers: adminHeaders,
+      payload: { productId: targetProductId, skuId: targetSkuId, observationId: initialObservation.json().data.id, templateVersionId, rules } })
+    expect(createdMapping.statusCode, createdMapping.body).toBe(201)
+    const targetMappingId = createdMapping.json().data.id as string
+    const reviewed = await inject({ method: 'POST', url: `/api/v1/admin/supplier-product-mappings/${targetMappingId}/review`,
+      headers: adminHeaders, payload: { expectedRevision: createdMapping.json().data.revision } })
+    expect(reviewed.statusCode, reviewed.body).toBe(200)
+    expect(reviewed.json().data.reviewed).toBe(true)
+    const customerCsrf = await inject({ method: 'GET', url: '/api/v1/customer/auth/csrf' })
+    const csrfCookie = cookie(customerCsrf, 'aikayun_customer_csrf')
+    const csrf = customerCsrf.json().data.csrfToken as string
+    const registration = await inject({ method: 'POST', url: '/api/v1/customer/auth/register',
+      headers: { origin, cookie: csrfCookie, 'x-csrf-token': csrf },
+      payload: { username: `map-order-${randomUUID().replaceAll('-', '').slice(0, 12)}`,
+        password: 'Mapping-Order-Customer-2026!' } })
+    expect(registration.statusCode, registration.body).toBe(201)
+    const customerHeaders = { origin, cookie: `${csrfCookie}; ${cookie(registration, 'aikayun_customer_session')}`,
+      'x-csrf-token': csrf }
+    const draftResponse = await inject({ method: 'POST', url: '/api/v1/storefront/purchase-drafts',
+      headers: customerHeaders, payload: { skuId: targetSkuId } })
+    expect(draftResponse.statusCode, draftResponse.body).toBe(201)
+    const draft = draftResponse.json().data as { id: string; revision: number }
+    const account = definition.fields.find(field => field.meaningKey === 'account_name')!
+    const digits = definition.fields.find(field => field.meaningKey === 'member_number')!
+    const channel = definition.fields.find(field => field.meaningKey === 'channel')!
+    const region = definition.fields.find(field => field.meaningKey === 'region')!
+    if (channel.type !== 'select' || region.type !== 'cascade') throw new Error('Invalid mapping test template')
+    const savedDraft = await inject({ method: 'PUT', url: `/api/v1/storefront/purchase-drafts/${draft.id}`,
+      headers: customerHeaders, payload: { skuId: targetSkuId, expectedRevision: draft.revision, values: {
+        [account.id]: 'synthetic-private-account', [digits.id]: '123456', [channel.id]: channel.options[0]!.id,
+        [region.id]: { path: [region.options[1]!.id], expanded: {} },
+      } } })
+    expect(savedDraft.statusCode, savedDraft.body).toBe(200)
+    expect(savedDraft.json().data.complete).toBe(true)
+    const items = [{ lineId: randomUUID(), skuId: targetSkuId, quantity: 1, draftId: draft.id, draftRevision: savedDraft.json().data.revision }]
+    const supplierCallsBeforeCheckout = fixture.requests.length
+    const quoted = await inject({ method: 'POST', url: '/api/v1/checkout/quote', headers: customerHeaders,
+      payload: { version: 2, items } })
+    expect(quoted.statusCode, quoted.body).toBe(200)
+    expect(quoted.json().data).toMatchObject({ canContinue: true, totalAmount: '1.00' })
+    const orderBody = { version: 2, items, idempotencyKey: randomUUID(), quoteToken: quoted.json().data.quoteToken }
+    const created = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders, payload: orderBody })
+    expect(created.statusCode, created.body).toBe(201)
+    expect(fixture.requests.length).toBe(supplierCallsBeforeCheckout)
+    const orderId = created.json().data.order.id as string
+
+    const current = (await inject({ method: 'GET', url: `/api/v1/admin/supplier-product-mappings/${targetMappingId}`,
+      headers: adminHeaders })).json().data
+    const alternate = await createObservation('201001', 1, 'global-member')
+    expect(alternate.statusCode, alternate.body).toBe(200)
+    const changed = await inject({ method: 'PUT', url: `/api/v1/admin/supplier-product-mappings/${targetMappingId}`, headers: adminHeaders,
+      payload: { expectedRevision: current.revision, productId: targetProductId, skuId: targetSkuId,
+        observationId: alternate.json().data.id, templateVersionId, rules } })
+    expect(changed.statusCode, changed.body).toBe(200)
+    expect(changed.json().data.revision).toBeGreaterThan(current.revision)
+    const supplierCallsBeforeReplay = fixture.requests.length
+    const replay = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders, payload: orderBody })
+    expect(replay.statusCode, replay.body).toBe(200)
+    expect(replay.json().data).toMatchObject({ created: false, order: { id: orderId, totalAmount: '1.00' } })
+    expect(fixture.requests.length).toBe(supplierCallsBeforeReplay)
+    expect(await db.selectFrom('orders').select('id').where('idempotency_key', '=', orderBody.idempotencyKey).execute()).toHaveLength(1)
+    expect(await db.selectFrom('order_items').select(['unit_price', 'line_amount']).where('order_id', '=', orderId).execute())
+      .toEqual([{ unit_price: '1.00', line_amount: '1.00' }])
+    const publicProduct = await inject({ method: 'GET', url: `/api/v1/public/products/${targetProductId}` })
+    expect(publicProduct.body).not.toContain('synthetic-private-account')
+    expect(publicProduct.body).not.toContain(fixtureKayixinCredentials.appSecret)
+  })
+
   it('uses optimistic revisions, preserves reviewed rows, and treats price/name/stock as non-structural observations', async () => {
     const historyBefore = await db.selectFrom('supplier_product_mapping_versions').selectAll().where('mapping_id', '=', mappingId).executeTakeFirstOrThrow()
     await expect(db.updateTable('supplier_product_mapping_versions').set({ upstream_product_name: 'SQL rewrite' })

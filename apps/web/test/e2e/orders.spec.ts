@@ -116,6 +116,7 @@ async function registerCustomer(page: Page, username: string): Promise<void> {
   await page.getByLabel('确认密码').fill(customerPassword)
   await page.getByRole('button', { name: '创建账户' }).click()
   await expect(page).toHaveURL(/\/account$/u)
+  await expect(page.getByRole('heading', { name: '个人账户' })).toBeVisible()
 }
 
 async function addProductToCart(page: Page, product: Product): Promise<void> {
@@ -181,16 +182,38 @@ test('creates a zero-value order, completes actual private delivery, and cancels
     await page.getByRole('button', { name: '清空购物车' }).click()
   }
   await addProductToCart(page, paidProduct)
+  await expect(page.getByText('¥8.80', { exact: true }).first()).toBeVisible()
   await page.goto('/cart')
+  await expect(page.getByText('¥8.80', { exact: true }).first()).toBeVisible()
   await page.getByRole('link', { name: '查看结算报价' }).click()
   await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
+  await expect(page.getByText('¥8.80', { exact: true }).first()).toBeVisible()
+  const prices = await page.request.get(`/api/v1/admin/products/${paidProduct.id}/prices`)
+  const pricePage = (await prices.json()).data as { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> }
+  const changedPrice = await page.request.patch(`/api/v1/admin/products/${paidProduct.id}/variants/${pricePage.items[0]!.skuId}/prices`, {
+    headers: await adminHeaders(page), data: { expectedRevision: pricePage.productRevision,
+      expectedSkuRevision: pricePage.items[0]!.skuRevision, salePrice: '12.30' },
+  })
+  expect(changedPrice.status(), await changedPrice.text()).toBe(200)
+  await page.getByRole('button', { name: '提交订单' }).click()
+  await expect(page.getByRole('alert').filter({ hasText: '已显示最新报价' })).toBeVisible()
+  await expect(page.getByText('¥12.30', { exact: true }).first()).toBeVisible()
   await page.getByRole('button', { name: '提交订单' }).click()
   await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
   const paidOrderUrl = page.url()
+  await expect(page.getByText('¥12.30', { exact: true }).first()).toBeVisible()
   await expect(page.locator('[data-slot="title"]').filter({ hasText: '等待付款' })).toBeVisible()
   await expect(page.getByText('暂时没有可用支付通道')).toBeVisible()
   await expect(page.getByRole('button', { name: '付款', exact: true })).toHaveCount(0)
+  const updatedPrices = await page.request.get(`/api/v1/admin/products/${paidProduct.id}/prices`)
+  const updatedPage = (await updatedPrices.json()).data as { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> }
+  const laterPrice = await page.request.patch(`/api/v1/admin/products/${paidProduct.id}/variants/${updatedPage.items[0]!.skuId}/prices`, {
+    headers: await adminHeaders(page), data: { expectedRevision: updatedPage.productRevision,
+      expectedSkuRevision: updatedPage.items[0]!.skuRevision, salePrice: '9.90' },
+  })
+  expect(laterPrice.status(), await laterPrice.text()).toBe(200)
   await page.reload()
+  await expect(page.getByText('¥12.30', { exact: true }).first()).toBeVisible()
   await expect(page.locator('[data-slot="title"]').filter({ hasText: '等待付款' })).toBeVisible()
   await page.getByRole('button', { name: '取消未付款订单' }).click()
   await page.getByRole('button', { name: '确认取消' }).click()

@@ -515,12 +515,14 @@ export function registerAdminProductPricingRuleRoutes(app: FastifyInstance, db: 
   }, async (request, reply) => {
     const { id: productId, variantId } = request.params as { id: string; variantId: string }
     try {
-      const exists = await db.selectFrom('product_variants').select('id')
-        .where('product_id', '=', productId).where('id', '=', variantId).executeTakeFirst()
-      if (!exists) throw new CatalogError(404, 'SKU_NOT_FOUND', 'SKU 不属于此商品。')
       const rows = await db.selectFrom('product_variant_pricing_rule_versions').selectAll()
         .where('product_id', '=', productId).where('product_variant_id', '=', variantId)
         .orderBy('revision', 'desc').limit(100).execute() as RuleHistoryDbRow[]
+      if (rows.length === 0) {
+        const exists = await db.selectFrom('product_variants').select('id')
+          .where('product_id', '=', productId).where('id', '=', variantId).executeTakeFirst()
+        if (!exists) throw new CatalogError(404, 'SKU_NOT_FOUND', 'SKU 不属于此商品。')
+      }
       const result: AdminProductPricingRuleHistory = { productId, skuId: variantId, items: rows.map(mapHistory) }
       return reply.send(success(result, request.id))
     } catch (error) { return fail(reply, error, request.id) }

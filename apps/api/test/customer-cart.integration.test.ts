@@ -814,22 +814,39 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     expect(overStock.statusCode).toBe(200)
     expect(overStock.json().data.canContinue).toBe(false)
     expect(overStock.json().data.items.every((item: { reason: string }) => item.reason === 'insufficient_inventory')).toBe(true)
+    // Mix two distinct filled lines with a free SKU that has no form. The
+    // free item must not acquire the other SKU's template or private answers.
+    const [freeCatalog] = await createCatalog({ mode: 'unlimited', price: '0.00', fulfillmentMethod: 'manual' })
+    await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true })
+      .where('product_variant_id', '=', freeCatalog!.skuId).execute()
+    const freeAdded = await addCartItem(customer, freeCatalog!.skuId, 1)
+    expect(freeAdded.statusCode, JSON.stringify(freeAdded.json())).toBe(200)
+    const freeLine = (freeAdded.json().data.cart.items as Array<{ lineId: string; skuId: string; quantity: number }>)
+      .find(line => line.skuId === freeCatalog!.skuId)!
+    const mixedOrderLines = [...orderLines, { lineId: freeLine.lineId, skuId: freeLine.skuId, quantity: freeLine.quantity }]
     const quoted = await app.inject({
       method: 'POST', url: '/api/v1/checkout/quote', headers: customerHeaders(customer),
-      payload: { version: 2, items: orderLines },
+      payload: { version: 2, items: mixedOrderLines },
     })
     expect(quoted.statusCode, JSON.stringify(quoted.json())).toBe(200)
     expect(quoted.json().data.canContinue).toBe(true)
-    const orderBody = { version: 2, items: orderLines, idempotencyKey: randomUUID(),
+    expect(quoted.json().data).toMatchObject({ totalAmount: '0.50', items: expect.arrayContaining([
+      expect.objectContaining({ skuId: freeCatalog!.skuId, unitPrice: '0.00', lineTotal: '0.00', purchasePreview: null }),
+    ]) })
+    const orderBody = { version: 2, items: mixedOrderLines, idempotencyKey: randomUUID(),
       quoteToken: quoted.json().data.quoteToken as string }
     const created = await app.inject({
       method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders(customer), payload: orderBody,
     })
     expect(created.statusCode, JSON.stringify(created.json())).toBe(201)
     const order = created.json().data.order as { id: string; items: Array<{ id: string; lineId: string }> }
-    expect(order.items).toHaveLength(2)
-    expect(new Set(order.items.map(item => item.lineId))).toEqual(new Set(lines.map(line => line.lineId)))
+    expect(order.items).toHaveLength(3)
+    expect(new Set(order.items.map(item => item.lineId))).toEqual(new Set([...lines.map(line => line.lineId), freeLine.lineId]))
     const firstOrderItem = order.items.find(item => item.lineId === retainedLineId)!
+    const freeOrderItem = order.items.find(item => item.lineId === freeLine.lineId)!
+    expect(await getOwnedOrderPurchaseSnapshot(db, config, owner, freeOrderItem.id)).toMatchObject({
+      state: 'none', templateVersionId: null,
+    })
     const snapshot = await getOwnedOrderPurchaseSnapshot(db, config, owner, firstOrderItem.id)
     expect(snapshot).toMatchObject({ state: 'filled', templateVersionId: versionId,
       values: { [fieldId]: '00041' } })
@@ -839,6 +856,10 @@ describe('customer cart and checkout quote with PostgreSQL', () => {
     await expect(getOwnedOrderPurchaseSnapshot(db, config, {
       kind: 'customer', customer: { id: other.id, sessionId: otherSession.id },
     }, firstOrderItem.id)).rejects.toMatchObject({ status: 404 })
+
+    const removedFreeLine = await app.inject({ method: 'DELETE',
+      url: `/api/v1/customer/cart/lines/${freeLine.lineId}`, headers: customerHeaders(customer) })
+    expect(removedFreeLine.statusCode).toBe(200)
 
     const otherLine = lines.find(line => line.lineId !== retainedLineId)!
     const collision = await app.inject({
