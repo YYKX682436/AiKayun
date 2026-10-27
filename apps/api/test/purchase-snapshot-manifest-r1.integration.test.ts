@@ -8,6 +8,7 @@ import { sql, type Kysely, type RawBuilder, type Transaction } from 'kysely'
 import sharp from 'sharp'
 import { createDatabase } from '../src/db/pool.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
+import { purchaseSnapshotManifestR1Migration } from '../src/db/migrations/202610250002_purchase_snapshot_manifest_r1.js'
 import type { Database } from '../src/db/types.js'
 import { readConfig, type AppConfig } from '../src/config.js'
 import { encryptPurchaseOrderValues } from '../src/commerce/purchase-form-crypto.js'
@@ -355,13 +356,21 @@ describe('⑥-2B R1 ordered purchase snapshot manifest gates', () => {
       migrationName: '202610270002_supplier_quote_source_consistency', status: 'Success',
     }), expect.objectContaining({
       migrationName: '202610270003_procurement_identity', status: 'Success',
+    }), expect.objectContaining({
+      migrationName: '202610270004_procurement_risk_budget', status: 'Success',
+    }), expect.objectContaining({
+      migrationName: '202610270005_procurement_execution', status: 'Success',
     })])
     expect(await durableRows()).toEqual(before)
     const repeated = await migrator.migrateToLatest()
     expect(repeated.error).toBeUndefined()
     expect(repeated.results).toEqual([])
     const downgrade = await migrator.migrateTo('202610250001_purchase_lines')
-    expect(downgrade.error).toMatchObject({ message: 'Cannot downgrade purchase snapshot gates while snapshots or archived objects exist' })
+    expect(downgrade.error).toMatchObject({ message: 'Procurement execution evidence and delivery identities are permanent; this migration is forward-only.' })
+    // Exercise the original migration's own guard as well, even though the new
+    // forward-only migration now prevents the migrator from reaching it.
+    await expect(db.transaction().execute(trx => purchaseSnapshotManifestR1Migration.down!(trx)))
+      .rejects.toMatchObject({ message: 'Cannot downgrade purchase snapshot gates while snapshots or archived objects exist' })
     expect(await durableRows()).toEqual(before)
     const owner = { kind: 'customer' as const, customer: { id: customerId, sessionId } }
     expect(await getOwnedOrderPurchaseSnapshot(db, config, owner, legacy.itemId)).toMatchObject({ state: 'legacy' })
@@ -435,7 +444,9 @@ describe('⑥-2B R1 ordered purchase snapshot manifest gates', () => {
       await objectLocked.promise
       const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
       const migration = direction === 'up'
-        ? migrator.migrateToLatest() : migrator.migrateTo('202610250001_purchase_lines')
+        ? migrator.migrateToLatest()
+        : db.transaction().execute(trx => purchaseSnapshotManifestR1Migration.down!(trx))
+          .then(() => ({ error: undefined as unknown }), error => ({ error }))
       try {
         await expect.poll(async () => {
           const waiting = await sql<{ waiting: boolean }>`SELECT EXISTS (

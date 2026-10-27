@@ -39,6 +39,8 @@ import { productPricingRulesMigration } from './migrations/202610260002_product_
 import { supplierQuoteObservationsMigration } from './migrations/202610270001_supplier_quote_observations.js'
 import { supplierQuoteSourceConsistencyMigration } from './migrations/202610270002_supplier_quote_source_consistency.js'
 import { procurementIdentityMigration } from './migrations/202610270003_procurement_identity.js'
+import { procurementRiskBudgetMigration } from './migrations/202610270004_procurement_risk_budget.js'
+import { procurementExecutionMigration } from './migrations/202610270005_procurement_execution.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -82,6 +84,8 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610270001_supplier_quote_observations': supplierQuoteObservationsMigration,
       '202610270002_supplier_quote_source_consistency': supplierQuoteSourceConsistencyMigration,
       '202610270003_procurement_identity': procurementIdentityMigration,
+      '202610270004_procurement_risk_budget': procurementRiskBudgetMigration,
+      '202610270005_procurement_execution': procurementExecutionMigration,
     }
   }
 }

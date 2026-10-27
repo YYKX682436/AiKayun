@@ -1123,7 +1123,7 @@ export interface OrderItemFulfillmentAttemptsTable {
   started_by_admin_id: string | null
   status: Generated<FulfillmentAttemptStatus>
   result_sha256: string | null
-  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link' | 'file' | 'api'>
+  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link' | 'file' | 'api' | 'procurement'>
   failure_code: string | null
   retry_after: Date | null
   created_at: Generated<Date>
@@ -1137,7 +1137,7 @@ export interface OrderItemFulfillmentDeliveriesTable {
   unit_index: number
   content: string | null
   content_sha256: string
-  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link' | 'file' | 'api'>
+  delivery_source: Generated<'manual' | 'code_pool' | 'fixed_content' | 'link' | 'file' | 'api' | 'procurement'>
   encrypted_content: Buffer | null
   content_nonce: Buffer | null
   content_auth_tag: Buffer | null

@@ -147,6 +147,9 @@ function handleOrderError(error: unknown, reply: FastifyReply, requestId: string
   if (constraint === 'procurement_source_version_mismatch') {
     return reply.code(409).send(failure('CHECKOUT_SOURCE_CHANGED', '商品配置已变化，请刷新报价后重试。', requestId))
   }
+  if (constraint === 'procurement_fulfillment_conflict' || constraint === 'procurement_delivery_conflict') {
+    return reply.code(409).send(failure('FULFILLMENT_REQUIRES_REVIEW', '此订单项存在待核对的履约记录，暂时不能重复交付。', requestId))
+  }
   if (constraint === 'order_inventory_insufficient_code_pool') {
     return reply.code(409).send(failure('INSUFFICIENT_CODE_POOL', '卡密池可售数量已变化，请刷新报价后重试。', requestId))
   }
@@ -335,6 +338,11 @@ export async function loadOrderDetail(db: Db, id: string, config: AppConfig): Pr
       fileMediaType = delivery.file_media_type
       const ownerPath = order.customer_id ? 'customer' : 'guest'
       downloadUrl = `/api/v1/${ownerPath}/orders/${order.id}/items/${item.id}/deliveries/${delivery.id}/file`
+    } else if (delivery.delivery_source === 'procurement') {
+      // The isolated completed-result fixture carries no customer-facing payload.
+      // Evidence and the original fulfillment attempt retain its unit identity.
+      content = null
+      contentFormat = 'confirmation'
     } else if (delivery.delivery_source === 'api') {
       const item = itemRows.find(row => row.id === delivery.order_item_id)
       if (!config || !item || item.fulfillment_method_snapshot !== 'api'

@@ -19,6 +19,7 @@ import { readConfig } from '../src/config.js'
 import type { AppConfig } from '../src/config.js'
 import { createDatabase } from '../src/db/pool.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
+import { purchaseFormActivationStateMigration } from '../src/db/migrations/202610250003_purchase_form_activation_state.js'
 import type { Database } from '../src/db/types.js'
 import {
   claimGuestPurchaseDrafts,
@@ -345,56 +346,80 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
   }, 45_000)
 
   it('preserves frozen templates, identities and audit payloads while applying the forward delete fix', async () => {
-    const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
-    const baseline = await migrator.migrateTo('202610240002_purchase_forms_drafts')
-    expect(baseline.error).toBeUndefined()
-    const admin = await makeAdminSession()
-    const fixture = await createTemplateFixture(admin)
-    const catalog = await createCatalog()
-    // Seed the historical 6-2A schema directly. The current application requires the
-    // activation-state migration before writes; this scenario verifies the forward migration
-    // preserves the legacy associations and immutable audit records byte-for-byte.
-    await sql`INSERT INTO product_purchase_form_settings (product_id, mode, template_version_id, updated_by_admin_id)
-      VALUES (${catalog.productId}, 'template', ${fixture.versionId}, ${adminId})`.execute(db)
-    const productRevisionAfterDefault = await db.updateTable('products').set({ updated_at: new Date() })
-      .where('id', '=', catalog.productId).returning('revision').executeTakeFirstOrThrow()
-    await sql`INSERT INTO purchase_form_audit_events
-      (id, administrator_id, operation, product_id, summary)
-      VALUES (${randomUUID()}, ${adminId}, 'product_assignment_updated', ${catalog.productId},
-        ${JSON.stringify({ mode: 'template', templateVersionId: fixture.versionId, revision: productRevisionAfterDefault.revision })}::jsonb)`
-      .execute(db)
-    await sql`INSERT INTO sku_purchase_form_overrides
-      (product_id, product_variant_id, mode, template_version_id, updated_by_admin_id)
-      VALUES (${catalog.productId}, ${catalog.skuId}, 'none', NULL, ${adminId})`.execute(db)
-    const productRevisionAfterOverride = await db.updateTable('products').set({ updated_at: new Date() })
-      .where('id', '=', catalog.productId).returning('revision').executeTakeFirstOrThrow()
-    await sql`INSERT INTO purchase_form_audit_events
-      (id, administrator_id, operation, product_id, product_variant_id, summary)
-      VALUES (${randomUUID()}, ${adminId}, 'sku_override_updated', ${catalog.productId}, ${catalog.skuId},
-        ${JSON.stringify({ mode: 'none', templateVersionId: null, revision: productRevisionAfterOverride.revision })}::jsonb)`
-      .execute(db)
-    const versionBefore = await db.selectFrom('purchase_form_template_versions').selectAll()
-      .where('id', '=', fixture.versionId).executeTakeFirstOrThrow()
-    const identitiesBefore = await db.selectFrom('purchase_form_template_identities').selectAll()
-      .where('template_id', '=', fixture.id).orderBy('id').execute()
-    const eventsBefore = await db.selectFrom('purchase_form_audit_events').selectAll()
-      .where('product_id', '=', catalog.productId).orderBy('created_at').orderBy('id').execute()
-    expect(eventsBefore).toHaveLength(2)
+    // The current forward-only procurement migration cannot be rolled back. Exercise
+    // the historical upgrade in an isolated schema from its original baseline.
+    const schema = `purchase_legacy_${randomUUID().replaceAll('-', '')}`
+    const mainDb = db
+    const mainApp = app
+    await sql.raw(`CREATE SCHEMA "${schema}"`).execute(mainDb)
+    const legacyDb = new Kysely<Database>({ dialect: new PostgresDialect({
+      pool: new Pool({ connectionString: testDatabaseUrl, options: `-c search_path=${schema}` }),
+    }) })
+    db = legacyDb
+    let legacyApp: FastifyInstance | undefined
+    try {
+      const migrator = new Migrator({ db, provider: new AppMigrationProvider(), migrationTableSchema: schema })
+      const baseline = await migrator.migrateTo('202610240002_purchase_forms_drafts')
+      expect(baseline.error).toBeUndefined()
+      await db.insertInto('admin_users').values({ id: adminId, email: `legacy-${adminId}@example.test`,
+        password_hash: await hashPassword('integration-admin-password') }).execute()
+      app = await createApp({ db, config: configA, logger: false })
+      await app.ready()
+      legacyApp = app
+      const admin = await makeAdminSession()
+      const fixture = await createTemplateFixture(admin)
+      const catalog = await createCatalog()
+      // Seed the historical 6-2A schema directly. The current application requires the
+      // activation-state migration before writes; this scenario verifies the forward migration
+      // preserves the legacy associations and immutable audit records byte-for-byte.
+      await sql`INSERT INTO product_purchase_form_settings (product_id, mode, template_version_id, updated_by_admin_id)
+        VALUES (${catalog.productId}, 'template', ${fixture.versionId}, ${adminId})`.execute(db)
+      const productRevisionAfterDefault = await db.updateTable('products').set({ updated_at: new Date() })
+        .where('id', '=', catalog.productId).returning('revision').executeTakeFirstOrThrow()
+      await sql`INSERT INTO purchase_form_audit_events
+        (id, administrator_id, operation, product_id, summary)
+        VALUES (${randomUUID()}, ${adminId}, 'product_assignment_updated', ${catalog.productId},
+          ${JSON.stringify({ mode: 'template', templateVersionId: fixture.versionId, revision: productRevisionAfterDefault.revision })}::jsonb)`
+        .execute(db)
+      await sql`INSERT INTO sku_purchase_form_overrides
+        (product_id, product_variant_id, mode, template_version_id, updated_by_admin_id)
+        VALUES (${catalog.productId}, ${catalog.skuId}, 'none', NULL, ${adminId})`.execute(db)
+      const productRevisionAfterOverride = await db.updateTable('products').set({ updated_at: new Date() })
+        .where('id', '=', catalog.productId).returning('revision').executeTakeFirstOrThrow()
+      await sql`INSERT INTO purchase_form_audit_events
+        (id, administrator_id, operation, product_id, product_variant_id, summary)
+        VALUES (${randomUUID()}, ${adminId}, 'sku_override_updated', ${catalog.productId}, ${catalog.skuId},
+          ${JSON.stringify({ mode: 'none', templateVersionId: null, revision: productRevisionAfterOverride.revision })}::jsonb)`
+        .execute(db)
+      const versionBefore = await db.selectFrom('purchase_form_template_versions').selectAll()
+        .where('id', '=', fixture.versionId).executeTakeFirstOrThrow()
+      const identitiesBefore = await db.selectFrom('purchase_form_template_identities').selectAll()
+        .where('template_id', '=', fixture.id).orderBy('id').execute()
+      const eventsBefore = await db.selectFrom('purchase_form_audit_events').selectAll()
+        .where('product_id', '=', catalog.productId).orderBy('created_at').orderBy('id').execute()
+      expect(eventsBefore).toHaveLength(2)
 
-    const upgraded = await migrator.migrateToLatest()
-    expect(upgraded.error).toBeUndefined()
-    expect(await db.selectFrom('purchase_form_template_versions').selectAll()
-      .where('id', '=', fixture.versionId).executeTakeFirstOrThrow()).toEqual(versionBefore)
-    expect(await db.selectFrom('purchase_form_template_identities').selectAll()
-      .where('template_id', '=', fixture.id).orderBy('id').execute()).toEqual(identitiesBefore)
-    expect(await db.selectFrom('purchase_form_audit_events').selectAll()
-      .where('product_id', '=', catalog.productId).orderBy('created_at').orderBy('id').execute()).toEqual(eventsBefore)
-    await expect(sql`UPDATE purchase_form_audit_events SET summary = summary WHERE id = ${eventsBefore[0]!.id}`.execute(db))
-      .rejects.toMatchObject({ code: '23514', constraint: 'purchase_form_history_immutable' })
-    await expect(sql`DELETE FROM purchase_form_audit_events WHERE id = ${eventsBefore[0]!.id}`.execute(db))
-      .rejects.toMatchObject({ code: '23514', constraint: 'purchase_form_history_immutable' })
-    expect((await db.selectFrom('product_purchase_form_settings').select('template_version_id')
-      .where('product_id', '=', catalog.productId).executeTakeFirstOrThrow()).template_version_id).toBe(fixture.versionId)
+      const upgraded = await migrator.migrateToLatest()
+      expect(upgraded.error).toBeUndefined()
+      expect(await db.selectFrom('purchase_form_template_versions').selectAll()
+        .where('id', '=', fixture.versionId).executeTakeFirstOrThrow()).toEqual(versionBefore)
+      expect(await db.selectFrom('purchase_form_template_identities').selectAll()
+        .where('template_id', '=', fixture.id).orderBy('id').execute()).toEqual(identitiesBefore)
+      expect(await db.selectFrom('purchase_form_audit_events').selectAll()
+        .where('product_id', '=', catalog.productId).orderBy('created_at').orderBy('id').execute()).toEqual(eventsBefore)
+      await expect(sql`UPDATE purchase_form_audit_events SET summary = summary WHERE id = ${eventsBefore[0]!.id}`.execute(db))
+        .rejects.toMatchObject({ code: '23514', constraint: 'purchase_form_history_immutable' })
+      await expect(sql`DELETE FROM purchase_form_audit_events WHERE id = ${eventsBefore[0]!.id}`.execute(db))
+        .rejects.toMatchObject({ code: '23514', constraint: 'purchase_form_history_immutable' })
+      expect((await db.selectFrom('product_purchase_form_settings').select('template_version_id')
+        .where('product_id', '=', catalog.productId).executeTakeFirstOrThrow()).template_version_id).toBe(fixture.versionId)
+    } finally {
+      if (legacyApp) await legacyApp.close()
+      db = mainDb
+      app = mainApp
+      await legacyDb.destroy()
+      await sql.raw(`DROP SCHEMA "${schema}" CASCADE`).execute(mainDb)
+    }
   }, 45_000)
 
   it('keeps a prepared order image when cleanup races an in-flight order bind', async () => {
@@ -1835,9 +1860,9 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     const paused = await inject({ method: 'POST', url: '/api/v1/admin/storefront/purchase-forms/transition',
       headers: adminHeaders(), payload: { expectedStatus: 'active', nextStatus: 'paused' } })
     expect(paused.statusCode, JSON.stringify(paused.json())).toBe(200)
-    const rollback = await new Migrator({ db, provider: new AppMigrationProvider() })
-      .migrateTo('202610250002_purchase_snapshot_manifest_r1')
-    expect(rollback.error).toMatchObject({ code: '55000' })
+    // Test the historical downgrade guard directly; the newer forward-only
+    // procurement migration correctly prevents traversing back through Migrator.
+    await expect(purchaseFormActivationStateMigration.down!(db)).rejects.toMatchObject({ code: '55000' })
     expect(await db.selectFrom('storefront_customer_policy').select('purchase_forms_status')
       .executeTakeFirstOrThrow()).toEqual({ purchase_forms_status: 'paused' })
     await expect(sql`SELECT purchase_forms_enabled FROM storefront_customer_policy`.execute(db))

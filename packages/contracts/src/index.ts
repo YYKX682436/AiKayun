@@ -2140,7 +2140,7 @@ export const AdminFulfillmentAttemptSchema = Type.Object({
   quantity: Type.Integer({ minimum: 1 }),
   status: Type.Union([Type.Literal('processing'), Type.Literal('unknown'), Type.Literal('succeeded'), Type.Literal('failed')]),
   deliverySource: Type.Union([
-    Type.Literal('manual'), Type.Literal('code_pool'), Type.Literal('fixed_content'), Type.Literal('link'), Type.Literal('file'), Type.Literal('api'),
+    Type.Literal('manual'), Type.Literal('code_pool'), Type.Literal('fixed_content'), Type.Literal('link'), Type.Literal('file'), Type.Literal('api'), Type.Literal('procurement'),
   ]),
   failureCode: Type.Union([Type.Null(),
     Type.Literal('CODE_POOL_DATA_INCONSISTENT'),

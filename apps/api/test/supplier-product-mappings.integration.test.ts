@@ -14,6 +14,16 @@ import type { Database } from '../src/db/types.js'
 import { fixtureKayixinCredentials, fixtureProduct, startKayixinV3Fixture } from './fixtures/kayixin-v3-server.js'
 import type { PurchaseFormDefinition, SupplierMappingRules } from '@aikayun/contracts'
 
+// This suite exercises a real downgrade to the quote migration and upgrades it
+// again. Keep its isolated database at the last reversible historical boundary;
+// later procurement migrations deliberately refuse to roll back.
+class LegacySupplierMappingMigrationProvider extends AppMigrationProvider {
+  override async getMigrations() {
+    const migrations = await super.getMigrations()
+    return Object.fromEntries(Object.entries(migrations).filter(([name]) => name <= '202610270003_procurement_identity'))
+  }
+}
+
 const databaseUrl = process.env.TEST_DATABASE_URL ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
 const origin = 'http://localhost:3000'
 const secretKey = randomBytes(32)
@@ -155,7 +165,7 @@ beforeAll(async () => {
   db = createDatabase()
   await sql`DROP SCHEMA public CASCADE`.execute(db)
   await sql`CREATE SCHEMA public`.execute(db)
-  const migrated = await new Migrator({ db, provider: new AppMigrationProvider() }).migrateToLatest()
+  const migrated = await new Migrator({ db, provider: new LegacySupplierMappingMigrationProvider() }).migrateToLatest()
   if (migrated.error) throw migrated.error
   await db.insertInto('admin_users').values({ id: adminId, email: `supplier-map-${adminId.slice(0, 8)}@example.test`,
     password_hash: await hashPassword(adminPassword) }).execute()
@@ -817,7 +827,7 @@ describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
   })
 
   it('R1 upgrades immutable legacy failures without presenting their uncertain source or amount', async () => {
-    const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
+    const migrator = new Migrator({ db, provider: new LegacySupplierMappingMigrationProvider() })
     const down = await migrator.migrateTo('202610270001_supplier_quote_observations')
     if (down.error) throw down.error
     const legacyId = randomUUID()

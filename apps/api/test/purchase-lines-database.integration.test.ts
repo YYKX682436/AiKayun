@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Migrator } from 'kysely/migration'
-import { sql, type Kysely, type Transaction } from 'kysely'
+import { Kysely, PostgresDialect, sql, type Transaction } from 'kysely'
+import { Pool } from 'pg'
 import { createDatabase } from '../src/db/pool.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
 import type { Database } from '../src/db/types.js'
@@ -629,17 +630,56 @@ describe('⑥-2B forward purchase data gates in PostgreSQL', () => {
   })
 
   it('preserves a legacy enabled storefront purchase-form flag as active on forward upgrade', async () => {
-    const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
-    const downgraded = await migrator.migrateTo('202610250002_purchase_snapshot_manifest_r1')
-    expect(downgraded.error).toBeUndefined()
-    await sql`UPDATE storefront_customer_policy SET purchase_forms_enabled = true WHERE singleton = true`.execute(db)
-    const upgraded = await migrator.migrateToLatest()
-    expect(upgraded.error).toBeUndefined()
-    expect(await db.selectFrom('storefront_customer_policy').select('purchase_forms_status')
-      .executeTakeFirstOrThrow()).toEqual({ purchase_forms_status: 'active' })
-    expect(await db.selectFrom('orders').select('request_sha256').where('id', '=', oldOrderId)
-      .executeTakeFirstOrThrow()).toEqual({ request_sha256: 'b'.repeat(64) })
-    await expect(sql`SELECT purchase_forms_enabled FROM storefront_customer_policy`.execute(db))
-      .rejects.toMatchObject({ code: '42703' })
+    // Newer migrations are intentionally forward-only. Recreate the actual old
+    // schema in a separate PostgreSQL namespace instead of rolling the current
+    // application schema backwards or deleting its migration history.
+    const schema = `legacy_forms_${randomUUID().replaceAll('-', '')}`
+    await sql.raw(`CREATE SCHEMA "${schema}"`).execute(db)
+    const legacyDb = new Kysely<Database>({ dialect: new PostgresDialect({ pool: new Pool({
+      connectionString: testDatabaseUrl, options: `-c search_path=${schema}`,
+    }) }) })
+    try {
+      const migrator = new Migrator({ db: legacyDb, provider: new AppMigrationProvider(), migrationTableSchema: schema })
+      const original = await migrator.migrateTo('202610240003_purchase_form_audit_product_identity')
+      if (original.error) throw original.error
+      const productId = randomUUID(), skuId = randomUUID()
+      await legacyDb.insertInto('customers').values({ id: oldCustomerId, username: `legacy-${oldCustomerId.slice(0, 8)}`,
+        password_hash: 'integration-only-hash', status: 'active' }).execute()
+      await legacyDb.transaction().execute(async trx => {
+        await trx.insertInto('products').values({ id: productId, name: 'Legacy order fixture', description: '',
+          product_type: 'digital', status: 'active' }).execute()
+        await trx.insertInto('product_variants').values({ id: skuId, product_id: productId,
+          sku_code: `LEGACY-${skuId.slice(0, 8)}`, combination_key: '', sale_price: '1.00', enabled: true,
+          retired_at: null, inventory_mode: 'unlimited' }).execute()
+        await trx.insertInto('product_variant_fulfillment').values({ product_variant_id: skuId,
+          method: 'manual', manual_delivery_ready: true }).execute()
+      })
+      await legacyDb.transaction().execute(async trx => {
+        await trx.insertInto('orders').values({ id: oldOrderId, customer_id: oldCustomerId, guest_order_session_id: null,
+          idempotency_key: randomUUID(), request_sha256: 'b'.repeat(64), total_amount: '1.00',
+          unpaid_expires_at: new Date(Date.now() + 60_000), history_hidden_at: null,
+          history_hidden_by_admin_id: null, history_hidden_reason: null }).execute()
+        await trx.insertInto('order_items').values({ id: oldOrderItemId, order_id: oldOrderId, product_id: productId,
+          product_variant_id: skuId, product_name_snapshot: 'Legacy order fixture', product_type_snapshot: 'digital',
+          sku_code_snapshot: `LEGACY-${skuId.slice(0, 8)}`, sku_snapshot: '[]', inventory_mode_snapshot: 'unlimited',
+          fulfillment_method_snapshot: 'manual', fulfillment_content_version_id: null, unit_price: '1.00', quantity: 1,
+          line_amount: '1.00' }).execute()
+        await trx.updateTable('orders').set({ items_sealed: true }).where('id', '=', oldOrderId).execute()
+      })
+      const legacy = await migrator.migrateTo('202610250002_purchase_snapshot_manifest_r1')
+      expect(legacy.error).toBeUndefined()
+      await sql`UPDATE storefront_customer_policy SET purchase_forms_enabled = true WHERE singleton = true`.execute(legacyDb)
+      const upgraded = await migrator.migrateToLatest()
+      expect(upgraded.error).toBeUndefined()
+      expect(await legacyDb.selectFrom('storefront_customer_policy').select('purchase_forms_status')
+        .executeTakeFirstOrThrow()).toEqual({ purchase_forms_status: 'active' })
+      expect(await legacyDb.selectFrom('orders').select('request_sha256').where('id', '=', oldOrderId)
+        .executeTakeFirstOrThrow()).toEqual({ request_sha256: 'b'.repeat(64) })
+      await expect(sql`SELECT purchase_forms_enabled FROM storefront_customer_policy`.execute(legacyDb))
+        .rejects.toMatchObject({ code: '42703' })
+    } finally {
+      await legacyDb.destroy()
+      await sql.raw(`DROP SCHEMA "${schema}" CASCADE`).execute(db)
+    }
   })
 })

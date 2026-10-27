@@ -479,36 +479,18 @@ describe('⑥-4B-1 isolated procurement identities', () => {
     expect(refund.statusCode, refund.body).toBe(409)
   })
 
-  it('preserves a known supplier number, append-only events and confirmed terminal states', async () => {
+  it('keeps historical unbudgeted identities non-executable and history append-only', async () => {
     const op = await db.selectFrom('procurement_operations').selectAll().executeTakeFirstOrThrow()
-    await db.updateTable('procurement_operations').set({ state: 'submit_in_flight', revision: 2 }).where('id', '=', op.id).execute()
-    await expect(db.updateTable('procurement_operations').set({ state: 'accepted_pending', revision: 3 }).where('id', '=', op.id).execute())
-      .rejects.toMatchObject({ constraint: 'procurement_operation_accepted_number_required' })
-    await db.transaction().execute(async trx => {
-      await trx.updateTable('procurement_operations').set({ state: 'unknown', revision: 3, supplier_order_number: 'synthetic-provider-1' })
-        .where('id', '=', op.id).execute()
-      await trx.updateTable('procurement_operation_units').set({ state: 'unknown' }).where('operation_id', '=', op.id).execute()
-    })
-    await expect(db.updateTable('procurement_operations').set({ supplier_order_number: 'synthetic-provider-2', revision: 4 })
-      .where('id', '=', op.id).execute()).rejects.toMatchObject({ constraint: 'procurement_operation_identity_immutable' })
-    await db.transaction().execute(async trx => {
-      await trx.updateTable('procurement_operations').set({ state: 'manual_review', revision: 4 }).where('id', '=', op.id).execute()
-      await trx.updateTable('procurement_operation_units').set({ state: 'manual_review' }).where('operation_id', '=', op.id).execute()
-    })
-    await db.transaction().execute(async trx => {
-      await trx.updateTable('procurement_operations').set({ state: 'rejected', revision: 5 }).where('id', '=', op.id).execute()
-      await trx.updateTable('procurement_operation_units').set({ state: 'rejected' }).where('operation_id', '=', op.id).execute()
-    })
-    await expect(db.updateTable('procurement_operations').set({ state: 'unknown', revision: 6 }).where('id', '=', op.id).execute())
-      .rejects.toMatchObject({ constraint: 'procurement_operation_terminal_immutable' })
-    expect((await db.selectFrom('procurement_operations').selectAll().where('id', '=', op.id).executeTakeFirstOrThrow()).supplier_order_number)
-      .toBe('synthetic-provider-1')
+    await expect(db.updateTable('procurement_operations').set({ state: 'submit_in_flight', revision: 2 })
+      .where('id', '=', op.id).execute()).rejects.toMatchObject({ constraint: 'procurement_submit_budget_required' })
+    await expect(db.updateTable('procurement_operations').set({ state: 'rejected', revision: 2 })
+      .where('id', '=', op.id).execute()).rejects.toMatchObject({ constraint: 'procurement_state_evidence_required' })
     expect(await db.selectFrom('procurement_operation_events').select('revision').where('operation_id', '=', op.id)
-      .orderBy('revision').execute()).toEqual([0, 1, 2, 3, 4, 5].map(revision => ({ revision })))
+      .orderBy('revision').execute()).toEqual([0, 1].map(revision => ({ revision })))
     await expect(sql`UPDATE procurement_unit_events SET next_state = 'completed' WHERE operation_id = ${op.id}::uuid`.execute(db))
       .rejects.toMatchObject({ constraint: 'order_purchase_data_immutable' })
     await expect(sql`INSERT INTO procurement_operation_events(operation_id, previous_state, next_state, revision)
-      VALUES (${op.id}::uuid, 'rejected', 'unknown', 6)`.execute(db))
+      VALUES (${op.id}::uuid, 'prepared', 'unknown', 2)`.execute(db))
       .rejects.toMatchObject({ constraint: 'procurement_history_insert_invalid' })
   })
 
