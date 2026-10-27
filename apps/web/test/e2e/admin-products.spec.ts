@@ -34,13 +34,9 @@ async function continueToCreatedProduct(page: import('@playwright/test').Page) {
     return await page.getByRole('link', { name: '继续编辑商品' }).count() > 0
   }).toBe(true)
   if (/\/admin\/products\/new(?:\?.*)?$/.test(page.url())) {
-    await expect.poll(async () => {
-      if (/\/admin\/products\/[0-9a-f-]+$/.test(page.url())) return true
-      return await page.getByRole('button', { name: '继续编辑商品' }).isEnabled().catch(() => false)
-    }, { timeout: 30_000 }).toBe(true)
-    if (/\/admin\/products\/new(?:\?.*)?$/.test(page.url())) {
-      await page.getByRole('link', { name: '继续编辑商品' }).click({ timeout: 3000 }).catch(() => undefined)
-    }
+    // The recovery link is usable while the form submit button remains busy
+    // waiting for the first navigation's authentication check.
+    await page.getByRole('link', { name: '继续编辑商品' }).click({ timeout: 3000 }).catch(() => undefined)
   }
   await expect(page).toHaveURL(/\/admin\/products\/[0-9a-f-]+$/, { timeout: 30000 })
   await expect.poll(() => page.evaluate(() => sessionStorage.getItem('aikayun-admin-product-create-v1'))).toBeNull()
@@ -49,6 +45,47 @@ async function continueToCreatedProduct(page: import('@playwright/test').Page) {
 function skuListRow(matrix: import('@playwright/test').Locator, skuCode: string) {
   return matrix.getByText(skuCode, { exact: true }).locator('xpath=ancestor::li[1]')
 }
+
+test('商品创建后的继续编辑链接可在首次导航等待鉴权时使用', async ({ page }) => {
+  test.setTimeout(30_000)
+  await signIn(page)
+  await page.goto('/admin/products/new')
+  const productName = `导航门闩 ${randomUUID().slice(0, 8)}`
+  await page.getByLabel('商品名称').fill(productName)
+  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  let release!: () => void
+  let arrived!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const waiting = new Promise<void>(resolve => { arrived = resolve })
+  let sessionRequests = 0
+  await page.route('**/api/v1/admin/session', async route => {
+    sessionRequests++
+    if (sessionRequests !== 1) return route.continue()
+    const response = await route.fetch()
+    arrived()
+    await gate
+    await route.fulfill({ response }).catch(() => undefined)
+  })
+  let continuation: Promise<void> | undefined
+  try {
+    await page.getByRole('button', { name: '保存为草稿' }).click()
+    await waiting
+    await expect(page.getByRole('link', { name: '继续编辑商品' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: '继续编辑商品' })).toBeDisabled()
+    continuation = continueToCreatedProduct(page)
+    await expect.poll(() => sessionRequests, { timeout: 5_000 }).toBeGreaterThan(1)
+    release()
+    await continuation
+    const products = await page.request.get(`/api/v1/admin/products?search=${encodeURIComponent(productName)}`)
+    expect(products.status()).toBe(200)
+    const items = (await products.json()).data.items as Array<{ name: string }>
+    expect(items.filter(item => item.name === productName)).toHaveLength(1)
+  } finally {
+    release()
+    await continuation?.catch(() => undefined)
+    await page.unroute('**/api/v1/admin/session')
+  }
+})
 
 async function runPricingRuleFlow(
   page: import('@playwright/test').Page,
