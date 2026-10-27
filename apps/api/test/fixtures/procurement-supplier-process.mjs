@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
 
@@ -9,6 +9,9 @@ if (!root) throw new Error('A private fixture directory is required')
 // Keep the temporary directory removable by the owning test runner; journal
 // and control files remain owner-only.
 await mkdir(root, { recursive: true, mode: 0o777 })
+// mkdir mode is filtered by the container's umask. The CI host must be able
+// to remove the nested bind-mount directory after this fixture exits.
+await chmod(root, 0o777)
 const journal = join(root, 'supplier-events.jsonl')
 const controlPath = join(root, 'supplier-control.json')
 let control = { kind: 'success', execute: true, holdSubmit: false, queryError: false }

@@ -77,7 +77,7 @@
 
 构建过程中 Google Fonts/Icons metadata 请求超时，Nuxt 使用可用的本地回退继续构建；没有因该网络告警跳过构建或测试。初轮全量 API 运行发现新增子进程测试沿用旧供应商版本、并挤占后续合成草稿容量；测试已改为读取当前映射版本并仅清理本轮测试草稿。指定 `procurement-executor.integration.test.ts` 随后通过 44/44，全量 PostgreSQL 套件最终通过 469/469。该问题属于新增测试夹具隔离，不是正式执行器缺陷；本轮没有复现到需要改动正式业务代码的生产缺陷。
 
-首次推送 SHA `853fbd8c1a732a01e93f84b30025eb0259064c3f` 的 GitHub Actions 中，Compose 采购/文件恢复证据、历史密钥解密、API/DB 容器 SIGKILL 替换、备份恢复和对账均已成功；最后清理临时宿主目录时报 `EACCES scandir`。根因为独立供应商夹具在非 root API 容器的宿主 bind mount 下创建了 `0700` 子目录，CI runner 无权递归删除。夹具临时目录现在设为可由 runner 清理的 `0777`，里面的合成日志和控制文件仍为 `0600`；不含凭据或顾客资料。修复仅在测试夹具，不影响产品代码、真实数据或正式目录权限；修复后的最终 SHA 将重新执行全部验证和 Actions。
+首次推送 SHA `853fbd8c1a732a01e93f84b30025eb0259064c3f` 的 GitHub Actions 中，Compose 采购/文件恢复证据、历史密钥解密、API/DB 容器 SIGKILL 替换、备份恢复和对账均已成功；清理时报 `EACCES scandir`。首次修复将宿主 bind mount 设为 `0777`，但 SHA `eb7adbdb5c9db3eab068341f6600e6fdef1d4f21` 的恢复证明虽然完整通过，清理仍报 `EACCES unlink supplier-events.jsonl`。根因是容器内 `mkdir` 创建的嵌套 `procurement-supplier` 目录受 umask 影响为 `0755`；宿主 runner 有权进入外层目录，但无权从内层目录删除 `0600` 日志。现在夹具在 `mkdir` 后显式 `chmod` 该临时子目录为 `0777`，合成日志和控制文件仍为 `0600`。本地再次运行独立 Compose 恢复脚本后以退出码 0 完成，采购/文件恢复证明与资源清理均通过；最终修复前 SHA 的 Actions run `40549541040` 仍记录为清理失败。该改动只影响可回收的隔离测试夹具，不影响产品代码、真实数据或正式目录权限；修复后的完整本地 `pnpm verify` 已重跑通过，最终推送 SHA 的 Actions 正在重新执行。
 
 `pnpm verify` 不包含 GitHub Actions 中完整 Compose Web/API 冒烟、重建持久化步骤；这些步骤及本 SHA Actions 状态以本轮最终推送后的实际 workflow 结果记录。独立 Compose 恢复专项则已按上节执行而非跳过。
 
