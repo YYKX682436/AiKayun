@@ -21,7 +21,7 @@
 | 中心 protocol | RFC9421/RFC9530验证、challenge、`queryOperation` | 单nonce、同operation摘要幂等、请求/响应绑定、超时未知恢复 |
 | 中心 signer/trust | `signLease/signStatus/signTransfer/signTimeReset` | 标准JWS，签名用途分离、固定kid，生产私钥不进商城 |
 | 商城 `src/licensing/contracts.ts` | 内部Snapshot/Evidence/Decision类型 | bigint字符串、时间半开区间、严格schema |
-| 商城 `identity.ts` | `loadBinding/checkIdentity/stageRecovery` | 缺失不自动覆盖，DB/文件/key匹配，恢复journal |
+| 商城 `identity.ts` | `loadBinding/checkIdentity/stageRecovery` | 缺失不自动覆盖，DB/文件/key匹配；唯一父表`local_license_operations`与逐attempt子表可恢复 |
 | 商城 `evidence.ts` | `verifyAndProjectEvidence` | `jose`严格验证，last-good保留，旧证据不回滚 |
 | 商城 `state.ts` | `persistLicenseEvidence/getLicenseSnapshot` | 事务内重读当前投影、水位与拒新优先级；不锁订单 |
 | 商城 `renewal.ts` | `startLicenseRenewalWorker` | API内定时/DB选主、超时退避、状态不影响旧worker |
@@ -46,10 +46,23 @@
 | B10 协议故障 | nonce过期/重复、签名目标URL改写、大body、TLS不可信、签名时间失准 | 拒绝且不改权益；signed challenge可校准请求时间但不授经营许可 |
 | B11 秘密与日志 | 全流程请求/异常/诊断/浏览器资源扫描 | 无私钥、activation code、raw JWT、业务凭据/个人数据泄露 |
 | B12 激活崩溃恢复 | 中心commit activation/code消费后丢响应；商城强杀于发送前、响应返回前、响应保存后、投影commit未知 | 恢复本地operation；中心返回原结果；code只消费一次、generation只增一次；投影jti读回后才清密文 |
-| B13 续签崩溃恢复 | pending先提交后强杀；中心已commit但商城未保存lease；商城证据事务commit未知 | 原operation续接/查询；原lease完整恢复，revision不回退，不生成第二续签意图 |
-| B14 nonce过期与迟到请求 | 原请求未提交且nonce过期，取新challenge续接同operation；并行释放旧请求、旧请求先后分别取中心license锁 | 旧请求在入口过期拒绝或同锁看到committed；单operation最多一次业务提交；一次not_found不作围栏 |
-| B15 状态与围栏 | operation committed/executing/not-found/unknown/terminal各状态，重复激活码与过期签名 | 未知沿用原op；新attempt仅换nonce/签名/时间且intent不变；cancel须中心原子终结后才能新意图 |
+| B13 续签崩溃恢复 | pending先提交后强杀；中心已commit但商城未保存lease；商城证据事务commit未知 | 原operation续接/查询；lease仍有效则按原凭证恢复，过期则只作历史证据并走新恢复operation；revision不回退、不重复权益操作 |
+| B14 nonce过期与迟到请求 | 原请求未提交且nonce过期，取新challenge续接同operation；旧请求和新请求并发争同一operation advisory锁 | 旧请求仅可终态一次；后到者回放终态，旧事务回滚后新attempt可继续；一次not_found不作围栏 |
+| B15 状态与围栏 | operation committed/rejected/cancelled、锁等待中的in-flight观测、瞬时not-found/unknown，重复激活码与过期签名 | 持久状态只有三种不可逆终态；in-flight非DB状态；未知沿用原op；新attempt只更新nonce/签名/时间，intent固定；cancel原子墓碑不可复活 |
 | B16 database_id错配 | DB dump与实例身份文件/签名claims/中心activation分别错配及合法恢复 | 任一不一致进入identity_mismatch、拒新；合法transfer按binding_revision恢复，历史义务继续 |
+| B17 中心终态认证边界 | 未认证身份/坏HTTP签名、过期nonce、5xx、确定性业务拒绝、commit后重放、取消与迟到请求并发 | 未认证请求不触碰操作表；retryable失败不终结；确定性拒绝/成功与attempt同事务落终态；墓碑不可更新/删除/复活 |
+| B18 已提交激活长期恢复 | activation/code已commit；商城丢失响应并强杀；原lease过exp后带原operation、nonce/digest和当前PoP恢复；分别注入订阅过期、撤销、generation替换 | 旧lease只存档；有效权益下签发新的恢复凭证且不重激活/耗码/增generation；任何拒新事实均无新lease并保持历史义务 |
+| B19 本地pending一致性与密钥灾备 | 激活请求发送前强杀；恢复同一DB操作表与pending密钥备份；分别缺密文/缺key/错误key恢复 | 父操作状态唯一、attempt行有FK且次序可恢复；匹配备份才能核对原nonce/digest并续接；缺key时fail-closed，不误判未发送、不新建操作 |
+
+R2协议收口的确定性测试计划（全部未来⑦-1B/1C实现，不在⑦-1A创建假运行时）：
+
+1. **中心激活已提交、本地响应丢失并强杀：** 中心断言activation、code消费、generation、`license_operations=committed`及attempt在同一事务各一次；杀商城进程后由同一`local_license_operations.operation_id`新challenge续接，核对中心原request_nonce_hash/request_digest/jkt/kid及返回历史原结果，不再消费码；若lease已过exp，绝不投影为经营许可。
+2. **原操作未提交、nonce过期后恢复：** 让原nonce超时且原业务事务回滚，旧请求不得建立终态；使用新challenge及递增attempt_no，保持operation_id/intent_digest/业务payload不变后续接成功；码/代次只变一次，不因一次`not_found`另建operation。
+3. **原请求迟到与新挑战并发：** 门闩分别控制旧请求/新attempt争取同一operation advisory锁；穷举旧先commit、旧rollback、新先commit、cancel先commit。最多一个终态和一个业务效果，后到请求只重放结果，墓碑不能被复活。
+4. **中心成功、本地证据事务提交未知：** 中心先commit并返回；商城投影事务真实提交后模拟连接确认丢失，重启读取jti/operation后幂等确认；再覆盖实际rollback分支，由原attempt恢复；不得产生第二activation/generation，也不得在结果未知时删pending。
+5. **数据库与实例身份错配：** 对安装binding.database_id、中心activation.database_id、签名claims.database_id逐一和组合篡改；普通续签及恢复凭证均拒绝新经营。认证失败不得终结目标operation；获准transfer只可按签名receipt切binding并保留业务database_id。
+6. **过期授权下v2附件预检与幂等重放：** 已完成订单的相同key/hash在预检前原样重放；新key含大附件必须在归档/写prepared之前轻量预检拒绝；预检后并发过期仍由最终数据库事务拒绝；确认无多余prepared文件且unknown-commit附件保持原保护语义。
+7. **pending密钥配对恢复：** 对含未完成activation pending和本机AES key的同一备份点完整恢复，验证原attempt证据可解密并续接；分别移除/替换key，确保fail-closed、保留记录、不把操作当未发送，并给出安全诊断而不泄漏密文。
 
 测试只用隔离中心/临时测试key和`_test`库；生产构建无可切换的绕过入口。不得把测试key加到生产trust bundle，不能用真实客户license验收。中心生产管理面、安全备份、托管与告警仍需后续发行运维门禁，不因B阶段测试通过而直接上线。
 

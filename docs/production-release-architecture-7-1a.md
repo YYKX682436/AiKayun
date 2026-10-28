@@ -130,15 +130,16 @@ PostgreSQL、媒体、私有文件使用固定命名卷/显式绑定路径，固
 | 私有文件 | 完整根，含交付文件、购买草稿附件、订单归档附件、提现QR等隔离命名空间，禁止只备数字交付子目录 |
 | 业务秘密 | payment/delivery两套密钥环的全部仍引用历史key、DB凭据、备份加密解密所需标识 |
 | 身份与部署 | instance私钥、identity.json、deployment.json、project/卷映射、origin、release manifest与签名、trust bundle版本 |
+| 授权恢复材料 | `local_license_operations`及attempt子表、持久化`license-pending-encryption-key`（按秘密材料加密托管）、本地身份私钥与DB binding；作为同一静止点配对恢复 |
 | 辅助恢复 | Caddy配置；ACME数据可受控备份或重签（考虑限流），不是订单身份 |
 
-备份秘密用独立的成熟加密备份工具/密钥托管封装；备份解密密钥不与备份明文一起存放。清单列所有文件长度、SHA256、schema head、release id、key IDs（不含key bytes）、身份thumbprint、写入停止/开始时间和工具版本。目录原子提交，验证所有校验和后才标记 `complete`；当前v2脚本只是基础，不能冒充这种完整生产备份。
+备份秘密用独立的成熟加密备份工具/密钥托管封装；备份解密密钥不与备份明文一起存放。`license-pending-encryption-key`必须是持久化部署secret，不能容器重建时临时生成；该密钥与含pending密文的PostgreSQL备份、身份私钥必须进入同一一致性backup set，以key ID和校验和配对。秘密托管保存可恢复的key材料，恢复前先在隔离流程验证密文可解密及原operation/attempt/nonce/digest可读；不能因恢复时缺key而删除pending或重发新operation。清单列所有文件长度、SHA256、schema head、release id、key IDs（不含key bytes）、身份thumbprint、写入停止/开始时间和工具版本。目录原子提交，验证所有校验和后才标记 `complete`；当前v2脚本只是基础，不能冒充这种完整生产备份。
 
 停止所有 API副本/内嵌worker以及人工CLI，禁止只有一个容器停了就宣称全局静止。旧 http_json_v1 或采购出站已发生而回执未落库时，保留 `unknown` 和原幂等身份，恢复后先查单；备份无法撤销外部已经发生的事实。需要记录停写前后未决操作清单和恢复后对账任务。普通恢复不能重新派发新商户订单号去“补单”。
 
 恢复到独立隔离环境：禁止真实收款/采购出站、禁止真实回调域名切流、禁止自动激活/续签克隆身份；导入相容版本、核对全部key引用和文件SHA、执行只读reconcile及账实检查，完整演练通过后销毁隔离副本。这个“运维隔离环境”不提供生产授权绕过：不能新经营，不获取并行有效许可证。生产恢复必须经目标身份/卷确认及受控恢复流程，现有 `_test` restore脚本绝不能改名当生产工具。
 
-同机恢复/正常服务器迁移恢复原 `database_id`、instance_id和身份密钥；灾难迁移必须按授权协议升 activation generation 并明确旧机失效风险。恢复旧备份不代表可以把中心 entitlement revision/generation 回滚。联网后先向中心核对；恢复模式在未核对前禁新经营，但不阻断历史义务。恢复后通过媒体读取SHA、历史解密、付款查单、未决交付、退款/提现账实检查才算成功，不以“进程都绿了”代替恢复验收。
+同机恢复/正常服务器迁移恢复原 `database_id`、instance_id和身份密钥；灾难迁移必须按授权协议升 activation generation 并明确旧机失效风险。恢复旧备份不代表可以把中心 entitlement revision/generation 回滚。联网后先向中心核对；恢复模式在未核对前禁新经营，但不阻断历史义务。若恢复材料包含未完成授权pending，先同时核对本地操作父表、attempt子表与pending加密key；缺失或不匹配时授权恢复停在fail-closed并进入人工灾难迁移，不能把旧lease当当前许可。恢复后通过媒体读取SHA、历史解密、付款查单、未决交付、退款/提现账实检查才算成功，不以“进程都绿了”代替恢复验收。
 
 ## 7. 健康、诊断与任务恢复
 

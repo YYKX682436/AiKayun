@@ -6,7 +6,7 @@
 
 配套：[发行架构](./production-release-architecture-7-1a.md)、[授权协议](./license-protocol-7-1a.md)、[开发与验收](./release-license-acceptance-7-1a.md)。
 
-R1补审（同一基线）：激活/续签恢复以协议中的持久pending operation、新challenge续接和中心DB锁序为准；v2附件应在幂等优先预检后、外部文件归档前做轻量准入提示，最终订单事务仍须重验。中心not_found不构成旧请求围栏。installation/database身份以签名database_id三方比对为准。相关确定性回归列于开发验收文档。
+R1/R2文档补审（仍以同一代码基线为审计证据）：R1确定中心not_found不构成旧请求围栏、v2附件先轻量预检再最终事务重验、database_id需三方绑定；R2进一步规定中心只持久化committed/rejected/cancelled终态，未认证请求不得碰目标操作，nonce/临时错误允许同operation续接，锁等待协调迟到请求。已提交但本地未投影的激活即使原lease过期，也只能以原operation及nonce/digest证据证明历史事实，再凭当前持钥和仍有效订阅签发新恢复lease。商城授权pending统一由`local_license_operations`父表及FK attempt子表承载，pending加密key与操作数据配对备份。所有新增情形均列入开发验收文档；本段是设计修订，不表示代码已实现或测试已执行。
 
 ## 结论与统一优先级
 
