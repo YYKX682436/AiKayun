@@ -1,4 +1,6 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { canonicalPurchaseFormJson, canonicalSupplierMappingJson } from '@aikayun/contracts'
+import { prepareOrderItemProcurement } from '../src/commerce/procurement-preparation.js'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -34,13 +36,52 @@ const adminId = randomUUID(), customerId = randomUUID(), sessionId = randomUUID(
 const customerToken = randomBytes(32).toString('base64url')
 const connectionId = randomUUID(), connectionVersionId = randomUUID()
 const templateId = randomUUID(), templateVersionId = randomUUID()
-const accountField = randomUUID(), imageField = randomUUID()
-const templateHash = 'a'.repeat(64), structureHash = 'b'.repeat(64), rulesHash = 'c'.repeat(64)
+const accountField = randomUUID(), imageField = randomUUID(), digitsField = randomUUID(), selectField = randomUUID(), cascadeField = randomUUID(), expandedField = randomUUID()
+const selectOption = randomUUID(), cascadeOption = randomUUID(), cascadeChild = randomUUID()
+const definition = { fields: [
+  { id: accountField, meaningKey: 'account', type: 'text', label: 'Account', required: true, maxLength: 120 },
+  { id: imageField, meaningKey: 'proof', type: 'image', label: 'Proof', required: false, maxCount: 1 },
+  { id: digitsField, meaningKey: 'digits', type: 'digits', label: 'Digits', required: false },
+  { id: selectField, meaningKey: 'choice', type: 'select', label: 'Choice', required: false,
+    options: [{ id: selectOption, meaningKey: 'choice_one', label: 'One' }] },
+  { id: cascadeField, meaningKey: 'cascade', type: 'cascade', label: 'Cascade', required: false,
+    options: [{ id: cascadeOption, meaningKey: 'plan', label: 'Plan', expandedFields: [
+      { id: expandedField, meaningKey: 'extra', type: 'text', label: 'Extra', required: false },
+    ], children: [{ id: cascadeChild, meaningKey: 'region', label: 'Region' }] }] },
+] }
+const structure = { version: 1, product: { goodsId: '123456', goodsType: 1, status: 1, skuType: 0, skuCode: null, combination: [] }, purchaseFields: [
+  { type: 0, title: 'Account', placeholder: null, required: true, regex: null, options: [] },
+  { type: 1, title: 'Proof', placeholder: null, required: false, regex: null, options: [] },
+  { type: 13, title: 'Digits', placeholder: null, required: false, regex: null, options: [] },
+  { type: 14, title: 'Choice', placeholder: null, required: false, regex: null, options: [
+    { name: 'One', value: '  original option  ', children: [], expand: [] },
+  ] },
+  { type: 16, title: 'Cascade', placeholder: null, required: false, regex: null, options: [
+    { name: 'Plan', value: 'plan-value', children: [{ name: 'Region', value: 'region-value', children: [], expand: [] }],
+      expand: [{ type: 0, title: 'Extra', placeholder: null, required: false, regex: null, options: [] }] },
+  ] },
+] }
+const rules = { version: 1, fields: [
+  { localFieldId: accountField, localMeaningKey: 'account', upstreamPath: [{ kind: 'field', index: 0 }], options: [] },
+  { localFieldId: imageField, localMeaningKey: 'proof', upstreamPath: [{ kind: 'field', index: 1 }], options: [] },
+  { localFieldId: digitsField, localMeaningKey: 'digits', upstreamPath: [{ kind: 'field', index: 2 }], options: [] },
+  { localFieldId: selectField, localMeaningKey: 'choice', upstreamPath: [{ kind: 'field', index: 3 }], options: [
+    { localOptionId: selectOption, localMeaningKey: 'choice_one', upstreamPath: [{ kind: 'field', index: 3 }, { kind: 'option', index: 0 }] },
+  ] },
+  { localFieldId: cascadeField, localMeaningKey: 'cascade', upstreamPath: [{ kind: 'field', index: 4 }], options: [
+    { localOptionId: cascadeOption, localMeaningKey: 'plan', upstreamPath: [{ kind: 'field', index: 4 }, { kind: 'option', index: 0 }] },
+    { localOptionId: cascadeChild, localMeaningKey: 'region', upstreamPath: [{ kind: 'field', index: 4 }, { kind: 'option', index: 0 }, { kind: 'child', index: 0 }] },
+  ] },
+  { localFieldId: expandedField, localMeaningKey: 'extra', upstreamPath: [{ kind: 'field', index: 4 }, { kind: 'option', index: 0 }, { kind: 'expand', index: 0 }], options: [] },
+] }
+const hash = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex')
+const templateHash = hash(canonicalPurchaseFormJson({ name: 'Synthetic template v1', definition }))
+const structureHash = hash(canonicalSupplierMappingJson(structure)), rulesHash = hash(canonicalSupplierMappingJson(rules))
 const digest = 'd'.repeat(64)
 const credentials = { providerType: 'kayixin_customer_v3' as const, appId: '12345', appSecret: 'synthetic-only-secret' }
 const owner = { kind: 'customer' as const, customer: { id: customerId, sessionId } }
 let db: Kysely<Database>, secondDb: Kysely<Database>, config: AppConfig
-let app: FastifyInstance, secondApp: FastifyInstance, thirdApp: FastifyInstance, privateRoot: string
+let app: FastifyInstance, secondApp: FastifyInstance, thirdApp: FastifyInstance, fourthApp: FastifyInstance, privateRoot: string
 let headers: Record<string, string>
 let skuA: Catalog
 let trackCrashFixtureDrafts = false
@@ -75,8 +116,8 @@ async function catalog(price: string, quantityStock = false, supplier = { id: co
        upstream_structure_snapshot, upstream_structure_sha256, upstream_observed_at, template_id, template_version_id,
        template_sha256, normalization_version, rules, rules_sha256, created_by_admin_id, updated_by_admin_id)
       VALUES (${mappingId}::uuid, ${productId}::uuid, ${skuId}::uuid, ${supplier.id}::uuid, ${supplier.versionId}::uuid,
-        '123456', 'synthetic good', 0, NULL, '[]'::jsonb, '{}'::jsonb, ${structureHash}, now(),
-        ${templateId}::uuid, ${templateVersionId}::uuid, ${templateHash}, 1, '{"version":1,"fields":[]}'::jsonb,
+        '123456', 'synthetic good', 0, NULL, '[]'::jsonb, ${JSON.stringify(structure)}::jsonb, ${structureHash}, now(),
+        ${templateId}::uuid, ${templateVersionId}::uuid, ${templateHash}, 1, ${JSON.stringify(rules)}::jsonb,
         ${rulesHash}, ${adminId}::uuid, ${adminId}::uuid)`.execute(trx)
     await sql`INSERT INTO supplier_product_mapping_versions
       (id, mapping_id, version_number, product_id, product_variant_id, supplier_connection_id, supplier_connection_version_id,
@@ -122,7 +163,7 @@ function line(sku: Catalog, saved: Awaited<ReturnType<typeof draft>>, quantity =
 }
 let checkoutSequence = 0
 async function checkout(items: Line[]) {
-  const checkoutApp = [app, secondApp, thirdApp][checkoutSequence++ % 3]!
+  const checkoutApp = [app, secondApp, thirdApp, fourthApp][checkoutSequence++ % 4]!
   const quote = await checkoutApp.inject({ method: 'POST', url: '/api/v1/checkout/quote', headers, payload: { version: 2, items } })
   expect(quote.statusCode, quote.body).toBe(200)
   expect(quote.json().data.canContinue, quote.body).toBe(true)
@@ -205,10 +246,6 @@ beforeAll(async () => {
   await db.insertInto('customers').values({ id: customerId, username: `proc-${customerId.slice(0, 8)}`, password_hash: 'fixture', status: 'active' }).execute()
   await db.insertInto('customer_sessions').values({ id: sessionId, customer_id: customerId, token_hash: hashToken(customerToken),
     expires_at: new Date(Date.now() + 3_600_000), revoked_at: null }).execute()
-  const definition = { fields: [
-    { id: accountField, meaningKey: 'account', type: 'text', label: 'Account', required: true, maxLength: 120 },
-    { id: imageField, meaningKey: 'proof', type: 'image', label: 'Proof', required: false, maxCount: 1 },
-  ] }
   await db.insertInto('purchase_form_templates').values({ id: templateId, name: 'Synthetic template', definition,
     created_by_admin_id: adminId, updated_by_admin_id: adminId }).execute()
   await db.insertInto('purchase_form_template_versions').values({ id: templateVersionId, template_id: templateId,
@@ -232,13 +269,14 @@ beforeAll(async () => {
   secondDb = createDatabase()
   secondApp = await createApp({ db: secondDb, config, logger: false }); await secondApp.ready()
   thirdApp = await createApp({ db, config, logger: false }); await thirdApp.ready()
+  fourthApp = await createApp({ db, config, logger: false }); await fourthApp.ready()
   const csrf = await app.inject({ method: 'GET', url: '/api/v1/customer/auth/csrf' })
   headers = { origin, cookie: `aikayun_customer_session=${customerToken}; ${cookie(csrf, 'aikayun_customer_csrf')}`,
     'x-csrf-token': csrf.json().data.csrfToken as string }
 })
 
 afterAll(async () => {
-  await thirdApp?.close(); await secondApp?.close(); await app?.close(); await secondDb?.destroy(); await db?.destroy()
+  await fourthApp?.close(); await thirdApp?.close(); await secondApp?.close(); await app?.close(); await secondDb?.destroy(); await db?.destroy()
   if (privateRoot) await rm(privateRoot, { recursive: true, force: true })
 })
 
@@ -304,6 +342,73 @@ async function fixtureServer(handler: (request: ProcurementFixtureRequest) => Pr
 }
 
 describe('⑥-4B-2 isolated procurement fixture', () => {
+  it('prepares frozen order data independently and never grants purchasing eligibility', async () => {
+    selected.rows = [{ skuId: skuA.skuId, mappingVersionId: skuA.versionId }]
+    const a = await draft('  0000123  '), b = await draft('different', true)
+    const result = await checkout([line(skuA, a, 2), line(skuA, b)])
+    const prepare = (id: string) => db.transaction().execute(trx => prepareOrderItemProcurement(trx, config, id))
+    const firstItem = result.order.items.find(item => item.quantity === 2)!
+    const secondItem = result.order.items.find(item => item.quantity === 1)!
+    const first = await prepare(firstItem.id)
+    expect(first).toMatchObject({ kind: 'prepared', quantity: 2, paymentEligibility: 'order_not_processing', purchaseEligible: false,
+      fields: [{ localFieldId: accountField, value: '  0000123  ' }] })
+    await pay(result.order.id)
+    const paid = await prepare(firstItem.id)
+    expect(paid).toMatchObject({ kind: 'prepared', paymentEligibility: 'eligible', purchaseEligible: false })
+    const second = await prepare(secondItem.id)
+    expect(second).toMatchObject({ kind: 'prepared', quantity: 1, purchaseEligible: false,
+      fields: [{ localFieldId: accountField, value: 'different' }, { localFieldId: imageField, attachments: [{ sha256: expect.stringMatching(/^[a-f0-9]{64}$/) }] }] })
+    expect(JSON.stringify(second)).not.toContain('storage_key')
+    expect(JSON.stringify(second)).not.toContain(credentials.appSecret)
+    expect(await db.selectFrom('procurement_operations').select('id').where('order_item_id', '=', firstItem.id).execute()).toHaveLength(0)
+  })
+  it('preserves numeric strings, option identities, conditional fields and frozen mapping on checkout replay', async () => {
+    selected.rows = [{ skuId: skuA.skuId, mappingVersionId: skuA.versionId }]
+    const created = await createPurchaseDraft(db, config, owner, templateVersionId)
+    const saved = await savePurchaseDraft(db, config, owner, { draftId: created.id, expectedRevision: created.revision, values: {
+      [accountField]: ' account ', [digitsField]: '000123', [selectField]: selectOption,
+      [cascadeField]: { path: [cascadeOption, cascadeChild], expanded: { [expandedField]: '  extra  ' } },
+    } })
+    const result = await checkout([{ lineId: randomUUID(), skuId: skuA.skuId, quantity: 1, draftId: created.id, draftRevision: saved.revision }])
+    const prepare = () => db.transaction().execute(trx => prepareOrderItemProcurement(trx, config, result.order.items[0]!.id))
+    const first = await prepare()
+    expect(first).toMatchObject({ kind: 'prepared', purchaseEligible: false })
+    if (first.kind !== 'prepared') throw new Error(first.reason)
+    expect(first.fields.find(field => field.localFieldId === digitsField)?.value).toBe('000123')
+    expect(first.fields.find(field => field.localFieldId === selectField)?.options).toMatchObject([{ localOptionId: selectOption, value: '  original option  ' }])
+    expect(first.fields.find(field => field.localFieldId === cascadeField)?.options).toMatchObject([{ localOptionId: cascadeOption, value: 'plan-value' }, { localOptionId: cascadeChild, value: 'region-value' }])
+    expect(first.fields.find(field => field.localFieldId === expandedField)).toMatchObject({ value: '  extra  ', upstreamPath: [{ kind: 'field', index: 4 }, { kind: 'option', index: 0 }, { kind: 'expand', index: 0 }] })
+    selected.fail = true
+    try {
+      const replay = await app.inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: result.body })
+      expect(replay.statusCode).toBe(200)
+    } finally { selected.fail = false }
+    expect(await prepare()).toEqual(first)
+    expect(await db.selectFrom('procurement_operations').select('id').where('order_item_id', '=', result.order.items[0]!.id).execute()).toHaveLength(0)
+  })
+  it('keeps mixed order items tied to their frozen mapping after the current mapping changes', async () => {
+    const one = await catalog('1.00'), two = await catalog('2.00')
+    selected.rows = [{ skuId: one.skuId, mappingVersionId: one.versionId }, { skuId: two.skuId, mappingVersionId: two.versionId }]
+    const result = await checkout([line(one, await draft('first')), line(two, await draft('second'))])
+    await pay(result.order.id)
+    const itemOne = result.order.items.find(item => item.skuId === one.skuId)!
+    const itemTwo = result.order.items.find(item => item.skuId === two.skuId)!
+    const prepare = (id: string) => db.transaction().execute(trx => prepareOrderItemProcurement(trx, config, id))
+    const before = await prepare(itemOne.id)
+    expect(before).toMatchObject({ kind: 'prepared', mappingVersionId: one.versionId, fields: [{ value: 'first' }], purchaseEligible: false })
+    expect(await prepare(itemTwo.id)).toMatchObject({ kind: 'prepared', mappingVersionId: two.versionId, fields: [{ value: 'second' }], purchaseEligible: false })
+    const changedRules = { version: 1, fields: [] }
+    await db.updateTable('supplier_product_mapping_heads').set({ status: 'draft', revision: 3, rules: changedRules,
+      rules_sha256: hash(canonicalSupplierMappingJson(changedRules)) }).where('id', '=', one.mappingId).executeTakeFirstOrThrow()
+    expect(await prepare(itemOne.id)).toEqual(before)
+  })
+  it('blocks ordinary orders without a frozen procurement source', async () => {
+    selected.rows = []
+    const result = await checkout([line(skuA, await draft('unmapped'))])
+    expect(await db.transaction().execute(trx => prepareOrderItemProcurement(trx, config, result.order.items[0]!.id)))
+      .toEqual({ kind: 'blocked', reason: 'source_missing', purchaseEligible: false })
+  })
+
   it('connects the offline V3 adapter to the kernel without creating or completing a purchase', async () => {
     await ensureTestRiskPolicy()
     const op = await readyOperation()
@@ -1313,6 +1418,9 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
 
   it('fails closed on unavailable historic key and recovers using the frozen version after rotation', async () => {
     const op = await readyOperation(), version2 = randomUUID()
+    const itemId = (await db.selectFrom('procurement_operations').select('order_item_id').where('id', '=', op.id).executeTakeFirstOrThrow()).order_item_id
+    const beforeRotation = await db.transaction().execute(trx => prepareOrderItemProcurement(trx, config, itemId))
+    expect(beforeRotation).toMatchObject({ kind: 'prepared', mappingVersionId: skuA.versionId, purchaseEligible: false })
     const envelope = encryptSupplierCredentials(config, connectionId, 2, credentials)
     await db.transaction().execute(async trx => {
       await trx.insertInto('supplier_connection_credentials').values({ supplier_connection_id: connectionId, credential_version: 2,
@@ -1323,6 +1431,7 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
         base_url: 'https://synthetic.example.test', credential_version: 2, created_by_admin_id: adminId }).execute()
       await trx.updateTable('supplier_connections').set({ current_version_id: version2 }).where('id', '=', connectionId).execute()
     })
+    expect(await db.transaction().execute(trx => prepareOrderItemProcurement(trx, config, itemId))).toEqual(beforeRotation)
     let calls = 0
     const server = await fixtureServer(async request => { calls++; return { requestIdentity: request.requestIdentity,
       kind: 'pending', supplierOrderNumber: 'historic-key-fixture', responseDigest: digest } })

@@ -1,7 +1,7 @@
 import { createServer, request as httpRequest } from 'node:http'
 import { signKayixinV3 } from '../src/commerce/kayixin-customer-v3.js'
 import { describe, expect, it, vi } from 'vitest'
-import { encodeFixtureCreate } from '../src/commerce/kayixin-procurement-protocol.js'
+import { encodeFixtureCreate } from './fixtures/kayixin-procurement-create.js'
 import { createKayixinProcurementFixtureTransport } from './fixtures/kayixin-procurement-transport.js'
 
 const source = { baseUrl: 'https://fixture.invalid', appId: '123', appSecret: 'secret' }
