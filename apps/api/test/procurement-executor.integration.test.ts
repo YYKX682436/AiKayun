@@ -257,6 +257,10 @@ import { prepareProcurementWithRisk, runProcurementFixturePass, type Procurement
 import { initializeSyntheticProcurementRiskPolicy, readProcurementRisk, recordProcurementRiskFact, lockProcurementRiskPolicy, reserveProcurementRisk } from '../src/commerce/procurement-risk-budget.js'
 import { finalizeProcurementUnit } from '../src/commerce/procurement-finalization.js'
 import { startProcurementCrashProcess, startProcurementSupplierProcess } from './fixtures/procurement-crash-tools.js'
+import { createKayixinProcurementFixtureTransport } from './fixtures/kayixin-procurement-transport.js'
+import { resolveKayixinFixtureSource } from './fixtures/kayixin-procurement-source.js'
+import { runKayixinFixturePass } from './fixtures/kayixin-procurement-pass.js'
+import { signKayixinV3 } from '../src/commerce/kayixin-customer-v3.js'
 
 async function readyOperation(quantity = 1, sku = skuA, utcDay?: string) {
   selected.rows = [{ skuId: sku.skuId, mappingVersionId: sku.versionId }]
@@ -300,6 +304,75 @@ async function fixtureServer(handler: (request: ProcurementFixtureRequest) => Pr
 }
 
 describe('⑥-4B-2 isolated procurement fixture', () => {
+  it('connects the offline V3 adapter to the kernel without creating or completing a purchase', async () => {
+    await ensureTestRiskPolicy()
+    const op = await readyOperation()
+    const seen: Array<{ path: string; body: string; signature: string }> = []
+    const server = createServer((request, response) => {
+      const chunks: Buffer[] = []
+      request.on('data', chunk => chunks.push(Buffer.from(chunk)))
+      request.on('end', () => {
+        seen.push({ path: request.url ?? '', body: Buffer.concat(chunks).toString('utf8'),
+          signature: String(request.headers['x-signature']) })
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ code: 1000, msg: 'ok', data: {
+          outerNumber: 'fixture-outer', orderNumber: 'fixture-order', status: 3,
+        } }))
+      })
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('Fixture listener unavailable')
+    const wire: Parameters<typeof runKayixinFixturePass>[3] = async request => {
+        const response = await fetch(`http://127.0.0.1:${address.port}${request.path}`, {
+          method: 'POST', headers: request.headers, body: request.body,
+        })
+        return { status: response.status, body: await response.text() }
+    }
+    const outerNumber = (id: string, identity: string) => id === op.id && identity === op.localBusinessNumber ? 'fixture-outer' : null
+    try {
+      expect(await runKayixinFixturePass(db, { ...config, paymentCredentialKeyRing: null }, op.id, wire, outerNumber)).toBe(false)
+      expect(await db.selectFrom('procurement_request_intents').select('id').where('operation_id', '=', op.id).execute()).toHaveLength(0)
+      expect(await runKayixinFixturePass(db, config, op.id, wire, outerNumber)).toBe(true)
+      expect(seen).toHaveLength(0)
+      for (let i = 0; i < 2; i++) {
+        await sql`UPDATE procurement_execution_leases SET next_action_at=clock_timestamp()-interval '1 second' WHERE operation_id=${op.id}::uuid`.execute(db)
+        expect(await runKayixinFixturePass(db, config, op.id, wire, outerNumber)).toBe(true)
+      }
+      expect(seen.map(row => [row.path, JSON.parse(row.body)])).toEqual([
+        ['/api/v3/order/getDetail', { outerNumber: 'fixture-outer' }],
+        ['/api/v3/order/getDetail', { orderNumber: 'fixture-order' }],
+      ])
+      for (const row of seen) expect(row.signature).toBe(signKayixinV3(credentials.appId, credentials.appSecret, '1700000000', row.body))
+      expect(await db.selectFrom('procurement_request_intents').select('action').where('operation_id', '=', op.id).orderBy('generation').execute())
+        .toEqual([{ action: 'submit' }, { action: 'query' }, { action: 'query' }])
+      expect(await db.selectFrom('procurement_operations').select(['state', 'supplier_order_number']).where('id', '=', op.id).executeTakeFirstOrThrow())
+        .toEqual({ state: 'unknown', supplier_order_number: 'fixture-order' })
+      expect((await db.transaction().execute(trx => readProcurementRisk(trx, op.id)))?.outstandingMinor).toBe('10')
+      expect(await finalizeProcurementUnit(db, op.id, 1)).toBe('not_ready')
+    } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
+  })
+  it('records an adapter identity conflict without trusting the conflicting supplier number', async () => {
+    await ensureTestRiskPolicy()
+    const op = await readyOperation()
+    const transport = createKayixinProcurementFixtureTransport({
+      supplier: { baseUrl: 'https://synthetic.example.test', appId: credentials.appId, appSecret: credentials.appSecret },
+      timestamp: () => '1700000000', outerNumberForOperation: () => 'fixture-outer',
+      wire: async () => ({ status: 200, body: JSON.stringify({ code: 1000, msg: 'ok', data: {
+        outerNumber: 'different-outer', orderNumber: 'untrusted-number', status: 3,
+      } }) }),
+    })
+    await runProcurementFixturePass(db, op.id, transport, async () => true)
+    await sql`UPDATE procurement_execution_leases SET next_action_at=clock_timestamp()-interval '1 second' WHERE operation_id=${op.id}::uuid`.execute(db)
+    await runProcurementFixturePass(db, op.id, transport, async () => true)
+    expect(await db.selectFrom('procurement_operations').select(['state', 'supplier_order_number']).where('id', '=', op.id).executeTakeFirstOrThrow())
+      .toEqual({ state: 'manual_review', supplier_order_number: null })
+    expect(await db.selectFrom('procurement_execution_evidence').select(['kind', 'supplier_order_number']).where('operation_id', '=', op.id).orderBy('generation').execute())
+      .toEqual([{ kind: 'unknown', supplier_order_number: null }, { kind: 'identity_conflict', supplier_order_number: null }])
+    expect((await db.transaction().execute(trx => readProcurementRisk(trx, op.id)))?.outstandingMinor).toBe('10')
+    expect(await runProcurementFixturePass(db, op.id, transport, async () => true)).toBe(false)
+    expect(await finalizeProcurementUnit(db, op.id, 1)).toBe('not_ready')
+  })
   it.each(['accepted', 'completed', 'rejected'] as const)('R1 prevents cross-operation supplier number collision after A is %s', async mode => {
     await db.transaction().execute(trx => initializeSyntheticProcurementRiskPolicy(trx, { currency: 'TST', limits: {
       perOperationMinor: '100', globalDailyMinor: '10000', globalOutstandingMinor: '10000',
@@ -1256,6 +1329,10 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
     try {
       expect(await runProcurementFixturePass(db, op.id, server.transport, async source => {
         expect(source.connectionVersionId).toBe(connectionVersionId); expect(source.credentialVersion).toBe(1)
+        expect(await resolveKayixinFixtureSource(db, config, { ...source, credentialKeyId: 'wrong-key' })).toBeNull()
+        expect(await resolveKayixinFixtureSource(db, config, { ...source, connectionVersionId: version2 })).toBeNull()
+        expect(await resolveKayixinFixtureSource(db, config, source)).toEqual({ baseUrl: 'https://synthetic.example.test',
+          appId: credentials.appId, appSecret: credentials.appSecret })
         return false
       })).toBe(false)
       expect(calls).toBe(0)

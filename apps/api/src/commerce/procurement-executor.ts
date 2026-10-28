@@ -18,6 +18,8 @@ export type ProcurementFixtureResult = {
   supplierOrderNumber: string | null
   unitIndices?: number[]
   deliveryConfirmed?: boolean
+  /** An adapter detected a contradictory identity without trusting its supplied number. */
+  identityConflict?: boolean
   responseDigest: string
 }
 export type ProcurementFixtureTransport = (request: ProcurementFixtureRequest) => Promise<ProcurementFixtureResult>
@@ -162,6 +164,7 @@ function normalizeResult(claimed: Claim, result: ProcurementFixtureResult): Proc
     || (result.supplierOrderNumber !== null && (typeof result.supplierOrderNumber !== 'string'
       || !result.supplierOrderNumber.trim() || result.supplierOrderNumber.length > 200))
     || (result.deliveryConfirmed !== undefined && typeof result.deliveryConfirmed !== 'boolean')
+    || (result.identityConflict !== undefined && typeof result.identityConflict !== 'boolean')
     || (result.unitIndices !== undefined && (!Array.isArray(result.unitIndices)
       || result.unitIndices.some(n => !Number.isSafeInteger(n) || n < 1)))) {
     return { requestIdentity: claimed.requestIdentity, kind: 'unknown', supplierOrderNumber: null, responseDigest: '0'.repeat(64) }
@@ -174,7 +177,8 @@ async function record(db: Kysely<Database>, claimed: Claim, raw: ProcurementFixt
   const invalidEncoding = raw?.unitIndices !== undefined && (!Array.isArray(raw.unitIndices)
     || raw.unitIndices.some(n => !Number.isSafeInteger(n) || n < 1)
     || new Set(raw.unitIndices).size !== raw.unitIndices.length)
-  const result = normalizeResult(claimed, invalidEncoding ? { ...raw, unitIndices: [] } : raw)
+  const normalized = normalizeResult(claimed, invalidEncoding ? { ...raw, unitIndices: [] } : raw)
+  const result = normalized.identityConflict === true ? { ...normalized, supplierOrderNumber: null } : normalized
   await db.transaction().execute(async trx => {
     const initial = await operationRow(trx, claimed.operationId)
     if (!initial) return
@@ -195,7 +199,7 @@ async function record(db: Kysely<Database>, claimed: Claim, raw: ProcurementFixt
       && ((op.supplier_order_number !== null && result.supplierOrderNumber !== op.supplier_order_number)
         || historicalNumbers.some(number => number !== result.supplierOrderNumber)))
     const wrongIdentity = result.requestIdentity !== claimed.requestIdentity
-    let kind: ProcurementFixtureResult['kind'] | 'identity_conflict' = wrongIdentity || numberConflict || invalidEncoding ? 'identity_conflict' : result.kind
+    let kind: ProcurementFixtureResult['kind'] | 'identity_conflict' = wrongIdentity || numberConflict || invalidEncoding || result.identityConflict === true ? 'identity_conflict' : result.kind
     const indexes = [...new Set(result.unitIndices ?? [])].sort((a, b) => a - b)
     const assigned = (await sql<{ unit_index: number }>`SELECT unit_index FROM procurement_operation_units
       WHERE operation_id = ${op.id}::uuid ORDER BY unit_index`.execute(trx)).rows.map(row => row.unit_index)
@@ -205,7 +209,7 @@ async function record(db: Kysely<Database>, claimed: Claim, raw: ProcurementFixt
     await sql`INSERT INTO procurement_execution_evidence(id, operation_id, generation, action, kind,
       supplier_order_number, request_identity, unit_indices, response_digest)
       VALUES (${evidenceId}::uuid, ${op.id}::uuid, ${claimed.generation}, ${claimed.action}, ${kind},
-        ${result.supplierOrderNumber}, ${claimed.requestIdentity}, ${kind === 'identity_conflict' ? [] : indexes}::integer[], ${result.responseDigest})`.execute(trx)
+        ${result.identityConflict === true ? null : result.supplierOrderNumber}, ${claimed.requestIdentity}, ${kind === 'identity_conflict' ? [] : indexes}::integer[], ${result.responseDigest})`.execute(trx)
     if (kind === 'success' && result.deliveryConfirmed === true) {
       await sql`INSERT INTO procurement_execution_evidence(id, operation_id, generation, action, kind,
         supplier_order_number, request_identity, unit_indices, response_digest)
