@@ -343,6 +343,7 @@ async function fixtureServer(handler: (request: ProcurementFixtureRequest) => Pr
 
 describe('⑥-4B-2 isolated procurement fixture', () => {
   it('prepares frozen order data independently and never grants purchasing eligibility', async () => {
+    beginCrashFixtureDraftTracking()
     selected.rows = [{ skuId: skuA.skuId, mappingVersionId: skuA.versionId }]
     const a = await draft('  0000123  '), b = await draft('different', true)
     const result = await checkout([line(skuA, a, 2), line(skuA, b)])
@@ -363,8 +364,10 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
     expect(await db.selectFrom('procurement_operations').select('id').where('order_item_id', '=', firstItem.id).execute()).toHaveLength(0)
   })
   it('preserves numeric strings, option identities, conditional fields and frozen mapping on checkout replay', async () => {
+    beginCrashFixtureDraftTracking()
     selected.rows = [{ skuId: skuA.skuId, mappingVersionId: skuA.versionId }]
     const created = await createPurchaseDraft(db, config, owner, templateVersionId)
+    crashFixtureDraftIds.push(created.id)
     const saved = await savePurchaseDraft(db, config, owner, { draftId: created.id, expectedRevision: created.revision, values: {
       [accountField]: ' account ', [digitsField]: '000123', [selectField]: selectOption,
       [cascadeField]: { path: [cascadeOption, cascadeChild], expanded: { [expandedField]: '  extra  ' } },
@@ -387,6 +390,7 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
     expect(await db.selectFrom('procurement_operations').select('id').where('order_item_id', '=', result.order.items[0]!.id).execute()).toHaveLength(0)
   })
   it('keeps mixed order items tied to their frozen mapping after the current mapping changes', async () => {
+    beginCrashFixtureDraftTracking()
     const one = await catalog('1.00'), two = await catalog('2.00')
     selected.rows = [{ skuId: one.skuId, mappingVersionId: one.versionId }, { skuId: two.skuId, mappingVersionId: two.versionId }]
     const result = await checkout([line(one, await draft('first')), line(two, await draft('second'))])
@@ -403,6 +407,7 @@ describe('⑥-4B-2 isolated procurement fixture', () => {
     expect(await prepare(itemOne.id)).toEqual(before)
   })
   it('blocks ordinary orders without a frozen procurement source', async () => {
+    beginCrashFixtureDraftTracking()
     selected.rows = []
     const result = await checkout([line(skuA, await draft('unmapped'))])
     expect(await db.transaction().execute(trx => prepareOrderItemProcurement(trx, config, result.order.items[0]!.id)))
