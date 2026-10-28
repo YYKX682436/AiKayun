@@ -88,7 +88,7 @@ interface ReleaseManifestV1 {
 /var/lib/aikayun/                    # 持久数据挂载根；禁止隐式改project名换卷
 ```
 
-PostgreSQL、媒体、私有文件使用固定命名卷/显式绑定路径，固定 project name 是部署配置的一部分。身份 UUIDv4 与 Ed25519 身份密钥首次安装产生，存活跨容器重建、版本更新、改域名和正常迁移；不来自业务库里“任意第一个用户”，也不随每次启动随机重建。DB 新增部署绑定行记录 `database_id`（首次建库 UUID）、`instance_id`、身份公钥 thumbprint。部署文件、DB binding 和私钥推导公钥三者必须匹配。业务 DB 中不存身份私钥；缓存许可证不是身份来源。
+PostgreSQL、媒体、私有文件使用固定命名卷/显式绑定路径，固定 project name 是部署配置的一部分。身份 UUIDv4 与 Ed25519 身份密钥首次安装产生，存活跨容器重建、版本更新、改域名和正常迁移；不来自业务库里“任意第一个用户”，也不随每次启动随机重建。DB 新增部署绑定行记录 `database_id`（首次建库 UUID）、`instance_id`、身份公钥thumbprint。部署文件、DB binding、签名许可证claims.database_id与中心activation登记、身份私钥推导公钥必须匹配；renew也带database_id供中心核对。错配禁新经营，保留历史义务；完整root克隆仍不可绝对阻止。业务DB中不存身份私钥；缓存许可证不是身份来源。
 
 缺失身份/秘密时禁止自动生成替代密钥覆盖历史数据。身份不匹配进入 `identity_mismatch`，只禁新经营，恢复/历史工作继续按现有安全约束运行；允许管理员诊断和用完整备份恢复。若历史凭据解密密钥确实丢失，相关付款查单/交付会无法完成，这是数据恢复故障，不能归因于授权，也不能忽略错误强行处理。
 

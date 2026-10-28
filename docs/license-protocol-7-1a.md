@@ -70,6 +70,7 @@ interface LicenseClaimsV1 {
   nbf: number
   exp: number
   instance_id: InstanceId
+  database_id: string
   identity_jkt: string
   activation_generation: ActivationGeneration
   entitlement_revision: Revision
@@ -104,14 +105,28 @@ license_activations(id PK, license_id FK, generation bigint, instance_id,
   UNIQUE INDEX(instance_id) WHERE state='active'
 activation_codes(id PK, license_id FK, token_hash UNIQUE, expires_at, consumed_at)
 request_nonces(nonce_hash PK, operation, instance_jkt, expires_at, consumed_at)
-license_operations(operation_id PK, actor, request_digest, kind,
-  license_id, result_generation, result_revision, response_jws, created_at)
+license_operations(operation_id PK, actor, intent_digest, kind,
+  license_id, database_id, state committed|cancelled,
+  result_generation, result_revision, encrypted_activation_result,
+  response_jws, committed_at)
+license_operation_attempts(attempt_id PK, operation_id FK, attempt_no,
+  body_digest, client_nonce_hash, server_nonce_hash, identity_jkt,
+  signature_created_at, received_at, result committed|rejected,
+  UNIQUE(operation_id,attempt_no), UNIQUE(server_nonce_hash))
 entitlement_events(id PK, license_id FK, external_event_id UNIQUE,
   previous_end, new_end, kind, actor, created_at) // 只追加
 license_audit_events(id PK, license_id, kind, actor, safe_details, created_at)
 ```
 
-每次激活/迁移/续费/撤销/恢复按 `licenses FOR UPDATE → active activation → nonce/code → operation/event` 顺序，在一个DB事务里校验和写入；重放在同锁内按operation_id和摘要返回原结果，摘要不符409。双并发激活只能一个成功，唯一约束兜底；不可用“先查询有没有active，再事务外insert”。generation/revision不回退、不复用，迁移/恢复为退休旧activation+插新activation同事务，不能先删旧记录再网络调用。签名材料和结果可在该短事务内生成并与operation一同持久化；只有提交后回复，未知提交由同operation_id恢复。拒绝无法确认的成功，不用客户端收到与否决定是否已激活。
+每次激活/续签/迁移操作先在商城本地生成UUID operation_id及固定 intent_digest，DB持久化pending记录后才请求challenge或发送。intent_digest覆盖不可变业务意图（操作类型、license_id/activation code、instance_id、database_id、identity_jkt、计划目标/预期generation），不覆盖nonce、签名时间、签名、attempt序号及挑战值。激活码只保存在受限本地pending密文中，不出现在中心operation明文/审计/日志。
+
+中心按 `licenses FOR UPDATE → license_operations → active activation → nonce/code → attempt/audit` 顺序执行短事务。唯一operation_id绑定唯一intent_digest；相同operation不同摘要409。检查已提交operation先于激活码是否已消耗；首次成功事务内同时消费code、创建activation、签JWT、存加密结果并把operation标committed。事务commit后才发HTTP响应。签名失败/确定性业务拒绝可安全终结为rejected，不生成activation；5xx/连接断开不能假设事务回滚。generation只在成功commit时增加，数据库失败/rollback不消耗代次。
+
+商城顺序固定为：①创建并fsync本地pending operation；②challenge；③持钥签请求；④中心一个DB事务commit；⑤收到响应后先把原始签名响应加密、原子持久化至pending；⑥独立本地事务验签并投影授权；⑦读回确认jti/generation/revision；⑧标本地operation完成并清理敏感pending。若第⑤与第⑥之间强杀，重启先处理本地已保存响应；若第⑥结果未知，先按operation查询本地license_state/jti，再幂等重跑投影；若中心已commit但响应丢失，向中心按同operation恢复结果。任何网络调用都不在商城SQL事务内。
+
+本地pending表至少为 `local_license_operations(operation_id PK, kind, intent_digest, license_id, database_id, identity_jkt, expected_generation, state pending|response_saved|projected|cancelled, encrypted_request_secret, encrypted_response, created_at, expires_at, last_attempt_id)`。激活码和可能含授权的原响应使用独立本机密钥加密，文件/DB访问权限仅API uid；编码前不写日志、trace、APM、异常或HTTP query。成功投影并读回后清除密文/临时文件；只保留不含secret/token的审计元数据。pending逾期不得自动删掉尚有未知结果的激活操作：先中心同操作核查/续接或人工处理。已证明未提交且用户明确取消的operation，在中心原子cancel后可清除密文；本地强杀残留只可在完成上述判定后按保留期回收。
+
+双并发激活仍由license行锁和部分唯一索引保护。唯一operation_id的业务结果只能commit一次；重试请求不会二次消耗激活码或产生第二个generation。
 
 未首次激活的license `current_generation=0`，首次成功激活设1，此后只增；所有已签lease的generation必须>0。
 
@@ -122,9 +137,10 @@ license_audit_events(id PK, license_id, kind, actor, safe_details, created_at)
 | 接口 | 鉴权及请求 | 成功/错误语义 |
 | --- | --- | --- |
 | `POST /v1/challenges` | operation、instance_id、public_jwk、operation_id、随机client_nonce（≥256 bit）；限流 | 一次性nonce，有效5m，绑定操作与jkt；返回签名challenge及中心时间，不授予权益 |
-| `POST /v1/activations` | 短期一次性activation code + 持钥HTTP签名；body含nonce、operation_id、database_id、instance_id、public_jwk、origin | 锁license/code/nonce后激活，登记DB绑定并签LicenseClaims；已有别的active→409 `ACTIVATION_CONFLICT` |
-| `POST /v1/leases/renew` | 当前身份签名，license_id/generation、known_revision、nonce、operation_id | active主体且订阅有效签新lease；过期/撤销/替换返回签名状态回执 |
-| `POST /v1/operations/query` | 当前nonce/持钥签名，原operation_id；仅原actor或中心明确授权的迁移目标可读 | 返回绑定本次query的签名操作回执，内嵌原业务结果与原lease；不延长权益 |
+| `POST /v1/activations` | 短期一次性activation code + 持钥HTTP签名；body含nonce、operation_id、intent_digest、database_id、instance_id、public_jwk、origin | 锁license/operation/code/nonce后激活，登记DB绑定并签LicenseClaims；已有别的active→409 `ACTIVATION_CONFLICT` |
+| `POST /v1/leases/renew` | 当前身份签名，license_id/database_id/generation、known_revision、nonce、operation_id、intent_digest | active主体且订阅有效签新lease；过期/撤销/替换返回签名状态回执 |
+| `POST /v1/operations/continue` | 原operation_id+原intent_digest、新attempt_no/新challenge nonce/持钥新签名；同一身份和payload | 原子串行检查该operation；committed回原结果，确定可执行则继续同一意图，绝不新建operation |
+| `POST /v1/operations/query` | 当前nonce/持钥签名，原operation_id+intent_digest；仅原actor或已授权迁移目标可读 | 返回签名状态快照。not_found只代表线性化查询时未见记录，**不能围栏尚在途的原请求**，也不能据此另建operation |
 | `POST /v1/origin` | 同身份签名、新规范origin、nonce、operation_id | 仅更新展示/审计域名；不强绑域名，不改变订阅或代次 |
 | `POST /v1/transfers/prepare` | 中心账号确认 + 原实例持钥证明、expected_generation | 发单次transfer ticket，10m有效，绑定目标jkt/instance；不提前释放旧激活 |
 | `POST /v1/transfers/commit` | 目标持钥签名、ticket、nonce、operation_id | 一个事务退休旧代次、代次+1激活目标、发新lease；冲突/过期ticket无副作用 |
@@ -135,9 +151,24 @@ HTTP签名覆盖 `@method`、`@target-uri`、`content-type`、`content-digest`�
 
 challenge响应为 `typ=aikayun-license-challenge+jwt` 的JWS，含issuer/audience、iat/exp≤5m、server_nonce、client_nonce、operation_id/operation、instance_id/jkt。客户端用可信公钥验签并核对随机client_nonce和≤5秒单调往返时间，由签名iat建立本次请求created/expires；严重wall偏移时也能发起renew/time-reset，不先用错误wall把challenge拒绝。challenge不清撤销、不降低水位、不形成经营许可；过期响应/旧client_nonce不接受。协议所有特殊JWT类型均独立schema/typ验证，不接受许可证充当challenge。
 
-请求重试必须复用原operation_id、原body、原签名和nonce；中心先验签，再在事务里查同operation摘要，已提交则返回原signed response（即使nonce已消费），未提交才检查nonce未消费/未过期。签名已过期的重试只可通过新challenge和签名调用只读 `POST /v1/operations/query` 查询原操作，查询响应用当前nonce绑定；其返回原业务结果和原lease，不延长旧lease。需要新lease则独立发新renew操作。不能为解决网络未知另生成新activation。operation记录至少保留许可证生命周期+审计保留期，nonce可短期清理但不能清掉幂等历史。
+明确的恢复决策：
 
-操作查询外层是 `typ=aikayun-license-operation+jwt` 的标准JWS/JWT，含iss/aud/sub/jti/iat/exp（≤5m）、actor_jkt、original_operation_id、original_request_digest、原response JWS、本次query nonce/digest。仅按当前query绑定校验外层；内层lease仍按原请求摘要/nonce校验，不能强行与新nonce比较，也不能重签延长原lease。应用内层前仍与当前generation/revision/拒新事实比较；查询不赋予已经退休的实例新权限。
+| 中心观察到的原operation状态 | 处理 |
+| --- | --- |
+| committed | 返回原业务结果和原响应签名；不再消耗code、不增加generation。商城保存响应并幂等投影 |
+| 当前请求仍在执行/等待license锁 | 同operation continue等待有界时间；超时返回状态未知，再query/continue；不并发开启新operation |
+| 可证明未提交 | 同operation continue可执行；DB无commit的事务会回滚，原nonce过期也不妨碍新attempt |
+| query返回not_found | 仅瞬时观测，不能证明迟到请求不会提交；必须continue同operation，由中心锁串行化 |
+| 状态未知/中心不可达 | 本地pending保留，指数退避；不得新建operation或另耗code。已有可信lease到期后只禁新经营 |
+| 已终态rejected/cancelled | 原operation不再继续。用户纠正输入后才可建立新operation；中心先对原op原子终结/围栏，激活码未消费才可使用 |
+
+每个新challenge会产生新server_nonce/client_nonce和递增attempt_no；业务operation_id与intent_digest始终不变。request body的授权业务字段不可改，签名证明、nonce、签名时间、challenge和attempt_no每次更新。对激活码：若原operation未提交/未消费，续接仍使用同一加密pending code；若已提交，operation先命中committed返回结果而不会重新消费code。不能因为普通query一次not_found就另发op。
+
+中心所有变更请求先验HTTP签名和challenge，随后锁license，再读取/插入operation。操作结果在同一事务commit，迟到旧请求即使曾验签，也必须获取同一license锁并检查operation：较新的请求先commit后旧请求读到committed；旧请求先commit后新请求读到committed；如果旧事务rollback，新请求才可继续。唯一op id/intent digest与事务锁因此围栏迟到请求。签名过期的旧请求在入口拒绝；原nonce重复不可消费。新attempt签名须绑定相同intent_digest和新challenge，不能改业务意图。
+
+query的not_found不被当作否定执行证明；同operation continue才是恢复活性路径。operation永久幂等墓碑（operation_id、intent_digest、terminal/result摘要）保留至少license生命周期+法务审计期，敏感密文可按规则清除。中心短期nonce按到期清理不影响operation墓碑。
+
+操作查询/continue结果外层是 `typ=aikayun-license-operation+jwt` 的标准JWS/JWT，含iss/aud/sub/jti/iat/exp（≤5m）、actor_jkt、operation_id、intent_digest、状态、attempt_no、当前nonce/digest、terminal结果摘要；committed时附原response JWS。原lease的nonce/digest仍绑定原续签attempt，不能强行改绑或重签延长；客户端先验外层新鲜回执，再验内层原lease，然后比较当前generation/revision/拒新事实。未提交操作的签名拒绝结果要明确为terminal或retryable；只有中心在operation锁内记录的terminal状态才可让本地清理pending。
 
 标准签名校验、nonce消费、速率限制、activation code消费、账号权限缺一不可。activation code≥256 bit随机，只存hash，默认24小时有效、单次使用；不放URL或日志，不作为常驻商城密码。中心响应若未签名或TLS/超时失败，只记录transport error，**不能作为撤销、恢复或新的截止时间证据**。
 
@@ -186,7 +217,7 @@ assertNewObligationAllowed(trx: Transaction<Database>,
   kind: 'create_order' | 'create_top_up'): Promise<AdmissionDecision>
 ```
 
-新增DB表草案：`installation_binding(singleton=true PK, database_id UNIQUE, instance_id UNIQUE, identity_jkt, binding_revision, binding_state ready|rebind_pending)`；`instance_license_state(singleton=true PK, raw_evidence, license_id, generation, entitlement_revision, evidence_seq, accepted_status, credential_jti, subscription_end, lease_exp, renew_after, trusted_server_time, time_epoch, observed_time_high_water, last_verified_at, last_contact_error, revision)`；`instance_license_events(id PK, kind, safe_reason, credential_jti, created_at)`只追加；`pending_license_operations(operation_id PK, kind, expected_binding_revision, source_generation, target_instance_id, target_jkt, request_digest, state, signed_receipt)`用于迁移/重绑恢复。所有时间`timestamptz`，bigint JSON用字符串，CHECK `lease_exp<=subscription_end`等；没有行/不识别schema默认禁新，不允许“未装授权模块所以放行”生产分支。
+新增DB表草案：`installation_binding(singleton=true PK, database_id UNIQUE, instance_id UNIQUE, identity_jkt, binding_revision, binding_state ready|rebind_pending)`；`instance_license_state(singleton=true PK, raw_evidence, license_id, database_id, generation, entitlement_revision, evidence_seq, accepted_status, credential_jti, subscription_end, lease_exp, renew_after, trusted_server_time, time_epoch, observed_time_high_water, last_verified_at, last_contact_error, revision)`；`instance_license_events(id PK, kind, safe_reason, credential_jti, operation_id, created_at)`只追加；`pending_license_operations(operation_id PK, kind, intent_digest, database_id, expected_binding_revision, source_generation, target_instance_id, target_jkt, state, encrypted_request_secret, encrypted_response, response_digest, last_attempt_no)`用于迁移/重绑恢复。所有时间`timestamptz`，bigint JSON用字符串，CHECK `lease_exp<=subscription_end`等；没有行/不识别schema默认禁新，不允许“未装授权模块所以放行”生产分支。
 
 `persistLicenseEvidence`须在获得当前投影 `FOR UPDATE` 后重新比较全部绑定/代次/revision/已接受拒新事实；锁前验签只证明密码学有效，不证明它比锁后当前状态新。同代同revision的lease按iat只接受严格更新者，相同iat保持已接受值（同jti重放幂等），拒新回执优先于同revision许可；恢复须更高revision。`evidence_seq`仅是本地每次提交+1的审计序号，不能作为中心证据新旧的依据。正常续签不得在不同license_id之间切换；换许可证必须中心显式签迁移/替换授权并清楚绑定旧/新license及实例，不接受任意有效客户token覆盖。
 
@@ -245,7 +276,9 @@ root可同时回滚DB、身份文件、水位和系统时间，也能修改程�
 | SSR目录/报价/购物车/填写草稿/登录后台/修复配置/补库存 | 允许 | 页面提示不可新下单，原权限和资源限额不变 |
 | 新的批量订单/导入开单/手工加余额销售等未来入口 | 默认不得上线 | 必须先分类为新义务并接同事务gate；当前未发现此类生产写入口 |
 
-调用示意：现有认证/owner锁 → 原幂等hash比较与返回 → 原业务校验/有序锁 → `assertNewObligationAllowed(trx, kind)` → 插入新义务及关联快照/预留 → 同事务commit。所有SQL可重试错误重试时重新检查；v2事务外附件复制只做准备，不获得经营许可，拒绝/提交未知仍沿用现有附件保护。网络授权请求绝不能放在交易事务、advisory lock或钱包锁内。
+v2购买附件轻量预检：现有认证与owner/idempotency lock → 先比较key/hash并返回已存在订单（不做授权拒绝）→ 校验报价/草稿 → 在昂贵的readVerified和归档复制前读取本地已验签projection及fresh DB时间作提示性准入检查 → 拒绝时不复制、不写prepared对象。此预检会与截止或撤销竞争，绝不是安全边界。最终订单事务仍在原幂等返回之后、orders INSERT之前重新锁授权projection并作权威检查；若预检后授权失效，沿用附件prepared清理与unknown-commit恢复规则，不删除可能已retained的对象。
+
+调用示意：现有认证/owner锁 → 原幂等hash比较与返回 → 原业务校验/有序锁 → 最终事务 `assertNewObligationAllowed(trx, kind)` → 插入新义务及关联快照/预留 → 同事务commit。所有SQL可重试错误重试时重新检查。网络授权请求绝不能放在交易事务、advisory lock或钱包锁内。
 
 新义务决策与状态更新在单例投影上串行。若交易先锁、采样时间有效，则授权更新等待其commit；更新先commit，则交易见新状态拒绝。**线性化点是最终事务内的fresh授权决策，不是中心真实撤销时间，也不是COMMIT时钟。**自然到期不自动取得DB锁：准入后短事务可能越过截止提交，这是明确允许的已准入事务边界。建议新准入后statement/transaction timeout≤5s、禁止后续外网IO；不能宣称“所有截止后commit均不可能”。⑦-1C必须测试等待跨期和更新竞争，长事务应失败重试并重验，而非拿事务开始时间放行。
 
@@ -256,15 +289,15 @@ root可同时回滚DB、身份文件、水位和系统时间，也能修改程�
 ### 7.1 首次激活
 
 1. 安装器生成实例身份与秘密，迁移业务库并绑定；HTTPS setup一次性初始化管理员。
-2. 管理员提交中心签发的短期activation code；API取challenge，签完整激活请求。
+2. 管理员提交中心签发的短期activation code；API先加密持久化pending operation/code，再取challenge和签请求。
 3. 中心事务锁license、校验订阅、code、nonce、无竞争激活，写activation/generation/operation/audit并签lease；提交后回复。
-4. 商城核对响应nonce/body摘要、签名、身份与水位，事务保存证据和投影；此时才允许新经营。
-5. 中心提交但回复丢失：同操作重试/查询；商城提交未知：读本地投影jti，不创建第二身份或第二license。
+4. 商城先加密持久化原响应，再核对nonce/body摘要、签名、database_id、身份与水位，事务保存投影；读回确认后清理激活码密文，此时才允许新经营。
+5. 中心提交但回复丢失：以新challenge续接原operation_id/intent_digest并恢复原结果。商城投影提交未知：读本地jti/operation_id后幂等补做，不创建第二激活。
 
 ### 7.2 周期续签、续费、离线
 
-1. 内嵌任务按6h±10%抖动取challenge并renew；中心核对active代次，签最长7d且不越confirmed_end的lease。
-2. 商城验证新证据，在单例锁下比较generation/revision/iat/已接受拒新事实，忽略乱序旧响应；更新授权和可信时间，不碰订单。
+1. 内嵌任务先持久化稳定operation_id/intent_digest，按6h±10%抖动取challenge并renew；中心核对active代次与database_id，签最长7d且不越confirmed_end的lease。
+2. 商城先加密持久化响应，再验签、在单例锁下比较generation/revision/iat/身份和已接受拒新事实，忽略乱序旧响应；投影、读回核对后清理pending。
 3. 中心失败：按退避重试，last-good仍在窗口则offline_valid；到exp/end即时在新交易gate拒新，无需定时器先写状态。
 4. 中心续费确认提升end/revision；商城接收新lease才恢复。断网不能根据本地续费截图放行，历史义务始终继续。
 

@@ -45,6 +45,11 @@
 | B09 迁移恢复 | 正常ticket、旧机死、身份丢失、commit丢响应、DB/文件每步强杀 | generation唯一升代，签名重绑保留database_id/业务UUID，journal幂等补写；旧机不可普通renew获新代次 |
 | B10 协议故障 | nonce过期/重复、签名目标URL改写、大body、TLS不可信、签名时间失准 | 拒绝且不改权益；signed challenge可校准请求时间但不授经营许可 |
 | B11 秘密与日志 | 全流程请求/异常/诊断/浏览器资源扫描 | 无私钥、activation code、raw JWT、业务凭据/个人数据泄露 |
+| B12 激活崩溃恢复 | 中心commit activation/code消费后丢响应；商城强杀于发送前、响应返回前、响应保存后、投影commit未知 | 恢复本地operation；中心返回原结果；code只消费一次、generation只增一次；投影jti读回后才清密文 |
+| B13 续签崩溃恢复 | pending先提交后强杀；中心已commit但商城未保存lease；商城证据事务commit未知 | 原operation续接/查询；原lease完整恢复，revision不回退，不生成第二续签意图 |
+| B14 nonce过期与迟到请求 | 原请求未提交且nonce过期，取新challenge续接同operation；并行释放旧请求、旧请求先后分别取中心license锁 | 旧请求在入口过期拒绝或同锁看到committed；单operation最多一次业务提交；一次not_found不作围栏 |
+| B15 状态与围栏 | operation committed/executing/not-found/unknown/terminal各状态，重复激活码与过期签名 | 未知沿用原op；新attempt仅换nonce/签名/时间且intent不变；cancel须中心原子终结后才能新意图 |
+| B16 database_id错配 | DB dump与实例身份文件/签名claims/中心activation分别错配及合法恢复 | 任一不一致进入identity_mismatch、拒新；合法transfer按binding_revision恢复，历史义务继续 |
 
 测试只用隔离中心/临时测试key和`_test`库；生产构建无可切换的绕过入口。不得把测试key加到生产trust bundle，不能用真实客户license验收。中心生产管理面、安全备份、托管与告警仍需后续发行运维门禁，不因B阶段测试通过而直接上线。
 
@@ -54,7 +59,7 @@
 
 仅允许在已实现B接口基础上改两处新经营事务及对应产品提示：
 
-1. `apps/api/src/commerce/orders.ts` 的最终 `createOrderTransaction`：原owner/幂等返回和原有有序锁/报价验证之后、`orders INSERT`之前调用准入，所有retry重新检查。v2预检只能提示，最终事务决定。legacy/v2/零元/游客/顾客全部覆盖。
+1. `apps/api/src/commerce/orders.ts` 的v2轻量预检须位于owner/idempotency锁及同key/hash重放之后、购买附件昂贵归档之前；非权威投影检查只用于避免失效实例制造prepared孤儿文件，不能拒绝已有幂等订单。最终 `createOrderTransaction` 仍在原owner/幂等返回和原有有序锁/报价验证之后、`orders INSERT`之前取得权威准入，所有retry重新检查。legacy/v2/零元/游客/顾客全部覆盖。
 2. `apps/api/src/payments/routes.ts` 的 `createTopUpAttempt`：原customer/wallet锁和同key返回之后，新充值INSERT之前调用准入，拒绝时无attempt/secrets/provider_state残留，更不能出站发起支付。
 3. 新拒绝错误稳定返回403，状态不可读503；同key同hash旧结果优先，原hash冲突仍409。前后台显示通用停购和管理员诊断，不能用全局写middleware/停API或停worker实现。
 
@@ -78,6 +83,7 @@
 | C10 中心断网 | 中心DNS/TLS/5xx/超时、续签进程崩溃 | 每笔订单无中心请求；未到窗口继续，过窗口禁新；所有旧worker仍运行 |
 | C11 强杀/恢复 | 准入后commit未知、v2附件复制后拒新、恢复旧备份 | 重放先查实际结果；不双单/丢附件；恢复核对中心水位后才新经营 |
 | C12 采购关闭 | 完整回归卡易信read-only、selector恒空、TST预算、无dispatcher | 生产采购保持关闭，许可active也不能开启 |
+| C13 v2预检与幂等 | 到期状态已有key/hash重放；新key含附件；预检期间授权失效并发请求 | 已有订单原样重放；新单在复制/写prepared前提示拒绝；绕过预检仍被最终事务拒绝；无效孤儿不增长 |
 
 必须同时运行原资金/库存/履约PG集成、既有真实SIGKILL恢复和浏览器关键流程。新增测试要能证明业务边界与竞争结果，不能只有mock状态机。CI记录对应精确commit，不用其他阶段绿灯替代。不得连接真实商户做这个阶段的验收。
 

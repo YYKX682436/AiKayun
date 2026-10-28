@@ -6,6 +6,8 @@
 
 配套：[发行架构](./production-release-architecture-7-1a.md)、[授权协议](./license-protocol-7-1a.md)、[开发与验收](./release-license-acceptance-7-1a.md)。
 
+R1补审（同一基线）：激活/续签恢复以协议中的持久pending operation、新challenge续接和中心DB锁序为准；v2附件应在幂等优先预检后、外部文件归档前做轻量准入提示，最终订单事务仍须重验。中心not_found不构成旧请求围栏。installation/database身份以签名database_id三方比对为准。相关确定性回归列于开发验收文档。
+
 ## 结论与统一优先级
 
 当前仓库有完整交易与履约安全基础，但尚不满足本轮商业发行定义；不能直接把现有Compose交给客户并声称正式发行。未发现必须在本轮修改业务才能完成设计的问题，下列缺口全部登记后续阶段，不扩大本轮范围。
