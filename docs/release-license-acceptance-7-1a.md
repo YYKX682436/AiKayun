@@ -51,8 +51,9 @@
 | B15 状态与围栏 | operation committed/rejected/cancelled、锁等待中的in-flight观测、瞬时not-found/unknown，重复激活码与过期签名 | 持久状态只有三种不可逆终态；in-flight非DB状态；未知沿用原op；新attempt只更新nonce/签名/时间，intent固定；cancel原子墓碑不可复活 |
 | B16 database_id错配 | DB dump与实例身份文件/签名claims/中心activation分别错配及合法恢复 | 任一不一致进入identity_mismatch、拒新；合法transfer按binding_revision恢复，历史义务继续 |
 | B17 中心终态认证边界 | 未认证身份/坏HTTP签名、过期nonce、5xx、确定性业务拒绝、commit后重放、取消与迟到请求并发 | 未认证请求不触碰操作表；retryable失败不终结；确定性拒绝/成功与attempt同事务落终态；墓碑不可更新/删除/复活 |
-| B18 已提交激活长期恢复 | activation/code已commit；商城丢失响应并强杀；原lease过exp后带原operation、nonce/digest和当前PoP恢复；分别注入订阅过期、撤销、generation替换 | 旧lease只存档；有效权益下签发新的恢复凭证且不重激活/耗码/增generation；任何拒新事实均无新lease并保持历史义务 |
+| B18 已提交激活长期恢复 | activation/code已commit；商城丢失响应并强杀；原lease过exp后带原operation、nonce/digest和当前PoP恢复；分别注入订阅到期、当前撤销、generation替换 | 同generation且当前订阅active时按中心最新revision恢复；旧lease只存档；不重激活/耗码/增generation；撤销/到期/superseded均无新lease |
 | B19 本地pending一致性与密钥灾备 | 激活请求发送前强杀；恢复同一DB操作表与pending密钥备份；分别缺密文/缺key/错误key恢复 | 父操作状态唯一、attempt行有FK且次序可恢复；匹配备份才能核对原nonce/digest并续接；缺key时fail-closed，不误判未发送、不新建操作 |
+| B20 续费后长期恢复与乱序 | 激活已commit；中心续费提升revision；商城未投影且旧lease过exp；恢复响应与旧lease乱序到达；另注入revoked、显式restored、superseded | 当前权威active时按最新revision签新lease、不增generation；同revision较新iat可恢复仅时间过期lease；旧revision active不能覆盖已接受revoked；superseded仅凭正式transfer/recovery回执处理 |
 
 R2协议收口的确定性测试计划（全部未来⑦-1B/1C实现，不在⑦-1A创建假运行时）：
 
@@ -63,6 +64,8 @@ R2协议收口的确定性测试计划（全部未来⑦-1B/1C实现，不在⑦
 5. **数据库与实例身份错配：** 对安装binding.database_id、中心activation.database_id、签名claims.database_id逐一和组合篡改；普通续签及恢复凭证均拒绝新经营。认证失败不得终结目标operation；获准transfer只可按签名receipt切binding并保留业务database_id。
 6. **过期授权下v2附件预检与幂等重放：** 已完成订单的相同key/hash在预检前原样重放；新key含大附件必须在归档/写prepared之前轻量预检拒绝；预检后并发过期仍由最终数据库事务拒绝；确认无多余prepared文件且unknown-commit附件保持原保护语义。
 7. **pending密钥配对恢复：** 对含未完成activation pending和本机AES key的同一备份点完整恢复，验证原attempt证据可解密并续接；分别移除/替换key，确保fail-closed、保留记录、不把操作当未发送，并给出安全诊断而不泄漏密文。
+
+R3续费/恢复确定性场景：先完成activation并记录generation `g`、revision `r`及原lease；中心提交正常续费事件，使revision为`r+1`并延长subscription_end；模拟原响应丢失、本地授权投影从未完成，推进时钟超过原lease `exp` 后用原operation证据和当前实例PoP恢复。预期中心核对仍为当前active的generation `g`及匹配database_id，按当前权益签发`revision=r+1`新lease；激活行/激活码消费次数/generation均不增加。恢复凭证投影后再释放旧revision原lease，必须因水位/iat保持新状态。变体A：在续费后撤销，当前状态revoked，拒绝恢复；若之后中心显式恢复并再提升revision，仅新revision lease可恢复，旧revision凭证仍拒绝。变体B：中心已替换activation generation，原实例恢复请求返回superseded且不能普通renew。以上变体均验证历史交易义务继续处理。
 
 测试只用隔离中心/临时测试key和`_test`库；生产构建无可切换的绕过入口。不得把测试key加到生产trust bundle，不能用真实客户license验收。中心生产管理面、安全备份、托管与告警仍需后续发行运维门禁，不因B阶段测试通过而直接上线。
 

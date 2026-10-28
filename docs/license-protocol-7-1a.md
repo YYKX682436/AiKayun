@@ -188,9 +188,9 @@ query的not_found不被当作否定执行证明；同operation continue才是恢
 
 中心已提交activation但商城未投影，原lease可能在恢复前已过exp。商城不得使用历史lease开放新经营。它只能作为“曾签发该activation”的历史签名证据：原响应须与本地持久的原operation_id、intent_digest、request_nonce_hash、request_digest、签名key/kid记录逐项一致；中心用操作回执证明该operation确实committed，并以当前实例私钥的新challenge证明当前持钥。
 
-恢复步骤：①从同一备份恢复原父operation、原attempt nonce hash/digest/jkt/kid及身份密钥；②用当前身份新challenge调用只读query原operation；③验证新鲜短期operation回执的主体/operation摘要，并将中心保存的原响应与本地原request_nonce_hash、request_digest、identity_jkt/key_id逐项比对；中心回执确认原operation=`committed`，原lease即使已过exp也只归档，不作经营许可；④通过当前实例私钥PoP和一致的database_id创建一个新的持久renew/recovery operation id，显式引用原activation operation id；⑤中心在operation advisory锁和license行锁内核对原activation事实、当前generation/revision、identity_jkt/database_id、订阅截止、撤销/替换状态，然后原子提交该新operation与新lease；这是恢复凭证签发，不创建第二条activation、不消费code、不增加generation；⑥商城按新operation的响应持久化/验签/投影/读回顺序执行。
+恢复步骤：①从同一备份恢复原父operation、原attempt nonce hash/digest/jkt/kid及身份密钥；②用当前身份新challenge调用只读query原operation；③验证新鲜短期operation回执的主体/operation摘要，并将中心保存的原响应与本地原request_nonce_hash、request_digest、identity_jkt/key_id逐项比对；中心回执确认原operation=`committed`，原lease即使已过exp也只归档，不作经营许可；④通过当前实例私钥PoP和一致的database_id创建一个新的持久renew/recovery operation id，显式引用原activation operation id；⑤中心从权威license/entitlement记录读取当前`entitlement_revision`、订阅截止与状态，并在operation advisory锁和license行锁内核对原activation仍是当前generation、实例key/database_id匹配、权益active且订阅未到期；然后原子提交该新operation与绑定最新revision的lease；这是恢复凭证签发，不创建第二条activation、不消费code、不增加generation；⑥商城按新operation的响应持久化/验签/投影/读回顺序执行。
 
-若订阅已过期、license撤销、activation代次已被替换或已出现更高entitlement_revision，中心对已认证的新恢复operation原子记terminal rejected；不签新lease、不重建activation、不消费激活码、不递增generation。数据库身份或当前持钥证明不匹配属于认证/主体绑定失败：拒绝本请求且不读写受害operation；合法身份下与operation固定database_id不一致则409，不改原墓碑。当前实例无法持钥时走灾难迁移人工审批，不可仅凭旧license token恢复。历史资金/履约不受该准入结论影响。
+更高`entitlement_revision`本身不是拒绝理由：中心必须检查该revision对应的权威权益事件和当前license状态。正常续费/权益调整后，只要同一activation generation仍有效、实例身份及database_id匹配、当前状态为active且`now < confirmed_subscription_end`，恢复operation可按最新revision签发新lease。撤销状态拒绝；仅在中心已显式恢复权益、追加更高revision恢复事件且当前状态重新为active时才可恢复签发。activation已被替换/当前generation不同（superseded）、订阅已到期或当前权益仍撤销时，中心对已认证的新恢复operation原子记terminal rejected；不签新lease、不重建activation、不消费激活码、不递增generation。数据库身份或当前持钥证明不匹配属于认证/主体绑定失败：拒绝本请求且不读写受害operation；合法身份下与operation固定database_id不一致则409，不改原墓碑。当前实例无法持钥时走灾难迁移人工审批，不可仅凭旧license token恢复。历史资金/履约不受该准入结论影响。
 
 原延迟HTTP响应与恢复query并发时均以原operation_id取同一中心advisory锁；中心committed墓碑及保存的原nonce_hash/request_digest/identity绑定是响应接收依据。商城延迟响应也必须匹配本地持久attempt记录；未知attempt、摘要或jkt/kid不符一律隔离拒绝。迟到原lease即使验签正确，也必须校验`exp`；过期只允许归档/恢复流程作证，不能更新active projection。新签lease有新的恢复operation_id、nonce/digest和jti，单独验签后才可恢复新经营。中心operation回执（短期、证明已提交操作事实）、历史license凭证（可能过期、仅证明曾签声明）、新license凭证（当前权益、受exp/subscription_end约束）使用不同typ/受众/校验函数，不可相互代替；恢复回执绝不延长历史license的`exp`。
 
@@ -241,7 +241,7 @@ assertNewObligationAllowed(trx: Transaction<Database>,
 
 新增DB表草案：`installation_binding(singleton=true PK, database_id UNIQUE, instance_id UNIQUE, identity_jkt, binding_revision, binding_state ready|rebind_pending)`；`instance_license_state(singleton=true PK, raw_evidence, license_id, database_id, generation, entitlement_revision, evidence_seq, accepted_status, credential_jti, subscription_end, lease_exp, renew_after, trusted_server_time, time_epoch, observed_time_high_water, last_verified_at, last_contact_error, revision)`；`instance_license_events(id PK, kind, safe_reason, credential_jti, operation_id, created_at)`只追加；商城唯一pending权威为`local_license_operations`，主键operation_id，kind区分activation/renewal/recovery/transfer/rebind，固定intent_digest与identity/database绑定；状态为`pending|response_saved|projected|terminal|cancelled`，迁移/重绑字段（expected_binding_revision、source_generation、target_instance_id、target_jkt、signed_receipt）按kind条件必填。CHECK约束验证状态/字段组合，所有时间`timestamptz`，bigint JSON用字符串，CHECK `lease_exp<=subscription_end`等；没有行/不识别schema默认禁新，不允许“未装授权模块所以放行”生产分支。不得另建`pending_license_operations`或文件journal作为第二个状态权威；跨DB/文件迁移journal只允许作可重建的原子文件stage索引，必须引用该表operation_id及其状态。
 
-`persistLicenseEvidence`须在获得当前投影 `FOR UPDATE` 后重新比较全部绑定/代次/revision/已接受拒新事实；锁前验签只证明密码学有效，不证明它比锁后当前状态新。同代同revision的lease按iat只接受严格更新者，相同iat保持已接受值（同jti重放幂等），拒新回执优先于同revision许可；恢复须更高revision。`evidence_seq`仅是本地每次提交+1的审计序号，不能作为中心证据新旧的依据。正常续签不得在不同license_id之间切换；换许可证必须中心显式签迁移/替换授权并清楚绑定旧/新license及实例，不接受任意有效客户token覆盖。
+`persistLicenseEvidence`须在获得当前投影 `FOR UPDATE` 后重新比较全部绑定/代次/revision/已接受拒新事实；锁前验签只证明密码学有效，不证明它比锁后当前状态新。同一generation与entitlement_revision的active lease按iat只接受严格更新者，相同iat保持已接受值（同jti重放幂等）。普通lease仅因`exp`到期、而当前权益仍active时，可接受同revision且iat更新的新续签凭证；更高revision要与中心签名的最新权益状态一致。已接受revoked证据记录其revision水位，任何同revision或更旧revision的active lease（无论iat多新）都不能解除撤销；只有中心显式恢复后签发的更高revision active lease可恢复。superseded须通过绑定新generation的transfer/recovery回执改变，普通lease不能解除。`evidence_seq`仅是本地每次提交+1的审计序号，不能作为中心证据新旧的依据。正常续签不得在不同license_id之间切换；换许可证必须中心显式签迁移/替换授权并清楚绑定旧/新license及实例，不接受任意有效客户token覆盖。
 
 普通renew仅接受与本地完全相同generation；更高generation的普通lease不能自动应用。代次提升仅接受本机预先持久登记的pending transfer/recovery操作及其中心签名提交回执；operations/query也必须经过此条件。初次激活只允许unactivated且与本机pending activation匹配的回执，不能把已有实例改成“初装”清水位。跨license替换不在v1普通renew能力内，未另行定义并验收前明确拒绝。
 
@@ -275,9 +275,12 @@ root可同时回滚DB、身份文件、水位和系统时间，也能修改程�
 | 当前凭证损坏/不可信且无有效last-good | invalid_credential | 拒绝 | 允许 |
 | 部署文件/私钥公钥/DB绑定不一致 | identity_mismatch | 拒绝 | 允许；缺实际业务key另报故障 |
 | 发现时钟异常/水位回退 | clock_suspect | 拒绝 | 允许 |
-| expired/offline_expired/revoked等收到新有效lease且满足恢复水位 | active | 本地提交后允许 | 允许 |
+| expired/offline_expired（仅lease exp到达、当前权益仍active）收到同generation/revision、iat更新的新有效lease | active | 本地提交后允许 | 允许 |
+| revoked后收到同rev或更旧revision active lease | revoked | 拒绝 | 允许 |
+| 中心显式恢复事件后收到更高revision、同activation generation的active lease | active | 本地提交后允许 | 允许 |
+| superseded收到普通lease；无签名transfer/recovery回执 | superseded | 拒绝 | 允许；迁移期间运维还须防双执行 |
 
-一次坏网络响应不得覆盖last-good；未过期last-good继续offline_valid。revoked/superseded/identity_mismatch/clock_suspect优先于普通时间状态；身份和时钟异常不能仅凭换token解除，先恢复绑定/校时再接受新lease。用户续费不能本地改 `subscription_end`，UI缓存也不能恢复权限。
+一次坏网络响应不得覆盖last-good；未过期last-good继续offline_valid。revoked/superseded/identity_mismatch/clock_suspect优先于普通时间状态；身份和时钟异常不能仅凭换token解除，先恢复绑定/校时再接受新lease。订阅续费由中心增加revision及截止时间；商城恢复时按当前签名权益处理，不能因revision变高本身拒绝。用户续费不能本地改 `subscription_end`，UI缓存也不能恢复权限。
 
 ## 6. 到期经营权限矩阵与最终事务
 
