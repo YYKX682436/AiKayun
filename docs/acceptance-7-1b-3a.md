@@ -19,6 +19,7 @@
 7. binding 已存在而私钥缺失、替换私钥、公钥/JKT不匹配、仅恢复 DB、仅恢复身份文件及混合备份都被拒绝；不会自动重建身份。
 8. 错误权限、目录/文件符号链接、非普通文件、额外目录项及仓库路径被拒绝。
 9. SQL UPDATE/DELETE/TRUNCATE 不能清除、修改或降级 `installation_binding`，初始化日志也不可被删除或截断。
+10. R1 在真实 PostgreSQL 上先于原实现证明两处缺口：只读 verify 未发现 intent mode 与不可变 DB journal 不一致；已有 binding 时跨 fresh/adopt_existing 重复 init 返回 ready。修复后 verify 对 intent/journal mode 冲突返回 `identity_mismatch`；fresh 与 adopt_existing 只允许同模式幂等重复，交叉模式拒绝，且不改写 intent、journal、私钥或已有商业数据。接管来源仍为 `operator_confirmed_not_verified`。
 
 ## 命令与执行证据
 
@@ -27,10 +28,10 @@
 | 项目 | 命令/证据 | 结果 |
 | --- | --- | --- |
 | 冻结依赖安装 | `pnpm install --frozen-lockfile` | 通过；lockfile up to date，pnpm 10.29.3 |
-| 身份 PostgreSQL 集成 | `NODE_ENV=test TEST_DATABASE_URL=<isolated _test PostgreSQL URL> pnpm --filter @aikayun/api exec vitest run test/installation-identity.integration.test.ts` | 18/18 通过（隔离 PG，当前轮） |
+| 身份 PostgreSQL 集成 | `NODE_ENV=test TEST_DATABASE_URL=<isolated _test PostgreSQL URL> pnpm --filter @aikayun/api exec vitest run test/installation-identity.integration.test.ts` | R1 原实现复现 2 项失败；修复后 20/20 通过（隔离 PG，包含原 18 项） |
 | 全仓 lint | `pnpm lint`（包含于 `pnpm verify`） | 通过，0 errors；`apps/web/pages/products/[id].vue` 有 7 条既有格式 warning |
 | 全仓类型检查 | `pnpm typecheck`（包含于 `pnpm verify`） | 通过 |
-| 全仓测试 | `pnpm test` | 通过；money 16/16，API 29 个文件、498/498 测试，真实 `_test` PostgreSQL |
+| 全仓测试 | `pnpm test` | 通过；money 16/16，API 29 个文件、500/500 测试，真实 `_test` PostgreSQL |
 | 全仓生产构建 | `pnpm build`（包含于 `pnpm verify`） | 通过；Nuxt 构建器访问 Google 字体元数据超时，采用 provider fallback 后构建完成 |
 | 浏览器回归及生产品牌回归 | `pnpm verify` | 通过；主套件 93/93、品牌变体 1/1、SSR 错误态 3/3、开发预览 1/1、生产品牌 1/1 |
 | Compose 容器/数据库强杀及配对备份恢复 | `node scripts/verify-digital-recovery.mjs` | 通过；隔离 API/PG 均 SIGKILL 重建，身份完全匹配，v3 配对恢复、数字履约对账差异 0，临时项目/卷/镜像已移除 |

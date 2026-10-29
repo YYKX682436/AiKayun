@@ -211,6 +211,53 @@ const integration = describe.skipIf(!testDatabaseUrl)('installation identity Pos
     })
   })
 
+  it('rejects a mismatch between the persisted intent mode and immutable database initialization history', async () => {
+    await withSandbox(async (sandbox) => {
+      await initialize(sandbox, 'fresh')
+      const intentPath = join(sandbox.identityRoot, 'current', 'identity-intent.json')
+      const intent = JSON.parse(await readFile(intentPath, 'utf8')) as Record<string, unknown>
+      await writeFile(intentPath, `${JSON.stringify({ ...intent, mode: 'adopt_existing' })}\n`, { mode: 0o600 })
+
+      expect(await verifyInstallationIdentity(sandbox.pool, sandbox.identityRoot)).toMatchObject({
+        status: 'identity_mismatch', code: 'identity_intent_journal_mismatch',
+      })
+    })
+  })
+
+  it('rejects repeated initialization in a mode different from the original fresh or adoption mode', async () => {
+    await withSandbox(async (sandbox) => {
+      const created = await initialize(sandbox, 'fresh')
+      const keyPath = join(sandbox.identityRoot, 'current', 'instance-private-key.pk8.pem')
+      const keyBefore = await readFile(keyPath)
+      const intentPath = join(sandbox.identityRoot, 'current', 'identity-intent.json')
+      const intentBefore = await readFile(intentPath)
+      await expectIdentityError(initialize(sandbox, 'adopt_existing'), 'identity_mismatch', 'initialization_mode_mismatch')
+      expect(await readFile(keyPath)).toEqual(keyBefore)
+      expect(await readFile(intentPath)).toEqual(intentBefore)
+      expect((await sandbox.pool.query('SELECT mode FROM installation_identity_initializations')).rows[0]?.mode).toBe('fresh')
+      expect(await verifyInstallationIdentity(sandbox.pool, sandbox.identityRoot)).toEqual(created)
+    })
+
+    await withSandbox(async (sandbox) => {
+      await sandbox.pool.query('CREATE TABLE orders (id integer PRIMARY KEY, total numeric NOT NULL)')
+      await sandbox.pool.query('INSERT INTO orders VALUES (1, 42.00)')
+      const before = (await sandbox.pool.query('SELECT * FROM orders')).rows
+      const adopted = await initialize(sandbox, 'adopt_existing', true)
+      expect(await initialize(sandbox, 'adopt_existing', true)).toEqual(adopted)
+      const keyPath = join(sandbox.identityRoot, 'current', 'instance-private-key.pk8.pem')
+      const keyBefore = await readFile(keyPath)
+      const intentPath = join(sandbox.identityRoot, 'current', 'identity-intent.json')
+      const intentBefore = await readFile(intentPath)
+      await expectIdentityError(initialize(sandbox, 'fresh'), 'identity_mismatch', 'initialization_mode_mismatch')
+      expect(await readFile(keyPath)).toEqual(keyBefore)
+      expect(await readFile(intentPath)).toEqual(intentBefore)
+      expect((await sandbox.pool.query('SELECT mode FROM installation_identity_initializations')).rows[0]?.mode).toBe('adopt_existing')
+      expect((await sandbox.pool.query('SELECT * FROM orders')).rows).toEqual(before)
+      expect(await verifyInstallationIdentity(sandbox.pool, sandbox.identityRoot)).toEqual(adopted)
+      expect(adopted.businessDataProvenance).toBe('operator_confirmed_not_verified')
+    })
+  })
+
   it('serializes two concurrent processes to the same durable identity', async () => {
     await withSandbox(async (sandbox) => {
       await seedEmptyBootstrapRows(sandbox.pool)

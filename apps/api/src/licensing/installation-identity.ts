@@ -83,6 +83,10 @@ interface IdentityManifest {
   private_key_file: 'instance-private-key.pk8.pem'
 }
 
+interface ValidatedIdentity extends IdentityManifest {
+  initializationMode: InstallationInitializationMode
+}
+
 const currentDirectoryName = 'current'
 const intentFileName = 'identity-intent.json'
 const manifestFileName = 'identity.json'
@@ -332,7 +336,7 @@ async function parseJsonFile(path: string, purpose: string): Promise<Record<stri
   }
 }
 
-async function readAndValidateIdentityDirectory(directory: string): Promise<IdentityManifest> {
+async function readAndValidateIdentityDirectory(directory: string): Promise<ValidatedIdentity> {
   await validateDirectory(directory, 'identity_directory')
   const entryNames = (await readdir(directory)).sort()
   const expectedNames = [intentFileName, manifestFileName, privateKeyFileName]
@@ -387,7 +391,10 @@ async function readAndValidateIdentityDirectory(directory: string): Promise<Iden
     || publicJwk.x !== jwkValue.x) {
     fail('identity_mismatch', 'identity_key_mismatch', 'Instance private key, public JWK and RFC 7638 thumbprint do not match')
   }
-  return manifestValue as unknown as IdentityManifest
+  return {
+    ...(manifestValue as unknown as IdentityManifest),
+    initializationMode: intentValue.mode as InstallationInitializationMode,
+  }
 }
 
 async function cleanupInterruptedWrites(stageDirectory: string): Promise<void> {
@@ -764,10 +771,10 @@ async function compareIdentity(
   const identity = await readAndValidateIdentityDirectory(currentPath)
   if (identity.operation_id !== journal.operation_id || identity.database_id !== binding.database_id
     || identity.instance_id !== binding.instance_id || identity.identity_jkt !== binding.identity_jkt
-    || binding.binding_revision !== '1') {
+    || binding.binding_revision !== '1' || identity.initializationMode !== journal.mode) {
     return {
       status: 'identity_mismatch',
-      code: 'identity_binding_mismatch',
+      code: identity.initializationMode !== journal.mode ? 'identity_intent_journal_mismatch' : 'identity_binding_mismatch',
       databaseId: binding.database_id,
       instanceId: binding.instance_id,
       identityJkt: binding.identity_jkt,
@@ -811,6 +818,9 @@ export async function initializeInstallationIdentity(
         fail(verified.status === 'not_verified' ? 'identity_mismatch' : verified.status,
           verified.code, 'Existing database binding does not match a complete instance identity; automatic replacement is forbidden')
       }
+      if (verified.initializationMode !== options.mode) {
+        fail('identity_mismatch', 'initialization_mode_mismatch', 'Repeated initialization must use the original persisted initialization mode')
+      }
       return verified
     }
 
@@ -851,7 +861,7 @@ export async function initializeInstallationIdentity(
       journal = { operation_id: operationId, mode: options.mode, state: 'preparing' }
       await options.onCheckpoint?.('initialization_journal_committed')
     } else if (journal.mode !== options.mode) {
-      fail('not_verified', 'initialization_mode_mismatch', 'Resume must use the same explicit initialization mode as the persisted journal')
+      fail('identity_mismatch', 'initialization_mode_mismatch', 'Resume must use the same explicit initialization mode as the persisted journal')
     }
 
     const otherStages = (await listInitializationStages(root)).filter(operationId => operationId !== journal?.operation_id)
