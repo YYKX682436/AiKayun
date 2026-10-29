@@ -35,7 +35,7 @@
 | 浏览器回归及生产品牌回归 | `pnpm verify` | 通过；主套件 93/93、品牌变体 1/1、SSR 错误态 3/3、开发预览 1/1、生产品牌 1/1 |
 | Compose 容器/数据库强杀及配对备份恢复 | `node scripts/verify-digital-recovery.mjs` | 通过；隔离 API/PG 均 SIGKILL 重建，身份完全匹配，v3 配对恢复、数字履约对账差异 0，临时项目/卷/镜像已移除 |
 | 迁移与私钥隔离 | migration provider、Compose Docker build 与镜像文件检查 | 新迁移由 API / Playwright 测试和隔离 Compose 实际应用；runtime image 扫描 `/app` 得到 `pkcs8Names=0,pemBlocks=0`，私钥只在运行时身份 volume |
-| 差异/仓库清洁 | `git diff --check`、`bash -n ...`、`node --check ...` | 静态检查通过；资源清理和提交后工作区检查待完成 |
+| 差异/仓库清洁 | `git diff --check`、`bash -n ...`、`node --check ...` | 通过；本轮生成的构建/Playwright 输出及隔离 PG/Compose/临时镜像已清理，提交推送后 `main` 工作区干净 |
 
 补充的 Compose 恢复验收在独立随机项目和端口中启动容器，恢复 DB、公开媒体、私有文件和身份 volume 为一组，并在 API / DB 容器强杀重建后再次比较身份与业务快照。它不会重启或操作默认商城 Compose 项目。生产数据库、授权中心和外部商家均不在本验收范围。
 
