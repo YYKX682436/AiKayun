@@ -38,6 +38,7 @@ export interface AppConfig {
   mediaRoot: string
   privateFileRoot: string
   identityRoot: string
+  licenseTrustStoreRoot: string
   supplierHttpTestAllowlist: string[]
   database: PoolConfig
   paymentCredentialKeyRing: PaymentCredentialKeyRing | null
@@ -162,6 +163,11 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error('INSTANCE_IDENTITY_ROOT must be an absolute path')
   }
   const identityRoot = resolve(configuredIdentityRoot ?? join(xdgDataHome, 'aikayun', 'identity'))
+  const configuredLicenseTrustStoreRoot = env.LICENSE_TRUST_STORE_ROOT
+  if (configuredLicenseTrustStoreRoot && !isAbsolute(configuredLicenseTrustStoreRoot)) {
+    throw new Error('LICENSE_TRUST_STORE_ROOT must be an absolute path')
+  }
+  const licenseTrustStoreRoot = resolve(configuredLicenseTrustStoreRoot ?? join(xdgDataHome, 'aikayun', 'license-trust'))
   const repo = repositoryRoot()
   if (repo && isWithin(repo, mediaRoot)) {
     throw new Error('MEDIA_ROOT must be outside the repository')
@@ -178,6 +184,13 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (isWithin(mediaRoot, identityRoot) || isWithin(identityRoot, mediaRoot)
     || isWithin(privateFileRoot, identityRoot) || isWithin(identityRoot, privateFileRoot)) {
     throw new Error('INSTANCE_IDENTITY_ROOT, MEDIA_ROOT and PRIVATE_FILE_ROOT must use isolated storage namespaces')
+  }
+  if (repo && isWithin(repo, licenseTrustStoreRoot)) {
+    throw new Error('LICENSE_TRUST_STORE_ROOT must be outside the repository')
+  }
+  const persistentRoots = [mediaRoot, privateFileRoot, identityRoot]
+  if (persistentRoots.some(root => isWithin(root, licenseTrustStoreRoot) || isWithin(licenseTrustStoreRoot, root))) {
+    throw new Error('LICENSE_TRUST_STORE_ROOT must use its own isolated API storage namespace')
   }
 
   const database: PoolConfig = env.DATABASE_URL
@@ -217,6 +230,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     mediaRoot,
     privateFileRoot,
     identityRoot,
+    licenseTrustStoreRoot,
     supplierHttpTestAllowlist,
     database,
     paymentCredentialKeyRing: parsePaymentCredentialKeyRing(env.PAYMENT_CREDENTIAL_KEY_RING),

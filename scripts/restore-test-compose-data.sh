@@ -21,12 +21,13 @@ backup_directory="$1"
 if [[ ! -f "$backup_directory/database.dump" || ! -f "$backup_directory/media.tar.gz" \
   || ! -f "$backup_directory/private-files.tar.gz" \
   || ! -f "$backup_directory/identity.tar.gz" \
+  || ! -f "$backup_directory/license-trust-store.tar.gz" \
   || ! -f "$backup_directory/SHA256SUMS" || ! -f "$backup_directory/manifest.txt" ]]; then
   printf 'The backup is incomplete.\n' >&2
   exit 2
 fi
-if ! grep -Fxq 'format=aikayun-compose-backup-v3' "$backup_directory/manifest.txt"; then
-  printf 'The backup manifest format is unsupported; expected v3 with paired instance identity.\n' >&2
+if ! grep -Fxq 'format=aikayun-compose-backup-v4' "$backup_directory/manifest.txt"; then
+  printf 'The backup manifest format is unsupported; expected v4 with paired instance identity and license trust store.\n' >&2
   exit 2
 fi
 (cd "$backup_directory" && sha256sum -c SHA256SUMS)
@@ -44,9 +45,11 @@ fi
 media_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.MEDIA_ROOT || "")')"
 private_file_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.PRIVATE_FILE_ROOT || "")')"
 identity_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.INSTANCE_IDENTITY_ROOT || "")')"
+license_trust_store_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.LICENSE_TRUST_STORE_ROOT || "")')"
 media_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$media_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
 private_file_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$private_file_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
 identity_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$identity_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
+license_trust_store_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$license_trust_store_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
 if [[ "$media_volume" != "${COMPOSE_PROJECT_NAME}_product_media" ]]; then
   printf 'Refusing restore because the media volume is not the project-scoped product_media volume.\n' >&2
   exit 2
@@ -57,6 +60,10 @@ if [[ "$private_file_volume" != "${COMPOSE_PROJECT_NAME}_private_files" ]]; then
 fi
 if [[ "$identity_volume" != "${COMPOSE_PROJECT_NAME}_instance_identity" ]]; then
   printf 'Refusing restore because the identity volume is not the project-scoped instance_identity volume.\n' >&2
+  exit 2
+fi
+if [[ "$license_trust_store_volume" != "${COMPOSE_PROJECT_NAME}_license_trust_store" ]]; then
+  printf 'Refusing restore because the license trust store is not the project-scoped license_trust_store volume.\n' >&2
   exit 2
 fi
 
@@ -74,5 +81,8 @@ docker compose run --rm --no-deps -T --entrypoint sh api -c \
 docker compose run --rm --no-deps -T --entrypoint sh api -c \
   'node -e '\''const fs=require("node:fs"),path=require("node:path"),root=process.env.INSTANCE_IDENTITY_ROOT;for(const name of fs.readdirSync(root))fs.rmSync(path.join(root,name),{recursive:true,force:true})'\'' && tar -xzf - -C "$INSTANCE_IDENTITY_ROOT"' \
   < "$backup_directory/identity.tar.gz"
+docker compose run --rm --no-deps -T --entrypoint sh api -c \
+  'node -e '\''const fs=require("node:fs"),path=require("node:path"),root=process.env.LICENSE_TRUST_STORE_ROOT;for(const name of fs.readdirSync(root))fs.rmSync(path.join(root,name),{recursive:true,force:true})'\'' && tar -xzf - -C "$LICENSE_TRUST_STORE_ROOT"' \
+  < "$backup_directory/license-trust-store.tar.gz"
 docker compose start api web caddy
 printf 'Restored the verified backup into isolated database %s.\n' "$database_name"

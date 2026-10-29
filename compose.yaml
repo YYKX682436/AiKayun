@@ -58,6 +58,18 @@ services:
       - private_files:${PRIVATE_FILE_ROOT:-/var/lib/aikayun/private-files}
     restart: "no"
 
+  license-trust-init:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p \"$$LICENSE_TRUST_STORE_ROOT\" && chown node:node \"$$LICENSE_TRUST_STORE_ROOT\" && chmod 700 \"$$LICENSE_TRUST_STORE_ROOT\""]
+    environment:
+      LICENSE_TRUST_STORE_ROOT: ${LICENSE_TRUST_STORE_ROOT:-/var/lib/aikayun/license-trust}
+    volumes:
+      - license_trust_store:${LICENSE_TRUST_STORE_ROOT:-/var/lib/aikayun/license-trust}
+    restart: "no"
+
   api:
     build:
       context: .
@@ -79,12 +91,14 @@ services:
       MEDIA_ROOT: ${MEDIA_ROOT:-/var/lib/aikayun/media}
       PRIVATE_FILE_ROOT: ${PRIVATE_FILE_ROOT:-/var/lib/aikayun/private-files}
       INSTANCE_IDENTITY_ROOT: ${INSTANCE_IDENTITY_ROOT:-/var/lib/aikayun/identity}
+      LICENSE_TRUST_STORE_ROOT: ${LICENSE_TRUST_STORE_ROOT:-/var/lib/aikayun/license-trust}
     expose:
       - "3001"
     volumes:
       - product_media:${MEDIA_ROOT:-/var/lib/aikayun/media}
       - private_files:${PRIVATE_FILE_ROOT:-/var/lib/aikayun/private-files}
       - instance_identity:${INSTANCE_IDENTITY_ROOT:-/var/lib/aikayun/identity}
+      - license_trust_store:${LICENSE_TRUST_STORE_ROOT:-/var/lib/aikayun/license-trust}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
@@ -99,6 +113,8 @@ services:
       media-init:
         condition: service_completed_successfully
       private-file-init:
+        condition: service_completed_successfully
+      license-trust-init:
         condition: service_completed_successfully
     restart: unless-stopped
 
@@ -149,5 +165,6 @@ volumes:
   product_media:
   private_files:
   instance_identity:
+  license_trust_store:
   caddy_data:
   caddy_config:

@@ -20,10 +20,12 @@ FROM node:24.22.0-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659b
 
 ENV NODE_ENV=production
 WORKDIR /app
-RUN mkdir -p /var/lib/aikayun/media /var/lib/aikayun/private-files /var/lib/aikayun/identity \
-  && chown node:node /var/lib/aikayun/media /var/lib/aikayun/private-files /var/lib/aikayun/identity \
-  && chmod 700 /var/lib/aikayun/private-files /var/lib/aikayun/identity
-COPY --from=build --chown=node:node /prod/api/ ./
+RUN mkdir -p /var/lib/aikayun/media /var/lib/aikayun/private-files /var/lib/aikayun/identity /var/lib/aikayun/license-trust \
+  && chown node:node /var/lib/aikayun/media /var/lib/aikayun/private-files /var/lib/aikayun/identity /var/lib/aikayun/license-trust \
+  && chmod 700 /var/lib/aikayun/private-files /var/lib/aikayun/identity /var/lib/aikayun/license-trust
+COPY --from=build --chown=node:node /prod/api/package.json ./package.json
+COPY --from=build --chown=node:node /prod/api/node_modules ./node_modules
+COPY --from=build --chown=node:node /prod/api/dist ./dist
 USER node
 EXPOSE 3001
 CMD ["node", "dist/index.js"]

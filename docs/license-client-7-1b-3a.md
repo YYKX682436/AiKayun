@@ -62,7 +62,7 @@ pnpm --filter @aikayun/api exec tsx src/licensing/installation-identity-cli.ts i
 
 ## 备份与恢复顺序
 
-数据库与实例目录必须作为同一静止点的配对成员保存。`scripts/backup-compose-data.sh` 现在生成 `aikayun-compose-backup-v3`，包含 PostgreSQL custom dump、媒体归档、私有文件归档、`identity.tar.gz` 和 SHA-256 校验。备份包含私钥，应按部署环境要求加密、限制访问并存放于独立持久位置；解密材料不得与明文备份放在一起。
+数据库与实例目录必须作为同一静止点的配对成员保存。**3A验收时** `scripts/backup-compose-data.sh` 生成 `aikayun-compose-backup-v3`，包含 PostgreSQL custom dump、媒体归档、私有文件归档、`identity.tar.gz` 和 SHA-256 校验。3B明确升级当前备份格式为 v4，新增独立授权 Trust Store 归档；该版本变化及恢复脚本约束见[3B客户端说明](license-client-7-1b-3b.md)。身份归档包含私钥，应按部署环境要求加密、限制访问并存放于独立持久位置；解密材料不得与明文备份放在一起。
 
 恢复必须在隔离环境按顺序执行：停止服务写入 → 校验清单与所有 SHA-256 → 恢复数据库 → 恢复媒体/私有文件/身份卷 → 启动 API → 运行 `identity:verify`。只有数据库与 identity archive 是同一备份集合，`verify` 才应返回 `ready`。只还原数据库、只还原身份目录，或混用不同备份集合都必须报错并停止；不得通过重跑 init 补发密钥。当前 `scripts/restore-test-compose-data.sh` 只接受项目隔离的 `_test` 数据库和 v3 成套备份，用于测试恢复，不是生产恢复入口。
 

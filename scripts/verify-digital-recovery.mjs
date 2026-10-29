@@ -29,6 +29,7 @@ const origin = `http://localhost:${httpPort}`
 const ring = JSON.stringify({ activeKeyId: 'current-test', keys: {
   'current-test': randomBytes(32).toString('base64'), 'legacy-test': randomBytes(32).toString('base64'),
 } })
+const trustStoreMarker = randomBytes(24).toString('base64url')
 const overridePath = join(directory, 'supplier-fixture.json')
 await chmod(directory, 0o777)
 await writeFile(overridePath, JSON.stringify({ services: { api: {
@@ -40,6 +41,7 @@ await writeFile(overridePath, JSON.stringify({ services: { api: {
     `${join(workspace, 'scripts/fixtures/procurement-selection-loader.mjs')}:/test/procurement-selection-loader.mjs:ro`,
     `${join(workspace, 'scripts/fixtures/seed-procurement-recovery.mjs')}:/test/seed-procurement-recovery.mjs:ro`,
     `${join(workspace, 'scripts/fixtures/verify-procurement-recovery.mjs')}:/test/verify-procurement-recovery.mjs:ro`,
+    `${join(workspace, 'apps/api/test/fixtures/trust-store-compose-restore.mjs')}:/app/trust-store-compose-restore.mjs:ro`,
     `${supplierDirectory}:/test-output`,
   ],
 } } }))
@@ -51,6 +53,7 @@ const env = {
   PG_PORT: await port(), HTTP_PORT: httpPort, HTTPS_PORT: await port(), API_PORT: await port(),
   ZPAY_FIXTURE_PORT: supplierPort, HTTP_BIND_ADDRESS: '127.0.0.1', SITE_ADDRESS: ':80', PUBLIC_ORIGIN: origin,
   COOKIE_SECURE: 'false', TRUST_PROXY: 'true', MEDIA_ROOT: '/var/lib/aikayun/media', PRIVATE_FILE_ROOT: '/var/lib/aikayun/private-files',
+  LICENSE_TRUST_STORE_ROOT: '/var/lib/aikayun/license-trust',
   PAYMENT_CREDENTIAL_KEY_RING: ring, CODE_POOL_ENCRYPTION_KEY_RING: ring,
   NUXT_PUBLIC_SITE_URL: origin,
 }
@@ -105,6 +108,11 @@ try {
   const verifiedIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', 'node',
     'dist/licensing/installation-identity-cli.js', 'verify'))
   assert.deepEqual(verifiedIdentity, initializedIdentity)
+  const trustFixtureOutput = compose('exec', '-T', 'api', 'node', '/app/trust-store-compose-restore.mjs', 'import')
+  const trustFixtureLine = trustFixtureOutput.split('\n').find(line => line.startsWith('TRUST_STORE_FIXTURE='))
+  assert.ok(trustFixtureLine, `isolated trust store seed did not emit metadata: ${trustFixtureOutput}`)
+  const trustFixture = JSON.parse(trustFixtureLine.slice('TRUST_STORE_FIXTURE='.length))
+  compose('exec', '-T', 'api', 'node', '-e', `require('node:fs').writeFileSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'),${JSON.stringify(trustStoreMarker)}+'\\n',{mode:0o600})`)
   proof.installationIdentity = {
     databaseId: initializedIdentity.databaseId,
     instanceId: initializedIdentity.instanceId,
@@ -265,17 +273,28 @@ try {
     assert.equal(snapshot(), facts)
     proof.sigkill.push({ service, replaced: true, historyIdentical: true, sha256: digest })
   }
-  console.log('Back up the database, file volumes and instance identity, then restore after a missing-file fault')
+  console.log('Back up the database, file volumes, instance identity and trust store, then restore after a missing-file fault')
   command('bash', ['scripts/backup-compose-data.sh', join(directory, 'backup')])
   await ready()
   await verifyDownload()
   const backups = await readdir(join(directory, 'backup'))
   assert.equal(backups.length, 1)
+  compose('exec', '-T', 'api', 'node', '-e', `require('node:fs').unlinkSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'))`)
+  compose('exec', '-T', 'api', 'node', '-e', `const fs=require('node:fs'),path=require('node:path'),root=process.env.LICENSE_TRUST_STORE_ROOT;for(const name of ['trust-bundle-state.json','trust-bundle-store.marker.json'])fs.rmSync(path.join(root,name),{force:true})`)
   compose('exec', '-T', 'api', 'node', '-e', `const fs=require('node:fs'),path=require('node:path'),id=${JSON.stringify(uploaded.uploadId)};fs.unlinkSync(path.join(process.env.PRIVATE_FILE_ROOT,'objects',id.slice(0,2),id+'.bin'))`)
   const missing = await fetch(`${origin}${downloadPath}`, { headers: headers(customer) })
   assert.equal(missing.status, 410)
   command('bash', ['scripts/restore-test-compose-data.sh', join(directory, 'backup', backups[0])], { env: { ...env, ALLOW_TEST_DATABASE_RESTORE: 'YES' } })
   await ready()
+  const restoredTrustMarker = compose('exec', '-T', 'api', 'node', '-e', `process.stdout.write(require('node:fs').readFileSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'),'utf8').trim())`).trim()
+  assert.equal(restoredTrustMarker, trustStoreMarker)
+  const trustRestoreOutput = compose('exec', '-T', '-e', `TRUST_STORE_TEST_FIXTURE=${JSON.stringify(trustFixture)}`,
+    'api', 'node', '/app/trust-store-compose-restore.mjs', 'verify')
+  const trustRestoreLine = trustRestoreOutput.split('\n').find(line => line.startsWith('TRUST_STORE_RESTORED='))
+  assert.ok(trustRestoreLine, `restored trust bundle was not verified: ${trustRestoreOutput}`)
+  const restoredTrust = JSON.parse(trustRestoreLine.slice('TRUST_STORE_RESTORED='.length))
+  assert.equal(restoredTrust.bundleVersion, trustFixture.bundleVersion)
+  assert.equal(restoredTrust.artifactSha256, trustFixture.artifactSha256)
   const restoredIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', 'node',
     'dist/licensing/installation-identity-cli.js', 'verify'))
   assert.deepEqual(restoredIdentity, initializedIdentity)
@@ -291,6 +310,7 @@ try {
   assert.equal(reconciliation.needsAttention, false)
   assert.equal(reconciliation.verifiedObjects, 1)
   proof.backupRestore = true
+  proof.trustStoreBackupRestore = true
   proof.fileSha256 = digest
   proof.paymentReceipts = 5
   proof.procurementPaymentReceipts = 4

@@ -51,21 +51,21 @@
 
 Compose 的 `private_files` 命名卷与 `product_media`、`postgres_data` 分开持久化。只重建容器不会删除这些卷；不要在需要保留数据时执行 `docker compose down -v`。部署根目录的 `.env` 应显式设置 `PRIVATE_FILE_ROOT=/var/lib/aikayun/private-files`，并保持该路径独立于 `MEDIA_ROOT`。
 
-`scripts/backup-compose-data.sh BACKUP_ROOT` 会停 API，在同一静止窗口导出 PostgreSQL、公开媒体、私有文件和独立安装身份目录，写入 `aikayun-compose-backup-v3` 清单及各归档 SHA-256 校验后恢复 API。身份归档包括 Ed25519 PKCS#8 私钥，备份应保存在访问受控、静态加密的异地介质中，解密材料单独托管。测试恢复使用隔离 `_test` 项目和完整 v3 配对备份，不要把恢复脚本用于生产。建议定期在独立测试 Compose 项目执行：
+`scripts/backup-compose-data.sh BACKUP_ROOT` 会停 API，在同一静止窗口导出 PostgreSQL、公开媒体、私有文件、独立安装身份目录和独立授权 Trust Store，写入 `aikayun-compose-backup-v4` 清单及各归档 SHA-256 校验后恢复 API。身份归档包括 Ed25519 PKCS#8 私钥；信任归档包括根签名 Trust Bundle 与单调 checkpoint。两者均须保存在访问受控、静态加密的异地介质中，解密材料单独托管。测试恢复只接受隔离 `_test` 项目和完整 v4 配对备份，不要把恢复脚本用于生产。建议定期在独立测试 Compose 项目执行：
 
 ```sh
-COMPOSE_PROJECT_NAME=aikayun-private-restore-test \
-POSTGRES_DB=aikayun_private_restore_test \
-PG_PORT=15433 HTTP_PORT=28080 HTTPS_PORT=28443 \
+export COMPOSE_PROJECT_NAME=aikayun-private-restore-test
+export POSTGRES_DB=aikayun_private_restore_test
+export PG_PORT=15433 HTTP_PORT=28080 HTTPS_PORT=28443
 docker compose up -d --build
 
 ALLOW_TEST_DATABASE_RESTORE=YES \
-scripts/restore-test-compose-data.sh /secure/backups/20261021T120000Z
+scripts/restore-test-compose-data.sh /secure/backups/20261030T120000Z # replace with an existing v4 backup directory
 
 docker compose exec -T api node dist/media/private-file-reconcile-cli.js --check
 ```
 
-恢复脚本仅接受 `_test` 数据库、`test`/`restore` 项目、完整 v2 备份、校验通过的三个归档及项目专属媒体/私有文件卷。恢复后要求检查器报告全部历史对象已验证，再登录顾客订单下载历史文件并对下载字节做 SHA-256 对比；仅仅看到版本元数据或目录文件名不够。出现缺失/损坏时先从同一备份恢复整组 PostgreSQL/媒体/私有文件，不要仅恢复数据库或覆盖包含较新订单的数据卷。
+恢复脚本仅接受 `_test` 数据库、`test`/`restore` 项目、完整 v4 备份、所有归档校验通过以及项目专属媒体、私有文件、身份和信任卷。恢复后要求检查器报告全部历史对象已验证，再登录顾客订单下载历史文件并对下载字节做 SHA-256 对比；仅仅看到版本元数据或目录文件名不够。出现缺失/损坏时先从同一备份恢复整组 PostgreSQL、媒体、私有文件、身份和信任状态，不要仅恢复数据库或覆盖包含较新订单的数据卷。
 
 `private-files:check` 只读核验当前对象；`private-files:repair` 只修复状态、暂停损坏版本的当前销售，并清理超过 24 小时、已确认无历史引用的孤儿/暂存文件。没有未解决问题时再次检查应报告 `needsAttention=false`；仍缺失或损坏的历史引用会继续报告 `needsAttention=true`，必须先从完整备份恢复同一摘要的文件。修复工具不删历史对象，也不重新开启销售；管理员应在后台核对摘要并明确启用。
 
