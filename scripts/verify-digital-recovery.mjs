@@ -99,6 +99,17 @@ try {
   console.log('Starting isolated recovery Compose project')
   compose('up', '-d', '--build')
   await ready()
+  const initializedIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', 'node',
+    'dist/licensing/installation-identity-cli.js', 'init', '--mode', 'fresh'))
+  assert.equal(initializedIdentity.status, 'ready')
+  const verifiedIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', 'node',
+    'dist/licensing/installation-identity-cli.js', 'verify'))
+  assert.deepEqual(verifiedIdentity, initializedIdentity)
+  proof.installationIdentity = {
+    databaseId: initializedIdentity.databaseId,
+    instanceId: initializedIdentity.instanceId,
+    identityJkt: initializedIdentity.identityJkt,
+  }
   compose('exec', '-d', 'api', 'node', '--experimental-strip-types', '/test/http-json-v1-server.ts', '--serve')
   await until(() => {
     compose('exec', '-T', 'api', 'node', '-e', "fetch('http://127.0.0.1:3101/__fixture/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))")
@@ -254,7 +265,7 @@ try {
     assert.equal(snapshot(), facts)
     proof.sigkill.push({ service, replaced: true, historyIdentical: true, sha256: digest })
   }
-  console.log('Back up the database and both file volumes, then restore after a missing-file fault')
+  console.log('Back up the database, file volumes and instance identity, then restore after a missing-file fault')
   command('bash', ['scripts/backup-compose-data.sh', join(directory, 'backup')])
   await ready()
   await verifyDownload()
@@ -265,6 +276,9 @@ try {
   assert.equal(missing.status, 410)
   command('bash', ['scripts/restore-test-compose-data.sh', join(directory, 'backup', backups[0])], { env: { ...env, ALLOW_TEST_DATABASE_RESTORE: 'YES' } })
   await ready()
+  const restoredIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', 'node',
+    'dist/licensing/installation-identity-cli.js', 'verify'))
+  assert.deepEqual(restoredIdentity, initializedIdentity)
   compose('exec', '-d', 'api', 'node', '/test/procurement-supplier-process.mjs', '/test-output/procurement-supplier', '3102')
   await until(async () => {
     compose('exec', '-T', 'api', 'node', '-e', "fetch('http://127.0.0.1:3102/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))")

@@ -34,14 +34,16 @@ docker compose run --rm --no-deps -T --entrypoint sh api \
   -c 'tar -czf - -C "$MEDIA_ROOT" .' > "$temp_directory/media.tar.gz"
 docker compose run --rm --no-deps -T --entrypoint sh api \
   -c 'tar -czf - -C "$PRIVATE_FILE_ROOT" .' > "$temp_directory/private-files.tar.gz"
+docker compose run --rm --no-deps -T --entrypoint sh api \
+  -c 'tar -czf - -C "$INSTANCE_IDENTITY_ROOT" .' > "$temp_directory/identity.tar.gz"
 
-printf 'format=aikayun-compose-backup-v2\ncreated_utc=%s\nproject=%s\ndatabase=%s\n' \
+printf 'format=aikayun-compose-backup-v3\ncreated_utc=%s\nproject=%s\ndatabase=%s\n' \
   "$timestamp" "${COMPOSE_PROJECT_NAME:-compose-default}" "$database_name" > "$temp_directory/manifest.txt"
-(cd "$temp_directory" && sha256sum database.dump media.tar.gz private-files.tar.gz > SHA256SUMS)
+(cd "$temp_directory" && sha256sum database.dump media.tar.gz private-files.tar.gz identity.tar.gz > SHA256SUMS)
 backup_path="$backup_root/$timestamp"
 if [[ -e "$backup_path" ]]; then
   printf 'Backup destination already exists: %s\n' "$backup_path" >&2
   exit 1
 fi
 mv "$temp_directory" "$backup_path"
-printf 'Created verified database, public-media and private-file backup: %s\n' "$backup_path"
+printf 'Created verified database, file and paired instance-identity backup: %s\n' "$backup_path"

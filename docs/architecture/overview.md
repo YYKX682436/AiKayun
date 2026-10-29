@@ -176,11 +176,11 @@ Fastify 的 `/api/v1/public/*` 接口与管理员接口分离，使用独立 Typ
 
 ④-1建立迁移、类型、钱包记账基础函数、数据库约束、状态投影和 PostgreSQL 集成测试。④-2至④-6增加顾客认证、购物车、订单 API、库存、限购和人工数字交付；④-7/④-8增加 ZPAY 在线支付、回调/主动查单、异常核对、钱包、在线充值及组合支付；④-9A增加顾客钱包退款和游客人工原路退款；④-9B增加手续费、现金冻结、商家审核与人工提现打款，并复用原钱包账本；⑤-1增加卡密池，⑤-2增加固定文本和 HTTPS 链接自动交付，均复用原订单履约系统。真实商户收款、线下退款和提现打款仍需真实资金凭证核验；自动原路退款未实现。余额转账、账号资源池、文件/API 发货仍未实现。验收和使用细节见[固定内容与固定链接自动交付](../digital-fixed-delivery.md)、[卡密池数字交付](../digital-code-pool.md)、[订单退款与售后](../order-refunds.md)、[在线支付协议与运行手册](../online-payments.md)及[提现与人工打款](../withdrawals.md)。
 
-部署前恢复方案沿用 [部署与恢复](../deployment.md)：先用 `scripts/backup-compose-data.sh` 同时保存 PostgreSQL custom dump 与商品媒体，再用隔离 Compose 项目、`_test` 数据库和项目专属媒体卷执行 `scripts/restore-test-compose-data.sh` 验证校验与恢复。若生产迁移失败，停止写入并从已验证的迁移前数据库/媒体备份恢复，再部署兼容版本；本次只在本机隔离 PostgreSQL 测试库验证前向升级，没有连接或迁移生产环境，也没有声称已完成生产备份恢复演练。
+部署恢复方案沿用[部署与恢复](../deployment.md)：`scripts/backup-compose-data.sh` 在同一静止窗口保存 PostgreSQL custom dump、商品媒体、私有交付文件和安装身份目录；隔离恢复验证使用 `_test` 数据库及项目专属卷，并要求恢复 v3 配对身份归档。若生产迁移失败，停止写入并从同一已验证备份集合恢复，再部署兼容版本；具体恢复能力与生产验证边界以运维手册和对应验收记录为准。
 
 ## 部署边界
 
-Compose 启动时先等 PostgreSQL 健康，再运行一次性迁移容器，之后启动 API、Nuxt SSR 和 Caddy。PG18 官方镜像卷挂在 `/var/lib/postgresql`，以覆盖 PG18 的版本化数据目录。所有镜像按当前稳定标签和 manifest digest 固定。站点域名、外部 HTTPS、PostgreSQL 密码均通过本地未跟踪的 `.env` 注入；本阶段没有授权中心、安装器或更新器。
+Compose 启动时先等 PostgreSQL 健康，再运行一次性迁移容器，之后启动 API、Nuxt SSR 和 Caddy。PG18 官方镜像卷挂在 `/var/lib/postgresql`，以覆盖 PG18 的版本化数据目录。所有镜像按当前稳定标签和 manifest digest 固定。站点域名、外部 HTTPS、PostgreSQL 密码均通过本地未跟踪的 `.env` 注入。⑦-1B-3A增加本地安装身份基础，但没有授权中心客户端、正式安装器或更新器；身份 CLI 仅在隔离开发/测试环境启用，普通 API 启动不会初始化身份，也没有经营授权门禁。
 
 ## 供应商只读连接（⑥-1）
 

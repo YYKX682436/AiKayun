@@ -83,7 +83,7 @@ pnpm --filter @aikayun/api purchase-drafts:repair
 
 检查只输出计数。修复器按到期草稿、失败/中断上传、待删除附件和无有效引用对象分批处理，最多每批 500；清理对象需经过 24 小时宽限、数据库状态/引用核对与锁定。重复修复安全。旧清理器不检查 `purchase-attachments`，新清理器不扫描旧 `objects/`/`staging`。
 
-现有 `scripts/backup-compose-data.sh` 在同一静止窗口备份 PostgreSQL、公开媒体和整个 `PRIVATE_FILE_ROOT`，因此包含新增命名空间；清单为 v2 并校验三个归档 SHA-256。`scripts/restore-test-compose-data.sh` 仅允许明确的隔离测试 Compose 项目及 `_test` 数据库。恢复验收应从代表性数据库样本和 private-file 根目录副本恢复到隔离副本，并比较模板版本、草稿身份/修订、附件关系和附件 SHA-256。卷与备份静态加密仍由部署环境负责。
+当前 `scripts/backup-compose-data.sh` 在同一静止窗口备份 PostgreSQL、公开媒体、整个 `PRIVATE_FILE_ROOT` 和独立 `INSTANCE_IDENTITY_ROOT`，v3 清单校验四个归档的 SHA-256。身份归档含 PKCS#8 实例私钥，备份必须静态加密并由部署环境单独托管解密材料。`scripts/restore-test-compose-data.sh` 仅允许明确的隔离测试 Compose 项目、`_test` 数据库及同一 v3 身份归档。恢复验收应从代表性数据库样本和 private-file 根目录副本恢复到隔离副本，并比较模板版本、草稿身份/修订、附件关系和附件 SHA-256。卷与备份静态加密仍由部署环境负责。
 
 ## 后台准备界面及启用隔离
 

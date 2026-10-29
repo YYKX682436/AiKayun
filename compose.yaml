@@ -78,11 +78,13 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       MEDIA_ROOT: ${MEDIA_ROOT:-/var/lib/aikayun/media}
       PRIVATE_FILE_ROOT: ${PRIVATE_FILE_ROOT:-/var/lib/aikayun/private-files}
+      INSTANCE_IDENTITY_ROOT: ${INSTANCE_IDENTITY_ROOT:-/var/lib/aikayun/identity}
     expose:
       - "3001"
     volumes:
       - product_media:${MEDIA_ROOT:-/var/lib/aikayun/media}
       - private_files:${PRIVATE_FILE_ROOT:-/var/lib/aikayun/private-files}
+      - instance_identity:${INSTANCE_IDENTITY_ROOT:-/var/lib/aikayun/identity}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
@@ -146,5 +148,6 @@ volumes:
   postgres_data:
   product_media:
   private_files:
+  instance_identity:
   caddy_data:
   caddy_config:

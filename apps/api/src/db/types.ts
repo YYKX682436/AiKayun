@@ -21,6 +21,25 @@ export interface AdminSessionsTable {
   revoked_at: Date | null
 }
 
+export interface InstallationIdentityInitializationsTable {
+  singleton: Generated<boolean>
+  operation_id: string
+  mode: 'fresh' | 'adopt_existing'
+  state: 'preparing' | 'identity_material_saved' | 'identity_staged' | 'committed'
+  created_at: Generated<Date>
+  committed_at: Date | null
+}
+
+export interface InstallationBindingTable {
+  singleton: Generated<boolean>
+  database_id: string
+  instance_id: string
+  identity_jkt: string
+  binding_revision: Generated<string>
+  binding_state: 'ready' | 'rebind_pending'
+  created_at: Generated<Date>
+}
+
 export interface AdminProductCreationRequestsTable {
   idempotency_key: string
   administrator_id: string
@@ -1370,6 +1389,8 @@ export interface ProductManagementAuditEventsTable {
 }
 
 export interface Database {
+  installation_identity_initializations: InstallationIdentityInitializationsTable
+  installation_binding: InstallationBindingTable
   admin_users: AdminUsersTable
   admin_sessions: AdminSessionsTable
   admin_product_creation_requests: AdminProductCreationRequestsTable

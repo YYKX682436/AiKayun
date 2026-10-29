@@ -43,11 +43,11 @@ docker compose exec -e ADMIN_INITIAL_EMAIL=owner@example.com -e ADMIN_INITIAL_PA
 
 ## 数据、升级和回滚
 
-PostgreSQL 18 使用命名卷 `postgres_data` 并挂载至 `/var/lib/postgresql`，覆盖 PG18 的实际版本化 PGDATA 路径。商品图片使用独立命名卷 `product_media`，默认挂载在 `/var/lib/aikayun/media`，目录通过 `MEDIA_ROOT` 配置。数字商品私有文件使用另一个 `private_files` 命名卷，默认挂载在 `/var/lib/aikayun/private-files`，目录通过 `PRIVATE_FILE_ROOT` 配置；它不能与公开媒体目录重合或嵌套。一次性 `media-init` 和 `private-file-init` 容器分别初始化所有权/权限，运行中的 Fastify API 始终使用非 root `node` 用户。`docker compose up -d --build` 或容器重建不会移除这三个数据卷；不要用 `docker compose down -v` 保留数据。
+PostgreSQL 18 使用命名卷 `postgres_data` 并挂载至 `/var/lib/postgresql`，覆盖 PG18 的实际版本化 PGDATA 路径。商品图片使用独立命名卷 `product_media`，默认挂载在 `/var/lib/aikayun/media`，目录通过 `MEDIA_ROOT` 配置。数字商品私有文件使用另一个 `private_files` 命名卷，默认挂载在 `/var/lib/aikayun/private-files`，目录通过 `PRIVATE_FILE_ROOT` 配置；实例身份使用独立的 `instance_identity` 命名卷，默认挂载在 `/var/lib/aikayun/identity`，由 `INSTANCE_IDENTITY_ROOT` 配置。三个 API 数据目录互不重合，身份卷仅挂给 API。一次性媒体/私有文件初始化容器负责对应目录权限；API 容器内身份根和私钥使用 POSIX `0700`/`0600`，API 进程使用非 root `node` 用户。`docker compose up -d --build` 或容器重建不会移除这四个数据卷；不要用 `docker compose down -v` 保留数据。
 
-PostgreSQL 元数据、公开媒体和 `PRIVATE_FILE_ROOT` 私有文件卷必须作为同一备份时间点的一组数据保存。该私有卷包括数字交付对象和⑥-2A新增的隔离 `purchase-attachments/` 命名空间。仓库提供 `scripts/backup-compose-data.sh BACKUP_ROOT`：它先停止 API 以静止业务写入，再生成 PostgreSQL custom dump、打包 `MEDIA_ROOT` 和整个 `PRIVATE_FILE_ROOT`、写入 v2 清单及 SHA-256 校验文件，最后重新启动 API。备份含顾客私有数据，应存放在访问受控、静态加密的异地持久位置；备份脚本本身不删除旧备份。私有文件密钥不由应用生成；卷和备份加密所需密钥由部署平台单独保管。购买填写附件的清理入口和⑥-2A恢复验收要求见[本地填写模板与私有草稿基础](./purchase-form-preparation-6-2a.md)。
+PostgreSQL 元数据、公开媒体、`PRIVATE_FILE_ROOT` 私有文件和身份目录必须作为同一备份时间点的一组数据保存。该私有卷包括数字交付对象和⑥-2A新增的隔离 `purchase-attachments/` 命名空间。仓库提供 `scripts/backup-compose-data.sh BACKUP_ROOT`：它先停止 API 以静止业务写入，再生成 PostgreSQL custom dump、打包 `MEDIA_ROOT`、整个 `PRIVATE_FILE_ROOT` 与 `INSTANCE_IDENTITY_ROOT`，写入 v3 清单及各归档 SHA-256 校验，最后重新启动 API。身份归档含 Ed25519 PKCS#8 私钥，连同顾客私有数据一起存放在访问受控、静态加密的异地持久位置；备份解密材料不得和备份明文放在一起。备份脚本本身不删除旧备份。私有文件密钥不由应用生成；卷和备份加密所需密钥由部署平台单独保管。购买填写附件的清理入口和⑥-2A恢复验收要求见[本地填写模板与私有草稿基础](./purchase-form-preparation-6-2a.md)。
 
-`scripts/restore-test-compose-data.sh BACKUP_DIRECTORY` 仅用于隔离恢复验证。它先校验完整 v2 备份的 SHA-256，只允许 Compose 目标数据库名以 `_test` 结尾，并要求显式设置 `ALLOW_TEST_DATABASE_RESTORE=YES`、显式测试/恢复项目名及项目专属 `product_media` 和 `private_files` 卷；失败时会让目标服务保持停止供检查。不要将该测试恢复脚本用于生产恢复。建议在单独 Compose 项目、独立命名卷和独立端口进行验证，例如：
+`scripts/restore-test-compose-data.sh BACKUP_DIRECTORY` 仅用于隔离恢复验证。它先校验完整 v3 备份的 SHA-256，只允许 Compose 目标数据库名以 `_test` 结尾，并要求显式设置 `ALLOW_TEST_DATABASE_RESTORE=YES`、显式测试/恢复项目名及项目专属 `product_media`、`private_files` 和 `instance_identity` 卷；数据库与身份归档必须成套恢复，否则身份验证将返回不匹配诊断。失败时会让目标服务保持停止供检查。不要将该测试恢复脚本用于生产恢复。建议在单独 Compose 项目、独立命名卷和独立端口进行验证，例如：
 
 ```sh
 export COMPOSE_PROJECT_NAME=aikayun-restore-test
@@ -57,9 +57,12 @@ docker compose up -d --build
 ALLOW_TEST_DATABASE_RESTORE=YES scripts/restore-test-compose-data.sh /secure/backups/20261017T120000Z
 docker compose exec -T api node dist/media/reconcile-cli.js --check
 docker compose exec -T api node dist/media/private-file-reconcile-cli.js --check
+docker compose exec -e NODE_ENV=test -T api node dist/licensing/installation-identity-cli.js verify
 ```
 
 恢复后再通过隔离站点的公开媒体 URL 请求图片，并将返回体 SHA-256 与媒体 API 元数据比较。只确认文件名存在不足以验收恢复。恢复完成后可停止隔离项目并删除它自己的测试卷；不要操作默认 Compose 项目或正式卷。
+
+⑦-1B-3A 只增加身份文件格式、数据库 binding 和隔离开发/测试 CLI。该 CLI 在生产环境禁用，普通 API 启动不会自动生成身份；当前没有生产初始化入口，也没有把身份接入经营门禁。商城端中心客户端、经营授权和受控生产安装流程须以后续阶段单独验收，不能据此宣称已完成商用授权保护。详细边界见[商城安装身份与数据库绑定](./license-client-7-1b-3a.md)。
 
 升级时拉取目标提交，检查迁移说明，然后 `docker compose up -d --build`。数据库迁移按版本前进并由部署前的一次性服务执行。当前未承诺自动 schema 回滚或在线零停机升级；如应用回滚依赖不可逆迁移，应恢复经过验证的备份并部署兼容版本。
 

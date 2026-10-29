@@ -37,6 +37,7 @@ export interface AppConfig {
   sessionTtlSeconds: number
   mediaRoot: string
   privateFileRoot: string
+  identityRoot: string
   supplierHttpTestAllowlist: string[]
   database: PoolConfig
   paymentCredentialKeyRing: PaymentCredentialKeyRing | null
@@ -156,6 +157,11 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error('PRIVATE_FILE_ROOT must be an absolute path')
   }
   const privateFileRoot = resolve(configuredPrivateFileRoot ?? join(xdgDataHome, 'aikayun', 'private-files'))
+  const configuredIdentityRoot = env.INSTANCE_IDENTITY_ROOT
+  if (configuredIdentityRoot && !isAbsolute(configuredIdentityRoot)) {
+    throw new Error('INSTANCE_IDENTITY_ROOT must be an absolute path')
+  }
+  const identityRoot = resolve(configuredIdentityRoot ?? join(xdgDataHome, 'aikayun', 'identity'))
   const repo = repositoryRoot()
   if (repo && isWithin(repo, mediaRoot)) {
     throw new Error('MEDIA_ROOT must be outside the repository')
@@ -165,6 +171,13 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   if (isWithin(mediaRoot, privateFileRoot) || isWithin(privateFileRoot, mediaRoot)) {
     throw new Error('PRIVATE_FILE_ROOT and MEDIA_ROOT must use isolated storage namespaces')
+  }
+  if (repo && isWithin(repo, identityRoot)) {
+    throw new Error('INSTANCE_IDENTITY_ROOT must be outside the repository')
+  }
+  if (isWithin(mediaRoot, identityRoot) || isWithin(identityRoot, mediaRoot)
+    || isWithin(privateFileRoot, identityRoot) || isWithin(identityRoot, privateFileRoot)) {
+    throw new Error('INSTANCE_IDENTITY_ROOT, MEDIA_ROOT and PRIVATE_FILE_ROOT must use isolated storage namespaces')
   }
 
   const database: PoolConfig = env.DATABASE_URL
@@ -203,6 +216,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     sessionTtlSeconds: 60 * 60 * 12,
     mediaRoot,
     privateFileRoot,
+    identityRoot,
     supplierHttpTestAllowlist,
     database,
     paymentCredentialKeyRing: parsePaymentCredentialKeyRing(env.PAYMENT_CREDENTIAL_KEY_RING),

@@ -51,7 +51,7 @@
 
 Compose 的 `private_files` 命名卷与 `product_media`、`postgres_data` 分开持久化。只重建容器不会删除这些卷；不要在需要保留数据时执行 `docker compose down -v`。部署根目录的 `.env` 应显式设置 `PRIVATE_FILE_ROOT=/var/lib/aikayun/private-files`，并保持该路径独立于 `MEDIA_ROOT`。
 
-`scripts/backup-compose-data.sh BACKUP_ROOT` 会停 API，在同一静止窗口导出 PostgreSQL、公开媒体、私有文件三个部分，写入 `aikayun-compose-backup-v2` 清单和 SHA-256 校验文件，然后恢复 API。备份包含商品授权资产，应保存在访问受控、加密的异地介质中。建议定期在独立测试 Compose 项目执行：
+`scripts/backup-compose-data.sh BACKUP_ROOT` 会停 API，在同一静止窗口导出 PostgreSQL、公开媒体、私有文件和独立安装身份目录，写入 `aikayun-compose-backup-v3` 清单及各归档 SHA-256 校验后恢复 API。身份归档包括 Ed25519 PKCS#8 私钥，备份应保存在访问受控、静态加密的异地介质中，解密材料单独托管。测试恢复使用隔离 `_test` 项目和完整 v3 配对备份，不要把恢复脚本用于生产。建议定期在独立测试 Compose 项目执行：
 
 ```sh
 COMPOSE_PROJECT_NAME=aikayun-private-restore-test \
