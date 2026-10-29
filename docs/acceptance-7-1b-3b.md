@@ -38,4 +38,4 @@ TrustStore 回归另覆盖：版本最低值和回退、同版本异工件、v1(
 
 ## 提交与 CI
 
-待提交并推送后，在此记录精确 main SHA、`origin/main` 和对应 GitHub Actions CI 结果。只有与最终 SHA 完全一致的 Actions run 通过，才将该项记为完成。
+实现提交：`fed6c0d1f29eef4c77d0028497a99bf6beea6aba`。推送时 `HEAD` 与 `origin/main` 精确一致。该提交的 [GitHub Actions CI 40928750634](https://github.com/YYKX682436/AiKayun/actions/runs/40928750634) 以同一 `headSha` 完整成功，包括 unit/PostgreSQL、生产构建、93 项浏览器 E2E、Compose 重建、SIGKILL、v4 备份恢复及未信任 TLS 拒绝。最终文档提交及其精确 SHA 对应 CI 在交付前另行核对。
