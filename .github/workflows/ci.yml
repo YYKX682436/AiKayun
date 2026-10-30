@@ -56,7 +56,7 @@ jobs:
         run: pnpm typecheck
       - name: Unit and PostgreSQL integration tests
         run: pnpm test
-      - name: Frozen license-center HTTPS and Challenge interoperability
+      - name: Frozen license-center HTTPS Challenge and activation interoperability
         run: scripts/test-license-center-interop.sh
       - name: Install Chromium
         run: pnpm --filter @aikayun/web exec playwright install --with-deps chromium

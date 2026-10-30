@@ -6,6 +6,7 @@ import { createDatabase } from 'file:///app/dist/db/pool.js'
 import {
   allocateLicenseOperationAttempt,
   createOrLoadActivationOperation,
+  markLicenseOperationAttemptSent,
   readActivationOperationPayload,
   readSavedLicenseOperationResponse,
   saveLicenseOperationResponse,
@@ -77,6 +78,7 @@ try {
         }
       },
     })
+    await markLicenseOperationAttemptSent(db, operationId, attempt.attemptNo)
     await saveLicenseOperationResponse(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId, attempt.attemptNo,
       Buffer.from('synthetic signed center response; no network request was made', 'utf8'))
     process.stdout.write('license_pending_fixture_seeded\n')

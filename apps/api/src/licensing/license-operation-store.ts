@@ -47,7 +47,7 @@ export interface AllocateOperationAttemptInput {
   clientNonce: string
   requestNonce: string
   identityJkt: string
-  buildRequest: (attemptNo: number) => BuiltLicenseOperationRequest
+  buildRequest: (attemptNo: number) => BuiltLicenseOperationRequest | Promise<BuiltLicenseOperationRequest>
 }
 
 export interface BuiltLicenseOperationRequest {
@@ -154,6 +154,10 @@ function validateOperationRequestBody(
   payload?: { activationCode: string; origin: string | null },
 ): void {
   const body = parseJsonObject(bodyBytes, 'attempt_request_body_invalid')
+  if (purpose === 'activation' && Object.keys(body).sort().join(',') !== [
+    'activation_code', 'attempt_no', 'challenge', 'database_id', 'identity_jkt', 'instance_id',
+    'intent_digest', 'license_id', 'operation_id', 'origin', 'public_jwk',
+  ].sort().join(',')) invalid('attempt_request_binding_conflict')
   const publicJwk = body.public_jwk
   if (body.operation_id !== operation.operation_id || body.intent_digest !== operation.intent_digest ||
     body.attempt_no !== attemptNo || body.license_id !== operation.license_id ||
@@ -331,6 +335,12 @@ export async function allocateLicenseOperationAttempt(
         invalid('operation_attempt_binding_conflict')
       }
       if (input.purpose === 'activation' && operation.kind !== 'activation') invalid('attempt_purpose_conflict')
+      if (input.purpose === 'activation') {
+        const initialActivation = await trx.selectFrom('local_license_operation_attempts').select('attempt_no')
+          .where('operation_id', '=', input.operationId).where('purpose', '=', 'activation')
+          .forUpdate().executeTakeFirst()
+        if (initialActivation) invalid('activation_attempt_already_exists')
+      }
       const prior = await trx.selectFrom('local_license_operation_attempts').selectAll()
         .where('operation_id', '=', input.operationId)
         .where(eb => eb.or([
@@ -364,7 +374,7 @@ export async function allocateLicenseOperationAttempt(
       const lastAttempt = await trx.selectFrom('local_license_operation_attempts').select('attempt_no')
         .where('operation_id', '=', input.operationId).orderBy('attempt_no', 'desc').forUpdate().executeTakeFirst()
       const attemptNo = (lastAttempt?.attempt_no ?? 0) + 1
-      const built = input.buildRequest(attemptNo)
+      const built = await input.buildRequest(attemptNo)
       if (!built || built.signingKeyId !== operation.identity_jkt || built.signingKeyId.length > 128 ||
         !(built.signatureCreatedAt instanceof Date) || !Number.isFinite(built.signatureCreatedAt.getTime())) {
         invalid('invalid_attempt_evidence')
@@ -502,7 +512,7 @@ export async function saveLicenseOperationResponse(
       return
     }
     if (!['pending', 'response_saved'].includes(operation.state) ||
-      !['prepared', 'sent', 'transport_unknown'].includes(attempt.send_state) ||
+      !['sent', 'transport_unknown'].includes(attempt.send_state) ||
       (operation.state === 'response_saved' && attempt.purpose === 'activation' && attempt.send_state === 'prepared')) {
       invalid('attempt_response_binding_conflict')
     }
@@ -571,7 +581,19 @@ export async function readLicenseOperationAttemptEnvelope(
   pendingKeyRoot: string,
   operationId: string,
   attemptNo: number,
-): Promise<{ attemptNo: number; purpose: LocalLicenseAttemptPurpose; sendState: string; requestBodyDigest: string; requestNonceHash: string; requestEnvelope: Buffer }> {
+): Promise<{
+  attemptNo: number
+  purpose: LocalLicenseAttemptPurpose
+  sendState: string
+  requestBodyDigest: string
+  requestNonceHash: string
+  clientNonceHash: string
+  signingKeyId: string
+  signatureCreatedAt: Date
+  identityJkt: string
+  intentDigest: string
+  requestEnvelope: Buffer
+}> {
   const [operation, attempt] = await Promise.all([
     db.selectFrom('local_license_operations').selectAll().where('operation_id', '=', operationId).executeTakeFirst(),
     db.selectFrom('local_license_operation_attempts').selectAll()
@@ -594,6 +616,11 @@ export async function readLicenseOperationAttemptEnvelope(
     sendState: attempt.send_state,
     requestBodyDigest: attempt.request_body_digest,
     requestNonceHash: attempt.request_nonce_hash,
+    clientNonceHash: attempt.client_nonce_hash,
+    signingKeyId: attempt.signing_key_id,
+    signatureCreatedAt: attempt.signature_created_at,
+    identityJkt: attempt.identity_jkt,
+    intentDigest: attempt.intent_digest,
     requestEnvelope,
   }
 }

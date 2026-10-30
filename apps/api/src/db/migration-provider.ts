@@ -45,6 +45,7 @@ import { procurementIdentityConflictGuardMigration } from './migrations/20261027
 import { procurementGlobalConflictsMigration } from './migrations/202610270007_procurement_global_conflicts.js'
 import { installationIdentityMigration } from './migrations/202610290001_installation_identity.js'
 import { localLicenseOperationsMigration } from './migrations/202610300001_local_license_operations.js'
+import { singleInitialActivationAttemptMigration } from './migrations/202610300002_single_initial_activation_attempt.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -94,6 +95,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610270007_procurement_global_conflicts': procurementGlobalConflictsMigration,
       '202610290001_installation_identity': installationIdentityMigration,
       '202610300001_local_license_operations': localLicenseOperationsMigration,
+      '202610300002_single_initial_activation_attempt': singleInitialActivationAttemptMigration,
     }
   }
 }

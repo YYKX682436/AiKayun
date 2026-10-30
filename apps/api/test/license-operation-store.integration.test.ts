@@ -10,6 +10,7 @@ import { Pool } from 'pg'
 import type { Pool as PgPool } from 'pg'
 import type { Database } from '../src/db/types.js'
 import { localLicenseOperationsMigration } from '../src/db/migrations/202610300001_local_license_operations.js'
+import { singleInitialActivationAttemptMigration } from '../src/db/migrations/202610300002_single_initial_activation_attempt.js'
 import { ed25519IdentityJkt } from '../src/licensing/license-intent.js'
 import {
   allocateLicenseOperationAttempt,
@@ -85,6 +86,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
       binding_state: 'ready',
     }).execute()
     await localLicenseOperationsMigration.up(db)
+    await singleInitialActivationAttemptMigration.up(db)
     const pendingRoot = await mkdtemp(join(tmpdir(), 'aikayun-license-pending-pg-'))
     pendingRoots.add(pendingRoot)
     await initializeTemporaryLicensePendingKey(pendingRoot, 'test')
@@ -240,23 +242,23 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
     })
   })
 
-  it('serializes attempt numbers across independent Node processes and persists exact encrypted recovery envelopes', async () => {
+  it('serializes shared query attempt numbers across independent processes and persists exact encrypted envelopes', async () => {
     await withSandbox(async sandbox => {
       const input = activationInput()
       const operation = await createOrLoadActivationOperation(sandbox.db, sandbox.pendingRoot, input)
-      const children = await Promise.all(Array.from({ length: 8 }, () => runChild(sandbox, 'concurrent-attempt', input)))
+      const children = await Promise.all(Array.from({ length: 8 }, () => runChild(sandbox, 'concurrent-query', input)))
       expect(children.every(child => child.code === 0 && child.signal === null)).toBe(true)
       expect(children.map(child => child.stdout.trim()).sort((a, b) => Number(a) - Number(b)))
         .toEqual(['1', '2', '3', '4', '5', '6', '7', '8'])
       const attempts = await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
         .where('operation_id', '=', input.operationId).orderBy('attempt_no').execute()
       expect(attempts.map(attempt => attempt.attempt_no)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
-      expect(attempts.every(attempt => attempt.intent_digest === operation.intentDigest && attempt.send_state === 'prepared')).toBe(true)
+      expect(attempts.every(attempt => attempt.intent_digest === operation.intentDigest && attempt.purpose === 'query' && attempt.send_state === 'prepared')).toBe(true)
       const recovered = await readLicenseOperationAttemptEnvelope(sandbox.db, sandbox.pendingRoot, input.operationId, 1)
-      expect(recovered).toMatchObject({ attemptNo: 1, purpose: 'activation', sendState: 'prepared' })
+      expect(recovered).toMatchObject({ attemptNo: 1, purpose: 'query', sendState: 'prepared' })
       const recoveredEnvelope = JSON.parse(recovered.requestEnvelope.toString('utf8')) as { body_base64url: string }
       expect(JSON.parse(Buffer.from(recoveredEnvelope.body_base64url, 'base64url').toString('utf8')))
-        .toMatchObject({ activation_code: input.activationCode, operation_id: input.operationId })
+        .toMatchObject({ operation_id: input.operationId, attempt_no: 1 })
       const allAttemptBytes = Buffer.concat(attempts.map(attempt => attempt.encrypted_request_envelope)).toString('utf8')
       expect(allAttemptBytes).not.toContain(input.activationCode)
     })
@@ -324,7 +326,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
       expect(await readSavedLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId)).toEqual(queryResponse)
       await expect(allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
         attemptInput(input.operationId, operation.intentDigest, testIdentityJkt, 'activation', true)))
-        .rejects.toMatchObject({ code: 'operation_not_pending' })
+        .rejects.toMatchObject({ code: 'activation_attempt_already_exists' })
       expect(await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
         .where('operation_id', '=', input.operationId).execute()).toHaveLength(2)
       expect(await sandbox.db.selectFrom('local_license_operations').selectAll().execute()).toHaveLength(1)
@@ -435,9 +437,8 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
       const allocated = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
         attemptInput(input.operationId, operation.intentDigest))
       expect(allocated.attemptNo).toBe(1)
-      const duplicate = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
-        attemptInput(input.operationId, operation.intentDigest))
-      expect(duplicate.attemptNo).toBe(1)
+      await expect(allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(input.operationId, operation.intentDigest))).rejects.toMatchObject({ code: 'activation_attempt_already_exists' })
       expect((await sandbox.db.selectFrom('local_license_operation_attempts').selectAll().execute())).toHaveLength(1)
 
       await expect(sql`UPDATE local_license_operations SET intent_digest = ${'A'.repeat(43)} WHERE operation_id = ${input.operationId}::uuid`.execute(sandbox.db)).rejects.toBeDefined()
@@ -449,6 +450,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         FROM local_license_operation_attempts WHERE operation_id = ${input.operationId}::uuid AND attempt_no = 1`.execute(sandbox.db)).rejects.toBeDefined()
 
       const centerResponse = Buffer.from('synthetic-center-signed-operation-response-for-storage-only', 'utf8')
+      await markLicenseOperationAttemptSent(sandbox.db, input.operationId, allocated.attemptNo)
       const saved = await saveLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId, 1, centerResponse)
       expect((await sandbox.db.selectFrom('local_license_operations').select('state').where('operation_id', '=', input.operationId).executeTakeFirst())?.state)
         .toBe('response_saved')
@@ -483,7 +485,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
       ])
       await expect(allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
         attemptInput(input.operationId, operation.intentDigest, testIdentityJkt, 'activation', true)))
-        .rejects.toMatchObject({ code: 'operation_not_pending' })
+        .rejects.toMatchObject({ code: 'activation_attempt_already_exists' })
 
       await expect(sql`UPDATE local_license_operations SET state='pending', response_attempt_no=NULL, response_digest=NULL, response_saved_at=NULL WHERE operation_id=${input.operationId}::uuid`.execute(sandbox.db)).rejects.toBeDefined()
       await expect(sql`UPDATE local_license_operations SET response_attempt_no=1 WHERE operation_id=${input.operationId}::uuid`.execute(sandbox.db)).rejects.toBeDefined()
@@ -535,9 +537,10 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
       expect(afterAttemptCommit.stderr).not.toContain(input.activationCode)
       const operation = await sandbox.db.selectFrom('local_license_operations').selectAll()
         .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
-      const sameAttempt = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
-        attemptInput(input.operationId, operation.intent_digest))
-      expect(sameAttempt).toMatchObject({ attemptNo: 1, state: 'prepared' })
+      const sameAttempt = await readLicenseOperationAttemptEnvelope(sandbox.db, sandbox.pendingRoot, input.operationId, 1)
+      expect(sameAttempt).toMatchObject({ attemptNo: 1, sendState: 'prepared' })
+      await expect(allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(input.operationId, operation.intent_digest))).rejects.toMatchObject({ code: 'activation_attempt_already_exists' })
       expect(await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
         .where('operation_id', '=', input.operationId).execute()).toHaveLength(1)
       const recovered = await readLicenseOperationAttemptEnvelope(sandbox.db, sandbox.pendingRoot, input.operationId, 1)
@@ -588,6 +591,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
           binding_state: 'ready',
         }).execute()
         await localLicenseOperationsMigration.up(restoredDb)
+        await singleInitialActivationAttemptMigration.up(restoredDb)
         await restoredDb.insertInto('local_license_operations').values(sourceOperation).execute()
         await restoredDb.insertInto('local_license_operation_attempts').values(sourceAttempt).execute()
         const sourceKey = join(source.pendingRoot, 'license-pending-aes-256-gcm.json')

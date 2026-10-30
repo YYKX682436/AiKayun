@@ -73,6 +73,7 @@ beforeAll(async () => {
     '202610270007_procurement_global_conflicts',
     '202610290001_installation_identity',
     '202610300001_local_license_operations',
+    '202610300002_single_initial_activation_attempt',
   ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])

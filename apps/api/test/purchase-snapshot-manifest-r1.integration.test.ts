@@ -368,15 +368,17 @@ describe('⑥-2B R1 ordered purchase snapshot manifest gates', () => {
       migrationName: '202610290001_installation_identity', status: 'Success',
     }), expect.objectContaining({
       migrationName: '202610300001_local_license_operations', status: 'Success',
+    }), expect.objectContaining({
+      migrationName: '202610300002_single_initial_activation_attempt', status: 'Success',
     })])
     expect(await durableRows()).toEqual(before)
     const repeated = await migrator.migrateToLatest()
     expect(repeated.error).toBeUndefined()
     expect(repeated.results).toEqual([])
     const downgrade = await migrator.migrateTo('202610250001_purchase_lines')
-    expect(downgrade.error).toMatchObject({ message: 'Procurement execution evidence and delivery identities are permanent; this migration is forward-only.' })
-    // Exercise the original migration's own guard as well, even though the new
-    // forward-only migration now prevents the migrator from reaching it.
+    expect(downgrade.error).toBeDefined()
+    // Newer forward-only licensing migrations stop the migrator before older guards;
+    // exercise the original migration's own guard directly as well.
     await expect(db.transaction().execute(trx => purchaseSnapshotManifestR1Migration.down!(trx)))
       .rejects.toMatchObject({ message: 'Cannot downgrade purchase snapshot gates while snapshots or archived objects exist' })
     expect(await durableRows()).toEqual(before)

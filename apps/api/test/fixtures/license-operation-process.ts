@@ -22,18 +22,18 @@ const db = createDatabase()
 const input = { operationId, licenseId, activationCode, instanceId, databaseId, identityJkt, origin: 'https://shop.example.test' }
 const intent = buildActivationIntent(input)
 
-function attemptInput(fixed: boolean) {
+function attemptInput(fixed: boolean, purpose: 'activation' | 'query' = 'activation') {
   const clientNonce = fixed ? Buffer.alloc(32, 0x70).toString('base64url') : randomBytes(32).toString('base64url')
   const requestNonce = fixed ? Buffer.alloc(32, 0x71).toString('base64url') : randomBytes(32).toString('base64url')
   return {
     operationId,
-    purpose: 'activation' as const,
+    purpose,
     intentDigest: intent.intentDigest,
     clientNonce,
     requestNonce,
     identityJkt,
     buildRequest(attemptNo: number) {
-      const requestBody = Buffer.from(JSON.stringify({
+      const body = {
         operation_id: operationId,
         intent_digest: intent.intentDigest,
         attempt_no: attemptNo,
@@ -43,13 +43,13 @@ function attemptInput(fixed: boolean) {
         identity_jkt: identityJkt,
         public_jwk: { kty: 'OKP', crv: 'Ed25519', x: Buffer.alloc(32, 9).toString('base64url') },
         challenge: 'synthetic-test-challenge-token'.padEnd(128, 'x'),
-        activation_code: activationCode,
-        origin: input.origin,
-      }), 'utf8')
+        ...(purpose === 'activation' ? { activation_code: activationCode, origin: input.origin } : {}),
+      }
+      const requestBody = Buffer.from(JSON.stringify(body), 'utf8')
       const requestEnvelope = Buffer.from(JSON.stringify({
         schema: 1,
         method: 'POST',
-        target: '/v1/activations',
+        target: purpose === 'activation' ? '/v1/activations' : '/v1/operations/query',
         headers: {
           'x-test-client-nonce': clientNonce,
           'x-test-request-nonce': requestNonce,
@@ -83,8 +83,9 @@ if (mode === 'restore-check') {
   const result = await saveLicenseOperationResponse(db, pendingRoot, operationId, attemptNo, response)
   process.stdout.write(`${result.responseDigest}\n`)
   if (mode === 'commit-response-kill') process.kill(process.pid, 'SIGKILL')
-} else if (mode === 'concurrent-attempt') {
-  const result = await allocateLicenseOperationAttempt(db, pendingRoot, attemptInput(false))
+} else if (mode === 'concurrent-attempt' || mode === 'concurrent-query') {
+  const purpose = mode === 'concurrent-query' ? 'query' : 'activation'
+  const result = await allocateLicenseOperationAttempt(db, pendingRoot, attemptInput(false, purpose))
   process.stdout.write(`${result.attemptNo}\n`)
 } else if (mode === 'rollback-operation') {
   const encrypted = await encryptLicensePendingBytes(pendingRoot, {

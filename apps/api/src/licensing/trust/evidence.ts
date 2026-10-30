@@ -45,6 +45,8 @@ export interface VerifiedCurrentLeaseEvidence {
   readonly renewAfter: number
   readonly expiresAt: number
   readonly subscriptionEnd: number
+  readonly requestNonce: string
+  readonly requestDigest: string
   readonly grants: readonly ['create_order', 'create_top_up']
   readonly signatureVerified: true
 }
@@ -73,6 +75,7 @@ export interface VerifiedStatusEvidence {
 
 export interface VerifiedOperationEvidence {
   readonly purpose: 'license_operation_receipt'
+  readonly signingKeyId: string
   readonly claims: Readonly<Record<string, unknown>>
   readonly signatureVerified: true
 }
@@ -181,6 +184,8 @@ export async function verifyCurrentLicenseLease(
     purpose: 'current_license_lease',
     ...lease,
     signingKeyId: assertStringClaim(verified.header, 'kid', 43),
+    requestNonce: assertDigest(verified.claims['request_nonce'], 'lease request nonce'),
+    requestDigest: assertDigest(verified.claims['request_digest'], 'lease request digest'),
     grants: Object.freeze(['create_order', 'create_top_up']) as readonly ['create_order', 'create_top_up'],
     signatureVerified: true,
   })
@@ -295,5 +300,10 @@ export async function verifyLicenseOperationReceipt(
   if (result !== null && (typeof result !== 'string' || result.length > 16 * 1024 || result.split('.').length !== 3)) {
     throw new Error('Invalid operation result JWS envelope')
   }
-  return Object.freeze({ purpose: 'license_operation_receipt', claims: Object.freeze({ ...claims }), signatureVerified: true })
+  return Object.freeze({
+    purpose: 'license_operation_receipt',
+    signingKeyId: assertStringClaim(verified.header, 'kid', 43),
+    claims: Object.freeze({ ...claims }),
+    signatureVerified: true,
+  })
 }

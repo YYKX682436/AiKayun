@@ -21,6 +21,11 @@ export interface TrustedTimeSample {
   assertFresh(): number
 }
 
+interface TestTimeAnchorOptions {
+  readonly testCa?: string | Buffer
+  readonly testLookup?: LookupFunction
+}
+
 function exactObject(value: unknown, fields: readonly string[], label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`)
   const record = value as Record<string, unknown>
@@ -49,7 +54,7 @@ function readBoundedJson(response: IncomingMessage): Promise<Buffer> {
 function postNonce(
   config: TrustedReleaseLicenseConfig,
   nonce: string,
-  options: { testCa?: string | Buffer; testLookup?: LookupFunction } = {},
+  options: TestTimeAnchorOptions = {},
 ): Promise<{ body: Buffer; roundTripMs: number; requestStartedAt: number; responseReceivedAt: number }> {
   const target = new URL('/v1/time-anchor', config.expected_center_origin)
   if (target.protocol !== 'https:' || target.origin !== config.expected_center_origin || target.pathname !== '/v1/time-anchor' || target.search || target.hash) {
@@ -76,7 +81,6 @@ function postNonce(
   }
   if (options.testCa !== undefined) requestOptions = { ...requestOptions, ca: options.testCa }
   if (options.testLookup !== undefined) requestOptions = { ...requestOptions, lookup: options.testLookup }
-
   return new Promise((resolve, reject) => {
     const requestStartedAt = performance.now()
     const request = httpsRequest(requestOptions, async (response) => {
@@ -114,7 +118,7 @@ function postNonce(
 export async function fetchTrustedTimeAnchor(
   config: TrustedReleaseLicenseConfig,
   candidate: RootAuthenticatedTrustBundleCandidate,
-  options: { testCa?: string | Buffer; testLookup?: LookupFunction } = {},
+  options: TestTimeAnchorOptions = {},
 ): Promise<TrustedTimeSample> {
   if (candidate.claims.sub !== config.expected_center_issuer) throw new Error('Candidate bundle does not match the configured center issuer')
   const nonce = createTimeAnchorNonce()
