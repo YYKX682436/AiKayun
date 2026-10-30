@@ -91,6 +91,7 @@ export interface LocalLicenseOperationAttemptsTable {
   encrypted_result_jws: Buffer | null
   result_digest: string | null
   result_saved_at: Date | null
+  result_archived: Generated<boolean>
   created_at: Generated<Date>
 }
 

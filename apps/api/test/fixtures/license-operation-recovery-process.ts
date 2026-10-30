@@ -19,7 +19,7 @@ const releaseConfig = await validateTrustedReleaseLicenseConfig(JSON.parse(await
 const info = JSON.parse(await readFile(infoPath, 'utf8')) as { tls_ca: string }
 const databaseUrl = new URL(process.env.TEST_DATABASE_URL ?? '')
 databaseUrl.searchParams.set('options', `-c search_path=${schema}`)
-const pool = new Pool({ connectionString: databaseUrl.toString(), max: 6, application_name: 'aikayun-operation-recovery-test' })
+const pool = new Pool({ connectionString: databaseUrl.toString(), max: Number(process.env.RECOVERY_TEST_POOL_MAX ?? 6), application_name: 'aikayun-operation-recovery-test' })
 const db = new Kysely<Database>({ dialect: new PostgresDialect({ pool }) })
 const lookup = ((hostname: string, optionsOrCallback: unknown, callbackMaybe?: (
   error: NodeJS.ErrnoException | null,
@@ -60,7 +60,20 @@ const client = createLicenseOperationRecoveryClient({
 })
 
 try {
-  const result = await client.recoverPendingActivation(operationId)
+  const mode = process.env.RECOVERY_TEST_MODE
+  let result: unknown
+  if (mode === 'parallel') {
+    result = await Promise.all([client.queryPendingActivation(operationId), client.queryPendingActivation(operationId)])
+  } else if (mode === 'busy') {
+    const occupied = await pool.connect()
+    const pending = client.queryPendingActivation(operationId)
+    setTimeout(() => occupied.release(), 500)
+    result = await pending
+  } else if (mode === 'query') {
+    result = await client.queryPendingActivation(operationId)
+  } else {
+    result = await client.recoverPendingActivation(operationId)
+  }
   process.stdout.write(`${JSON.stringify(result)}\n`)
 } finally {
   await db.destroy().catch(() => undefined)

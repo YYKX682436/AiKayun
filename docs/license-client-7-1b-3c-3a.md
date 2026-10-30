@@ -70,3 +70,11 @@ continue 只解决 query 线性化之后可能仍在途的原 activation 与原 
 - 订单、支付、退款、提现、自动履约、采购与既有 worker 行为不在本阶段改动。
 
 完成 3C-3A 后停止，等待独立严格验收；不进入 3C-3B。
+
+## R1：持锁资源隔离与归档恢复校验
+
+恢复锁使用独立 PostgreSQL session，继承业务池的数据库连接配置，保留原 advisory lock 键。同一进程最多持有四条恢复锁连接；连接建立与锁等待有上限，每次调用结束关闭连接，不归还业务连接池。取得锁后在发送前、收到响应后及返回前确认 session 可用，并核对解锁结果。锁状态不可确认时失败关闭；已发出的 HTTPS 请求可能仍到达中心，其 attempt 保持未知，后续通过同一 operation 查询及中心锁解决竞争。
+
+持锁连接需要直连 PostgreSQL 或使用保持 session 的代理；transaction pooling 不能提供跨请求的 session advisory lock 语义。
+
+v5 配对恢复的 test-only 预检逐条读取 result JWS，复用原有 Pending AES-GCM 解密、AAD、key ID 和摘要校验。迁移 `202610300004_license_result_archive_presence` 回填已有归档的单调存在标记；写入归档与标记在同一事务中完成，约束及触发器禁止不一致和标记回退。旧记录没有归档仍可恢复，标记存在而归档字段缺失则拒绝恢复。v5 文件校验和继续保护数据库备份及配对密钥文件；如果数据库中归档和存在标记等所有独立证据同时被抹除，且没有其他可信证据，无法与合法旧记录区分。

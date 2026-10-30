@@ -22,6 +22,7 @@ import { installationIdentityMigration } from '../src/db/migrations/202610290001
 import { localLicenseOperationsMigration } from '../src/db/migrations/202610300001_local_license_operations.js'
 import { singleInitialActivationAttemptMigration } from '../src/db/migrations/202610300002_single_initial_activation_attempt.js'
 import { licenseOperationResultArchiveMigration } from '../src/db/migrations/202610300003_license_operation_result_archive.js'
+import { licenseResultArchivePresenceMigration } from '../src/db/migrations/202610300004_license_result_archive_presence.js'
 import type { Database } from '../src/db/types.js'
 import { initializeInstallationIdentity, withVerifiedInstallationSigningContext } from '../src/licensing/installation-identity.js'
 import { createOrLoadActivationOperation } from '../src/licensing/license-operation-store.js'
@@ -154,6 +155,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     await localLicenseOperationsMigration.up(apiDb)
     await singleInitialActivationAttemptMigration.up(apiDb)
     await licenseOperationResultArchiveMigration.up(apiDb)
+    await licenseResultArchivePresenceMigration.up(apiDb)
     identitySnapshot = await initializeInstallationIdentity(apiPool, { identityRoot, mode: 'fresh' })
     if (identitySnapshot.status !== 'ready' || !identitySnapshot.databaseId || !identitySnapshot.instanceId || !identitySnapshot.identityJkt) {
       throw new Error('Isolated 3A instance identity did not initialize')
@@ -286,6 +288,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       await localLicenseOperationsMigration.up(caseDb)
       await singleInitialActivationAttemptMigration.up(caseDb)
       await licenseOperationResultArchiveMigration.up(caseDb)
+      await licenseResultArchivePresenceMigration.up(caseDb)
       const identity = await initializeInstallationIdentity(casePool, { identityRoot: caseIdentityRoot, mode: 'fresh' })
       if (!identity.databaseId || !identity.instanceId || !identity.identityJkt) throw new Error('Recovery fixture identity is missing')
       await initializeTemporaryLicensePendingKey(casePendingRoot, 'test')
@@ -385,6 +388,9 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     identityRoot: string
     pendingRoot: string
     trustRoot: string
+    poolMax?: number
+    mode?: 'query' | 'parallel' | 'busy'
+    timeoutMs?: number
   }) {
     const databaseUrl = new URL(testDatabaseUrl!)
     databaseUrl.searchParams.set('options', `-c search_path=${input.schema}`)
@@ -402,6 +408,8 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
           TEST_DATABASE_URL: testDatabaseUrl!,
           DATABASE_URL: databaseUrl.toString(),
           LICENSE_PENDING_KEY_ROOT: input.pendingRoot,
+          ...(input.poolMax === undefined ? {} : { RECOVERY_TEST_POOL_MAX: String(input.poolMax) }),
+          ...(input.mode === undefined ? {} : { RECOVERY_TEST_MODE: input.mode }),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       })
@@ -409,8 +417,9 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       let stderr = ''
       child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk })
       child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk })
-      child.once('error', reject)
-      child.once('close', (code, signal) => resolveResult({ code, signal, stdout, stderr }))
+      const timeout = setTimeout(() => child.kill('SIGKILL'), input.timeoutMs ?? 60_000)
+      child.once('error', error => { clearTimeout(timeout); reject(error) })
+      child.once('close', (code, signal) => { clearTimeout(timeout); resolveResult({ code, signal, stdout, stderr }) })
     })
   }
 
@@ -1249,6 +1258,64 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     }
   }, 75_000)
 
+  it('recovers with a one-connection business pool and when concurrent calls saturate it', async () => {
+    const fixture = await createRecoveryCase({ name: 'recovery-small-pool', license: info.activation_concurrent })
+    try {
+      const input = {
+        schema: fixture.schema, operationId: fixture.operation.operationId, identityRoot: fixture.identityRoot,
+        pendingRoot: fixture.pendingRoot, trustRoot: join(fixture.root, 'trust'), timeoutMs: 25_000,
+      }
+      const results = await Promise.all((['query', 'parallel', 'busy'] as const).map(async mode => ({
+        mode, result: await runRecoveryChild({ ...input, mode, poolMax: mode === 'parallel' ? 2 : 1 }),
+      })))
+      expect(results.map(({ mode, result }) => ({ mode, code: result.code, signal: result.signal })))
+        .toEqual(['query', 'parallel', 'busy'].map(mode => ({ mode, code: 0, signal: null })))
+      const attempts = await fixture.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', fixture.operation.operationId).orderBy('attempt_no', 'asc').execute()
+      expect(attempts.map(row => [row.attempt_no, row.purpose])).toEqual([
+        [1, 'query'], [2, 'query'], [3, 'query'], [4, 'query'],
+      ])
+    } finally { await fixture.close() }
+  }, 40_000)
+
+  it.each(['before_http_send', 'after_http_response'] as const)('fails closed after lock loss at %s and recovers with a new attempt', async (killStage) => {
+    const fixture = await createRecoveryCase({ name: `recovery-lock-lost-${killStage}`, license: info.activation_concurrent })
+    let killed = false
+    try {
+      const client = fixture.recoveryClientForCase(async stage => {
+        if (stage !== killStage || killed) return
+        const result = await fixture.pool.query<{ killed: boolean }>(
+          `SELECT pg_terminate_backend(pid) AS killed FROM pg_stat_activity
+           WHERE application_name = 'aikayun-license-recovery-lock' AND pid <> pg_backend_pid()`,
+        )
+        expect(result.rows).toEqual([{ killed: true }])
+        killed = true
+      })
+      await expect(client.queryPendingActivation(fixture.operation.operationId)).rejects.toMatchObject({ code: 'operation_recovery_result_unknown' })
+      const first = await fixture.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', fixture.operation.operationId).where('attempt_no', '=', 1).executeTakeFirstOrThrow()
+      expect(first.send_state).toBe('transport_unknown')
+      const result = await fixture.recoveryClientForCase().queryPendingActivation(fixture.operation.operationId)
+      expect(result).toMatchObject({ state: 'not_found', requestAttemptNo: 2 })
+    } finally { await fixture.close() }
+  }, 40_000)
+
+  it('bounds a blocked advisory lock wait and permits a later recovery', async () => {
+    const fixture = await createRecoveryCase({ name: 'recovery-lock-timeout', license: info.activation_concurrent })
+    const blocker = await fixture.pool.connect()
+    try {
+      await blocker.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [`aikayun-license-recovery:${fixture.operation.operationId}`])
+      const start = Date.now()
+      await expect(fixture.recoveryClientForCase().queryPendingActivation(fixture.operation.operationId)).rejects.toBeTruthy()
+      expect(Date.now() - start).toBeLessThan(25_000)
+      expect(await fixture.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', fixture.operation.operationId).execute()).toHaveLength(0)
+      await blocker.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [`aikayun-license-recovery:${fixture.operation.operationId}`])
+      const result = await fixture.recoveryClientForCase().queryPendingActivation(fixture.operation.operationId)
+      expect(result).toMatchObject({ state: 'not_found', requestAttemptNo: 1 })
+    } finally { blocker.release(); await fixture.close() }
+  }, 45_000)
+
   it('serializes two independent API processes restoring one activation operation', async () => {
     const fixture = await createRecoveryCase({ name: 'parallel-recovery-processes', license: info.activation_concurrent })
     try {
@@ -1258,6 +1325,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
         identityRoot: fixture.identityRoot,
         pendingRoot: fixture.pendingRoot,
         trustRoot: join(fixture.root, 'trust'),
+        poolMax: 1,
       }
       const [left, right] = await Promise.all([
         runRecoveryChild(childInput),
@@ -1537,6 +1605,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       await localLicenseOperationsMigration.up(rejectDb)
       await singleInitialActivationAttemptMigration.up(rejectDb)
       await licenseOperationResultArchiveMigration.up(rejectDb)
+      await licenseResultArchivePresenceMigration.up(rejectDb)
       const rejectedIdentity = await initializeInstallationIdentity(rejectPool, { identityRoot: rejectIdentityRoot, mode: 'fresh' })
       if (!rejectedIdentity.databaseId || !rejectedIdentity.instanceId || !rejectedIdentity.identityJkt) throw new Error('Rejected activation identity missing')
       await initializeTemporaryLicensePendingKey(rejectPendingRoot, 'test')
@@ -1645,6 +1714,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
         await localLicenseOperationsMigration.up(caseDb)
         await singleInitialActivationAttemptMigration.up(caseDb)
         await licenseOperationResultArchiveMigration.up(caseDb)
+        await licenseResultArchivePresenceMigration.up(caseDb)
         const caseIdentity = await initializeInstallationIdentity(casePool, { identityRoot: caseIdentityRoot, mode: 'fresh' })
         if (!caseIdentity.databaseId || !caseIdentity.instanceId || !caseIdentity.identityJkt) throw new Error('Crash fixture identity missing')
         await initializeTemporaryLicensePendingKey(casePendingRoot, 'test')
@@ -1731,6 +1801,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
         await localLicenseOperationsMigration.up(caseDb)
         await singleInitialActivationAttemptMigration.up(caseDb)
         await licenseOperationResultArchiveMigration.up(caseDb)
+        await licenseResultArchivePresenceMigration.up(caseDb)
         const caseIdentity = await initializeInstallationIdentity(casePool, { identityRoot: caseIdentityRoot, mode: 'fresh' })
         if (!caseIdentity.databaseId || !caseIdentity.instanceId || !caseIdentity.identityJkt) throw new Error('HTTP fixture identity missing')
         await initializeTemporaryLicensePendingKey(casePendingRoot, 'test')

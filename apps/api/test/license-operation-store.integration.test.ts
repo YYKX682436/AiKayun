@@ -12,6 +12,7 @@ import type { Database } from '../src/db/types.js'
 import { localLicenseOperationsMigration } from '../src/db/migrations/202610300001_local_license_operations.js'
 import { singleInitialActivationAttemptMigration } from '../src/db/migrations/202610300002_single_initial_activation_attempt.js'
 import { licenseOperationResultArchiveMigration } from '../src/db/migrations/202610300003_license_operation_result_archive.js'
+import { licenseResultArchivePresenceMigration } from '../src/db/migrations/202610300004_license_result_archive_presence.js'
 import { ed25519IdentityJkt } from '../src/licensing/license-intent.js'
 import {
   allocateLicenseOperationAttempt,
@@ -27,7 +28,7 @@ import {
   saveLicenseOperationResponse,
   saveLicenseOperationResultJws,
 } from '../src/licensing/license-operation-store.js'
-import { initializeTemporaryLicensePendingKey } from '../src/licensing/pending-encryption-key.js'
+import { encryptLicensePendingBytes, initializeTemporaryLicensePendingKey } from '../src/licensing/pending-encryption-key.js'
 import vector from './fixtures/activation-intent-7-1b-3c-1.json' with { type: 'json' }
 
 const testPublicJwk = { kty: 'OKP' as const, crv: 'Ed25519' as const, x: Buffer.alloc(32, 9).toString('base64url') }
@@ -90,7 +91,8 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
     }).execute()
     await localLicenseOperationsMigration.up(db)
     await singleInitialActivationAttemptMigration.up(db)
-      await licenseOperationResultArchiveMigration.up(db)
+    await licenseOperationResultArchiveMigration.up(db)
+    await licenseResultArchivePresenceMigration.up(db)
     const pendingRoot = await mkdtemp(join(tmpdir(), 'aikayun-license-pending-pg-'))
     pendingRoots.add(pendingRoot)
     await initializeTemporaryLicensePendingKey(pendingRoot, 'test')
@@ -584,12 +586,37 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
     })
   })
 
+  it('backfills archive presence for results created before the presence migration', async () => {
+    await withSandbox(async sandbox => {
+      const input = activationInput()
+      const operation = await createOrLoadActivationOperation(sandbox.db, sandbox.pendingRoot, input)
+      await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot, attemptInput(input.operationId, operation.intentDigest))
+      await markLicenseOperationAttemptSent(sandbox.db, input.operationId, 1)
+      const result = Buffer.from(`${'a'.repeat(40)}.${'b'.repeat(40)}.${'c'.repeat(40)}`)
+      await saveLicenseOperationResultJws(sandbox.db, sandbox.pendingRoot, input.operationId, 1, result)
+      await sql.raw(`DROP TRIGGER guard_license_result_archive_presence ON local_license_operation_attempts;
+        DROP FUNCTION guard_license_result_archive_presence();
+        ALTER TABLE local_license_operation_attempts DROP CONSTRAINT local_license_result_archive_presence_check;
+        ALTER TABLE local_license_operation_attempts DROP COLUMN result_archived`).execute(sandbox.db)
+      await licenseResultArchivePresenceMigration.up(sandbox.db)
+      const row = await sandbox.db.selectFrom('local_license_operation_attempts').select('result_archived')
+        .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
+      expect(row.result_archived).toBe(true)
+      expect(await readLicenseOperationAttemptResultJws(sandbox.db, sandbox.pendingRoot, input.operationId, 1)).toEqual(result)
+    })
+  })
+
   it('restores a PostgreSQL pending operation and its separate key volume as one decryptable backup pair', async () => {
     await withSandbox(async source => {
       const input = activationInput()
       const operation = await createOrLoadActivationOperation(source.db, source.pendingRoot, input)
       await allocateLicenseOperationAttempt(source.db, source.pendingRoot,
         attemptInput(input.operationId, operation.intentDigest))
+      const legacyCheck = await runChild(source, 'restore-check', input)
+      expect(legacyCheck.code).toBe(0)
+      await markLicenseOperationAttemptSent(source.db, input.operationId, 1)
+      const resultJws = Buffer.from(`${'a'.repeat(40)}.${'b'.repeat(40)}.${'c'.repeat(40)}`)
+      await saveLicenseOperationResultJws(source.db, source.pendingRoot, input.operationId, 1, resultJws)
       const sourceOperation = await source.db.selectFrom('local_license_operations').selectAll()
         .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
       const sourceAttempt = await source.db.selectFrom('local_license_operation_attempts').selectAll()
@@ -628,8 +655,11 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         await localLicenseOperationsMigration.up(restoredDb)
         await singleInitialActivationAttemptMigration.up(restoredDb)
         await licenseOperationResultArchiveMigration.up(restoredDb)
+        await licenseResultArchivePresenceMigration.up(restoredDb)
         await restoredDb.insertInto('local_license_operations').values(sourceOperation).execute()
+        await sql.raw('ALTER TABLE local_license_operation_attempts DISABLE TRIGGER USER').execute(restoredDb)
         await restoredDb.insertInto('local_license_operation_attempts').values(sourceAttempt).execute()
+        await sql.raw('ALTER TABLE local_license_operation_attempts ENABLE TRIGGER USER').execute(restoredDb)
         const sourceKey = join(source.pendingRoot, 'license-pending-aes-256-gcm.json')
         const restoredKey = join(restoredRoot, 'license-pending-aes-256-gcm.json')
         await copyFile(sourceKey, restoredKey)
@@ -641,6 +671,50 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         expect(check.stdout).not.toContain(input.activationCode)
         expect(await readActivationOperationPayload(restoredDb, restoredRoot, input.operationId))
           .toEqual({ activationCode: input.activationCode, origin: input.origin })
+        expect(await readLicenseOperationAttemptResultJws(restoredDb, restoredRoot, input.operationId, 1)).toEqual(resultJws)
+        await expect(restoredDb.updateTable('local_license_operation_attempts').set({ result_archived: false })
+          .where('operation_id', '=', input.operationId).where('attempt_no', '=', 1).execute()).rejects.toThrow()
+
+        // Simulate corruption in the restored backup; the normal immutable-history trigger
+        // prevents an application from performing this mutation.
+        await sql.raw('ALTER TABLE local_license_operation_attempts DISABLE TRIGGER USER').execute(restoredDb)
+        const corruptResult = Buffer.from(sourceAttempt.encrypted_result_jws!)
+        corruptResult[corruptResult.length - 1] = corruptResult[corruptResult.length - 1]! ^ 1
+        await restoredDb.updateTable('local_license_operation_attempts').set({ encrypted_result_jws: corruptResult })
+          .where('operation_id', '=', input.operationId).where('attempt_no', '=', 1).execute()
+        const corruptedCheck = await runChild({ schema: restoredSchema, pendingRoot: restoredRoot }, 'restore-check', input)
+        expect(corruptedCheck.code).not.toBe(0)
+        await restoredDb.updateTable('local_license_operation_attempts').set({ encrypted_result_jws: sourceAttempt.encrypted_result_jws })
+          .where('operation_id', '=', input.operationId).where('attempt_no', '=', 1).execute()
+        const wrongAad = await encryptLicensePendingBytes(restoredRoot, {
+          operationId: input.operationId, attemptNo: 1, record: 'attempt', field: 'center_response',
+        }, resultJws)
+        const corruptions = [
+          { result_key_id: 'wrong-key' },
+          { encrypted_result_jws: wrongAad.ciphertext },
+          { result_digest: Buffer.alloc(32, 3).toString('base64url') },
+          { encrypted_result_jws: null },
+          { result_key_id: null, encrypted_result_jws: null, result_digest: null, result_saved_at: null },
+          { result_archived: false },
+        ]
+        // A damaged dump can bypass a table constraint; the reader must still reject
+        // incomplete fields. Production inserts and updates retain the constraint.
+        await sql.raw('ALTER TABLE local_license_operation_attempts DROP CONSTRAINT local_license_operation_attempt_result_check').execute(restoredDb)
+        await sql.raw('ALTER TABLE local_license_operation_attempts DROP CONSTRAINT local_license_result_archive_presence_check').execute(restoredDb)
+        for (const corruption of corruptions) {
+          await restoredDb.updateTable('local_license_operation_attempts').set(corruption)
+            .where('operation_id', '=', input.operationId).where('attempt_no', '=', 1).execute()
+          const rejected = await runChild({ schema: restoredSchema, pendingRoot: restoredRoot }, 'restore-check', input)
+          expect(rejected.code).not.toBe(0)
+          await restoredDb.updateTable('local_license_operation_attempts').set({
+            result_key_id: sourceAttempt.result_key_id,
+            encrypted_result_jws: sourceAttempt.encrypted_result_jws,
+            result_digest: sourceAttempt.result_digest,
+            result_saved_at: sourceAttempt.result_saved_at,
+            result_archived: true,
+          }).where('operation_id', '=', input.operationId).where('attempt_no', '=', 1).execute()
+        }
+        await sql.raw('ALTER TABLE local_license_operation_attempts ENABLE TRIGGER USER').execute(restoredDb)
 
         const missingRoot = await mkdtemp(join(tmpdir(), 'aikayun-license-pending-missing-'))
         pendingRoots.add(missingRoot)

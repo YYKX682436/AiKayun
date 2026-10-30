@@ -44,3 +44,21 @@
 冻结中心在 activation code 无效、过期或已消费时可能返回未签名 403，不能安全区分“业务拒绝终态”与“无 operation 记录/请求未完成”。本地不得删除唯一 operation、改 `not_found` 为 terminal、换 code、释放原 Pending 或重建 operation。建议中心在同一 operation 锁内对确定性错误持久化原始签名终态 receipt、`terminal_reject` attempt 和 `rejected` operation；临时错误继续保持可续接。另建议现有 operation actor 在没有 active activation 时仍能 query 自己已持久化的终态，避免被 `not_found` 掩盖。
 
 本阶段没有独立 recovery operation、自动重试 worker、经营门禁、权益投影、公开 API/UI、生产密钥、部署或授权中心改动。订单、支付、退款、提现、履约、采购与既有 worker 行为保持原样。完成 3C-3A 后立即停止，等待独立严格验收，不进入 3C-3B。
+
+## R1：连接池隔离与结果归档恢复
+
+商城 R1 起点为 `2a770da1e6c6d65c48015235462399e4a87a064e`，授权中心仍固定于本文所列 SHA。旧实现的真实中心回归中，业务池 `max=1` 单次恢复、`max=2` 并发恢复占满、`max=1` 业务连接暂时占满三个场景均在 8 秒内无法完成。修复使用独立受控持锁 session、保留原锁键并设置有界等待；持锁 session 断线时不把已发出的请求判断为未到达中心。
+
+旧恢复预检漏检复现：真实数据库中已持久化 result JWS，将归档密文翻转一字节后旧 verifier 仍退出 0。R1 逐 attempt 调用既有结果读取和解密逻辑，并以迁移回填的单调存在标记识别归档整组缺失。针对性 PostgreSQL 测试 10/10 通过，覆盖旧记录、迁移回填、整组或部分缺失、密文损坏、错误 key、AAD 与摘要。独立 Compose fixture 经生产归档函数保存临时签名的 Compact JWS，在 API/PG 强杀重建和 v5 配对恢复后逐字节比较。
+
+如果归档字段及独立存在标记等所有数据库证据同时被抹除，且无其他可信证据，无法区别合法旧记录；v5 备份文件校验和仍用于发现文件传输损坏。R1 不改变 v5 配对格式或原 operation 状态机。
+
+R1 最终代码本地验收：
+
+| 检查 | 结果 |
+| --- | --- |
+| `pnpm install --frozen-lockfile` | 通过，锁文件未变。 |
+| 冻结中心真实 HTTPS/PostgreSQL 互操作 | 26 passed，含原 22 项、池饥饿、多进程、锁等待超时和发送前/响应后锁连接断线。 |
+| `pnpm verify` | 通过：lint 0 errors、7 条既有 Vue warning；typecheck 通过；money 16 passed；API 538 passed、26 skipped（中心互操作另行通过）；生产构建通过；主 Playwright 93 passed，alternate brand 1、SSR errors 3、dev preview 1、production brand 1 passed。Google Fonts metadata 请求超时后使用 fallback。 |
+| `node scripts/verify-digital-recovery.mjs` | 通过，退出码 0。隔离 API 和 PostgreSQL SIGKILL 重建、v5 配对备份恢复及采购恢复均通过；真实持久化的测试签名 result JWS 在各阶段逐字节一致。 |
+| 清理 | 测试脚本清理隔离 Compose 资源及临时中心 checkout；独立测试 PostgreSQL 和生成的构建/E2E 产物在验收后清理。 |

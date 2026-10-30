@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { createPublicKey } from 'node:crypto'
+import { createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createDatabase } from 'file:///app/dist/db/pool.js'
@@ -8,8 +8,10 @@ import {
   createOrLoadActivationOperation,
   markLicenseOperationAttemptSent,
   readActivationOperationPayload,
+  readLicenseOperationAttemptResultJws,
   readSavedLicenseOperationResponse,
   saveLicenseOperationResponse,
+  saveLicenseOperationResultJws,
 } from 'file:///app/dist/licensing/license-operation-store.js'
 
 const operationId = '44444444-4444-4444-8444-444444444444'
@@ -81,12 +83,27 @@ try {
     await markLicenseOperationAttemptSent(db, operationId, attempt.attemptNo)
     await saveLicenseOperationResponse(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId, attempt.attemptNo,
       Buffer.from('synthetic signed center response; no network request was made', 'utf8'))
+    // A real compact Ed25519 JWS, signed with an ephemeral test key, stored by the
+    // production archive function. This fixture does not impersonate the center.
+    const { privateKey: resultKey, publicKey: resultPublicKey } = generateKeyPairSync('ed25519')
+    const header = Buffer.from(JSON.stringify({ alg: 'EdDSA', typ: 'aikayun-license+jwt', kid: 'test-only' })).toString('base64url')
+    const payload = Buffer.from(JSON.stringify({ sub: licenseId, operation_id: operationId, fixture: 'backup-pair' })).toString('base64url')
+    const signingInput = Buffer.from(`${header}.${payload}`)
+    const signature = sign(null, signingInput, resultKey)
+    assert.ok(verify(null, signingInput, resultPublicKey, signature))
+    const resultJws = Buffer.from(`${signingInput.toString('ascii')}.${signature.toString('base64url')}`)
+    await saveLicenseOperationResultJws(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId, attempt.attemptNo, resultJws)
+    assert.deepEqual(await readLicenseOperationAttemptResultJws(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId, 1), resultJws)
+    process.stdout.write(`RESULT_JWS=${resultJws.toString('base64url')}\n`)
     process.stdout.write('license_pending_fixture_seeded\n')
   } else if (mode === 'verify') {
     const payload = await readActivationOperationPayload(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId)
     assert.deepEqual(payload, { activationCode, origin })
     const response = await readSavedLicenseOperationResponse(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId)
     assert.equal(response.toString('utf8'), 'synthetic signed center response; no network request was made')
+    const resultJws = await readLicenseOperationAttemptResultJws(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId, 1)
+    assert.ok(resultJws)
+    process.stdout.write(`RESULT_JWS=${resultJws.toString('base64url')}\n`)
     const state = await db.selectFrom('local_license_operations').select('state')
       .where('operation_id', '=', operationId).executeTakeFirstOrThrow()
     assert.equal(state.state, 'response_saved')

@@ -8,6 +8,7 @@ import {
   verifyRFC9530DigestHeader,
 } from '@misskey-dev/node-http-message-signatures'
 import type { Kysely } from 'kysely'
+import { Client } from 'pg'
 import type { Pool } from 'pg'
 import type { Database, LocalLicenseOperationAttemptsTable } from '../db/types.js'
 import {
@@ -521,24 +522,57 @@ async function requestBoundChallenge(options: LicenseOperationRecoveryClientOpti
   })
 }
 
-async function withRecoveryOperationLock<T>(pool: Pool, operationId: string, action: () => Promise<T>): Promise<T> {
-  const client = await pool.connect()
+let activeRecoveryLockConnections = 0
+const MAX_RECOVERY_LOCK_CONNECTIONS = 4
+
+async function withRecoveryOperationLock<T>(pool: Pool, operationId: string, action: (assertHeld: () => Promise<void>) => Promise<T>): Promise<T> {
+  if (activeRecoveryLockConnections >= MAX_RECOVERY_LOCK_CONNECTIONS) fail('operation_recovery_lock_capacity_exceeded')
+  // A fresh, non-pooled connection preserves the business pool's database, credentials,
+  // TLS and startup options. It is always closed, never returned for reuse.
+  const client = new Client({
+    ...pool.options,
+    password: pool.options.password,
+    connectionTimeoutMillis: 5_000,
+    lock_timeout: 15_000,
+    statement_timeout: 20_000,
+    query_timeout: 22_000,
+    application_name: 'aikayun-license-recovery-lock',
+  })
+  activeRecoveryLockConnections += 1
   let locked = false
-  let releaseError: Error | undefined
+  let lost = false
+  let backendPid = 0
+  client.on('error', () => { lost = true })
+  client.on('end', () => { lost = true })
+  const assertHeld = async () => {
+    if (lost || !locked) fail('operation_recovery_lock_lost')
+    try {
+      const status = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+      if (status.rows[0]?.pid !== backendPid) { lost = true; fail('operation_recovery_lock_lost') }
+    } catch { lost = true; fail('operation_recovery_lock_lost') }
+    if (lost) fail('operation_recovery_lock_lost')
+  }
   try {
-    // Session lock spans network waits but is never held inside a SQL transaction.
-    await client.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [`aikayun-license-recovery:${operationId}`])
+    await client.connect()
+    await client.query("SELECT set_config('lock_timeout', '15s', false), set_config('statement_timeout', '20s', false)")
+    const acquired = await client.query<{ pid: number }>(
+      'SELECT pg_backend_pid() AS pid, pg_advisory_lock(hashtextextended($1, 0))', [`aikayun-license-recovery:${operationId}`],
+    )
+    backendPid = acquired.rows[0]?.pid ?? 0
+    if (!backendPid || lost) fail('operation_recovery_lock_lost')
     locked = true
-    return await action()
+    await assertHeld()
+    const result = await action(assertHeld)
+    await assertHeld()
+    const unlocked = await client.query<{ unlocked: boolean }>(
+      'SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS unlocked', [`aikayun-license-recovery:${operationId}`],
+    )
+    if (lost || unlocked.rows[0]?.unlocked !== true) fail('operation_recovery_lock_lost')
+    locked = false
+    return result
   } finally {
-    if (locked) {
-      try {
-        await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [`aikayun-license-recovery:${operationId}`])
-      } catch (error) {
-        releaseError = error instanceof Error ? error : new Error('operation recovery lock release failed')
-      }
-    }
-    client.release(releaseError)
+    // Closing the dedicated session releases any lock even after errors/timeouts.
+    try { await client.end() } finally { activeRecoveryLockConnections -= 1 }
   }
 }
 
@@ -851,6 +885,7 @@ async function runOneRecoveryRequest(input: {
   operationId: string
   stage: 'query' | 'continue'
   checkpoint: (stage: LicenseRecoveryCheckpoint) => Promise<void>
+  assertLockHeld: () => Promise<void>
 }): Promise<VerifiedOperationRecoveryEvidence> {
   const { options, operationId, stage, checkpoint } = input
   return withVerifiedInstallationSigningContext(options.pool, options.identityRoot, async (identity) => {
@@ -968,17 +1003,25 @@ async function runOneRecoveryRequest(input: {
     let response
     try {
       await checkpoint('before_http_send')
+      await input.assertLockHeld()
       response = await postSignedLicenseRequest({
         origin,
         path,
         signed: request,
         ...(options.testTls === undefined ? {} : { testTls: options.testTls }),
       })
+      await input.assertLockHeld()
     } catch {
       await markLicenseOperationAttemptTransportResult(options.db, operationId, attempt.attemptNo, 'transport_unknown')
       fail('operation_recovery_result_unknown')
     }
-    await checkpoint('after_http_response')
+    try {
+      await checkpoint('after_http_response')
+      await input.assertLockHeld()
+    } catch {
+      await markLicenseOperationAttemptTransportResult(options.db, operationId, attempt.attemptNo, 'transport_unknown')
+      fail('operation_recovery_result_unknown')
+    }
     if (response.statusCode !== 200) {
       await markLicenseOperationAttemptTransportResult(options.db, operationId, attempt.attemptNo, 'transport_unknown')
       mapHttpFailure(response.statusCode, stage)
@@ -1046,7 +1089,7 @@ export function createLicenseOperationRecoveryClient(options: LicenseOperationRe
     fail('license_test_transport_forbidden')
   }
   const checkpoint = async (stage: LicenseRecoveryCheckpoint) => options.onTestCheckpoint?.(stage)
-  async function queryLocked(operationId: string): Promise<VerifiedOperationRecoveryEvidence> {
+  async function queryLocked(operationId: string, assertLockHeld: () => Promise<void>): Promise<VerifiedOperationRecoveryEvidence> {
     const identity = await withVerifiedInstallationSigningContext(options.pool, options.identityRoot, async current => ({
       databaseId: current.databaseId, instanceId: current.instanceId, identityJkt: current.identityJkt,
     }))
@@ -1055,12 +1098,12 @@ export function createLicenseOperationRecoveryClient(options: LicenseOperationRe
       db: options.db, pool: options.pool, pendingKeyRoot: options.pendingKeyRoot, operationId,
       issuer: options.releaseConfig.expected_center_issuer, centerOrigin: origin, identity,
     })
-    return runOneRecoveryRequest({ options, operationId, stage: 'query', checkpoint })
+    return runOneRecoveryRequest({ options, operationId, stage: 'query', checkpoint, assertLockHeld })
   }
   return Object.freeze({
     async queryPendingActivation(operationId: string): Promise<VerifiedOperationRecoveryEvidence> {
       try {
-        return await withRecoveryOperationLock(options.pool, operationId, () => queryLocked(operationId))
+        return await withRecoveryOperationLock(options.pool, operationId, assertHeld => queryLocked(operationId, assertHeld))
       } catch (error) {
         if (error instanceof LicenseOperationRecoveryError) throw error
         if (error instanceof LocalLicenseOperationError) fail(error.code)
@@ -1071,8 +1114,8 @@ export function createLicenseOperationRecoveryClient(options: LicenseOperationRe
     },
     async continuePendingActivation(operationId: string): Promise<RecoveredActivationOperation> {
       try {
-        return await withRecoveryOperationLock(options.pool, operationId, async () => {
-          const query = await queryLocked(operationId)
+        return await withRecoveryOperationLock(options.pool, operationId, async (assertHeld) => {
+          const query = await queryLocked(operationId, assertHeld)
           if (query.state !== 'not_found') return Object.freeze({ query, continuation: null })
           const identity = await withVerifiedInstallationSigningContext(options.pool, options.identityRoot, async current => ({
             databaseId: current.databaseId, instanceId: current.instanceId, identityJkt: current.identityJkt,
@@ -1084,7 +1127,7 @@ export function createLicenseOperationRecoveryClient(options: LicenseOperationRe
           })
           // The signed not_found is advisory only. Continue uses the identical operation and intent;
           // the center's operation lock serializes it with any late original activation.
-          const continuation = await runOneRecoveryRequest({ options, operationId, stage: 'continue', checkpoint })
+          const continuation = await runOneRecoveryRequest({ options, operationId, stage: 'continue', checkpoint, assertLockHeld: assertHeld })
           return Object.freeze({ query, continuation })
         })
       } catch (error) {

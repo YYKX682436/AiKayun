@@ -5,6 +5,7 @@ import {
   readActivationOperationPayload,
   readLicenseOperationAttemptEnvelope,
   readLicenseOperationAttemptResponse,
+  readLicenseOperationAttemptResultJws,
   readSavedLicenseOperationResponse,
 } from './license-operation-store.js'
 import { loadLicensePendingKey } from './pending-encryption-key.js'
@@ -42,6 +43,8 @@ export async function verifyLicensePendingBackupPair(): Promise<{ operations: nu
       if (attempt.send_state === 'response_saved') {
         await readLicenseOperationAttemptResponse(db, config.licensePendingKeyRoot, attempt.operation_id, attempt.attempt_no)
       }
+      // This also accepts legacy rows without a result and rejects incomplete archives.
+      await readLicenseOperationAttemptResultJws(db, config.licensePendingKeyRoot, attempt.operation_id, attempt.attempt_no)
     }
     for (const operation of operations) {
       if (operation.state === 'response_saved') {

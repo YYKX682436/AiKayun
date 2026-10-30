@@ -617,7 +617,12 @@ export async function saveLicenseOperationResultJws(
       !['sent', 'transport_unknown', 'response_saved'].includes(attempt.send_state)) {
       invalid('operation_result_binding_conflict')
     }
-    if (attempt.result_key_id !== null) {
+    if (attempt.result_archived !== true && attempt.result_archived !== false) invalid('operation_result_binding_mismatch')
+    if (typeof attempt.result_archived !== 'boolean') invalid('operation_result_binding_mismatch')
+    if (attempt.result_archived || attempt.result_key_id !== null) {
+      if (!attempt.result_archived || !attempt.result_key_id || !attempt.encrypted_result_jws || !attempt.result_saved_at) {
+        invalid('operation_result_binding_mismatch')
+      }
       if (attempt.result_digest !== resultDigest) invalid('operation_result_conflict')
       const existing = await decryptLicensePendingBytes(pendingKeyRoot, {
         operationId, attemptNo, record: 'attempt', field: 'center_result_jws',
@@ -625,12 +630,16 @@ export async function saveLicenseOperationResultJws(
       if (!existing.equals(Buffer.from(resultJws))) invalid('operation_result_conflict')
       return
     }
+    if (attempt.encrypted_result_jws !== null || attempt.result_digest !== null || attempt.result_saved_at !== null) {
+      invalid('operation_result_binding_mismatch')
+    }
     const savedAt = await databaseNow(trx)
     await trx.updateTable('local_license_operation_attempts').set({
       result_key_id: encrypted.keyId,
       encrypted_result_jws: encrypted.ciphertext,
       result_digest: resultDigest,
       result_saved_at: savedAt,
+      result_archived: true,
     }).where('operation_id', '=', operationId).where('attempt_no', '=', attemptNo)
       .where('result_key_id', 'is', null).executeTakeFirstOrThrow()
   })
@@ -646,10 +655,12 @@ export async function readLicenseOperationAttemptResultJws(
   const attempt = await db.selectFrom('local_license_operation_attempts').selectAll()
     .where('operation_id', '=', operationId).where('attempt_no', '=', attemptNo).executeTakeFirst()
   if (!attempt) invalid('operation_attempt_unavailable')
-  if (attempt.result_key_id === null && attempt.encrypted_result_jws === null && attempt.result_digest === null && attempt.result_saved_at === null) {
+  if (typeof attempt.result_archived !== 'boolean') invalid('operation_result_binding_mismatch')
+  if (attempt.result_archived !== true && attempt.result_archived !== false) invalid('operation_result_binding_mismatch')
+  if (!attempt.result_archived && attempt.result_key_id === null && attempt.encrypted_result_jws === null && attempt.result_digest === null && attempt.result_saved_at === null) {
     return null
   }
-  if (!attempt.result_key_id || !attempt.encrypted_result_jws || !attempt.result_digest || !attempt.result_saved_at) {
+  if (!attempt.result_archived || !attempt.result_key_id || !attempt.encrypted_result_jws || !attempt.result_digest || !attempt.result_saved_at) {
     invalid('operation_result_binding_mismatch')
   }
   const raw = await decryptLicensePendingBytes(pendingKeyRoot, {
