@@ -63,6 +63,9 @@ importers:
       '@fastify/type-provider-typebox':
         specifier: 6.3.0
         version: 6.3.0(ajv-formats@3.0.1(ajv@8.20.0))(typebox@1.3.37)
+      '@misskey-dev/node-http-message-signatures':
+        specifier: 1.1.2
+        version: 1.1.2
       canonicalize:
         specifier: 5.1.0
         version: 5.1.0
@@ -84,6 +87,9 @@ importers:
       sharp:
         specifier: 0.35.5
         version: 0.35.5(@types/node@24.19.2)
+      structured-headers:
+        specifier: 1.0.1
+        version: 1.0.1
       typebox:
         specifier: 1.3.37
         version: 1.3.37
@@ -1053,6 +1059,11 @@ packages:
   '@keyv/serialize@1.1.1':
     resolution: {integrity: sha512-dXn3FZhPv0US+7dtJsIi2R+c7qWYiReoEh5zUntWCf4oSpMNib8FDhSoed6m3QyZdx5hK7iLFkYk3rNxwt8vTA==}
 
+  '@lapo/asn1js@2.1.3':
+    resolution: {integrity: sha512-eX1xNRPeP5dCtUpQg/lqHZjBd0//wJ05yn/4osewSc4rxC1KCXBfbUeCiQEdNREbGMa3xjZxjkYNY1AHzUkleQ==}
+    engines: {node: '>=14.6.0'}
+    hasBin: true
+
   '@lukeed/ms@2.0.2':
     resolution: {integrity: sha512-9I2Zn6+NJLfaGoz9jN3lpwDgAYvfGeNYdbAIjJOqzs4Tpc+VU3Jqq4IofSUBKajiDS8k9fZIg18/z13mpk1bsA==}
     engines: {node: '>=8'}
@@ -1061,6 +1072,10 @@ packages:
     resolution: {integrity: sha512-uwPAhccfFJlsfCxMYTwOdVfOz3xqyj8xYL3zJj8f0pb30tLohnnFPhLuqp4/qoEz8sNxe4SESZedcBojRefIzg==}
     engines: {node: '>=18'}
     hasBin: true
+
+  '@misskey-dev/node-http-message-signatures@1.1.2':
+    resolution: {integrity: sha512-UQw5tGJNda0eh05ZAOfhEb6wbFxdppzkXRAGYXmvJagjN1GxNJDvwPHXhwIe+RyRB4iQRdSBkSzw9sR9Ff647w==}
+    engines: {node: '>=18.4.0'}
 
   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
     resolution: {integrity: sha512-oTXEIha4SsuXdTA4Iyskj0kpdx2yVXdhd75c2v3xGrHFfVMsbhTPZU/nMPL4sWKo4pBHm3aucLaqGlF696dTyQ==}
@@ -4457,6 +4472,9 @@ packages:
     resolution: {integrity: sha512-g6QUff04oZpHs0eG5p83rFLhHeV00ug/Yf9nZM6fLeUrPguBTkTQOdpAWWspMh55TZfVQDPaN3NQJfbVRAxdIw==}
     engines: {iojs: '>=1.0.0', node: '>=0.10.0'}
 
+  rfc4648@1.5.4:
+    resolution: {integrity: sha512-rRg/6Lb+IGfJqO05HZkN50UtY7K/JhxJag1kP23+zyMfrvoB0B7RWv06MbOzoc79RgCdNTiUaNsTT1AJZ7Z+cg==}
+
   rfdc@1.4.1:
     resolution: {integrity: sha512-q1b3N5QkRUWUl7iyylaaj3kOpIT0N2i9MqIEQXP73GVsN9cw3fdx8X63cEmWhJGi2PPCF23Ijp7ktmd39rawIA==}
 
@@ -4701,6 +4719,10 @@ packages:
 
   structured-clone-es@2.0.1:
     resolution: {integrity: sha512-10ZL5r77LhknxlP1FBiCW+VdnuWOEFLdSS2SKtjyEV+L4qP1hUEIMIZW94LC3jKxRmT/Dj7KkD1mqh/IY6lhKQ==}
+
+  structured-headers@1.0.1:
+    resolution: {integrity: sha512-QYBxdBtA4Tl5rFPuqmbmdrS9kbtren74RTJTcs0VSQNVV5iRhJD4QlYTLD0+81SBwUQctjEQzjTRI3WG4DzICA==}
+    engines: {node: '>= 14', npm: '>=6'}
 
   stylehacks@9.0.8:
     resolution: {integrity: sha512-PIopN/yo+/Queh2lTvJLQuXJ5yrqxWk6fQTN10daJVjnEaqkM+i+IjQdc8Jzl2fnJ8Ngq1vb57vI0hoLkKs22w==}
@@ -6233,6 +6255,8 @@ snapshots:
 
   '@keyv/serialize@1.1.1': {}
 
+  '@lapo/asn1js@2.1.3': {}
+
   '@lukeed/ms@2.0.2': {}
 
   '@mapbox/node-pre-gyp@2.0.3':
@@ -6247,6 +6271,12 @@ snapshots:
     transitivePeerDependencies:
       - encoding
       - supports-color
+
+  '@misskey-dev/node-http-message-signatures@1.1.2':
+    dependencies:
+      '@lapo/asn1js': 2.1.3
+      rfc4648: 1.5.4
+      structured-headers: 1.0.1
 
   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
     optional: true
@@ -10177,6 +10207,8 @@ snapshots:
 
   reusify@1.1.0: {}
 
+  rfc4648@1.5.4: {}
+
   rfdc@1.4.1: {}
 
   rolldown-string@0.3.1(rolldown@1.2.14):
@@ -10464,6 +10496,8 @@ snapshots:
       js-tokens: 10.0.0
 
   structured-clone-es@2.0.1: {}
+
+  structured-headers@1.0.1: {}
 
   stylehacks@9.0.8(postcss@8.5.30):
     dependencies:

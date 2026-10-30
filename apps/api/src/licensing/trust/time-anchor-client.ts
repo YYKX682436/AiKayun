@@ -1,6 +1,7 @@
 import { request as httpsRequest } from 'node:https'
 import type { IncomingMessage } from 'node:http'
 import type { RequestOptions } from 'node:https'
+import type { LookupFunction } from 'node:net'
 import { performance } from 'node:perf_hooks'
 import { parseStrictJson } from '../strict-json.js'
 import { createTimeAnchorNonce, MAX_TIME_ANCHOR_RTT_MS, verifyTimeAnchorWithTrustBundleCandidate } from '../crypto/time-anchor.js'
@@ -48,14 +49,14 @@ function readBoundedJson(response: IncomingMessage): Promise<Buffer> {
 function postNonce(
   config: TrustedReleaseLicenseConfig,
   nonce: string,
-  options: { testCa?: string | Buffer } = {},
+  options: { testCa?: string | Buffer; testLookup?: LookupFunction } = {},
 ): Promise<{ body: Buffer; roundTripMs: number; requestStartedAt: number; responseReceivedAt: number }> {
   const target = new URL('/v1/time-anchor', config.expected_center_origin)
   if (target.protocol !== 'https:' || target.origin !== config.expected_center_origin || target.pathname !== '/v1/time-anchor' || target.search || target.hash) {
     throw new Error('Time-anchor target must be the configured HTTPS origin')
   }
-  if (options.testCa !== undefined && process.env.NODE_ENV !== 'test') {
-    throw new Error('A custom TLS root is restricted to isolated test runs')
+  if ((options.testCa !== undefined || options.testLookup !== undefined) && process.env.NODE_ENV !== 'test') {
+    throw new Error('Test-only TLS and DNS overrides are restricted to isolated test runs')
   }
   const requestBody = Buffer.from(JSON.stringify({ client_nonce: nonce }), 'utf8')
   let requestOptions: RequestOptions = {
@@ -66,6 +67,7 @@ function postNonce(
     method: 'POST',
     agent: false,
     rejectUnauthorized: true,
+    servername: target.hostname,
     headers: {
       accept: 'application/json',
       'content-type': 'application/json',
@@ -73,6 +75,7 @@ function postNonce(
     },
   }
   if (options.testCa !== undefined) requestOptions = { ...requestOptions, ca: options.testCa }
+  if (options.testLookup !== undefined) requestOptions = { ...requestOptions, lookup: options.testLookup }
 
   return new Promise((resolve, reject) => {
     const requestStartedAt = performance.now()
@@ -111,7 +114,7 @@ function postNonce(
 export async function fetchTrustedTimeAnchor(
   config: TrustedReleaseLicenseConfig,
   candidate: RootAuthenticatedTrustBundleCandidate,
-  options: { testCa?: string | Buffer } = {},
+  options: { testCa?: string | Buffer; testLookup?: LookupFunction } = {},
 ): Promise<TrustedTimeSample> {
   if (candidate.claims.sub !== config.expected_center_issuer) throw new Error('Candidate bundle does not match the configured center issuer')
   const nonce = createTimeAnchorNonce()

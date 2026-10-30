@@ -1,8 +1,9 @@
-import { createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID } from 'node:crypto'
+import { createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sign as signEd25519 } from 'node:crypto'
 import { constants, existsSync } from 'node:fs'
 import { lstat, mkdir, open, readdir, realpath, rename, unlink } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
+import type { KeyObject } from 'node:crypto'
 import type { Pool, PoolClient } from 'pg'
 import { calculateJwkThumbprint } from 'jose'
 
@@ -85,6 +86,15 @@ interface IdentityManifest {
 
 interface ValidatedIdentity extends IdentityManifest {
   initializationMode: InstallationInitializationMode
+  privateKey: KeyObject
+}
+
+export interface VerifiedInstallationSigningContext {
+  readonly databaseId: string
+  readonly instanceId: string
+  readonly identityJkt: string
+  readonly publicJwk: Readonly<{ kty: 'OKP'; crv: 'Ed25519'; x: string }>
+  sign(message: Uint8Array): Buffer
 }
 
 const currentDirectoryName = 'current'
@@ -394,6 +404,7 @@ async function readAndValidateIdentityDirectory(directory: string): Promise<Vali
   return {
     ...(manifestValue as unknown as IdentityManifest),
     initializationMode: intentValue.mode as InstallationInitializationMode,
+    privateKey,
   }
 }
 
@@ -944,6 +955,47 @@ export async function verifyInstallationIdentity(
   } finally {
     client.release()
   }
+}
+
+/**
+ * Runs a short-lived signer callback with the key whose manifest, public key,
+ * JKT, initialization journal and database binding have just been rechecked.
+ * The private key itself is never returned or serialized.
+ */
+export async function withVerifiedInstallationSigningContext<T>(
+  pool: Pool,
+  identityRoot: string,
+  work: (identity: VerifiedInstallationSigningContext) => Promise<T>,
+  forbiddenRoots: string[] = [],
+): Promise<T> {
+  const root = await requireIdentityRoot(identityRoot, forbiddenRoots)
+  const client = await pool.connect()
+  let signingContext: VerifiedInstallationSigningContext
+  try {
+    await assertIdentitySchema(client)
+    const snapshot = await compareIdentity(client, root)
+    if (snapshot.status !== 'ready' || !snapshot.databaseId || !snapshot.instanceId || !snapshot.identityJkt) {
+      throw new InstallationIdentityError(
+        snapshot.status === 'ready' ? 'identity_mismatch' : snapshot.status,
+        snapshot.code,
+        'A fully verified installation identity is required for license signing',
+      )
+    }
+    const identity = await readAndValidateIdentityDirectory(join(root, currentDirectoryName))
+    if (identity.database_id !== snapshot.databaseId || identity.instance_id !== snapshot.instanceId || identity.identity_jkt !== snapshot.identityJkt) {
+      throw new InstallationIdentityError('identity_mismatch', 'identity_changed_during_signing', 'Installation identity changed while its signing context was loaded')
+    }
+    signingContext = Object.freeze({
+      databaseId: identity.database_id,
+      instanceId: identity.instance_id,
+      identityJkt: identity.identity_jkt,
+      publicJwk: Object.freeze({ ...identity.public_jwk }),
+      sign: (message: Uint8Array) => signEd25519(null, Buffer.from(message), identity.privateKey),
+    })
+  } finally {
+    client.release()
+  }
+  return work(signingContext)
 }
 
 export function identityDataDirectory(identityRoot: string): string {

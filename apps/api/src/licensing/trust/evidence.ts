@@ -79,6 +79,7 @@ export interface VerifiedOperationEvidence {
 
 export interface VerifiedChallengeEvidence {
   readonly purpose: 'license_challenge'
+  readonly signingKeyId: string
   readonly claims: Readonly<Record<string, unknown>>
   readonly signatureVerified: true
 }
@@ -256,7 +257,12 @@ export async function verifyLicenseChallenge(
   assertDigest(claims.identity_jkt, 'identity JKT')
   assertDigest(claims.client_nonce, 'client nonce')
   assertDigest(claims.server_nonce, 'server nonce')
-  return Object.freeze({ purpose: 'license_challenge', claims: Object.freeze({ ...claims }), signatureVerified: true })
+  return Object.freeze({
+    purpose: 'license_challenge',
+    signingKeyId: assertStringClaim(verified.header, 'kid', 43),
+    claims: Object.freeze({ ...claims }),
+    signatureVerified: true,
+  })
 }
 
 export async function verifyLicenseOperationReceipt(

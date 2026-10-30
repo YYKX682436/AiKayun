@@ -361,6 +361,83 @@ describe('trusted release configuration and frozen center interoperability', () 
     })).rejects.toThrow(/binding/u)
   })
 
+  it('rejects expired, future-dated, unknown-kid and revoked-key Challenge JWSs', async () => {
+    const root = await makePair()
+    const center = await makePair()
+    const keyRecord = await publicEntry(center)
+    const activeStore = await storeFor(await temporaryStoreDirectory(), root)
+    const active = await activeStore.accept(
+      await bundle(root, CENTER_ISSUER, { version: '1', keys: [keyRecord] }),
+      BASE,
+    )
+    const instanceId = randomUUID()
+    const claims = {
+      v: 1,
+      iss: CENTER_ISSUER,
+      aud: 'aikayun-commerce',
+      sub: instanceId,
+      jti: randomUUID(),
+      iat: BASE - 1,
+      nbf: BASE - 1,
+      exp: BASE + 299,
+      operation: 'activation',
+      operation_id: randomUUID(),
+      intent_digest: randomBytes(32).toString('base64url'),
+      instance_id: instanceId,
+      identity_jkt: randomBytes(32).toString('base64url'),
+      client_nonce: randomBytes(32).toString('base64url'),
+      server_nonce: randomBytes(32).toString('base64url'),
+    }
+    const activeHeader = { alg: 'Ed25519', kid: center.kid, typ: 'aikayun-license-challenge+jwt' }
+    const valid = await signJws(center.privateKey, activeHeader, claims)
+    await expect(verifyLicenseChallenge(valid, {
+      resolver: active.resolver, issuer: CENTER_ISSUER, trustedTime: BASE,
+    })).resolves.toMatchObject({ signatureVerified: true, signingKeyId: center.kid })
+
+    const expired = await signJws(center.privateKey, activeHeader, {
+      ...claims,
+      iat: BASE - 301,
+      nbf: BASE - 301,
+      exp: BASE - 1,
+    })
+    await expect(verifyLicenseChallenge(expired, {
+      resolver: active.resolver, issuer: CENTER_ISSUER, trustedTime: BASE,
+    })).rejects.toThrow()
+
+    const futureDated = await signJws(center.privateKey, activeHeader, {
+      ...claims,
+      iat: BASE + 1,
+      nbf: BASE + 1,
+      exp: BASE + 301,
+    })
+    await expect(verifyLicenseChallenge(futureDated, {
+      resolver: active.resolver, issuer: CENTER_ISSUER, trustedTime: BASE,
+    })).rejects.toThrow()
+
+    const wrongKid = await signJws(center.privateKey, {
+      ...activeHeader,
+      kid: randomBytes(32).toString('base64url'),
+    }, claims)
+    await expect(verifyLicenseChallenge(wrongKid, {
+      resolver: active.resolver, issuer: CENTER_ISSUER, trustedTime: BASE,
+    })).rejects.toThrow()
+
+    const revokedStore = await storeFor(await temporaryStoreDirectory(), root)
+    const revoked = await revokedStore.accept(
+      await bundle(root, CENTER_ISSUER, {
+        version: '1',
+        keys: [{ ...keyRecord, revoked_at: BASE - 1 }],
+        at: BASE,
+        iat: BASE,
+        nbf: BASE,
+      }),
+      BASE,
+    )
+    await expect(verifyLicenseChallenge(valid, {
+      resolver: revoked.resolver, issuer: CENTER_ISSUER, trustedTime: BASE,
+    })).rejects.toThrow(/revoked|signing key|trust bundle/iu)
+  })
+
   it('rejects leases with non-canonical signed request nonce or digest claims', async () => {
     const root = await makePair()
     const center = await makePair()
