@@ -46,6 +46,7 @@ import { procurementGlobalConflictsMigration } from './migrations/202610270007_p
 import { installationIdentityMigration } from './migrations/202610290001_installation_identity.js'
 import { localLicenseOperationsMigration } from './migrations/202610300001_local_license_operations.js'
 import { singleInitialActivationAttemptMigration } from './migrations/202610300002_single_initial_activation_attempt.js'
+import { licenseOperationResultArchiveMigration } from './migrations/202610300003_license_operation_result_archive.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -96,6 +97,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610290001_installation_identity': installationIdentityMigration,
       '202610300001_local_license_operations': localLicenseOperationsMigration,
       '202610300002_single_initial_activation_attempt': singleInitialActivationAttemptMigration,
+      '202610300003_license_operation_result_archive': licenseOperationResultArchiveMigration,
     }
   }
 }

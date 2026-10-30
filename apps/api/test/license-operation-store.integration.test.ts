@@ -11,6 +11,7 @@ import type { Pool as PgPool } from 'pg'
 import type { Database } from '../src/db/types.js'
 import { localLicenseOperationsMigration } from '../src/db/migrations/202610300001_local_license_operations.js'
 import { singleInitialActivationAttemptMigration } from '../src/db/migrations/202610300002_single_initial_activation_attempt.js'
+import { licenseOperationResultArchiveMigration } from '../src/db/migrations/202610300003_license_operation_result_archive.js'
 import { ed25519IdentityJkt } from '../src/licensing/license-intent.js'
 import {
   allocateLicenseOperationAttempt,
@@ -21,8 +22,10 @@ import {
   readActivationOperationPayload,
   readLicenseOperationAttemptEnvelope,
   readLicenseOperationAttemptResponse,
+  readLicenseOperationAttemptResultJws,
   readSavedLicenseOperationResponse,
   saveLicenseOperationResponse,
+  saveLicenseOperationResultJws,
 } from '../src/licensing/license-operation-store.js'
 import { initializeTemporaryLicensePendingKey } from '../src/licensing/pending-encryption-key.js'
 import vector from './fixtures/activation-intent-7-1b-3c-1.json' with { type: 'json' }
@@ -87,6 +90,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
     }).execute()
     await localLicenseOperationsMigration.up(db)
     await singleInitialActivationAttemptMigration.up(db)
+      await licenseOperationResultArchiveMigration.up(db)
     const pendingRoot = await mkdtemp(join(tmpdir(), 'aikayun-license-pending-pg-'))
     pendingRoots.add(pendingRoot)
     await initializeTemporaryLicensePendingKey(pendingRoot, 'test')
@@ -330,6 +334,37 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
       expect(await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
         .where('operation_id', '=', input.operationId).execute()).toHaveLength(2)
       expect(await sandbox.db.selectFrom('local_license_operations').selectAll().execute()).toHaveLength(1)
+    })
+  })
+
+  it('keeps the center result JWS independently from an attempt HTTP response', async () => {
+    await withSandbox(async sandbox => {
+      const input = activationInput()
+      const operation = await createOrLoadActivationOperation(sandbox.db, sandbox.pendingRoot, input)
+      const attempt = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(input.operationId, operation.intentDigest, testIdentityJkt, 'activation', true))
+      await markLicenseOperationAttemptSent(sandbox.db, input.operationId, attempt.attemptNo)
+      const resultToken = Buffer.from(JSON.stringify({ alg: 'Ed25519', typ: 'aikayun-license+jwt' })).toString('base64url') + '.' +
+        Buffer.from(JSON.stringify({ sub: input.licenseId, result: 'center-original' })).toString('base64url') + '.' +
+        Buffer.alloc(64, 0x4a).toString('base64url')
+      const responseToken = Buffer.from(JSON.stringify({ alg: 'Ed25519', typ: 'aikayun-license-operation+jwt' })).toString('base64url') + '.' +
+        Buffer.from(JSON.stringify({ result_jws: resultToken })).toString('base64url') + '.' +
+        Buffer.alloc(64, 0x4b).toString('base64url')
+      await saveLicenseOperationResultJws(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo,
+        Buffer.from(resultToken, 'ascii'))
+      const archivedResult = await readLicenseOperationAttemptResultJws(sandbox.db, sandbox.pendingRoot,
+        input.operationId, attempt.attemptNo)
+      expect(archivedResult?.toString('ascii')).toBe(resultToken)
+      await saveLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo,
+        Buffer.from(responseToken, 'ascii'))
+      expect((await readLicenseOperationAttemptResponse(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo)).toString('ascii'))
+        .toBe(responseToken)
+      expect((await readLicenseOperationAttemptResultJws(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo))?.toString('ascii'))
+        .toBe(resultToken)
+      await expect(saveLicenseOperationResultJws(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo,
+        Buffer.from(`${resultToken.slice(0, -1)}A`, 'ascii'))).rejects.toMatchObject({ code: 'operation_result_conflict' })
+      await expect(sql`UPDATE local_license_operation_attempts SET result_digest=${'Z'.repeat(43)}
+        WHERE operation_id=${input.operationId}::uuid AND attempt_no=${attempt.attemptNo}`.execute(sandbox.db)).rejects.toBeDefined()
     })
   })
 
@@ -592,6 +627,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         }).execute()
         await localLicenseOperationsMigration.up(restoredDb)
         await singleInitialActivationAttemptMigration.up(restoredDb)
+        await licenseOperationResultArchiveMigration.up(restoredDb)
         await restoredDb.insertInto('local_license_operations').values(sourceOperation).execute()
         await restoredDb.insertInto('local_license_operation_attempts').values(sourceAttempt).execute()
         const sourceKey = join(source.pendingRoot, 'license-pending-aes-256-gcm.json')

@@ -87,6 +87,10 @@ export interface LocalLicenseOperationAttemptsTable {
   encrypted_response: Buffer | null
   response_digest: string | null
   response_saved_at: Date | null
+  result_key_id: string | null
+  encrypted_result_jws: Buffer | null
+  result_digest: string | null
+  result_saved_at: Date | null
   created_at: Generated<Date>
 }
 

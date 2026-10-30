@@ -28,7 +28,7 @@ export interface PendingCiphertext {
 export interface PendingSecretContext {
   operationId: string
   record: 'operation' | 'attempt'
-  field: 'intent_payload' | 'request_envelope' | 'center_response' | 'center_evidence'
+  field: 'intent_payload' | 'request_envelope' | 'center_response' | 'center_evidence' | 'center_result_jws'
   attemptNo?: number
 }
 
@@ -200,7 +200,8 @@ function aad(context: PendingSecretContext, keyId: string): Buffer {
   if (context.record === 'operation' && context.field !== 'intent_payload' && context.field !== 'center_evidence') {
     fail('pending_cipher_context_invalid')
   }
-  if (context.record === 'attempt' && context.field !== 'request_envelope' && context.field !== 'center_response') {
+  if (context.record === 'attempt' && context.field !== 'request_envelope' &&
+    context.field !== 'center_response' && context.field !== 'center_result_jws') {
     fail('pending_cipher_context_invalid')
   }
   if (context.record === 'attempt' && (!Number.isSafeInteger(context.attemptNo) || context.attemptNo! < 1)) {

@@ -154,10 +154,13 @@ function validateOperationRequestBody(
   payload?: { activationCode: string; origin: string | null },
 ): void {
   const body = parseJsonObject(bodyBytes, 'attempt_request_body_invalid')
-  if (purpose === 'activation' && Object.keys(body).sort().join(',') !== [
-    'activation_code', 'attempt_no', 'challenge', 'database_id', 'identity_jkt', 'instance_id',
-    'intent_digest', 'license_id', 'operation_id', 'origin', 'public_jwk',
-  ].sort().join(',')) invalid('attempt_request_binding_conflict')
+  const commonFields = [
+    'attempt_no', 'challenge', 'database_id', 'identity_jkt', 'instance_id', 'intent_digest',
+    'license_id', 'operation_id', 'public_jwk',
+  ]
+  const expectedFields = purpose === 'query' ? commonFields
+    : [...commonFields, 'activation_code', 'origin', ...(purpose === 'continue' ? ['kind'] : [])]
+  if (Object.keys(body).sort().join(',') !== expectedFields.sort().join(',')) invalid('attempt_request_binding_conflict')
   const publicJwk = body.public_jwk
   if (body.operation_id !== operation.operation_id || body.intent_digest !== operation.intent_digest ||
     body.attempt_no !== attemptNo || body.license_id !== operation.license_id ||
@@ -173,15 +176,13 @@ function validateOperationRequestBody(
   if (ed25519IdentityJkt({ kty: 'OKP', crv: 'Ed25519', x: jwk.x }) !== operation.identity_jkt) {
     invalid('attempt_request_binding_conflict')
   }
-  if (purpose === 'activation' || (purpose === 'continue' && operation.kind === 'activation')) {
+  if (purpose === 'activation' || purpose === 'continue') {
     const expectedTarget = purpose === 'activation' ? '/v1/activations' : '/v1/operations/continue'
     if (operation.kind !== 'activation' || target !== expectedTarget || !payload ||
       body.activation_code !== payload.activationCode || body.origin !== payload.origin ||
       (purpose === 'continue' && body.kind !== 'activation')) invalid('attempt_request_binding_conflict')
   } else if (purpose === 'query') {
     if (target !== '/v1/operations/query') invalid('attempt_request_binding_conflict')
-  } else if (purpose === 'continue') {
-    invalid('attempt_request_kind_not_supported')
   }
 }
 
@@ -412,6 +413,10 @@ export async function allocateLicenseOperationAttempt(
         encrypted_response: null,
         response_digest: null,
         response_saved_at: null,
+        result_key_id: null,
+        encrypted_result_jws: null,
+        result_digest: null,
+        result_saved_at: null,
       }).returning(['operation_id', 'attempt_no', 'request_body_digest', 'request_nonce_hash', 'send_state'])
         .executeTakeFirstOrThrow()
       return {
@@ -573,6 +578,88 @@ export async function readLicenseOperationAttemptResponse(
     field: 'center_response',
   }, { keyId: attempt.response_key_id, ciphertext: attempt.encrypted_response })
   if (sha256Base64url(raw) !== attempt.response_digest) invalid('operation_response_digest_mismatch')
+  return raw
+}
+
+const compactJwsBytesPattern = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u
+
+/** Archive the center-authenticated original result separately from this attempt's HTTP response. */
+export async function saveLicenseOperationResultJws(
+  db: Kysely<Database>,
+  pendingKeyRoot: string,
+  operationId: string,
+  attemptNo: number,
+  resultJws: Uint8Array,
+): Promise<{ resultDigest: string }> {
+  if (!Number.isSafeInteger(attemptNo) || attemptNo < 1 || resultJws.byteLength < 100 || resultJws.byteLength > 16 * 1024) {
+    invalid('invalid_operation_result')
+  }
+  const token = Buffer.from(resultJws).toString('ascii')
+  if (!compactJwsBytesPattern.test(token) || !Buffer.from(token, 'ascii').equals(Buffer.from(resultJws))) {
+    invalid('invalid_operation_result')
+  }
+  const resultDigest = sha256Base64url(resultJws)
+  const encrypted = await encryptLicensePendingBytes(pendingKeyRoot, {
+    operationId,
+    attemptNo,
+    record: 'attempt',
+    field: 'center_result_jws',
+  }, resultJws)
+  await db.transaction().execute(async (trx) => {
+    await lockOperation(trx, operationId)
+    const operation = await trx.selectFrom('local_license_operations').selectAll()
+      .where('operation_id', '=', operationId).forUpdate().executeTakeFirst()
+    const attempt = await trx.selectFrom('local_license_operation_attempts').selectAll()
+      .where('operation_id', '=', operationId).where('attempt_no', '=', attemptNo).forUpdate().executeTakeFirst()
+    if (!operation || !attempt || operation.kind !== 'activation' ||
+      !['activation', 'continue'].includes(attempt.purpose) ||
+      attempt.intent_digest !== operation.intent_digest || attempt.identity_jkt !== operation.identity_jkt ||
+      !['sent', 'transport_unknown', 'response_saved'].includes(attempt.send_state)) {
+      invalid('operation_result_binding_conflict')
+    }
+    if (attempt.result_key_id !== null) {
+      if (attempt.result_digest !== resultDigest) invalid('operation_result_conflict')
+      const existing = await decryptLicensePendingBytes(pendingKeyRoot, {
+        operationId, attemptNo, record: 'attempt', field: 'center_result_jws',
+      }, { keyId: attempt.result_key_id, ciphertext: attempt.encrypted_result_jws! })
+      if (!existing.equals(Buffer.from(resultJws))) invalid('operation_result_conflict')
+      return
+    }
+    const savedAt = await databaseNow(trx)
+    await trx.updateTable('local_license_operation_attempts').set({
+      result_key_id: encrypted.keyId,
+      encrypted_result_jws: encrypted.ciphertext,
+      result_digest: resultDigest,
+      result_saved_at: savedAt,
+    }).where('operation_id', '=', operationId).where('attempt_no', '=', attemptNo)
+      .where('result_key_id', 'is', null).executeTakeFirstOrThrow()
+  })
+  return { resultDigest }
+}
+
+export async function readLicenseOperationAttemptResultJws(
+  db: Kysely<Database>,
+  pendingKeyRoot: string,
+  operationId: string,
+  attemptNo: number,
+): Promise<Buffer | null> {
+  const attempt = await db.selectFrom('local_license_operation_attempts').selectAll()
+    .where('operation_id', '=', operationId).where('attempt_no', '=', attemptNo).executeTakeFirst()
+  if (!attempt) invalid('operation_attempt_unavailable')
+  if (attempt.result_key_id === null && attempt.encrypted_result_jws === null && attempt.result_digest === null && attempt.result_saved_at === null) {
+    return null
+  }
+  if (!attempt.result_key_id || !attempt.encrypted_result_jws || !attempt.result_digest || !attempt.result_saved_at) {
+    invalid('operation_result_binding_mismatch')
+  }
+  const raw = await decryptLicensePendingBytes(pendingKeyRoot, {
+    operationId,
+    attemptNo,
+    record: 'attempt',
+    field: 'center_result_jws',
+  }, { keyId: attempt.result_key_id, ciphertext: attempt.encrypted_result_jws })
+  if (sha256Base64url(raw) !== attempt.result_digest || !compactJwsBytesPattern.test(raw.toString('ascii')) ||
+    !Buffer.from(raw.toString('ascii'), 'ascii').equals(raw)) invalid('operation_result_digest_mismatch')
   return raw
 }
 
