@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Kysely, PostgresDialect, sql } from 'kysely'
+import type { Transaction } from 'kysely'
 import { Pool } from 'pg'
 import type { Pool as PgPool } from 'pg'
 import type { Database } from '../src/db/types.js'
@@ -162,7 +163,12 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
     }
   }
 
-  function runChild(sandbox: Pick<Sandbox, 'schema' | 'pendingRoot'>, mode: string, input: ReturnType<typeof activationInput>) {
+  function runChild(
+    sandbox: Pick<Sandbox, 'schema' | 'pendingRoot'>,
+    mode: string,
+    input: ReturnType<typeof activationInput>,
+    extraArgs: string[] = [],
+  ) {
     return new Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }>((resolveResult, reject) => {
       const databaseUrl = new URL(testDatabaseUrl!)
       databaseUrl.searchParams.set('options', `-c search_path=${sandbox.schema}`)
@@ -171,6 +177,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         resolve(import.meta.dirname, 'fixtures/license-operation-process.ts'),
         mode, sandbox.schema, sandbox.pendingRoot, input.operationId, input.licenseId,
         input.databaseId, input.instanceId, input.identityJkt, input.activationCode,
+        ...extraArgs,
       ], {
         cwd: resolve(import.meta.dirname, '../../..'),
         env: {
@@ -189,6 +196,21 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
       child.once('error', reject)
       child.once('close', (code, signal) => resolveResult({ code, signal, stdout, stderr }))
     })
+  }
+
+  function loseCommitAcknowledgementAfterPostgresCommit(db: Kysely<Database>): Kysely<Database> {
+    return {
+      transaction() {
+        const builder = db.transaction()
+        return {
+          execute<T>(callback: (trx: Transaction<Database>) => Promise<T>): Promise<T> {
+            return builder.execute(callback).then(() => {
+              throw new Error('injected_unknown_commit_acknowledgement')
+            })
+          },
+        }
+      },
+    } as unknown as Kysely<Database>
   }
 
   it('idempotently reuses the same operation and rejects conflicting intent or a second operation for the same install binding', async () => {
@@ -237,6 +259,157 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         .toMatchObject({ activation_code: input.activationCode, operation_id: input.operationId })
       const allAttemptBytes = Buffer.concat(attempts.map(attempt => attempt.encrypted_request_envelope)).toString('utf8')
       expect(allAttemptBytes).not.toContain(input.activationCode)
+    })
+  })
+
+  it('archives a late activation response without moving the newer query response pointer backwards', async () => {
+    await withSandbox(async sandbox => {
+      const input = activationInput()
+      const operation = await createOrLoadActivationOperation(sandbox.db, sandbox.pendingRoot, input)
+      const activationAttempt = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(input.operationId, operation.intentDigest, testIdentityJkt, 'activation', true))
+      await markLicenseOperationAttemptSent(sandbox.db, input.operationId, activationAttempt.attemptNo)
+      await markLicenseOperationAttemptTransportResult(sandbox.db, input.operationId, activationAttempt.attemptNo, 'transport_unknown')
+
+      const queryAttempt = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(input.operationId, operation.intentDigest, testIdentityJkt, 'query', true))
+      expect(queryAttempt.attemptNo).toBe(activationAttempt.attemptNo + 1)
+      await markLicenseOperationAttemptSent(sandbox.db, input.operationId, queryAttempt.attemptNo)
+      const queryResponse = Buffer.from('synthetic-newer-query-response', 'utf8')
+      await saveLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId, queryAttempt.attemptNo, queryResponse)
+      const latestBeforeLateResponse = await sandbox.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
+      const queryAttemptBeforeLateResponse = await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', input.operationId).where('attempt_no', '=', queryAttempt.attemptNo).executeTakeFirstOrThrow()
+      const activationAttemptBeforeLateResponse = await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', input.operationId).where('attempt_no', '=', activationAttempt.attemptNo).executeTakeFirstOrThrow()
+
+      const lateActivationResponse = Buffer.from('synthetic-late-activation-response', 'utf8')
+      await expect(saveLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId,
+        activationAttempt.attemptNo, lateActivationResponse)).resolves.toMatchObject({
+        responseDigest: expect.any(String),
+      })
+
+      const parentAfter = await sandbox.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
+      const activationAfter = await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', input.operationId).where('attempt_no', '=', activationAttempt.attemptNo).executeTakeFirstOrThrow()
+      const queryAttemptAfter = await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', input.operationId).where('attempt_no', '=', queryAttempt.attemptNo).executeTakeFirstOrThrow()
+      expect(parentAfter).toMatchObject({
+        state: 'response_saved',
+        response_attempt_no: queryAttempt.attemptNo,
+        response_digest: latestBeforeLateResponse.response_digest,
+        response_saved_at: latestBeforeLateResponse.response_saved_at,
+      })
+      expect(activationAfter.send_state).toBe('response_saved')
+      expect(activationAfter.response_digest).not.toBe(parentAfter.response_digest)
+      expect(activationAfter).toMatchObject({
+        client_nonce_hash: activationAttemptBeforeLateResponse.client_nonce_hash,
+        request_nonce_hash: activationAttemptBeforeLateResponse.request_nonce_hash,
+        request_body_digest: activationAttemptBeforeLateResponse.request_body_digest,
+        identity_jkt: activationAttemptBeforeLateResponse.identity_jkt,
+        signing_key_id: activationAttemptBeforeLateResponse.signing_key_id,
+        signature_created_at: activationAttemptBeforeLateResponse.signature_created_at,
+        request_key_id: activationAttemptBeforeLateResponse.request_key_id,
+        encrypted_request_envelope: activationAttemptBeforeLateResponse.encrypted_request_envelope,
+      })
+      expect(await readLicenseOperationAttemptResponse(sandbox.db, sandbox.pendingRoot, input.operationId,
+        activationAttempt.attemptNo)).toEqual(lateActivationResponse)
+      expect(await readLicenseOperationAttemptResponse(sandbox.db, sandbox.pendingRoot, input.operationId,
+        queryAttempt.attemptNo)).toEqual(queryResponse)
+      expect(queryAttemptAfter.encrypted_response).toEqual(queryAttemptBeforeLateResponse.encrypted_response)
+      expect(queryAttemptAfter.encrypted_request_envelope).toEqual(queryAttemptBeforeLateResponse.encrypted_request_envelope)
+      expect(queryAttemptAfter.response_saved_at).toEqual(queryAttemptBeforeLateResponse.response_saved_at)
+      expect(await readSavedLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId)).toEqual(queryResponse)
+      await expect(allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(input.operationId, operation.intentDigest, testIdentityJkt, 'activation', true)))
+        .rejects.toMatchObject({ code: 'operation_not_pending' })
+      expect(await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', input.operationId).execute()).toHaveLength(2)
+      expect(await sandbox.db.selectFrom('local_license_operations').selectAll().execute()).toHaveLength(1)
+    })
+  })
+
+  it('saves concurrent identical responses once, makes identical replay idempotent, and rejects different bytes', async () => {
+    await withSandbox(async sandbox => {
+      const input = activationInput()
+      const operation = await createOrLoadActivationOperation(sandbox.db, sandbox.pendingRoot, input)
+      const attempt = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(input.operationId, operation.intentDigest))
+      await markLicenseOperationAttemptSent(sandbox.db, input.operationId, attempt.attemptNo)
+      const response = Buffer.from('synthetic-identical-response-bytes', 'utf8')
+      const concurrent = await Promise.all([
+        runChild(sandbox, 'save-response', input, [String(attempt.attemptNo), response.toString('base64url')]),
+        runChild(sandbox, 'save-response', input, [String(attempt.attemptNo), response.toString('base64url')]),
+      ])
+      expect(concurrent.every(result => result.code === 0 && result.signal === null)).toBe(true)
+      expect(concurrent[0]!.stdout.trim()).toBe(concurrent[1]!.stdout.trim())
+      const storedBeforeReplay = await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', input.operationId).where('attempt_no', '=', attempt.attemptNo).executeTakeFirstOrThrow()
+      const parentBeforeReplay = await sandbox.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
+
+      await expect(saveLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo, response))
+        .resolves.toMatchObject({ responseDigest: storedBeforeReplay.response_digest })
+      const storedAfterReplay = await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', input.operationId).where('attempt_no', '=', attempt.attemptNo).executeTakeFirstOrThrow()
+      const parentAfterReplay = await sandbox.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
+      expect(storedAfterReplay.encrypted_response).toEqual(storedBeforeReplay.encrypted_response)
+      expect(storedAfterReplay.response_saved_at).toEqual(storedBeforeReplay.response_saved_at)
+      expect(parentAfterReplay.response_attempt_no).toBe(parentBeforeReplay.response_attempt_no)
+      expect(parentAfterReplay.response_digest).toBe(parentBeforeReplay.response_digest)
+      expect(parentAfterReplay.response_saved_at).toEqual(parentBeforeReplay.response_saved_at)
+      await expect(saveLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo,
+        Buffer.from('different-response-must-not-overwrite', 'utf8')))
+        .rejects.toMatchObject({ code: 'attempt_response_conflict' })
+      const retained = await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', input.operationId).where('attempt_no', '=', attempt.attemptNo).executeTakeFirstOrThrow()
+      expect(retained.encrypted_response).toEqual(storedBeforeReplay.encrypted_response)
+      expect(retained.response_saved_at).toEqual(storedBeforeReplay.response_saved_at)
+      const parentAfterConflict = await sandbox.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
+      expect(parentAfterConflict.response_attempt_no).toBe(parentBeforeReplay.response_attempt_no)
+      expect(parentAfterConflict.response_digest).toBe(parentBeforeReplay.response_digest)
+      expect(parentAfterConflict.response_saved_at).toEqual(parentBeforeReplay.response_saved_at)
+      expect(await readLicenseOperationAttemptResponse(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo))
+        .toEqual(response)
+    })
+  })
+
+  it('recovers a response after unknown PostgreSQL commit acknowledgement and process SIGKILL', async () => {
+    await withSandbox(async sandbox => {
+      const input = activationInput()
+      const operation = await createOrLoadActivationOperation(sandbox.db, sandbox.pendingRoot, input)
+      const attempt = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(input.operationId, operation.intentDigest))
+      await markLicenseOperationAttemptSent(sandbox.db, input.operationId, attempt.attemptNo)
+      const response = Buffer.from('synthetic-response-after-unknown-commit', 'utf8')
+
+      await expect(saveLicenseOperationResponse(loseCommitAcknowledgementAfterPostgresCommit(sandbox.db),
+        sandbox.pendingRoot, input.operationId, attempt.attemptNo, response))
+        .rejects.toThrow('injected_unknown_commit_acknowledgement')
+      const committed = await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', input.operationId).where('attempt_no', '=', attempt.attemptNo).executeTakeFirstOrThrow()
+      expect(committed.send_state).toBe('response_saved')
+      expect(await readLicenseOperationAttemptResponse(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo))
+        .toEqual(response)
+
+      const killed = await runChild(sandbox, 'commit-response-kill', input,
+        [String(attempt.attemptNo), response.toString('base64url')])
+      expect(killed.signal).toBe('SIGKILL')
+      expect(killed.code).toBeNull()
+      await expect(saveLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo, response))
+        .resolves.toMatchObject({ responseDigest: committed.response_digest })
+      const retained = await sandbox.db.selectFrom('local_license_operation_attempts').selectAll()
+        .where('operation_id', '=', input.operationId).where('attempt_no', '=', attempt.attemptNo).executeTakeFirstOrThrow()
+      expect(retained.encrypted_response).toEqual(committed.encrypted_response)
+      expect(retained.response_saved_at).toEqual(committed.response_saved_at)
+      const parent = await sandbox.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
+      expect(parent.response_attempt_no).toBe(attempt.attemptNo)
+      expect(await readSavedLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId)).toEqual(response)
     })
   })
 

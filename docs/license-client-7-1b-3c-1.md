@@ -48,7 +48,9 @@ Pending 密钥只服务于授权操作 API，固定为独立 32 字节 AES-256-G
 | `projected` | 为后续 3D 保留的状态 | 本阶段不可写入 |
 | `terminal` / `cancelled` | 需要后续中心权威证据的最终状态 | 本阶段不可写入，也不会由本地错误或 HTTP 超时产生 |
 
-父表触发器只允许从 `pending` 到 `response_saved`，之后只允许在 `response_saved` 内用更高 attempt 编号推进最新响应指针；每次指针都必须匹配已保存响应 attempt 的摘要和时间。响应 attempt 与父指针由可延迟约束触发器要求在同一个事务提交。activation attempt 不能在保存响应后重发；恢复只能追加 query/continue。终态复活、终态/投影伪造、意图/attempt 修改和历史删除均由数据库拒绝。单纯 `response_saved` 不代表签名验证、lease、经营权限或本地投影。
+父表触发器只允许从 `pending` 到 `response_saved`，之后只允许在 `response_saved` 内用更高 attempt 编号推进最新响应指针；每次指针都必须匹配已保存响应 attempt 的摘要和时间。响应 attempt 与父指针由可延迟约束触发器要求在同一个事务提交。响应归档和父指针推进是两个独立决定：任何已发送或结果未知的 attempt 可以保存其真实响应；若 attempt 编号低于父表指针，只归档该 attempt 的 AES-GCM 响应，不改父表，因此不会把迟到响应冒充最新状态。迁移中的延迟约束已要求父指针指向至少不早于每个已归档 attempt 的响应，R1 实测该触发器支持乱序归档，无需改写或追加迁移。
+
+同一 attempt 的完全相同原始响应会先按原 AAD 解密已存 ciphertext 并逐字节比对，再幂等返回；不会重新加密、更新时间或更新父指针。不同响应字节对同一 attempt 一律拒绝覆盖。操作已到 `response_saved` 后，不可再发送 activation attempt；只允许归档之前已经 `sent` 或 `transport_unknown` 的迟到响应，仍为 `prepared` 的旧 activation attempt 拒绝响应保存。提交结果对调用方未知时，可按相同 operation/attempt 重试归档；不创建 operation、不生成 terminal。终态复活、终态/投影伪造、意图/attempt 修改和历史删除均由数据库拒绝。单纯 `response_saved` 不代表签名验证、lease、经营权限或本地投影。
 
 ## 崩溃恢复边界
 

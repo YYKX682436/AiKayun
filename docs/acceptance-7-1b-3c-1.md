@@ -9,11 +9,13 @@
 | activation intent JCS 与中心跨仓向量 | 通过。逐字段算法相同，SHA-256 输入为激活码规范 Base64URL 文本；向量不含真实授权码。 |
 | AES-256-GCM key 文件与 AAD | 通过。跨重载解密；篡改、错 operation/字段 AAD、替换 key、key ID 不符、缺失、symlink、hardlink、错误 mode 及损坏均失败关闭。加载器同时核对 POSIX owner；本轮未单独构造错误 owner fixture。 |
 | PostgreSQL 操作/attempt 约束 | 通过。重复请求幂等、intent 冲突、同安装身份抢占、并发进程分配连续 attempt、不可变记录、非法 SQL 修改、状态回退/本地终态、重复编号及 DELETE/TRUNCATE 拒绝均有真实 PostgreSQL 覆盖。 |
+| R1 乱序与重复响应归档 | 通过。真实 PostgreSQL 证明 query 响应先于 activation 响应保存时，旧 activation 密文进入原 attempt 历史而父指针、最新响应和较新 attempt 密文/时间不变；并发相同响应与重放幂等且密文/时间不变，不同 bytes 冲突拒绝覆盖。原延迟约束触发器已覆盖此模式，无需追加迁移。 |
+| R1 提交确认未知与 SIGKILL | 通过。注入调用方提交确认丢失于真实 PostgreSQL COMMIT 后，已提交响应可读且重放成功；子进程在幂等恢复提交后 SIGKILL，重启读取仍为原密文和时间。 |
 | DB commit 与进程强杀 | 通过。操作/attempt 提交前 SIGKILL 无记录；提交后 SIGKILL 保留记录，重放读取同一 operation/attempt，不重复分配。 |
 | 配对备份预检 | 通过。实际隔离 Compose 使用 v5 配对 DB 与 key 卷，恢复前 verifier 解密 activation payload、request envelope 和加密响应。v4、缺 key、替换 key 的脚本预检测试均在任何 Docker 操作前拒绝。 |
 | 真实 Compose 强杀与恢复 | 通过。隔离恢复脚本分别 SIGKILL 并替换 API、PostgreSQL 容器，随后校验操作与 attempt 仍可解密；执行 v5 配对备份/恢复后再次核对。脚本只创建并删除自身带 `-test` 名称的项目、容器、网络和卷。 |
 | 商城恢复快照与既有功能 | 通过。隔离验收对订单、库存、支付/收据、退款、提现、交付、supplier/procurement 操作快照及 reconciliation 进行恢复前后比对；验证私有文件下载 SHA-256、所有六种交付方式及采购恢复数据保持一致。 |
-| `pnpm verify` | 通过。Node `24.22.0`、锁定依赖；lint 0 errors（既有商品页有 7 条 warning），typecheck、528 API 测试、16 money 测试、生产构建、93 主 E2E、备用品牌 1 项、SSR 3 项、开发预览 1 项、生产品牌 1 项全部通过。 |
+| `pnpm verify` | 通过。Node `24.22.0`、锁定依赖；lint 0 errors（既有商品页有 7 条 warning），typecheck、531 API 测试、16 money 测试、生产构建、93 主 E2E、备用品牌 1 项、SSR 3 项、开发预览 1 项、生产品牌 1 项全部通过。 |
 | Compose 配置与 shell 语法 | 通过。`docker compose config --quiet` 及新增/修改备份脚本 `bash -n` 通过。 |
 
 `pnpm verify` 的测试 PostgreSQL 使用单独临时容器和 `_test` 数据库；测试结束停止并删除。全程未对已有 `aikayun` DB、容器或授权中心执行写入。`pnpm verify` 的 Nuxt 构建成功；Google Fonts 元数据不可达产生字体 provider warning，不影响构建及浏览器测试。
@@ -22,6 +24,7 @@
 
 - 唯一 operation 权威是 PostgreSQL 父表；activation code、完整请求封套及原始签名响应只以独立 Pending key 加密后持久化。
 - operation ID、业务意图和 attempt 证据受约束保护；每个 operation 的编号由事务 advisory lock、父行锁和触发器共同连续分配。
+- attempt 响应历史独立于父操作最新响应指针；较早响应可加密归档但不会回退指针，同 attempt 原始 bytes 重放幂等，不同 bytes 不可覆盖。
 - 迁移只允许 `pending → response_saved`；不提供本地 `projected`、`terminal`、`cancelled` 写入。终态不能由本地失败或超时伪造。
 - 这轮未接入 HTTP/RFC 9421、challenge、激活码提交、query/continue、worker、经营门禁或 UI；response_saved 只是加密原始 bytes 已持久化，不是中心签名已验证或经营授权成功。
 - 本地业务表和 worker 无授权依赖；本阶段没有执行真实授权操作。

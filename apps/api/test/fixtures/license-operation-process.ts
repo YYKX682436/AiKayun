@@ -4,6 +4,7 @@ import { buildActivationIntent, sha256Base64url } from '../../src/licensing/lice
 import {
   allocateLicenseOperationAttempt,
   createOrLoadActivationOperation,
+  saveLicenseOperationResponse,
 } from '../../src/licensing/license-operation-store.js'
 import { verifyLicensePendingBackupPair } from '../../src/licensing/license-pending-restore-check.js'
 import { encryptLicensePendingBytes } from '../../src/licensing/pending-encryption-key.js'
@@ -76,6 +77,12 @@ if (mode === 'restore-check') {
   const result = await allocateLicenseOperationAttempt(db, pendingRoot, attemptInput(true))
   process.stdout.write(`${result.attemptNo}\n`)
   process.kill(process.pid, 'SIGKILL')
+} else if (mode === 'save-response' || mode === 'commit-response-kill') {
+  const attemptNo = Number(process.argv[11])
+  const response = Buffer.from(process.argv[12] ?? '', 'base64url')
+  const result = await saveLicenseOperationResponse(db, pendingRoot, operationId, attemptNo, response)
+  process.stdout.write(`${result.responseDigest}\n`)
+  if (mode === 'commit-response-kill') process.kill(process.pid, 'SIGKILL')
 } else if (mode === 'concurrent-attempt') {
   const result = await allocateLicenseOperationAttempt(db, pendingRoot, attemptInput(false))
   process.stdout.write(`${result.attemptNo}\n`)

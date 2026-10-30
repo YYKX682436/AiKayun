@@ -487,12 +487,25 @@ export async function saveLicenseOperationResponse(
     await lockOperation(trx, operationId)
     const operation = await trx.selectFrom('local_license_operations').selectAll()
       .where('operation_id', '=', operationId).forUpdate().executeTakeFirst()
-    if (!operation || !['pending', 'response_saved'].includes(operation.state)) invalid('operation_not_pending')
+    if (!operation) invalid('operation_not_pending')
     const attempt = await trx.selectFrom('local_license_operation_attempts').selectAll()
       .where('operation_id', '=', operationId).where('attempt_no', '=', attemptNo).forUpdate().executeTakeFirst()
-    if (!attempt || attempt.intent_digest !== operation.intent_digest || attempt.identity_jkt !== operation.identity_jkt ||
+    if (!attempt || attempt.intent_digest !== operation.intent_digest || attempt.identity_jkt !== operation.identity_jkt) {
+      invalid('attempt_response_binding_conflict')
+    }
+    if (attempt.send_state === 'response_saved') {
+      if (attempt.response_digest !== responseDigest) invalid('attempt_response_conflict')
+      const existing = await decryptLicensePendingBytes(pendingKeyRoot, {
+        operationId, attemptNo, record: 'attempt', field: 'center_response',
+      }, { keyId: attempt.response_key_id!, ciphertext: attempt.encrypted_response! })
+      if (!existing.equals(Buffer.from(rawSignedResponse))) invalid('attempt_response_conflict')
+      return
+    }
+    if (!['pending', 'response_saved'].includes(operation.state) ||
       !['prepared', 'sent', 'transport_unknown'].includes(attempt.send_state) ||
-      (operation.state === 'response_saved' && attempt.purpose === 'activation')) invalid('attempt_response_binding_conflict')
+      (operation.state === 'response_saved' && attempt.purpose === 'activation' && attempt.send_state === 'prepared')) {
+      invalid('attempt_response_binding_conflict')
+    }
     const savedAt = await databaseNow(trx)
     const updated = await trx.updateTable('local_license_operation_attempts').set({
       send_state: 'response_saved',
@@ -504,13 +517,15 @@ export async function saveLicenseOperationResponse(
     }).where('operation_id', '=', operationId).where('attempt_no', '=', attemptNo)
       .where('send_state', 'in', ['prepared', 'sent', 'transport_unknown']).returning('attempt_no').executeTakeFirst()
     if (!updated) invalid('attempt_response_binding_conflict')
-    const parentUpdate = trx.updateTable('local_license_operations').set({
-      state: 'response_saved', response_attempt_no: attemptNo, response_digest: responseDigest, response_saved_at: savedAt,
-    }).where('operation_id', '=', operationId).where('state', '=', operation.state)
-    const updatedParent = operation.state === 'pending'
-      ? await parentUpdate.returning('operation_id').executeTakeFirst()
-      : await parentUpdate.where('response_attempt_no', '<', attemptNo).returning('operation_id').executeTakeFirst()
-    if (!updatedParent) invalid('operation_response_pointer_conflict')
+    if (operation.state === 'pending' || operation.response_attempt_no === null || attemptNo > operation.response_attempt_no) {
+      const parentUpdate = trx.updateTable('local_license_operations').set({
+        state: 'response_saved', response_attempt_no: attemptNo, response_digest: responseDigest, response_saved_at: savedAt,
+      }).where('operation_id', '=', operationId).where('state', '=', operation.state)
+      const updatedParent = operation.state === 'pending'
+        ? await parentUpdate.returning('operation_id').executeTakeFirst()
+        : await parentUpdate.where('response_attempt_no', '<', attemptNo).returning('operation_id').executeTakeFirst()
+      if (!updatedParent) invalid('operation_response_pointer_conflict')
+    }
   })
   return { responseDigest }
 }
