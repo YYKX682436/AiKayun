@@ -30,6 +30,7 @@ const ring = JSON.stringify({ activeKeyId: 'current-test', keys: {
   'current-test': randomBytes(32).toString('base64'), 'legacy-test': randomBytes(32).toString('base64'),
 } })
 const trustStoreMarker = randomBytes(24).toString('base64url')
+const pendingActivationCode = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
 const overridePath = join(directory, 'supplier-fixture.json')
 await chmod(directory, 0o777)
 await writeFile(overridePath, JSON.stringify({ services: { api: {
@@ -42,6 +43,7 @@ await writeFile(overridePath, JSON.stringify({ services: { api: {
     `${join(workspace, 'scripts/fixtures/seed-procurement-recovery.mjs')}:/test/seed-procurement-recovery.mjs:ro`,
     `${join(workspace, 'scripts/fixtures/verify-procurement-recovery.mjs')}:/test/verify-procurement-recovery.mjs:ro`,
     `${join(workspace, 'apps/api/test/fixtures/trust-store-compose-restore.mjs')}:/app/trust-store-compose-restore.mjs:ro`,
+    `${join(workspace, 'apps/api/test/fixtures/license-pending-compose-recovery.mjs')}:/app/license-pending-compose-recovery.mjs:ro`,
     `${supplierDirectory}:/test-output`,
   ],
 } } }))
@@ -86,7 +88,10 @@ async function request(path, { cookies, token, body, method = 'GET', expected = 
   return JSON.parse(text).data
 }
 const historyTables = ['orders', 'order_items', 'order_inventory_reservations', 'order_inventory_events', 'payment_attempts',
-  'payment_receipts', 'payment_provider_events', 'product_variant_inventory_adjustments',
+  'payment_receipts', 'payment_provider_events', 'order_refunds', 'order_refund_allocations', 'order_refund_audit_events',
+  'order_refund_manual_attempts', 'withdrawals', 'withdrawal_payout_attempts', 'withdrawal_audit_events',
+  'withdrawal_settings_audit_events', 'withdrawal_private_files', 'withdrawal_payout_results', 'code_pool_withdrawal_entries',
+  'product_variant_inventory_adjustments',
   'order_item_fulfillment_attempts', 'order_item_fulfillment_deliveries',
   'product_variant_fulfillment_versions', 'private_file_objects', 'code_pool_batches', 'code_pool_entries',
   'supplier_api_delivery_operations', 'supplier_api_delivery_events', 'supplier_connection_versions', 'supplier_connection_credentials',
@@ -97,7 +102,7 @@ const historyTables = ['orders', 'order_items', 'order_inventory_reservations', 
   'procurement_risk_daily', 'procurement_risk_reservations', 'procurement_risk_events', 'order_item_purchase_snapshots',
   'purchase_order_attachment_objects', 'order_item_purchase_attachments']
 const snapshot = () => database(historyTables.map(table => `SELECT '${table}' AS table_name, count(*)::text, md5(COALESCE(string_agg(to_jsonb(row)::text, '' ORDER BY to_jsonb(row)::text), '')) FROM ${table} AS row`).join(' UNION ALL '))
-const proof = { project, database: env.POSTGRES_DB, sigkill: [], backupRestore: false, procurementBackupRestore: null, tlsRejected: false }
+const proof = { project, database: env.POSTGRES_DB, sigkill: [], backupRestore: false, licensePendingBackupRestore: false, procurementBackupRestore: null, tlsRejected: false }
 try {
   console.log('Starting isolated recovery Compose project')
   compose('up', '-d', '--build')
@@ -108,6 +113,12 @@ try {
   const verifiedIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', 'node',
     'dist/licensing/installation-identity-cli.js', 'verify'))
   assert.deepEqual(verifiedIdentity, initializedIdentity)
+  const testDatabaseUrl = `postgresql://${env.POSTGRES_USER}:${env.POSTGRES_PASSWORD}@db:5432/${env.POSTGRES_DB}`
+  compose('exec', '-T', '-e', 'NODE_ENV=test', '-e', `TEST_DATABASE_URL=${testDatabaseUrl}`, 'api', 'node',
+    'dist/licensing/pending-encryption-key-cli.js', 'init', '--temporary', '--environment', 'test',
+    '--pending-key-dir', '/var/lib/aikayun/license-pending')
+  compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'seed')
+  assert.ok(!compose('logs', 'api').includes(pendingActivationCode), 'activation code leaked to API logs')
   const trustFixtureOutput = compose('exec', '-T', 'api', 'node', '/app/trust-store-compose-restore.mjs', 'import')
   const trustFixtureLine = trustFixtureOutput.split('\n').find(line => line.startsWith('TRUST_STORE_FIXTURE='))
   assert.ok(trustFixtureLine, `isolated trust store seed did not emit metadata: ${trustFixtureOutput}`)
@@ -269,16 +280,20 @@ try {
     const newId = compose('ps', '-q', service).trim()
     assert.notEqual(newId, oldId)
     await ready()
+    compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'verify')
     await verifyDownload()
     assert.equal(snapshot(), facts)
     proof.sigkill.push({ service, replaced: true, historyIdentical: true, sha256: digest })
   }
-  console.log('Back up the database, file volumes, instance identity and trust store, then restore after a missing-file fault')
+  console.log('Back up the database, business files, instance identity, trust store and paired license Pending key, then restore in isolation')
   command('bash', ['scripts/backup-compose-data.sh', join(directory, 'backup')])
   await ready()
   await verifyDownload()
   const backups = await readdir(join(directory, 'backup'))
   assert.equal(backups.length, 1)
+  const backupSummary = `${await readFile(join(directory, 'backup', backups[0], 'manifest.txt'), 'utf8')}
+${await readFile(join(directory, 'backup', backups[0], 'SHA256SUMS'), 'utf8')}`
+  assert.ok(!backupSummary.includes(pendingActivationCode), 'activation code leaked to backup summary')
   compose('exec', '-T', 'api', 'node', '-e', `require('node:fs').unlinkSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'))`)
   compose('exec', '-T', 'api', 'node', '-e', `const fs=require('node:fs'),path=require('node:path'),root=process.env.LICENSE_TRUST_STORE_ROOT;for(const name of ['trust-bundle-state.json','trust-bundle-store.marker.json'])fs.rmSync(path.join(root,name),{force:true})`)
   compose('exec', '-T', 'api', 'node', '-e', `const fs=require('node:fs'),path=require('node:path'),id=${JSON.stringify(uploaded.uploadId)};fs.unlinkSync(path.join(process.env.PRIVATE_FILE_ROOT,'objects',id.slice(0,2),id+'.bin'))`)
@@ -286,6 +301,7 @@ try {
   assert.equal(missing.status, 410)
   command('bash', ['scripts/restore-test-compose-data.sh', join(directory, 'backup', backups[0])], { env: { ...env, ALLOW_TEST_DATABASE_RESTORE: 'YES' } })
   await ready()
+  compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'verify')
   const restoredTrustMarker = compose('exec', '-T', 'api', 'node', '-e', `process.stdout.write(require('node:fs').readFileSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'),'utf8').trim())`).trim()
   assert.equal(restoredTrustMarker, trustStoreMarker)
   const trustRestoreOutput = compose('exec', '-T', '-e', `TRUST_STORE_TEST_FIXTURE=${JSON.stringify(trustFixture)}`,
@@ -310,6 +326,7 @@ try {
   assert.equal(reconciliation.needsAttention, false)
   assert.equal(reconciliation.verifiedObjects, 1)
   proof.backupRestore = true
+  proof.licensePendingBackupRestore = true
   proof.trustStoreBackupRestore = true
   proof.fileSha256 = digest
   proof.paymentReceipts = 5

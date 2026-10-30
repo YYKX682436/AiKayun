@@ -38,14 +38,28 @@ docker compose run --rm --no-deps -T --entrypoint sh api \
   -c 'tar -czf - -C "$INSTANCE_IDENTITY_ROOT" .' > "$temp_directory/identity.tar.gz"
 docker compose run --rm --no-deps -T --entrypoint sh api \
   -c 'tar -czf - -C "$LICENSE_TRUST_STORE_ROOT" .' > "$temp_directory/license-trust-store.tar.gz"
+docker compose run --rm --no-deps -T --entrypoint sh api \
+  -c 'tar -czf - -C "$LICENSE_PENDING_KEY_ROOT" .' > "$temp_directory/license-pending-key.tar.gz"
+pending_key_identity="$(docker compose run --rm --no-deps -T --entrypoint node api --input-type=module -e '
+import { createHash } from "node:crypto";
+import { loadLicensePendingKey } from "./dist/licensing/pending-encryption-key.js";
+const value = await loadLicensePendingKey(process.env.LICENSE_PENDING_KEY_ROOT);
+process.stdout.write(`${value.keyId}:${createHash("sha256").update(value.key).digest("hex")}`);')"
+pending_key_id="${pending_key_identity%%:*}"
+pending_key_sha256="${pending_key_identity#*:}"
+if [[ -z "$pending_key_id" || ! "$pending_key_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+  printf 'The license pending encryption key is missing or invalid; refusing to create an unpaired backup.\n' >&2
+  exit 2
+fi
 
-printf 'format=aikayun-compose-backup-v4\ncreated_utc=%s\nproject=%s\ndatabase=%s\n' \
+printf 'format=aikayun-compose-backup-v5\ncreated_utc=%s\nproject=%s\ndatabase=%s\n' \
   "$timestamp" "${COMPOSE_PROJECT_NAME:-compose-default}" "$database_name" > "$temp_directory/manifest.txt"
-(cd "$temp_directory" && sha256sum database.dump media.tar.gz private-files.tar.gz identity.tar.gz license-trust-store.tar.gz > SHA256SUMS)
+printf 'pending_key_id=%s\npending_key_sha256=%s\n' "$pending_key_id" "$pending_key_sha256" >> "$temp_directory/manifest.txt"
+(cd "$temp_directory" && sha256sum database.dump media.tar.gz private-files.tar.gz identity.tar.gz license-trust-store.tar.gz license-pending-key.tar.gz > SHA256SUMS)
 backup_path="$backup_root/$timestamp"
 if [[ -e "$backup_path" ]]; then
   printf 'Backup destination already exists: %s\n' "$backup_path" >&2
   exit 1
 fi
 mv "$temp_directory" "$backup_path"
-printf 'Created verified database, file, instance-identity and license-trust-store backup: %s\n' "$backup_path"
+printf 'Created verified v5 database, file, instance-identity, license-trust-store and paired license-pending-key backup: %s\n' "$backup_path"

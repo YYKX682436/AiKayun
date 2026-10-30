@@ -1,0 +1,14 @@
+{
+  "source_commit": "6f554b51b867a15ad7747c6d002b548e016f65c6",
+  "source_function": "src/intent.ts activationIntentDigest()",
+  "input": {
+    "licenseId": "11111111-1111-4111-8111-111111111111",
+    "activationCode": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "instanceId": "22222222-2222-4222-8222-222222222222",
+    "databaseId": "33333333-3333-4333-8333-333333333333",
+    "identityJkt": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk",
+    "origin": "https://shop.example.test"
+  },
+  "activation_code_sha256": "6oZqdX5MOLq_qBJ8vppAnT4fk6AP8UiP9zX8-Rev_9A",
+  "intent_digest": "peNSmjAZepDkirOsO8lfPjuXbHRVT-QiK17uixy8q80"
+}

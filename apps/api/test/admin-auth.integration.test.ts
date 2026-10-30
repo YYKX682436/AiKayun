@@ -1013,6 +1013,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       'customer_cart_merge_requests', 'customer_management_audit',
       'customer_sessions', 'customers', 'guest_order_sessions',
       'installation_binding', 'installation_identity_initializations',
+      'local_license_operation_attempts', 'local_license_operations',
       'order_inventory_events', 'order_inventory_reservations', 'order_item_fulfillment_attempts',
       'order_item_fulfillment_deliveries', 'order_item_procurement_sources', 'order_item_purchase_attachments', 'order_item_purchase_snapshots', 'order_items',
       'order_refund_allocations', 'order_refund_audit_events', 'order_refund_manual_attempts',

@@ -39,6 +39,7 @@ export interface AppConfig {
   privateFileRoot: string
   identityRoot: string
   licenseTrustStoreRoot: string
+  licensePendingKeyRoot: string
   supplierHttpTestAllowlist: string[]
   database: PoolConfig
   paymentCredentialKeyRing: PaymentCredentialKeyRing | null
@@ -168,6 +169,11 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error('LICENSE_TRUST_STORE_ROOT must be an absolute path')
   }
   const licenseTrustStoreRoot = resolve(configuredLicenseTrustStoreRoot ?? join(xdgDataHome, 'aikayun', 'license-trust'))
+  const configuredLicensePendingKeyRoot = env.LICENSE_PENDING_KEY_ROOT
+  if (configuredLicensePendingKeyRoot && !isAbsolute(configuredLicensePendingKeyRoot)) {
+    throw new Error('LICENSE_PENDING_KEY_ROOT must be an absolute path')
+  }
+  const licensePendingKeyRoot = resolve(configuredLicensePendingKeyRoot ?? join(xdgDataHome, 'aikayun', 'license-pending'))
   const repo = repositoryRoot()
   if (repo && isWithin(repo, mediaRoot)) {
     throw new Error('MEDIA_ROOT must be outside the repository')
@@ -188,9 +194,14 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (repo && isWithin(repo, licenseTrustStoreRoot)) {
     throw new Error('LICENSE_TRUST_STORE_ROOT must be outside the repository')
   }
-  const persistentRoots = [mediaRoot, privateFileRoot, identityRoot]
-  if (persistentRoots.some(root => isWithin(root, licenseTrustStoreRoot) || isWithin(licenseTrustStoreRoot, root))) {
+  const preexistingPersistentRoots = [mediaRoot, privateFileRoot, identityRoot]
+  if (preexistingPersistentRoots.some(root => isWithin(root, licenseTrustStoreRoot) || isWithin(licenseTrustStoreRoot, root))) {
     throw new Error('LICENSE_TRUST_STORE_ROOT must use its own isolated API storage namespace')
+  }
+  if ((repo && (isWithin(repo, licensePendingKeyRoot) || isWithin(licensePendingKeyRoot, repo)))
+    || [...preexistingPersistentRoots, licenseTrustStoreRoot].some(root =>
+      isWithin(root, licensePendingKeyRoot) || isWithin(licensePendingKeyRoot, root))) {
+    throw new Error('LICENSE_PENDING_KEY_ROOT must use its own API-only storage namespace outside the repository')
   }
 
   const database: PoolConfig = env.DATABASE_URL
@@ -231,6 +242,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     privateFileRoot,
     identityRoot,
     licenseTrustStoreRoot,
+    licensePendingKeyRoot,
     supplierHttpTestAllowlist,
     database,
     paymentCredentialKeyRing: parsePaymentCredentialKeyRing(env.PAYMENT_CREDENTIAL_KEY_RING),

@@ -22,15 +22,39 @@ if [[ ! -f "$backup_directory/database.dump" || ! -f "$backup_directory/media.ta
   || ! -f "$backup_directory/private-files.tar.gz" \
   || ! -f "$backup_directory/identity.tar.gz" \
   || ! -f "$backup_directory/license-trust-store.tar.gz" \
+  || ! -f "$backup_directory/license-pending-key.tar.gz" \
   || ! -f "$backup_directory/SHA256SUMS" || ! -f "$backup_directory/manifest.txt" ]]; then
   printf 'The backup is incomplete.\n' >&2
   exit 2
 fi
-if ! grep -Fxq 'format=aikayun-compose-backup-v4' "$backup_directory/manifest.txt"; then
-  printf 'The backup manifest format is unsupported; expected v4 with paired instance identity and license trust store.\n' >&2
+if ! grep -Fxq 'format=aikayun-compose-backup-v5' "$backup_directory/manifest.txt"; then
+  printf 'The backup manifest format is unsupported; expected v5 with paired instance identity, license trust store and pending encryption key.\n' >&2
   exit 2
 fi
 (cd "$backup_directory" && sha256sum -c SHA256SUMS)
+pending_key_archive_listing="$(tar -tzf "$backup_directory/license-pending-key.tar.gz")"
+if ! grep -Fxq './license-pending-aes-256-gcm.json' <<< "$pending_key_archive_listing"; then
+  printf 'The v5 backup is missing its paired license pending encryption key.\n' >&2
+  exit 2
+fi
+pending_key_identity="$(tar -xOzf "$backup_directory/license-pending-key.tar.gz" ./license-pending-aes-256-gcm.json | node -e '
+let input = ""; process.stdin.setEncoding("utf8"); process.stdin.on("data", chunk => { input += chunk }); process.stdin.on("end", () => {
+  try {
+    const value = JSON.parse(input);
+    const key = Buffer.from(value.key, "base64url");
+    if (value.schema !== 1 || value.purpose !== "aikayun-license-pending-aes-256-gcm-v1" ||
+      typeof value.key_id !== "string" || !/^[A-Za-z0-9_-]{1,48}$/.test(value.key_id) ||
+      key.length !== 32 || key.toString("base64url") !== value.key) process.exit(2);
+    const digest = require("node:crypto").createHash("sha256").update(key).digest("hex");
+    process.stdout.write(`${value.key_id}:${digest}`);
+  } catch { process.exit(2); }
+});')"
+backup_key_id="$(sed -n 's/^pending_key_id=//p' "$backup_directory/manifest.txt")"
+backup_key_sha256="$(sed -n 's/^pending_key_sha256=//p' "$backup_directory/manifest.txt")"
+if [[ "$pending_key_identity" != "$backup_key_id:$backup_key_sha256" || ! "$backup_key_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+  printf 'The v5 backup pending key does not match its manifest; refusing restore.\n' >&2
+  exit 2
+fi
 
 database_name="$(docker compose exec -T db sh -lc 'printf %s "$POSTGRES_DB"')"
 if [[ "$database_name" != *_test ]]; then
@@ -46,10 +70,12 @@ media_root="$(docker compose exec -T api node -e 'process.stdout.write(process.e
 private_file_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.PRIVATE_FILE_ROOT || "")')"
 identity_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.INSTANCE_IDENTITY_ROOT || "")')"
 license_trust_store_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.LICENSE_TRUST_STORE_ROOT || "")')"
+license_pending_key_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.LICENSE_PENDING_KEY_ROOT || "")')"
 media_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$media_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
 private_file_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$private_file_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
 identity_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$identity_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
 license_trust_store_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$license_trust_store_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
+license_pending_key_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$license_pending_key_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
 if [[ "$media_volume" != "${COMPOSE_PROJECT_NAME}_product_media" ]]; then
   printf 'Refusing restore because the media volume is not the project-scoped product_media volume.\n' >&2
   exit 2
@@ -64,6 +90,10 @@ if [[ "$identity_volume" != "${COMPOSE_PROJECT_NAME}_instance_identity" ]]; then
 fi
 if [[ "$license_trust_store_volume" != "${COMPOSE_PROJECT_NAME}_license_trust_store" ]]; then
   printf 'Refusing restore because the license trust store is not the project-scoped license_trust_store volume.\n' >&2
+  exit 2
+fi
+if [[ "$license_pending_key_volume" != "${COMPOSE_PROJECT_NAME}_license_pending_key" ]]; then
+  printf 'Refusing restore because the license pending key is not in the project-scoped license_pending_key volume.\n' >&2
   exit 2
 fi
 
@@ -84,5 +114,10 @@ docker compose run --rm --no-deps -T --entrypoint sh api -c \
 docker compose run --rm --no-deps -T --entrypoint sh api -c \
   'node -e '\''const fs=require("node:fs"),path=require("node:path"),root=process.env.LICENSE_TRUST_STORE_ROOT;for(const name of fs.readdirSync(root))fs.rmSync(path.join(root,name),{recursive:true,force:true})'\'' && tar -xzf - -C "$LICENSE_TRUST_STORE_ROOT"' \
   < "$backup_directory/license-trust-store.tar.gz"
+docker compose run --rm --no-deps -T --entrypoint sh api -c \
+  'node -e '\''const fs=require("node:fs"),path=require("node:path"),root=process.env.LICENSE_PENDING_KEY_ROOT;for(const name of fs.readdirSync(root))fs.rmSync(path.join(root,name),{recursive:true,force:true})'\'' && tar -xzf - -C "$LICENSE_PENDING_KEY_ROOT"' \
+  < "$backup_directory/license-pending-key.tar.gz"
+docker compose run --rm --no-deps -T -e NODE_ENV=test --entrypoint node api \
+  dist/licensing/license-pending-restore-check.js
 docker compose start api web caddy
 printf 'Restored the verified backup into isolated database %s.\n' "$database_name"

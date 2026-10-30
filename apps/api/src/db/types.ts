@@ -40,6 +40,56 @@ export interface InstallationBindingTable {
   created_at: Generated<Date>
 }
 
+export type LocalLicenseOperationKind = 'activation' | 'renewal' | 'recovery' | 'transfer_prepare'
+  | 'transfer_commit' | 'disaster_transfer_prepare' | 'disaster_transfer_commit' | 'time_reset'
+export type LocalLicenseOperationState = 'pending' | 'response_saved' | 'projected' | 'terminal' | 'cancelled'
+export interface LocalLicenseOperationsTable {
+  operation_id: string
+  kind: LocalLicenseOperationKind
+  intent_digest: string
+  license_id: string
+  database_id: string
+  instance_id: string
+  identity_jkt: string
+  expected_generation: string | null
+  intent_schema: Generated<number>
+  payload_key_id: string
+  encrypted_intent_payload: Buffer
+  state: Generated<LocalLicenseOperationState>
+  response_attempt_no: number | null
+  response_digest: string | null
+  encrypted_center_evidence: Buffer | null
+  center_evidence_key_id: string | null
+  center_evidence_digest: string | null
+  created_at: Generated<Date>
+  response_saved_at: Date | null
+  finalized_at: Date | null
+}
+
+export type LocalLicenseAttemptPurpose = 'activation' | 'query' | 'continue'
+export type LocalLicenseAttemptSendState = 'prepared' | 'sent' | 'transport_unknown' | 'transport_error' | 'response_saved'
+export interface LocalLicenseOperationAttemptsTable {
+  operation_id: string
+  attempt_no: number
+  purpose: LocalLicenseAttemptPurpose
+  intent_digest: string
+  client_nonce_hash: string
+  request_nonce_hash: string
+  request_body_digest: string
+  identity_jkt: string
+  signing_key_id: string
+  signature_created_at: Date
+  request_key_id: string
+  encrypted_request_envelope: Buffer
+  send_state: Generated<LocalLicenseAttemptSendState>
+  sent_at: Date | null
+  response_key_id: string | null
+  encrypted_response: Buffer | null
+  response_digest: string | null
+  response_saved_at: Date | null
+  created_at: Generated<Date>
+}
+
 export interface AdminProductCreationRequestsTable {
   idempotency_key: string
   administrator_id: string
@@ -1391,6 +1441,8 @@ export interface ProductManagementAuditEventsTable {
 export interface Database {
   installation_identity_initializations: InstallationIdentityInitializationsTable
   installation_binding: InstallationBindingTable
+  local_license_operations: LocalLicenseOperationsTable
+  local_license_operation_attempts: LocalLicenseOperationAttemptsTable
   admin_users: AdminUsersTable
   admin_sessions: AdminSessionsTable
   admin_product_creation_requests: AdminProductCreationRequestsTable
