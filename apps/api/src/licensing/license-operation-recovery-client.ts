@@ -46,7 +46,9 @@ import {
   verifyLicenseChallenge,
   verifyCurrentLicenseLease,
   verifyExpiredHistoricalLease,
+  verifyExpiredHistoricalStatusReceipt,
   verifyExpiredHistoricalOperationReceipt,
+  verifyHistoricalLicenseOperationReceipt,
   verifyLicenseOperationReceipt,
   verifyLicenseStatusReceipt,
 } from './trust/evidence.js'
@@ -854,6 +856,7 @@ function boundOperationReceiptClaims(input: {
   requestNonceHash: string
   requestDigest: string
   claims: Readonly<Record<string, unknown>>
+  allowUnverifiedRecoveryEvidence?: boolean
 }): { state: VerifiedOperationRecoveryEvidence['state']; outcomeCode: string | null; committedAttemptNo: number | null; resultJws: string | null; resultDigest: string | null } {
   const { claims, history } = input
   if (claims.sub !== history.operation.licenseId || claims.actor_jkt !== history.operation.identityJkt ||
@@ -943,7 +946,7 @@ function boundOperationReceiptClaims(input: {
     fail('operation_recovery_result_binding_invalid')
   }
   const savedResponse = committed.response
-  if (savedResponse !== null) {
+  if (savedResponse !== null && !input.allowUnverifiedRecoveryEvidence) {
     if (committed.row.purpose === 'activation' || committed.row.purpose === 'recovery') {
       if (!savedResponse.equals(Buffer.from(resultJws, 'ascii'))) fail('operation_recovery_history_result_conflict')
     } else {
@@ -952,7 +955,8 @@ function boundOperationReceiptClaims(input: {
       if (previous.claims.result_jws !== resultJws) fail('operation_recovery_history_result_conflict')
     }
   }
-  if (committed.archivedResult !== null && !committed.archivedResult.equals(Buffer.from(resultJws, 'ascii'))) {
+  if (!input.allowUnverifiedRecoveryEvidence && committed.archivedResult !== null &&
+    !committed.archivedResult.equals(Buffer.from(resultJws, 'ascii'))) {
     fail('operation_recovery_history_result_conflict')
   }
   return { state: typedState, outcomeCode: typedOutcome, committedAttemptNo: Number(committedNo), resultJws, resultDigest }
@@ -1864,6 +1868,198 @@ async function verifyDirectRecoveryResponse(input: {
   })
 }
 
+/**
+ * Verify a recovery result against the immutable mutation attempt. Historical result archives may
+ * have been written before signature verification by older clients, so archive presence alone is
+ * never proof that the bytes are a center result.
+ */
+async function verifyBoundRecoveryResultJws(input: {
+  history: ValidatedRecoveryOperationHistory
+  attemptNo: number
+  token: string
+  accepted: Awaited<ReturnType<TrustBundleStore['getAccepted']>>
+  trustedTime: number
+  depth?: number
+}): Promise<void> {
+  if ((input.depth ?? 0) > 2) fail('operation_recovery_result_binding_invalid')
+  const attempt = input.history.attempts.find(item => item.row.attempt_no === input.attemptNo)
+  if (!attempt || !['recovery', 'continue'].includes(attempt.row.purpose) ||
+    String(attempt.row.send_state) !== 'response_saved') fail('operation_recovery_commit_binding_invalid')
+  const decoded = decodeCompactJws(input.token)
+  const identity = {
+    status: 'ready' as const,
+    code: 'ready',
+    databaseId: input.history.operation.databaseId,
+    instanceId: input.history.operation.instanceId,
+    identityJkt: input.history.operation.identityJkt,
+    bindingState: 'ready' as const,
+  }
+  const requestNonce = String(attempt.challengeClaims.server_nonce)
+  const requestDigest = attempt.row.request_body_digest
+  if (decoded.header.typ === 'aikayun-license+jwt') {
+    let lease
+    if (typeof decoded.claims.exp === 'number' && decoded.claims.exp <= input.trustedTime) {
+      lease = await verifyExpiredHistoricalLease(input.token, {
+        resolver: input.accepted.resolver,
+        issuer: input.accepted.centerIssuer,
+        trustedTime: input.trustedTime,
+        identity,
+      })
+    } else {
+      lease = await verifyCurrentLicenseLease(input.token, {
+        resolver: input.accepted.resolver,
+        issuer: input.accepted.centerIssuer,
+        trustedTime: input.trustedTime,
+        identity,
+      })
+    }
+    const claims = decoded.claims
+    if (lease.licenseId !== input.history.operation.licenseId || lease.databaseId !== identity.databaseId ||
+      lease.instanceId !== identity.instanceId || lease.identityJkt !== identity.identityJkt ||
+      lease.activationGeneration !== input.history.payload.expectedGeneration ||
+      !positiveRevision(String(claims.entitlement_revision)) ||
+      BigInt(String(claims.entitlement_revision)) < BigInt(input.history.payload.knownRevision) ||
+      claims.request_nonce !== requestNonce || claims.request_digest !== requestDigest) {
+      fail('operation_recovery_result_binding_invalid')
+    }
+    return
+  }
+  if (decoded.header.typ === 'aikayun-license-status+jwt') {
+    let status
+    if (typeof decoded.claims.exp === 'number' && decoded.claims.exp <= input.trustedTime) {
+      status = await verifyExpiredHistoricalStatusReceipt(input.token, {
+        resolver: input.accepted.resolver,
+        issuer: input.accepted.centerIssuer,
+        trustedTime: input.trustedTime,
+      })
+    } else {
+      status = await verifyLicenseStatusReceipt(input.token, {
+        resolver: input.accepted.resolver,
+        issuer: input.accepted.centerIssuer,
+        trustedTime: input.trustedTime,
+      })
+    }
+    const claims = status.claims
+    if (claims.sub !== input.history.operation.licenseId || claims.instance_id !== identity.instanceId ||
+      claims.identity_jkt !== identity.identityJkt || claims.activation_generation !== input.history.payload.expectedGeneration ||
+      claims.request_nonce !== requestNonce || claims.request_digest !== requestDigest ||
+      !recoveryStatusOutcome(claims.status)) fail('operation_recovery_result_binding_invalid')
+    return
+  }
+  if (decoded.header.typ === 'aikayun-license-operation+jwt') {
+    let receipt
+    if (typeof decoded.claims.exp === 'number' && decoded.claims.exp <= input.trustedTime) {
+      try {
+        receipt = await verifyExpiredHistoricalOperationReceipt(input.token, {
+          resolver: input.accepted.resolver,
+          issuer: input.accepted.centerIssuer,
+          trustedTime: input.trustedTime,
+        })
+      } catch {
+        receipt = await verifyHistoricalLicenseOperationReceipt(input.token, {
+          resolver: input.accepted.resolver,
+          issuer: input.accepted.centerIssuer,
+          trustedTime: input.trustedTime,
+        })
+      }
+    } else {
+      receipt = await verifyLicenseOperationReceipt(input.token, {
+        resolver: input.accepted.resolver,
+        issuer: input.accepted.centerIssuer,
+        trustedTime: input.trustedTime,
+      })
+    }
+    const claims = receipt.claims
+    if (claims.sub !== input.history.operation.licenseId || claims.actor_jkt !== identity.identityJkt ||
+      claims.operation_id !== input.history.operation.operationId || claims.intent_digest !== input.history.operation.intentDigest ||
+      claims.attempt_no !== input.attemptNo || claims.request_nonce_hash !== attempt.row.request_nonce_hash ||
+      claims.request_digest !== requestDigest || !['committed', 'rejected', 'cancelled'].includes(String(claims.state))) {
+      fail('operation_recovery_result_binding_invalid')
+    }
+    if (claims.result_jws === null) {
+      if (claims.committed_attempt_no !== null || claims.committed_request_nonce_hash !== null ||
+        claims.committed_request_digest !== null || claims.state === 'committed') {
+        fail('operation_recovery_result_binding_invalid')
+      }
+      return
+    }
+    const checked = boundOperationReceiptClaims({
+      history: input.history,
+      requestAttemptNo: input.attemptNo,
+      requestNonceHash: attempt.row.request_nonce_hash,
+      requestDigest,
+      claims,
+      allowUnverifiedRecoveryEvidence: true,
+    })
+    if (checked.resultJws !== null && checked.committedAttemptNo !== null) {
+      await verifyBoundRecoveryResultJws({
+        ...input,
+        attemptNo: checked.committedAttemptNo,
+        token: checked.resultJws,
+        depth: (input.depth ?? 0) + 1,
+      })
+    }
+    return
+  }
+  fail('operation_recovery_result_binding_invalid')
+}
+
+async function recoveryResultConflictsWithTrustedReceipt(input: {
+  history: ValidatedRecoveryOperationHistory
+  attemptNo: number
+  centerResultJws: string
+  accepted: Awaited<ReturnType<TrustBundleStore['getAccepted']>>
+  trustedTime: number
+}): Promise<boolean> {
+  const authoritative = Buffer.from(input.centerResultJws, 'ascii')
+  for (const attempt of input.history.attempts) {
+    if (!['recovery', 'continue'].includes(attempt.row.purpose)) continue
+    for (const candidate of [attempt.response, attempt.archivedResult]) {
+      if (!candidate || candidate.equals(authoritative)) continue
+      try {
+        const decoded = decodeCompactJws(candidate.toString('ascii'))
+        await verifyBoundRecoveryResultJws({
+          history: input.history,
+          attemptNo: attempt.row.attempt_no,
+          token: candidate.toString('ascii'),
+          accepted: input.accepted,
+          trustedTime: input.trustedTime,
+        })
+        if (decoded.header.typ === 'aikayun-license-operation+jwt' && decoded.claims.result_jws === input.centerResultJws) {
+          continue
+        }
+        return true
+      } catch {
+        // Saved HTTP bytes and legacy result archives are inert unless they still verify
+        // against this exact operation attempt and installation identity.
+      }
+    }
+  }
+  return false
+}
+
+async function archiveVerifiedRecoveryResult(input: {
+  options: LicenseOperationRecoveryClientOptions
+  history: ValidatedRecoveryOperationHistory
+  attemptNo: number
+  token: string
+}): Promise<void> {
+  const attempt = input.history.attempts.find(item => item.row.attempt_no === input.attemptNo)
+  if (!attempt) fail('operation_recovery_commit_binding_invalid')
+  const bytes = Buffer.from(input.token, 'ascii')
+  if (attempt.archivedResult !== null) {
+    if (attempt.archivedResult.equals(bytes)) return
+    // Preserve an immutable legacy archive that failed trusted verification. The fresh signed
+    // operation receipt containing the verified result is durably retained as the query response.
+    return
+  }
+  await saveLicenseOperationResultJws(input.options.db, input.options.pendingKeyRoot,
+    input.history.operation.operationId, input.attemptNo, bytes)
+  const saved = await readLicenseOperationAttemptResultJws(input.options.db, input.options.pendingKeyRoot,
+    input.history.operation.operationId, input.attemptNo)
+  if (!saved || !saved.equals(bytes)) fail('operation_result_archive_unknown')
+}
+
 async function verifyRecoveryOperationReceipt(input: {
   options: LicenseOperationRecoveryClientOptions
   history: ValidatedRecoveryOperationHistory
@@ -1897,16 +2093,16 @@ async function verifyRecoveryOperationReceipt(input: {
     requestNonceHash: currentAttempt.row.request_nonce_hash,
     requestDigest: currentAttempt.row.request_body_digest,
     claims: verified.claims,
+    allowUnverifiedRecoveryEvidence: true,
   })
-  if (checked.resultJws && checked.committedAttemptNo !== null) {
-    const committed = history.attempts.find(item => item.row.attempt_no === checked.committedAttemptNo)
-    if (!committed) fail('operation_recovery_commit_binding_invalid')
-    const resultBytes = Buffer.from(checked.resultJws, 'ascii')
-    await saveLicenseOperationResultJws(input.options.db, input.options.pendingKeyRoot,
-      history.operation.operationId, checked.committedAttemptNo, resultBytes)
-    const saved = await readLicenseOperationAttemptResultJws(input.options.db, input.options.pendingKeyRoot,
-      history.operation.operationId, checked.committedAttemptNo)
-    if (!saved || !saved.equals(resultBytes)) fail('operation_result_archive_unknown')
+  if (checked.resultJws !== null && checked.committedAttemptNo !== null) {
+    if (await recoveryResultConflictsWithTrustedReceipt({
+      history,
+      attemptNo: checked.committedAttemptNo,
+      centerResultJws: checked.resultJws,
+      accepted: input.accepted,
+      trustedTime: input.trustedTime,
+    })) fail('operation_recovery_history_result_conflict')
   }
   return { checked, history }
 }
@@ -1932,8 +2128,26 @@ async function resultFromRecoveryOperationReceipt(input: {
 }): Promise<LicenseRecoveryOperationResult | null> {
   const { checked, history } = input
   if (checked.state === 'not_found') {
-    await ensureNotFoundDoesNotContradictHistory({ history, issuer: input.options.releaseConfig.expected_center_issuer,
-      trustedTime: input.trustedTime })
+    for (const attempt of history.attempts) {
+      if (!['recovery', 'continue'].includes(attempt.row.purpose)) continue
+      for (const candidate of [attempt.response, attempt.archivedResult]) {
+        if (!candidate) continue
+        try {
+          await verifyBoundRecoveryResultJws({
+            history,
+            attemptNo: attempt.row.attempt_no,
+            token: candidate.toString('ascii'),
+            accepted: input.accepted,
+            trustedTime: input.trustedTime,
+          })
+          fail('operation_recovery_history_conflicts_with_not_found')
+        } catch (error) {
+          if (error instanceof LicenseOperationRecoveryError &&
+            error.code === 'operation_recovery_history_conflicts_with_not_found') throw error
+          // A not_found receipt can proceed past unverified recovery response bytes.
+        }
+      }
+    }
     return null
   }
   if (checked.state === 'cancelled') fail('recovery_operation_cancelled')
@@ -1941,6 +2155,21 @@ async function resultFromRecoveryOperationReceipt(input: {
     const result = checked.resultJws
     const committed = checked.committedAttemptNo === null ? undefined
       : history.attempts.find(item => item.row.attempt_no === checked.committedAttemptNo)
+    if (result && committed) {
+      await verifyBoundRecoveryResultJws({
+        history,
+        attemptNo: checked.committedAttemptNo!,
+        token: result,
+        accepted: input.accepted,
+        trustedTime: input.trustedTime,
+      })
+      await archiveVerifiedRecoveryResult({
+        options: input.options,
+        history,
+        attemptNo: checked.committedAttemptNo!,
+        token: result,
+      })
+    }
     if (!result || !committed) {
       return recoveryStatusEvidence({
         sourceOperationId: history.payload.recoveryOfOperationId,
@@ -1977,6 +2206,12 @@ async function resultFromRecoveryOperationReceipt(input: {
     resolver: input.accepted.resolver,
     issuer: input.options.releaseConfig.expected_center_issuer,
     trustedTime: input.trustedTime,
+  })
+  await archiveVerifiedRecoveryResult({
+    options: input.options,
+    history,
+    attemptNo: checked.committedAttemptNo,
+    token: checked.resultJws,
   })
   return lease
 }
@@ -2113,11 +2348,6 @@ async function runOneRecoveryOperationRequest(input: {
         if (!persisted.equals(parsedResponse.token)) fail('operation_response_archive_mismatch')
       } catch { fail('operation_response_archive_unknown') }
     }
-    if (stage === 'recovery') {
-      await saveLicenseOperationResultJws(options.db, options.pendingKeyRoot, operationId, attempt.attemptNo, parsedResponse.token)
-      const archived = await readLicenseOperationAttemptResultJws(options.db, options.pendingKeyRoot, operationId, attempt.attemptNo)
-      if (!archived || !archived.equals(parsedResponse.token)) fail('operation_result_archive_unknown')
-    }
     await checkpoint('after_response_saved')
     const responseCandidate = await options.trustStore.getCandidateForTimeBootstrap()
     if (!responseCandidate || responseCandidate.claims.sub !== options.releaseConfig.expected_center_issuer) {
@@ -2135,6 +2365,12 @@ async function runOneRecoveryOperationRequest(input: {
       })
       const result = await verifyDirectRecoveryResponse({
         options, history, attemptNo: attempt.attemptNo, response: parsedResponse, accepted, trustedTime,
+      })
+      await archiveVerifiedRecoveryResult({
+        options,
+        history,
+        attemptNo: attempt.attemptNo,
+        token: parsedResponse.token.toString('ascii'),
       })
       const latest = await options.trustStore.getAccepted(responseSample.assertFresh)
       if (latest.artifactSha256 !== accepted.artifactSha256) fail('operation_trust_bundle_changed')

@@ -203,6 +203,11 @@ try {
   const recoveryCrash = await issueActivationScenario()
   const recoveryTamper = await issueActivationScenario()
   const recoveryTimeout = await issueActivationScenario()
+  const recoveryForgedResponse = await issueActivationScenario()
+  const recoveryWrongKidResponse = await issueActivationScenario()
+  const recoveryMisboundResponse = await issueActivationScenario()
+  const recoveryHistoricalBadArchive = await issueActivationScenario()
+  const recoveryConflictingVerifiedResponse = await issueActivationScenario()
   const crashActivationCases = []
   for (let index = 0; index < 7; index += 1) crashActivationCases.push(await issueActivationScenario())
   const transportActivationCases = []
@@ -540,6 +545,42 @@ try {
     return { operation_receipt: token }
   })
   app.addHook('preSerialization', async (request, reply, payload) => {
+    if (request.method === 'POST' && request.url === '/v1/leases/renew' && reply.statusCode === 200) {
+      let mode
+      try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { return payload }
+      if (['forged_recovery_signature', 'wrong_recovery_kid', 'misbound_recovery_request',
+        'different_bound_recovery_lease'].includes(mode) &&
+        payload && typeof payload === 'object' && typeof payload.license === 'string') {
+        const parts = payload.license.split('.')
+        if (mode === 'forged_recovery_signature') {
+          const signature = parts[2]
+          if (!signature) throw new Error('Recovery lease fixture signature is missing')
+          parts[2] = `${signature.slice(0, -1)}${signature.endsWith('A') ? 'B' : 'A'}`
+        } else if (mode === 'wrong_recovery_kid') {
+          const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'))
+          header.kid = 'A'.repeat(43)
+          parts[0] = Buffer.from(JSON.stringify(header)).toString('base64url')
+        } else {
+          const claims = decodeJwt(payload.license)
+          const misbound = mode === 'misbound_recovery_request'
+          const forged = await signLicenseLease({ ...runtime.signer, issuer: origin }, {
+            licenseId: claims.sub,
+            databaseId: claims.database_id,
+            instanceId: claims.instance_id,
+            identityJkt: claims.identity_jkt,
+            generation: claims.activation_generation,
+            entitlementRevision: claims.entitlement_revision,
+            plan: claims.plan,
+            subscriptionEnd: new Date(claims.subscription_end * 1000),
+            requestNonce: misbound ? randomBytes(32).toString('base64url') : claims.request_nonce,
+            requestDigest: misbound ? 'A'.repeat(43) : claims.request_digest,
+            now: new Date(),
+          })
+          return { ...payload, license: forged.token }
+        }
+        return { ...payload, license: parts.join('.') }
+      }
+    }
     if (request.method !== 'POST' || request.url !== '/v1/activations' || reply.statusCode !== 409) return payload
     let mode
     try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { return payload }
@@ -621,6 +662,11 @@ try {
     recovery_crash: recoveryCrash,
     recovery_tamper: recoveryTamper,
     recovery_timeout: recoveryTimeout,
+    recovery_forged_response: recoveryForgedResponse,
+    recovery_wrong_kid_response: recoveryWrongKidResponse,
+    recovery_misbound_response: recoveryMisboundResponse,
+    recovery_historical_bad_archive: recoveryHistoricalBadArchive,
+    recovery_conflicting_verified_response: recoveryConflictingVerifiedResponse,
     crash_activation_cases: crashActivationCases,
     transport_activation_cases: transportActivationCases,
   }), { mode: 0o600, flag: 'wx' })

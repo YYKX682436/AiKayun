@@ -36,6 +36,7 @@ import {
   readLicenseOperationAttemptResultJws,
   readLicenseOperationCenterEvidence,
   readSavedLicenseOperationResponse,
+  saveLicenseOperationResultJws,
 } from '../src/licensing/license-operation-store.js'
 import { buildRecoveryIntent } from '../src/licensing/license-intent.js'
 import { decryptLicensePendingBytes, initializeTemporaryLicensePendingKey } from '../src/licensing/pending-encryption-key.js'
@@ -94,6 +95,11 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     recovery_crash: { license_id: string; activation_code: string }
     recovery_tamper: { license_id: string; activation_code: string }
     recovery_timeout: { license_id: string; activation_code: string }
+    recovery_forged_response: { license_id: string; activation_code: string }
+    recovery_wrong_kid_response: { license_id: string; activation_code: string }
+    recovery_misbound_response: { license_id: string; activation_code: string }
+    recovery_historical_bad_archive: { license_id: string; activation_code: string }
+    recovery_conflicting_verified_response: { license_id: string; activation_code: string }
     crash_activation_cases: Array<{ license_id: string; activation_code: string }>
     transport_activation_cases: Array<{ license_id: string; activation_code: string }>
     activation_control_path: string
@@ -2198,6 +2204,136 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     }
   }, 90_000)
 
+  it.each([
+    { mode: 'forged_recovery_signature', licenseKey: 'recovery_forged_response', error: 'recovery_operation_result_not_current' },
+    { mode: 'wrong_recovery_kid', licenseKey: 'recovery_wrong_kid_response', error: 'recovery_operation_result_not_current' },
+    { mode: 'misbound_recovery_request', licenseKey: 'recovery_misbound_response', error: 'recovery_operation_result_binding_invalid' },
+  ] as const)('does not promote a $mode direct response and recovers the center committed result', async ({ mode, licenseKey, error }) => {
+    const scenario = info[licenseKey]
+    const fixture = await createRecoveryCase({ name: `recovery-untrusted-direct-${mode}`, license: scenario })
+    try {
+      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      await setCenterMode(mode)
+      await expect(fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId))
+        .rejects.toMatchObject({ code: error })
+      await clearCenterMode()
+
+      const recovery = await fixture.db.selectFrom('local_license_operations').selectAll()
+        .where('kind', '=', 'recovery').executeTakeFirstOrThrow()
+      const directResponse = await readLicenseOperationAttemptResponse(
+        fixture.db, fixture.pendingRoot, recovery.operation_id, 1,
+      )
+      const archivedResult = await readLicenseOperationAttemptResultJws(
+        fixture.db, fixture.pendingRoot, recovery.operation_id, 1,
+      )
+      expect(archivedResult).toBeNull()
+      const committedCenterOperation = await centerPool.query<{ state: string; response_jws: string | null }>(
+        `SELECT state, response_jws FROM license_operations WHERE operation_id = $1`, [recovery.operation_id],
+      )
+      expect(committedCenterOperation.rows).toHaveLength(1)
+      expect(committedCenterOperation.rows[0]?.state).toBe('committed')
+      expect(committedCenterOperation.rows[0]?.response_jws).not.toBe(directResponse.toString('ascii'))
+
+      const [recovered, repeated] = await Promise.all([
+        fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId),
+        fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId),
+      ])
+      expect(recovered).toMatchObject({
+        purpose: 'verified_current_lease_recovery_unprojected',
+        recoveryOperationId: recovery.operation_id,
+        activationGeneration: '1',
+        signatureVerified: true,
+        projected: false,
+      })
+      expect(await readLicenseOperationAttemptResultJws(fixture.db, fixture.pendingRoot, recovery.operation_id, 1))
+        .toEqual(Buffer.from(committedCenterOperation.rows[0]!.response_jws!, 'ascii'))
+      const queryReceipt = await readLicenseOperationAttemptResponse(fixture.db, fixture.pendingRoot, recovery.operation_id, 2)
+      expect(decodeJwt(queryReceipt.toString('ascii')).result_jws).toBe(committedCenterOperation.rows[0]!.response_jws)
+      expect(repeated).toMatchObject({ recoveryOperationId: recovery.operation_id, resultJwsDigest: recovered.resultJwsDigest })
+      expect((await centerPool.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM license_operations WHERE license_id = $1`, [scenario.license_id],
+      )).rows).toEqual([{ count: '2' }])
+    } finally {
+      await clearCenterMode()
+      await fixture.close()
+    }
+  }, 90_000)
+
+  it('rejects conflicting recovery results when both leases have trusted signatures and the original request binding', async () => {
+    const scenario = info.recovery_conflicting_verified_response
+    const fixture = await createRecoveryCase({ name: 'recovery-conflicting-verified-results', license: scenario })
+    try {
+      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      await setCenterMode('different_bound_recovery_lease')
+      const first = await fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId)
+      await clearCenterMode()
+
+      const recovery = await fixture.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', first.recoveryOperationId).executeTakeFirstOrThrow()
+      const originalResponse = await readLicenseOperationAttemptResponse(
+        fixture.db, fixture.pendingRoot, recovery.operation_id, 1,
+      )
+      const storedResult = await readLicenseOperationAttemptResultJws(
+        fixture.db, fixture.pendingRoot, recovery.operation_id, 1,
+      )
+      expect(storedResult).toEqual(originalResponse)
+      const centerOperation = await centerPool.query<{ response_jws: string | null }>(
+        `SELECT response_jws FROM license_operations WHERE operation_id = $1`, [recovery.operation_id],
+      )
+      expect(centerOperation.rows[0]?.response_jws).toBeTruthy()
+      expect(centerOperation.rows[0]?.response_jws).not.toBe(originalResponse.toString('ascii'))
+      expect(first.resultJwsDigest).not.toBe(createHash('sha256')
+        .update(centerOperation.rows[0]!.response_jws!, 'ascii').digest('base64url'))
+
+      await expect(fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId))
+        .rejects.toMatchObject({ code: 'operation_recovery_history_result_conflict' })
+      expect(await readLicenseOperationAttemptResultJws(fixture.db, fixture.pendingRoot, recovery.operation_id, 1))
+        .toEqual(originalResponse)
+    } finally {
+      await clearCenterMode()
+      await fixture.close()
+    }
+  }, 90_000)
+
+  it('recovers through the signed query receipt when a legacy unverified result archive is immutable', async () => {
+    const scenario = info.recovery_historical_bad_archive
+    const fixture = await createRecoveryCase({ name: 'recovery-legacy-unverified-result-archive', license: scenario })
+    try {
+      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      await setCenterMode('forged_recovery_signature')
+      await expect(fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId))
+        .rejects.toMatchObject({ code: 'recovery_operation_result_not_current' })
+      await clearCenterMode()
+
+      const recovery = await fixture.db.selectFrom('local_license_operations').selectAll()
+        .where('kind', '=', 'recovery').executeTakeFirstOrThrow()
+      const forgedResponse = await readLicenseOperationAttemptResponse(fixture.db, fixture.pendingRoot, recovery.operation_id, 1)
+      await saveLicenseOperationResultJws(fixture.db, fixture.pendingRoot, recovery.operation_id, 1, forgedResponse)
+
+      const centerOperation = await centerPool.query<{ response_jws: string | null }>(
+        `SELECT response_jws FROM license_operations WHERE operation_id = $1`, [recovery.operation_id],
+      )
+      expect(centerOperation.rows[0]?.response_jws).toBeTruthy()
+      expect(centerOperation.rows[0]?.response_jws).not.toBe(forgedResponse.toString('ascii'))
+      const recovered = await fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId)
+      expect(recovered).toMatchObject({
+        purpose: 'verified_current_lease_recovery_unprojected',
+        recoveryOperationId: recovery.operation_id,
+        signatureVerified: true,
+        projected: false,
+      })
+      expect(await readLicenseOperationAttemptResultJws(fixture.db, fixture.pendingRoot, recovery.operation_id, 1))
+        .toEqual(forgedResponse)
+      const queryReceipt = await readLicenseOperationAttemptResponse(fixture.db, fixture.pendingRoot, recovery.operation_id, 2)
+      expect(decodeJwt(queryReceipt.toString('ascii')).result_jws).toBe(centerOperation.rows[0]!.response_jws)
+      const repeated = await fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId)
+      expect(repeated).toMatchObject({ recoveryOperationId: recovery.operation_id, resultJwsDigest: recovered.resultJwsDigest })
+    } finally {
+      await clearCenterMode()
+      await fixture.close()
+    }
+  }, 90_000)
+
   it.each(['retired', 'revoked'] as const)(
     'uses the current center proof and signer after the original lease signer is %s', async lifecycle => {
       const scenario = lifecycle === 'retired' ? info.recovery_retired_signer : info.recovery_revoked_signer
@@ -2385,6 +2521,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       const firstAttempt = await fixture.db.selectFrom('local_license_operation_attempts').selectAll()
         .where('operation_id', '=', durable.operation_id).executeTakeFirstOrThrow()
       expect(firstAttempt).toMatchObject({ purpose: 'recovery', send_state: 'response_saved' })
+      expect(await readLicenseOperationAttemptResultJws(fixture.db, fixture.pendingRoot, durable.operation_id, 1)).toBeNull()
       const recovered = await fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId)
       expect(recovered).toMatchObject({
         purpose: 'verified_current_lease_recovery_unprojected',
@@ -2396,6 +2533,11 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       expect((await centerPool.query<{ count: string }>(
         `SELECT count(*)::text AS count FROM license_operations WHERE license_id = $1`, [scenario.license_id],
       )).rows).toEqual([{ count: '2' }])
+      const committed = await centerPool.query<{ response_jws: string | null }>(
+        `SELECT response_jws FROM license_operations WHERE operation_id = $1`, [durable.operation_id],
+      )
+      expect(await readLicenseOperationAttemptResultJws(fixture.db, fixture.pendingRoot, durable.operation_id, 1))
+        .toEqual(Buffer.from(committed.rows[0]!.response_jws!, 'ascii'))
     } finally { await fixture.close() }
   }, 90_000)
 

@@ -221,7 +221,27 @@ export async function verifyLicenseStatusReceipt(
   token: unknown,
   input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
 ): Promise<VerifiedStatusEvidence> {
-  const verified = await verifyPurpose(token, { ...input, typ: STATUS_TYP, claims: STATUS_CLAIMS })
+  return verifyStatusReceipt(token, input, false)
+}
+
+/** Historical status evidence is signature checked at current trusted time but may be expired. */
+export async function verifyExpiredHistoricalStatusReceipt(
+  token: unknown,
+  input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
+): Promise<VerifiedStatusEvidence> {
+  const verified = await verifyStatusReceipt(token, input, true)
+  if (Number(verified.claims.exp) > input.trustedTime) throw new Error('Historical status receipt has not expired')
+  return verified
+}
+
+async function verifyStatusReceipt(
+  token: unknown,
+  input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
+  historical: boolean,
+): Promise<VerifiedStatusEvidence> {
+  const verified = await verifyPurpose(token, {
+    ...input, typ: STATUS_TYP, claims: STATUS_CLAIMS, ...(historical ? { allowExpired: true } : {}),
+  })
   const claims = verified.claims
   const iat = assertIntegerClaim(claims, 'iat', 1)
   if (assertIntegerClaim(claims, 'v') !== 1 || claims.aud !== AUDIENCE ||
@@ -274,7 +294,7 @@ export async function verifyLicenseOperationReceipt(
   token: unknown,
   input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
 ): Promise<VerifiedOperationEvidence> {
-  return verifyOperationReceipt(token, input, false)
+  return verifyOperationReceipt(token, input, 'current')
 }
 
 /** Historical verification is only for recognizing an expired R3 rejection before retrying. */
@@ -282,21 +302,36 @@ export async function verifyExpiredHistoricalOperationReceipt(
   token: unknown,
   input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
 ): Promise<{ readonly purpose: 'expired_r3_rejection_history'; readonly claims: Readonly<Record<string, unknown>> }> {
-  const verified = await verifyOperationReceipt(token, input, true)
+  const verified = await verifyOperationReceipt(token, input, 'expired_r3_rejection')
   return Object.freeze({ purpose: 'expired_r3_rejection_history', claims: verified.claims })
+}
+
+/** Historical verification for reconciling an immutable recovery result with a fresh center receipt. */
+export async function verifyHistoricalLicenseOperationReceipt(
+  token: unknown,
+  input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
+): Promise<VerifiedOperationEvidence> {
+  const verified = await verifyOperationReceipt(token, input, 'expired')
+  if (Number(verified.claims.exp) > input.trustedTime) throw new Error('Historical operation receipt has not expired')
+  return verified
 }
 
 async function verifyOperationReceipt(
   token: unknown,
   input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
-  historical: boolean,
+  historical: 'current' | 'expired_r3_rejection' | 'expired',
 ): Promise<VerifiedOperationEvidence> {
-  const verified = await verifyPurpose(token, { ...input, typ: OPERATION_TYP, claims: OPERATION_CLAIMS, allowExpired: historical })
+  const verified = await verifyPurpose(token, {
+    ...input, typ: OPERATION_TYP, claims: OPERATION_CLAIMS, ...(historical === 'current' ? {} : { allowExpired: true }),
+  })
   const claims = verified.claims
   const iat = assertIntegerClaim(claims, 'iat', 1)
-  if (historical && (assertIntegerClaim(claims, 'exp', 1) > input.trustedTime ||
+  if (historical === 'expired_r3_rejection' && (assertIntegerClaim(claims, 'exp', 1) > input.trustedTime ||
     claims.state !== 'rejected' || claims.outcome_code !== 'ACTIVATION_AUTHORIZATION_INVALID')) {
     throw new Error('Invalid historical R3 rejection')
+  }
+  if (historical === 'expired' && assertIntegerClaim(claims, 'exp', 1) > input.trustedTime) {
+    throw new Error('Historical operation receipt has not expired')
   }
   if (assertIntegerClaim(claims, 'v') !== 1 || claims.aud !== AUDIENCE || assertIntegerClaim(claims, 'exp', 1) !== iat + 5 * 60 ||
     !['not_found', 'committed', 'rejected', 'cancelled'].includes(String(claims.state))) throw new Error('Invalid license operation receipt')
