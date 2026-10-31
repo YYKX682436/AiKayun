@@ -33,7 +33,7 @@ R1 失败复现先在真实 PostgreSQL 18 和冻结授权中心环境中确认�
 - 最小修复：新鲜 query 仍调用原来的当前 operation receipt 验证。只在持久化 query/continue 来源回执确已过期时，改用现有 `verifyHistoricalLicenseOperationReceipt` 验历史签名来源；其签名、issuer/audience、Trust Store、过期时间、精确 operation/attempt/nonce/digest 和内层结果绑定规则不变。被携带的 lease/status JWS 仍按当前可信时间独立验证，过期 lease 不会成为有效凭证，历史来源不产生新的中心提交事实。
 - R2 冻结中心定向回归：延迟首次投影、已投影后的 revision 更新和重复提交、旧错误不可变 archive 保持不变、expired inner lease 对应的 revoked/superseded、错误 receipt 签名/kid、已撤销 signer、R1 冲突拒绝及 v5 配对备份核验均通过（8 项通过）。
 - 完整 `pnpm verify`：lint 无错误（7 条既有 Vue 格式 warning）；类型检查、构建通过；API 618 项、unit 16 项、主 E2E 93 项、alternate-brand 1 项、SSR-error 3 项、dev-preview 1 项和 production-brand 1 项全部通过。
-- 授权中心仍只读，SHA `a5cf99439e3bf92b65f19d60c013bca088cf221a`。本段 CI 结果待本次变更推送后记录。
+- 授权中心仍只读，SHA `a5cf99439e3bf92b65f19d60c013bca088cf221a`。GitHub Actions CI `41223612849`：success，26m46s；unit/PostgreSQL、冻结中心 HTTPS 互操作、生产构建、主 E2E、Compose 管理流与重建持久性、SIGKILL/备份恢复/TLS 拒绝全部通过。
 
 ## 验证
 
