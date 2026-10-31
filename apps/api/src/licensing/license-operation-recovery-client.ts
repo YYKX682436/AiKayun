@@ -1967,7 +1967,9 @@ async function verifyBoundRecoveryResultJws(input: {
   if ((input.depth ?? 0) > 2) fail('operation_recovery_result_binding_invalid')
   const attempt = input.history.attempts.find(item => item.row.attempt_no === input.attemptNo)
   if (!attempt || !['recovery', 'continue'].includes(attempt.row.purpose) ||
-    String(attempt.row.send_state) !== 'response_saved') fail('operation_recovery_commit_binding_invalid')
+    !['sent', 'transport_unknown', 'response_saved'].includes(String(attempt.row.send_state))) {
+    fail('operation_recovery_commit_binding_invalid')
+  }
   const decoded = decodeCompactJws(input.token)
   const identity = {
     status: 'ready' as const,
@@ -2188,6 +2190,84 @@ async function verifyRecoveryOperationReceipt(input: {
     })) fail('operation_recovery_history_result_conflict')
   }
   return { checked, history }
+}
+
+/**
+ * Read a result nested in a persisted query/continue receipt for the single license projection
+ * writer. The receipt and the inner result are verified again from the immutable request history;
+ * the legacy result archive is deliberately not treated as an authority.
+ */
+export async function readVerifiedPersistedRecoveryQueryResult(input: {
+  options: LicenseOperationRecoveryClientOptions
+  operationId: string
+  receiptAttemptNo: number
+  identity: { databaseId: string; instanceId: string; identityJkt: string }
+  accepted: Awaited<ReturnType<TrustBundleStore['getAccepted']>>
+  trustedTime: number
+}): Promise<Readonly<{
+  receiptAttemptNo: number
+  committedAttemptNo: number
+  receiptJws: Buffer
+  resultJws: Buffer
+}> | null> {
+  let history: ValidatedRecoveryOperationHistory
+  try {
+    history = await validateRecoveryOperationHistory({
+      db: input.options.db,
+      pendingKeyRoot: input.options.pendingKeyRoot,
+      operationId: input.operationId,
+      issuer: input.options.releaseConfig.expected_center_issuer,
+      centerOrigin: new URL(input.options.releaseConfig.expected_center_origin),
+      identity: input.identity,
+    })
+  } catch {
+    return null
+  }
+  const receiptAttempt = history.attempts.find(attempt => attempt.row.attempt_no === input.receiptAttemptNo)
+  if (!receiptAttempt || !['query', 'continue'].includes(receiptAttempt.row.purpose) ||
+    String(receiptAttempt.row.send_state) !== 'response_saved' || receiptAttempt.response === null) return null
+
+  let header: { typ?: string }
+  try { header = decodeCompactJws(receiptAttempt.response.toString('ascii')).header } catch { return null }
+  if (header.typ !== 'aikayun-license-operation+jwt') return null
+
+  let verified: Awaited<ReturnType<typeof verifyRecoveryOperationReceipt>>
+  try {
+    verified = await verifyRecoveryOperationReceipt({
+      options: input.options,
+      history,
+      attemptNo: input.receiptAttemptNo,
+      responseToken: receiptAttempt.response,
+      accepted: input.accepted,
+      trustedTime: input.trustedTime,
+    })
+  } catch (error) {
+    // A contradictory pair of currently trusted results is a hard stop, not an ignorable source.
+    if (error instanceof LicenseOperationRecoveryError && error.code === 'operation_recovery_history_result_conflict') {
+      throw error
+    }
+    return null
+  }
+  const { checked } = verified
+  if (!['committed', 'rejected'].includes(checked.state) || checked.resultJws === null ||
+    checked.committedAttemptNo === null) return null
+  try {
+    await verifyBoundRecoveryResultJws({
+      history: verified.history,
+      attemptNo: checked.committedAttemptNo,
+      token: checked.resultJws,
+      accepted: input.accepted,
+      trustedTime: input.trustedTime,
+    })
+  } catch {
+    return null
+  }
+  return Object.freeze({
+    receiptAttemptNo: input.receiptAttemptNo,
+    committedAttemptNo: checked.committedAttemptNo,
+    receiptJws: receiptAttempt.response,
+    resultJws: Buffer.from(checked.resultJws, 'ascii'),
+  })
 }
 
 async function assertRecoveryIdentityUnchanged(

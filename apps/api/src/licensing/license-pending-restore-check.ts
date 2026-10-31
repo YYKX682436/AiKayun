@@ -1,5 +1,6 @@
 import { sql } from 'kysely'
 import { createHash } from 'node:crypto'
+import { parseStrictJson } from './strict-json.js'
 import { readConfig } from '../config.js'
 import { createDatabase } from '../db/pool.js'
 import {
@@ -75,12 +76,14 @@ export async function verifyLicensePendingBackupPair(): Promise<{ operations: nu
         .where('singleton', '=', true).executeTakeFirst()
       if (!binding || binding.database_id !== projection.database_id || binding.instance_id !== projection.instance_id ||
         binding.identity_jkt !== projection.identity_jkt) throw new Error('license_pending_restore_check_projection_identity_mismatch')
-      await verifyProjectionEvidence({
-        db, pendingKeyRoot: config.licensePendingKeyRoot,
-        operationId: projection.credential_operation_id!, attemptNo: projection.credential_attempt_no!,
-        keyId: projection.credential_encryption_key_id!, ciphertext: projection.encrypted_credential_jws!,
-        digest: projection.credential_jws_digest!, field: 'projection_lease_jws',
-      })
+      if (projection.credential_jti !== null) {
+        await verifyProjectionEvidence({
+          db, pendingKeyRoot: config.licensePendingKeyRoot,
+          operationId: projection.credential_operation_id!, attemptNo: projection.credential_attempt_no!,
+          keyId: projection.credential_encryption_key_id!, ciphertext: projection.encrypted_credential_jws!,
+          digest: projection.credential_jws_digest!, field: 'projection_lease_jws',
+        })
+      }
       if (projection.refusal_status !== null) {
         await verifyProjectionEvidence({
           db, pendingKeyRoot: config.licensePendingKeyRoot,
@@ -125,7 +128,75 @@ async function verifyProjectionEvidence(input: {
   }
   const response = await readLicenseOperationAttemptResponse(input.db, input.pendingKeyRoot, input.operationId, input.attemptNo)
   const archivedResult = await readLicenseOperationAttemptResultJws(input.db, input.pendingKeyRoot, input.operationId, input.attemptNo)
-  if (!response.equals(raw) && !archivedResult?.equals(raw)) {
+  if (response.equals(raw) || archivedResult?.equals(raw)) return
+  const receiptAttempt = await readLicenseOperationAttemptEnvelope(input.db, input.pendingKeyRoot,
+    input.operationId, input.attemptNo)
+  if (!['query', 'continue'].includes(receiptAttempt.purpose) || receiptAttempt.sendState !== 'response_saved') {
+    throw new Error('license_pending_restore_check_projection_source_mismatch')
+  }
+  const receiptToken = response.toString('ascii')
+  const receiptParts = receiptToken.split('.')
+  if (receiptParts.length !== 3 || !receiptParts.every(part => /^[A-Za-z0-9_-]+$/u.test(part))) {
+    throw new Error('license_pending_restore_check_projection_source_mismatch')
+  }
+  let header: unknown
+  let claims: unknown
+  try {
+    header = parseStrictJson(Buffer.from(receiptParts[0]!, 'base64url'))
+    claims = parseStrictJson(Buffer.from(receiptParts[1]!, 'base64url'))
+  } catch {
+    throw new Error('license_pending_restore_check_projection_source_mismatch')
+  }
+  if (!header || typeof header !== 'object' || Array.isArray(header) ||
+    !claims || typeof claims !== 'object' || Array.isArray(claims)) {
+    throw new Error('license_pending_restore_check_projection_source_mismatch')
+  }
+  const protectedHeader = header as Record<string, unknown>
+  const receipt = claims as Record<string, unknown>
+  const operation = await input.db.selectFrom('local_license_operations').selectAll()
+    .where('operation_id', '=', input.operationId).executeTakeFirst()
+  if (protectedHeader.typ !== 'aikayun-license-operation+jwt' || !operation || operation.kind !== 'recovery' ||
+    receipt.sub !== operation.license_id || receipt.actor_jkt !== operation.identity_jkt ||
+    receipt.operation_id !== input.operationId || receipt.intent_digest !== operation.intent_digest ||
+    receipt.attempt_no !== input.attemptNo || receipt.request_digest !== receiptAttempt.requestBodyDigest ||
+    receipt.request_nonce_hash !== receiptAttempt.requestNonceHash || !['committed', 'rejected'].includes(String(receipt.state)) ||
+    receipt.result_jws !== raw.toString('ascii') || !Number.isSafeInteger(receipt.committed_attempt_no) ||
+    typeof receipt.committed_request_digest !== 'string' || typeof receipt.committed_request_nonce_hash !== 'string') {
+    throw new Error('license_pending_restore_check_projection_source_mismatch')
+  }
+  const committedAttemptNo = Number(receipt.committed_attempt_no)
+  const committed = await readLicenseOperationAttemptEnvelope(input.db, input.pendingKeyRoot,
+    input.operationId, committedAttemptNo)
+  if (!['recovery', 'continue'].includes(committed.purpose) ||
+    ['prepared', 'transport_error'].includes(committed.sendState) ||
+    committed.requestBodyDigest !== receipt.committed_request_digest ||
+    committed.requestNonceHash !== receipt.committed_request_nonce_hash) {
+    throw new Error('license_pending_restore_check_projection_source_mismatch')
+  }
+  const envelope = parseStrictJson(committed.requestEnvelope)
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope) ||
+    typeof (envelope as Record<string, unknown>).body_base64url !== 'string') {
+    throw new Error('license_pending_restore_check_projection_source_mismatch')
+  }
+  const body = Buffer.from((envelope as Record<string, unknown>).body_base64url as string, 'base64url')
+  const bodyClaimsValue = parseStrictJson(body)
+  const resultParts = raw.toString('ascii').split('.')
+  if (resultParts.length !== 3 || !resultParts.every(part => /^[A-Za-z0-9_-]+$/u.test(part))) {
+    throw new Error('license_pending_restore_check_projection_source_mismatch')
+  }
+  const resultClaimsValue = parseStrictJson(Buffer.from(resultParts[1]!, 'base64url'))
+  if (!bodyClaimsValue || typeof bodyClaimsValue !== 'object' || Array.isArray(bodyClaimsValue) ||
+    !resultClaimsValue || typeof resultClaimsValue !== 'object' || Array.isArray(resultClaimsValue) ||
+    (resultClaimsValue as Record<string, unknown>).request_digest !== committed.requestBodyDigest ||
+    typeof (bodyClaimsValue as Record<string, unknown>).challenge !== 'string') {
+    throw new Error('license_pending_restore_check_projection_source_mismatch')
+  }
+  const challengeParts = ((bodyClaimsValue as Record<string, unknown>).challenge as string).split('.')
+  if (challengeParts.length !== 3) throw new Error('license_pending_restore_check_projection_source_mismatch')
+  const challengeClaimsValue = parseStrictJson(Buffer.from(challengeParts[1]!, 'base64url'))
+  if (!challengeClaimsValue || typeof challengeClaimsValue !== 'object' || Array.isArray(challengeClaimsValue) ||
+    (resultClaimsValue as Record<string, unknown>).request_nonce !==
+      (challengeClaimsValue as Record<string, unknown>).server_nonce) {
     throw new Error('license_pending_restore_check_projection_source_mismatch')
   }
 }

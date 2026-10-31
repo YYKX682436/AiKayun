@@ -524,6 +524,8 @@ try {
     ])
     if (!forgedModes.has(mode)) return payload
     const body = request.body
+    if (['wrong_receipt_signature', 'wrong_receipt_kid'].includes(mode) && control.operation_id &&
+      body.operation_id !== control.operation_id) return payload
     if (mode === 'recovery_query_not_found' && body.operation_id !== control.operation_id) return payload
     const challenge = decodeJwt(body.challenge)
     const requestDigest = createHash('sha256').update(request.rawBody).digest('base64url')

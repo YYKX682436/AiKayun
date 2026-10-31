@@ -10,7 +10,11 @@ import {
   encryptLicensePendingBytes,
 } from './pending-encryption-key.js'
 import type { LicenseOperationRecoveryClientOptions, PersistedLicenseProjectionHistory } from './license-operation-recovery-client.js'
-import { readPersistedLicenseProjectionHistory } from './license-operation-recovery-client.js'
+import {
+  LicenseOperationRecoveryError,
+  readPersistedLicenseProjectionHistory,
+  readVerifiedPersistedRecoveryQueryResult,
+} from './license-operation-recovery-client.js'
 import { fetchTrustedTimeAnchor } from './trust/time-anchor-client.js'
 import {
   verifyCurrentLicenseLease,
@@ -28,6 +32,7 @@ const DECIMAL = /^[1-9][0-9]{0,18}$/u
 
 export type LicenseProjectionCheckpoint =
   | 'after_projection_row_locked'
+  | 'after_projection_binding_locked'
   | 'after_projection_row_update'
   | 'after_projection_commit'
 
@@ -52,9 +57,13 @@ export interface LicenseStateProjectionResult {
 
 interface CandidateSource {
   history: PersistedLicenseProjectionHistory
+  /** Attempt that durably contains the source bytes (the query attempt for receipt results). */
   attemptNo: number
+  /** Mutation attempt whose challenge and digest bind the inner result. */
+  bindingAttemptNo: number
   purpose: PersistedLicenseProjectionHistory['attempts'][number]['purpose']
   raw: Buffer
+  queryReceiptJws: Buffer | null
 }
 
 type VerifiedCandidate =
@@ -116,23 +125,56 @@ function exactJws(raw: Buffer): string | null {
   return JWS.test(token) && Buffer.from(token, 'ascii').equals(raw) ? token : null
 }
 
-function candidateSources(history: PersistedLicenseProjectionHistory): CandidateSource[] {
+async function candidateSources(input: {
+  options: LicenseStateProjectionOptions
+  history: PersistedLicenseProjectionHistory
+  accepted: AcceptedTrustBundle
+  trustedTime: number
+  identity: { databaseId: string; instanceId: string; identityJkt: string }
+}): Promise<CandidateSource[]> {
+  const { history } = input
   const output: CandidateSource[] = []
   for (const attempt of history.attempts) {
-    // Query attempts carry operation receipts. Only activation/recovery mutation attempts may
-    // introduce a credential or signed status fact into the durable projection.
     if (attempt.purpose === 'query' || attempt.sendState !== 'response_saved') continue
     for (const raw of [attempt.response, attempt.archivedResult]) {
       if (!raw || !exactJws(raw)) continue
-      output.push({ history, attemptNo: attempt.attemptNo, purpose: attempt.purpose, raw })
+      output.push({ history, attemptNo: attempt.attemptNo, bindingAttemptNo: attempt.attemptNo,
+        purpose: attempt.purpose, raw, queryReceiptJws: null })
+    }
+  }
+  if (history.operationKind === 'recovery') {
+    for (const attempt of history.attempts) {
+      if (!['query', 'continue'].includes(attempt.purpose) || attempt.sendState !== 'response_saved') continue
+      try {
+        const verified = await readVerifiedPersistedRecoveryQueryResult({
+          options: input.options,
+          operationId: history.operationId,
+          receiptAttemptNo: attempt.attemptNo,
+          identity: input.identity,
+          accepted: input.accepted,
+          trustedTime: input.trustedTime,
+        })
+        if (!verified || !exactJws(verified.resultJws)) continue
+        const bindingAttempt = history.attempts.find(item => item.attemptNo === verified.committedAttemptNo)
+        if (!bindingAttempt || !['recovery', 'continue'].includes(bindingAttempt.purpose)) continue
+        output.push({ history, attemptNo: attempt.attemptNo, bindingAttemptNo: bindingAttempt.attemptNo,
+          purpose: bindingAttempt.purpose, raw: verified.resultJws, queryReceiptJws: verified.receiptJws })
+      } catch (error) {
+        if (error instanceof LicenseOperationRecoveryError && error.code === 'operation_recovery_history_result_conflict') {
+          throw error
+        }
+        // Unsigned, malformed, unbound and otherwise untrusted receipts have no projection rights.
+      }
     }
   }
   return output
 }
 
-function matchingAttempt(history: PersistedLicenseProjectionHistory, attemptNo: number) {
+function matchingAttempt(history: PersistedLicenseProjectionHistory, attemptNo: number, fromQueryReceipt: boolean) {
   const attempt = history.attempts.find(item => item.attemptNo === attemptNo)
-  if (!attempt || attempt.sendState !== 'response_saved' || attempt.purpose === 'query') {
+  const allowedState = attempt?.sendState === 'response_saved' ||
+    fromQueryReceipt && ['sent', 'transport_unknown'].includes(String(attempt?.sendState))
+  if (!attempt || !allowedState || attempt.purpose === 'query') {
     fail('license_projection_source_attempt_invalid')
   }
   return attempt
@@ -146,7 +188,7 @@ async function verifyCandidate(input: {
 }): Promise<VerifiedCandidate | null> {
   const { source, accepted, trustedTime, identity } = input
   const history = source.history
-  const attempt = matchingAttempt(history, source.attemptNo)
+  const attempt = matchingAttempt(history, source.bindingAttemptNo, source.queryReceiptJws !== null)
   if (history.databaseId !== identity.databaseId || history.instanceId !== identity.instanceId ||
     history.identityJkt !== identity.identityJkt || attempt.requestDigest.length !== 43) return null
   const token = exactJws(source.raw)
@@ -288,6 +330,8 @@ async function sourceRawMatches(input: {
   options: LicenseStateProjectionOptions
   tx: Kysely<Database>
   candidate: VerifiedCandidate
+  accepted: AcceptedTrustBundle
+  trustedTime: number
   identity: { databaseId: string; instanceId: string; identityJkt: string }
 }): Promise<boolean> {
   const history = await readPersistedLicenseProjectionHistory({
@@ -300,6 +344,19 @@ async function sourceRawMatches(input: {
     history.operationKind !== input.candidate.source.history.operationKind) return false
   const attempt = history.attempts.find(item => item.attemptNo === input.candidate.source.attemptNo)
   if (!attempt || attempt.sendState !== 'response_saved') return false
+  if (input.candidate.source.queryReceiptJws !== null) {
+    const recovered = await readVerifiedPersistedRecoveryQueryResult({
+      options: { ...input.options, db: input.tx },
+      operationId: history.operationId,
+      receiptAttemptNo: input.candidate.source.attemptNo,
+      identity: input.identity,
+      accepted: input.accepted,
+      trustedTime: input.trustedTime,
+    })
+    return recovered !== null && recovered.committedAttemptNo === input.candidate.source.bindingAttemptNo &&
+      recovered.receiptJws.equals(input.candidate.source.queryReceiptJws) &&
+      recovered.resultJws.equals(input.candidate.source.raw)
+  }
   return [attempt.response, attempt.archivedResult].some(raw => raw?.equals(input.candidate.source.raw))
 }
 
@@ -309,6 +366,8 @@ async function readAndVerifyStoredEvidence(input: {
   row: InstanceLicenseStateRow
   identity: { databaseId: string; instanceId: string; identityJkt: string }
   kind: 'lease' | 'refusal'
+  accepted: AcceptedTrustBundle
+  trustedTime: number
 }): Promise<void> {
   const lease = input.kind === 'lease'
   const operationId = lease ? input.row.credential_operation_id! : input.row.refusal_operation_id!
@@ -328,7 +387,18 @@ async function readAndVerifyStoredEvidence(input: {
     options: { ...input.options, db: input.tx }, operationId, identity: input.identity,
   })
   const attempt = history.attempts.find(item => item.attemptNo === attemptNo)
-  if (!attempt || ![attempt.response, attempt.archivedResult].some(value => value?.equals(raw))) {
+  if (!attempt) fail('license_projection_saved_source_mismatch')
+  let bindingAttempt = attempt
+  const matchesDirectSource = [attempt.response, attempt.archivedResult].some(value => value?.equals(raw))
+  if (!matchesDirectSource) {
+    const recovered = await readVerifiedPersistedRecoveryQueryResult({
+      options: { ...input.options, db: input.tx }, operationId, receiptAttemptNo: attemptNo,
+      identity: input.identity, accepted: input.accepted, trustedTime: input.trustedTime,
+    })
+    if (!recovered || !recovered.resultJws.equals(raw)) fail('license_projection_saved_source_mismatch')
+    bindingAttempt = history.attempts.find(item => item.attemptNo === recovered.committedAttemptNo)!
+  }
+  if (!bindingAttempt) {
     fail('license_projection_saved_source_mismatch')
   }
   const token = exactJws(raw)
@@ -341,15 +411,15 @@ async function readAndVerifyStoredEvidence(input: {
   }
   const claims = claimsValue as Record<string, unknown>
   const header = decodeProtectedHeader(token)
-  const challengeValue = parseStrictJson(Buffer.from(attempt.challengeToken.split('.')[1]!, 'base64url'))
+  const challengeValue = parseStrictJson(Buffer.from(bindingAttempt.challengeToken.split('.')[1]!, 'base64url'))
   if (!challengeValue || typeof challengeValue !== 'object' || Array.isArray(challengeValue)) {
     fail('license_projection_saved_challenge_invalid')
   }
   const challenge = challengeValue as Record<string, unknown>
   const requestNonce = challenge.server_nonce
-  if (typeof requestNonce !== 'string' || sha256Base64url(requestNonce) !== attempt.requestNonceHash ||
-    sha256Base64url(String(claims.request_nonce)) !== attempt.requestNonceHash ||
-    claims.request_digest !== attempt.requestDigest || claims.iss !== input.options.releaseConfig.expected_center_issuer ||
+  if (typeof requestNonce !== 'string' || sha256Base64url(requestNonce) !== bindingAttempt.requestNonceHash ||
+    sha256Base64url(String(claims.request_nonce)) !== bindingAttempt.requestNonceHash ||
+    claims.request_digest !== bindingAttempt.requestDigest || claims.iss !== input.options.releaseConfig.expected_center_issuer ||
     claims.aud !== 'aikayun-commerce') {
     fail('license_projection_saved_evidence_mismatch')
   }
@@ -404,7 +474,10 @@ async function applyCandidate(input: {
   identity: { databaseId: string; instanceId: string; identityJkt: string }
 }): Promise<{ row: InstanceLicenseStateRow; changed: boolean; evidenceDigest: string | null }> {
   const { candidate } = input
-  if (!(await sourceRawMatches({ options: input.options, tx: input.tx, candidate, identity: input.identity }))) {
+  if (!(await sourceRawMatches({
+    options: input.options, tx: input.tx, candidate, accepted: input.accepted, trustedTime: input.trustedTime,
+    identity: input.identity,
+  }))) {
     fail('license_projection_source_changed')
   }
   if (candidate.kind === 'lease') {
@@ -434,9 +507,13 @@ async function applyCandidate(input: {
     const row = await input.tx.selectFrom('instance_license_state').selectAll().where('singleton', '=', true).executeTakeFirstOrThrow()
     return { row, changed: true, evidenceDigest: candidate.digest }
   }
-  if (input.row.license_id === null || candidate.licenseId !== input.row.license_id ||
-    candidate.databaseId !== input.row.database_id || candidate.instanceId !== input.row.instance_id ||
-    candidate.identityJkt !== input.row.identity_jkt || candidate.generation !== input.row.activation_generation) {
+  const initializesRefusalOnlyState = input.row.license_id === null &&
+    candidate.source.history.operationKind === 'recovery' && candidate.source.history.recoveryPayload !== null &&
+    candidate.generation === candidate.source.history.recoveryPayload.expectedGeneration
+  if ((!initializesRefusalOnlyState && input.row.license_id === null) ||
+    input.row.license_id !== null && (candidate.licenseId !== input.row.license_id ||
+      candidate.databaseId !== input.row.database_id || candidate.instanceId !== input.row.instance_id ||
+      candidate.identityJkt !== input.row.identity_jkt || candidate.generation !== input.row.activation_generation)) {
     return { row: input.row, changed: false, evidenceDigest: null }
   }
   if (input.row.refusal_status === 'superseded') return { row: input.row, changed: false, evidenceDigest: null }
@@ -452,6 +529,14 @@ async function applyCandidate(input: {
   const encrypted = await encryptLicensePendingBytes(input.options.pendingKeyRoot,
     credentialContext(candidate, 'projection_rejection_jws'), candidate.source.raw)
   await input.tx.updateTable('instance_license_state').set({
+    ...(initializesRefusalOnlyState ? {
+      license_id: candidate.licenseId,
+      database_id: candidate.databaseId,
+      instance_id: candidate.instanceId,
+      identity_jkt: candidate.identityJkt,
+      activation_generation: candidate.generation,
+      entitlement_revision: candidate.revision,
+    } : {}),
     refusal_status: candidate.status,
     refusal_generation: candidate.generation,
     refusal_revision: candidate.revision,
@@ -497,30 +582,31 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
         let transactionOutcome: { result: LicenseStateProjectionResult; fingerprint: string }
         try {
           transactionOutcome = await options.db.transaction().execute(async tx => {
-          const row = await tx.selectFrom('instance_license_state').selectAll()
-            .where('singleton', '=', true).forUpdate().executeTakeFirst()
-          if (!row) fail('license_projection_singleton_missing')
-          await checkpoint('after_projection_row_locked')
           const binding = await tx.selectFrom('installation_binding').selectAll()
             .where('singleton', '=', true).forUpdate().executeTakeFirst()
           if (!binding || binding.binding_state !== 'ready' || binding.database_id !== identity.databaseId ||
             binding.instance_id !== identity.instanceId || binding.identity_jkt !== identity.identityJkt) {
             fail('license_projection_identity_changed')
           }
+          await checkpoint('after_projection_binding_locked')
+          const row = await tx.selectFrom('instance_license_state').selectAll()
+            .where('singleton', '=', true).forUpdate().executeTakeFirst()
+          if (!row) fail('license_projection_singleton_missing')
+          await checkpoint('after_projection_row_locked')
           const trustedTime = sample.assertFresh()
-          if (row.license_id !== null) {
+          if (row.license_id !== null && row.credential_jti !== null) {
             await readAndVerifyStoredEvidence({
               options, tx, row,
               identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
-              kind: 'lease',
+              kind: 'lease', accepted, trustedTime,
             })
-            if (row.refusal_status !== null) {
-              await readAndVerifyStoredEvidence({
-                options, tx, row,
-                identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
-                kind: 'refusal',
-              })
-            }
+          }
+          if (row.license_id !== null && row.refusal_status !== null) {
+            await readAndVerifyStoredEvidence({
+              options, tx, row,
+              identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
+              kind: 'refusal', accepted, trustedTime,
+            })
           }
           const rows = await tx.selectFrom('local_license_operations').select(['operation_id', 'kind'])
             .where('license_id', '=', target.license_id).where('database_id', '=', identity.databaseId)
@@ -533,7 +619,10 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
               options: { ...options, db: tx }, operationId: item.operation_id,
               identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
             })
-            candidates.push(...candidateSources(history))
+            candidates.push(...await candidateSources({
+              options: { ...options, db: tx }, history, accepted, trustedTime,
+              identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
+            }))
           }
           const verified: VerifiedCandidate[] = []
           for (const source of candidates) {

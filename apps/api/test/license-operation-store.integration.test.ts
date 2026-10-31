@@ -16,6 +16,7 @@ import { licenseResultArchivePresenceMigration } from '../src/db/migrations/2026
 import { licenseOperationTrustedRejectionMigration } from '../src/db/migrations/202610310001_license_operation_trusted_rejection.js'
 import { licenseOperationRecoveryAttemptsMigration } from '../src/db/migrations/202610310002_license_operation_recovery_attempts.js'
 import { instanceLicenseStateMigration } from '../src/db/migrations/202610310003_instance_license_state.js'
+import { instanceLicenseRefusalFirstMigration } from '../src/db/migrations/202610311001_instance_license_refusal_first.js'
 import { buildRecoveryIntent, ed25519IdentityJkt } from '../src/licensing/license-intent.js'
 import {
   allocateLicenseOperationAttempt,
@@ -102,6 +103,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
     await licenseOperationTrustedRejectionMigration.up(db)
     await licenseOperationRecoveryAttemptsMigration.up(db)
     await instanceLicenseStateMigration.up(db)
+    await instanceLicenseRefusalFirstMigration.up(db)
     const pendingRoot = await mkdtemp(join(tmpdir(), 'aikayun-license-pending-pg-'))
     pendingRoots.add(pendingRoot)
     await initializeTemporaryLicensePendingKey(pendingRoot, 'test')
@@ -844,6 +846,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         await licenseOperationTrustedRejectionMigration.up(restoredDb)
         await licenseOperationRecoveryAttemptsMigration.up(restoredDb)
         await instanceLicenseStateMigration.up(restoredDb)
+        await instanceLicenseRefusalFirstMigration.up(restoredDb)
         await restoredDb.transaction().execute(async trx => {
           await sql.raw('ALTER TABLE local_license_operations DISABLE TRIGGER USER').execute(trx)
           await sql.raw('ALTER TABLE local_license_operation_attempts DISABLE TRIGGER USER').execute(trx)
