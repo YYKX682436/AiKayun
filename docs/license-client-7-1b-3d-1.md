@@ -25,7 +25,7 @@ R1 失败复现先在真实 PostgreSQL 18 和冻结授权中心环境中确认�
 - R1 定向回归：query 找回 lease、错误不可变 archive 保持不变、revoked/superseded 先于 lease 落库、not_found/错误签名回执/相互矛盾可信结果拒绝投影、安装绑定先锁的 PostgreSQL 并发测试、query 与拒新状态 v5 配对恢复检查均通过。
 - 冻结中心 SHA `a5cf99439e3bf92b65f19d60c013bca088cf221a` 的真实 HTTPS 与 PostgreSQL 18 回归：3C-3A、3C-3B、2D-2 及 operation recovery、未知 COMMIT、事务回滚、真实 SIGKILL/重启和 projection 锁序均通过。
 - 完整 `pnpm verify`：lint 无错误（7 条既有 Vue 格式 warning）；类型检查、构建通过；API 612 项、unit 16 项、主 E2E 93 项、alternate-brand 1 项、SSR-error 3 项、dev-preview 1 项及 production-brand 1 项全部通过。
-- GitHub CI：推送后核对结果并补录。
+- GitHub Actions CI `41217396325`：success，36m3s。Lint、typecheck、unit/PostgreSQL 集成、冻结授权中心 HTTPS 互操作、production build、93 项 E2E、production branding、Compose 服务/admin 与数据库重建持久性、SIGKILL/备份恢复/TLS 拒绝全部通过。
 
 ## 验证
 
