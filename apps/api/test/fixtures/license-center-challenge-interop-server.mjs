@@ -16,7 +16,7 @@ const [
   { trustBundleArtifactDigest },
   { initializeSignerRequestDigest, acceptSignerTrustBundleRequestDigest, rotateSignerRequestDigest },
   { createAdminService, createLicenseRequestDigest, issueActivationCodeRequestDigest, changeLicenseStatusRequestDigest, renewLicenseRequestDigest },
-  { signOperationReceipt, signLicenseLease }, { decodeJwt },
+  { signOperationReceipt, signLicenseLease }, { signTimeAnchor }, { decodeJwt },
 ] = await Promise.all([
   centerImport('test/support/runtime.ts'),
   centerImport('src/db/database.ts'),
@@ -26,6 +26,7 @@ const [
   centerImport('src/admin/signing-service.ts'),
   centerImport('src/admin/service.ts'),
   centerImport('src/receipts.ts'),
+  centerImport('src/crypto/time-reset.ts'),
   import('jose'),
 ])
 
@@ -491,6 +492,18 @@ try {
       })
   })
   app.addHook('preSerialization', async (request, reply, payload) => {
+    if (request.method === 'POST' && request.url === '/v1/time-anchor') {
+      let control
+      try { control = JSON.parse(await readFile(activationControlPath, 'utf8')) } catch { return payload }
+      if (control.mode === 'advance_trusted_time' && Number.isSafeInteger(control.trusted_time_offset_seconds) &&
+        control.trusted_time_offset_seconds > 300 && control.trusted_time_offset_seconds <= 3600) {
+        const signer = { ...runtime.signer, ...currentOnlineKey, issuer: origin }
+        const token = await signTimeAnchor(signer, request.body.client_nonce,
+          new Date(Date.now() + control.trusted_time_offset_seconds * 1000))
+        return { time_anchor: token }
+      }
+      return payload
+    }
     if (request.method === 'POST' && request.url === '/v1/leases/renew') {
       let mode
       try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { return payload }
@@ -640,7 +653,7 @@ try {
     }
     if ((reply.statusCode === 200 && request.url === '/v1/activations' && mode === 'drop_after_commit') ||
       (reply.statusCode === 200 && request.url === '/v1/operations/continue' && mode === 'drop_continue_after_commit') ||
-      (reply.statusCode === 200 && request.url === '/v1/leases/renew' && mode === 'drop_recovery_after_commit') ||
+      ([200, 409].includes(reply.statusCode) && request.url === '/v1/leases/renew' && mode === 'drop_recovery_after_commit') ||
       (reply.statusCode === 200 && request.url === '/v1/operations/continue' && mode === 'drop_recovery_continue_after_commit') ||
       (request.url === '/v1/activations' && mode === 'drop_activation_rejection' && reply.statusCode === 409)) reply.raw.destroy()
     return payload

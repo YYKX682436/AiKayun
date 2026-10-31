@@ -2152,12 +2152,16 @@ async function verifyRecoveryOperationReceipt(input: {
   responseToken: Buffer
   accepted: Awaited<ReturnType<TrustBundleStore['getAccepted']>>
   trustedTime: number
+  historicalSource?: boolean
 }): Promise<{ checked: ReturnType<typeof boundOperationReceiptClaims>; history: ValidatedRecoveryOperationHistory }> {
-  const verified = await verifyLicenseOperationReceipt(input.responseToken.toString('ascii'), {
+  const verificationInput = {
     resolver: input.accepted.resolver,
     issuer: input.options.releaseConfig.expected_center_issuer,
     trustedTime: input.trustedTime,
-  })
+  }
+  const verified = input.historicalSource
+    ? await verifyHistoricalLicenseOperationReceipt(input.responseToken.toString('ascii'), verificationInput)
+    : await verifyLicenseOperationReceipt(input.responseToken.toString('ascii'), verificationInput)
   const history = await validateRecoveryOperationHistory({
     db: input.options.db,
     pendingKeyRoot: input.options.pendingKeyRoot,
@@ -2194,8 +2198,9 @@ async function verifyRecoveryOperationReceipt(input: {
 
 /**
  * Read a result nested in a persisted query/continue receipt for the single license projection
- * writer. The receipt and the inner result are verified again from the immutable request history;
- * the legacy result archive is deliberately not treated as an authority.
+ * writer. An expired outer receipt is verified only as a historical source proof; the inner lease
+ * or status is independently checked at current trusted time by the projection. This path cannot
+ * resume an operation or mint a fresh center fact, and never treats a legacy result archive as authority.
  */
 export async function readVerifiedPersistedRecoveryQueryResult(input: {
   options: LicenseOperationRecoveryClientOptions
@@ -2227,9 +2232,11 @@ export async function readVerifiedPersistedRecoveryQueryResult(input: {
   if (!receiptAttempt || !['query', 'continue'].includes(receiptAttempt.row.purpose) ||
     String(receiptAttempt.row.send_state) !== 'response_saved' || receiptAttempt.response === null) return null
 
-  let header: { typ?: string }
-  try { header = decodeCompactJws(receiptAttempt.response.toString('ascii')).header } catch { return null }
-  if (header.typ !== 'aikayun-license-operation+jwt') return null
+  let decodedReceipt: ReturnType<typeof decodeCompactJws>
+  try { decodedReceipt = decodeCompactJws(receiptAttempt.response.toString('ascii')) } catch { return null }
+  if (decodedReceipt.header.typ !== 'aikayun-license-operation+jwt') return null
+  const historicalSource = typeof decodedReceipt.claims.exp === 'number' &&
+    decodedReceipt.claims.exp <= input.trustedTime
 
   let verified: Awaited<ReturnType<typeof verifyRecoveryOperationReceipt>>
   try {
@@ -2240,6 +2247,7 @@ export async function readVerifiedPersistedRecoveryQueryResult(input: {
       responseToken: receiptAttempt.response,
       accepted: input.accepted,
       trustedTime: input.trustedTime,
+      historicalSource,
     })
   } catch (error) {
     // A contradictory pair of currently trusted results is a hard stop, not an ignorable source.

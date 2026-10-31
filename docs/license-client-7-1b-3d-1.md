@@ -27,6 +27,14 @@ R1 失败复现先在真实 PostgreSQL 18 和冻结授权中心环境中确认�
 - 完整 `pnpm verify`：lint 无错误（7 条既有 Vue 格式 warning）；类型检查、构建通过；API 612 项、unit 16 项、主 E2E 93 项、alternate-brand 1 项、SSR-error 3 项、dev-preview 1 项及 production-brand 1 项全部通过。
 - GitHub Actions CI `41217396325`：success，36m3s。Lint、typecheck、unit/PostgreSQL 集成、冻结授权中心 HTTPS 互操作、production build、93 项 E2E、production branding、Compose 服务/admin 与数据库重建持久性、SIGKILL/备份恢复/TLS 拒绝全部通过。
 
+## R2：历史 query 回执过期后的投影恢复
+
+- 失败复现：冻结中心真实 HTTPS/PostgreSQL 18 测试先让中心提交 recovery 但丢弃 mutation 响应，再由可信 query 回执找回内层 lease；使用中心签名 time anchor 推进可信时间超过 query receipt 的五分钟 `exp`。旧代码在首次投影时以 `license_projection_recovery_source_unverified` 失败。对已投影后 revision 更新，以及 query 找回的 revoked/superseded 状态也分别复现同一失败。
+- 最小修复：新鲜 query 仍调用原来的当前 operation receipt 验证。只在持久化 query/continue 来源回执确已过期时，改用现有 `verifyHistoricalLicenseOperationReceipt` 验历史签名来源；其签名、issuer/audience、Trust Store、过期时间、精确 operation/attempt/nonce/digest 和内层结果绑定规则不变。被携带的 lease/status JWS 仍按当前可信时间独立验证，过期 lease 不会成为有效凭证，历史来源不产生新的中心提交事实。
+- R2 冻结中心定向回归：延迟首次投影、已投影后的 revision 更新和重复提交、旧错误不可变 archive 保持不变、expired inner lease 对应的 revoked/superseded、错误 receipt 签名/kid、已撤销 signer、R1 冲突拒绝及 v5 配对备份核验均通过（8 项通过）。
+- 完整 `pnpm verify`：lint 无错误（7 条既有 Vue 格式 warning）；类型检查、构建通过；API 618 项、unit 16 项、主 E2E 93 项、alternate-brand 1 项、SSR-error 3 项、dev-preview 1 项和 production-brand 1 项全部通过。
+- 授权中心仍只读，SHA `a5cf99439e3bf92b65f19d60c013bca088cf221a`。本段 CI 结果待本次变更推送后记录。
+
 ## 验证
 
 - 冻结中心与 PostgreSQL 18：activation lease、revision 2 recovery lease、revoked/superseded 防旧证据重放、中心 revoke/restore 后 generation 1 的 revision 3 lease、Trust Store signer 轮换、并发、事务回滚、未知 COMMIT 确认、真实 SIGKILL 前后提交与重启均通过。
