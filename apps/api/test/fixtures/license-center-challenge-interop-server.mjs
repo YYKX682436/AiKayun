@@ -13,7 +13,8 @@ if (!checkout || !infoPath) throw new Error('interop fixture requires an isolate
 const centerImport = async (relativePath) => import(pathToFileURL(join(checkout, relativePath)).href)
 const [
   { createTestSigningRuntime }, { createDatabase, migrateToLatest }, { createApp }, offlineTrust,
-  { initializeSignerRequestDigest },
+  { trustBundleArtifactDigest },
+  { initializeSignerRequestDigest, acceptSignerTrustBundleRequestDigest, rotateSignerRequestDigest },
   { createAdminService, createLicenseRequestDigest, issueActivationCodeRequestDigest, changeLicenseStatusRequestDigest },
   { signOperationReceipt, signLicenseLease }, { decodeJwt },
 ] = await Promise.all([
@@ -21,6 +22,7 @@ const [
   centerImport('src/db/database.ts'),
   centerImport('src/app.ts'),
   centerImport('tools/offline-trust/trust-bundle-signing.ts'),
+  centerImport('src/trust/trust-bundle.ts'),
   centerImport('src/admin/signing-service.ts'),
   centerImport('src/admin/service.ts'),
   centerImport('src/receipts.ts'),
@@ -34,6 +36,9 @@ let runtime
 let db
 let app
 let licenseAdmin
+let currentOnlineKey
+let currentTrustKeys
+let pendingSignerRotation
 let shuttingDown = false
 
 async function availablePort() {
@@ -72,13 +77,20 @@ try {
   runtime.config.publicOrigin = origin
   runtime.config.port = port
   const now = Math.floor(Date.now() / 1000)
+  const initialKeyRecord = {
+    ...runtime.onlineKey.record,
+    retire_after: now + 7 * 24 * 60 * 60,
+    verify_until: now + 15 * 24 * 60 * 60,
+  }
+  currentOnlineKey = { ...runtime.onlineKey, record: initialKeyRecord }
+  currentTrustKeys = [initialKeyRecord]
   const claims = await offlineTrust.buildTrustBundleClaims(origin, {
     bundle_version: '1',
     iat: now - 60,
     nbf: now - 30,
     exp: now + 30 * 24 * 60 * 60,
     propagation_budget_seconds: 24 * 60 * 60,
-    keys: [runtime.onlineKey.record],
+    keys: [initialKeyRecord],
   }, runtime.offlineRootPublicJwk)
   const bundle = await offlineTrust.signTrustBundle(claims, runtime.offlineRootPrivateKey, runtime.offlineRootPublicJwk)
   db = createDatabase(runtime.config.databaseUrl)
@@ -177,7 +189,7 @@ try {
     activationRetryCases.push({ variant, license_id: target.license_id, rejected_code: rejectedCode })
   }
   const activationFinalizationCases = []
-  for (let index = 0; index < 6; index += 1) activationFinalizationCases.push(await issueActivationScenario())
+  for (let index = 0; index < 7; index += 1) activationFinalizationCases.push(await issueActivationScenario())
   const activationExpiredChallenge = await issueActivationScenario()
   const crashActivationCases = []
   for (let index = 0; index < 7; index += 1) crashActivationCases.push(await issueActivationScenario())
@@ -215,11 +227,92 @@ try {
     }
     return reply.code(200).send({ activation_code: issued.activationCode })
   })
+  app.post('/__test/prepare-signer-rotation', async (request, reply) => {
+    const body = request.body
+    if (!body || typeof body !== 'object' || !['retired', 'revoked'].includes(body.lifecycle)) {
+      return reply.code(400).send({ error: 'invalid signer lifecycle' })
+    }
+    if (pendingSignerRotation) return reply.code(409).send({ error: 'signer rotation already prepared' })
+    const newKey = await runtime.createOnlineKey()
+    const now = Math.floor(Date.now() / 1000)
+    const previousKeys = currentTrustKeys.map(record => record.kid !== currentOnlineKey.kid
+      ? { ...record }
+      : body.lifecycle === 'revoked'
+        ? { ...record, revoked_at: now }
+        : { ...record })
+    const keys = [...previousKeys, newKey.record]
+    const claims = await offlineTrust.buildTrustBundleClaims(origin, {
+      bundle_version: String(Number((await admin.getState()).bundleVersion) + 1),
+      iat: now,
+      nbf: now,
+      exp: now + 80 * 24 * 60 * 60,
+      propagation_budget_seconds: 24 * 60 * 60,
+      keys,
+    }, runtime.offlineRootPublicJwk)
+    const bundle = await offlineTrust.signTrustBundle(claims, runtime.offlineRootPrivateKey, runtime.offlineRootPublicJwk)
+    pendingSignerRotation = {
+      bundle,
+      bundleVersion: claims.bundle_version,
+      keys,
+      newKey,
+      lifecycle: body.lifecycle,
+      oldKid: currentOnlineKey.kid,
+    }
+    return reply.code(200).send({
+      bundle_jws: bundle.token,
+      bundle_version: claims.bundle_version,
+      old_kid: currentOnlineKey.kid,
+      old_verify_until: keys.find(record => record.kid === currentOnlineKey.kid).verify_until,
+      new_kid: newKey.kid,
+    })
+  })
+  app.post('/__test/activate-signer-rotation', async (request, reply) => {
+    if (!pendingSignerRotation) return reply.code(409).send({ error: 'no signer rotation prepared' })
+    const pending = pendingSignerRotation
+    const state = await admin.getState()
+    const acceptInput = {
+      operationId: randomUUID(),
+      expectedSignerRevision: state.signerRevision,
+      reason: `isolated interop ${pending.lifecycle} historical signer`,
+      bundleJws: pending.bundle.token,
+    }
+    const accepted = await admin.acceptTrustBundle({
+      ...acceptInput,
+      rolloutGate: 'isolated-development-confirmed',
+      confirmedRequestDigest: acceptSignerTrustBundleRequestDigest(acceptInput),
+    })
+    if (accepted.state !== 'succeeded') throw new Error('Isolated trust-bundle acceptance failed')
+    runtime.config.signingKeyring.set(pending.newKey.kid, pending.newKey)
+    const afterAccept = await admin.getState()
+    const rotateInput = {
+      operationId: randomUUID(),
+      expectedSignerRevision: afterAccept.signerRevision,
+      targetKid: pending.newKey.kid,
+      bundleVersion: pending.bundleVersion,
+      artifactSha256: trustBundleArtifactDigest(pending.bundle.token),
+      reason: `isolated interop ${pending.lifecycle} historical signer`,
+    }
+    const rotated = await admin.rotate({
+      ...rotateInput,
+      rolloutGate: 'isolated-development-confirmed',
+      confirmedRequestDigest: rotateSignerRequestDigest(rotateInput),
+    })
+    if (rotated.state !== 'succeeded') throw new Error('Isolated signer rotation failed')
+    currentOnlineKey = pending.newKey
+    currentTrustKeys = pending.keys
+    pendingSignerRotation = undefined
+    const info = JSON.parse(await readFile(infoPath, 'utf8'))
+    info.trust_bundle = pending.bundle.token
+    await writeFile(infoPath, JSON.stringify(info), { mode: 0o600 })
+    return reply.code(200).send({ state: 'succeeded', active_kid: rotated.activeSigningKid, bundle_version: rotated.bundleVersion })
+  })
   let isolatedClientAddress = 0
   app.server.on('secureConnection', (socket) => {
     // Keep the real center rate-limit hooks while isolating each in-process test client.
-    isolatedClientAddress = (isolatedClientAddress % 254) + 1
-    Object.defineProperty(socket, 'remoteAddress', { configurable: true, value: `192.0.2.${isolatedClientAddress}` })
+    isolatedClientAddress = (isolatedClientAddress % 65_024) + 1
+    const thirdOctet = Math.floor((isolatedClientAddress - 1) / 254)
+    const fourthOctet = ((isolatedClientAddress - 1) % 254) + 1
+    Object.defineProperty(socket, 'remoteAddress', { configurable: true, value: `198.18.${thirdOctet}.${fourthOctet}` })
   })
   app.addHook('onRequest', async (request, reply) => {
     if (request.method !== 'POST') return
@@ -312,7 +405,7 @@ try {
     if (request.url !== '/v1/operations/query') return payload
     const forgedModes = new Set([
       'forged_actor', 'forged_operation', 'forged_committed_attempt', 'forged_not_found_result',
-      'wrong_request_digest', 'wrong_receipt_signature', 'wrong_receipt_kid', 'query_unrecorded_rejection',
+      'wrong_request_digest', 'wrong_receipt_signature', 'wrong_receipt_kid', 'query_unrecorded_rejection', 'query_not_found',
     ])
     if (!forgedModes.has(mode)) return payload
     const body = request.body
@@ -324,9 +417,9 @@ try {
       identityJkt: mode === 'forged_actor' ? 'A'.repeat(43) : body.identity_jkt,
       operationId: mode === 'forged_operation' ? randomUUID() : body.operation_id,
       intentDigest: body.intent_digest,
-      state: mode === 'forged_not_found_result' ? 'not_found'
+      state: ['forged_not_found_result', 'query_not_found'].includes(mode) ? 'not_found'
         : mode === 'query_unrecorded_rejection' ? 'rejected' : 'committed',
-      outcomeCode: mode === 'forged_not_found_result' ? 'OPERATION_NOT_FOUND'
+      outcomeCode: ['forged_not_found_result', 'query_not_found'].includes(mode) ? 'OPERATION_NOT_FOUND'
         : mode === 'query_unrecorded_rejection' ? 'ACTIVATION_AUTHORIZATION_INVALID' : 'ACTIVATED',
       attemptNo: body.attempt_no,
       requestNonceHash: challengeNonceHash,
@@ -341,6 +434,8 @@ try {
     }
     const signer = mode === 'wrong_receipt_kid'
       ? { ...runtime.signer, ...(await runtime.createOnlineKey()), issuer: origin }
+      : mode === 'query_not_found'
+        ? { ...runtime.signer, ...currentOnlineKey, issuer: origin }
       : { ...runtime.signer, issuer: origin }
     let token = await signOperationReceipt(signer, claims)
     if (mode === 'wrong_receipt_signature') {
@@ -350,6 +445,36 @@ try {
       token = parts.join('.')
     }
     reply.code(200)
+    return { operation_receipt: token }
+  })
+  app.addHook('preSerialization', async (request, reply, payload) => {
+    if (request.method !== 'POST' || request.url !== '/v1/activations' || reply.statusCode !== 409) return payload
+    let mode
+    try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { return payload }
+    if (!['forged_activation_rejection_signature', 'misbound_activation_rejection_actor', 'misbound_activation_rejection_intent'].includes(mode)) return payload
+    if (!payload || typeof payload !== 'object' || typeof payload.operation_receipt !== 'string') return payload
+    let token = payload.operation_receipt
+    if (mode === 'forged_activation_rejection_signature') {
+      const parts = token.split('.')
+      const signature = parts[2]
+      if (!signature) throw new Error('Activation rejection fixture signature is missing')
+      parts[2] = `${signature.slice(0, -1)}${signature.endsWith('A') ? 'B' : 'A'}`
+      token = parts.join('.')
+    } else {
+      const claims = decodeJwt(token)
+      token = await signOperationReceipt({ ...runtime.signer, issuer: origin }, {
+        licenseId: claims.sub,
+        identityJkt: mode === 'misbound_activation_rejection_actor' ? 'A'.repeat(43) : claims.actor_jkt,
+        operationId: claims.operation_id,
+        intentDigest: mode === 'misbound_activation_rejection_intent' ? 'B'.repeat(43) : claims.intent_digest,
+        state: 'rejected',
+        outcomeCode: claims.outcome_code,
+        attemptNo: claims.attempt_no,
+        requestNonceHash: claims.request_nonce_hash,
+        requestDigest: claims.request_digest,
+        now: new Date(claims.iat * 1000),
+      })
+    }
     return { operation_receipt: token }
   })
   app.addHook('onSend', async (request, reply, payload) => {

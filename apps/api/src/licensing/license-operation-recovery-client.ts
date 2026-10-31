@@ -59,6 +59,11 @@ const MUTATION_FIELDS = [
   'attempt_no', 'challenge', 'database_id', 'identity_jkt', 'instance_id', 'intent_digest', 'license_id',
   'operation_id', 'public_jwk',
 ]
+const OPERATION_RECEIPT_CLAIMS = [
+  'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'actor_jkt', 'operation_id', 'intent_digest',
+  'state', 'outcome_code', 'attempt_no', 'request_nonce_hash', 'request_digest', 'committed_attempt_no',
+  'committed_request_nonce_hash', 'committed_request_digest', 'result_jws',
+]
 const CHALLENGE_CLAIMS = [
   'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'operation', 'operation_id', 'intent_digest',
   'instance_id', 'identity_jkt', 'client_nonce', 'server_nonce',
@@ -697,6 +702,45 @@ function boundOperationReceiptClaims(input: {
   return { state: typedState, outcomeCode: typedOutcome, committedAttemptNo: Number(committedNo), resultJws, resultDigest }
 }
 
+/**
+ * A saved R3 invalid-authorization receipt whose signer can no longer be verified is inert history.
+ * Its untrusted claims may only identify the exact local request; they can never settle an operation.
+ */
+function isBoundUnpersistedR3RejectionShape(input: {
+  history: ValidatedOperationHistory
+  attempt: ValidatedHistoricalAttempt
+  issuer: string
+  trustedTime: number
+  header: Record<string, unknown>
+  claims: Record<string, unknown>
+}): boolean {
+  const { history, attempt, issuer, trustedTime, header, claims } = input
+  if (!exactKeys(header, ['alg', 'kid', 'typ']) || header.alg !== 'Ed25519' ||
+    header.typ !== 'aikayun-license-operation+jwt' || typeof header.kid !== 'string' || !DIGEST.test(header.kid) ||
+    !exactKeys(claims, OPERATION_RECEIPT_CLAIMS) || claims.v !== 1 || claims.iss !== issuer ||
+    claims.aud !== 'aikayun-commerce' || claims.state !== 'rejected' ||
+    claims.outcome_code !== 'ACTIVATION_AUTHORIZATION_INVALID' ||
+    !UUID.test(String(claims.jti)) || !Number.isSafeInteger(claims.iat) ||
+    claims.nbf !== claims.iat || !Number.isSafeInteger(claims.exp) ||
+    claims.exp !== Number(claims.iat) + 5 * 60 || Number(claims.iat) > trustedTime ||
+    !['activation', 'continue'].includes(String(attempt.row.purpose)) ||
+    String(attempt.row.send_state) !== 'response_saved') return false
+  try {
+    const bound = boundOperationReceiptClaims({
+      history,
+      requestAttemptNo: attempt.row.attempt_no,
+      requestNonceHash: attempt.row.request_nonce_hash,
+      requestDigest: attempt.row.request_body_digest,
+      claims,
+    })
+    return bound.state === 'rejected' && bound.outcomeCode === 'ACTIVATION_AUTHORIZATION_INVALID' &&
+      bound.committedAttemptNo === null &&
+      bound.resultJws === null && bound.resultDigest === null
+  } catch {
+    return false
+  }
+}
+
 async function verifiedHistoricalTerminal(input: {
   history: ValidatedOperationHistory
   resolver: Awaited<ReturnType<TrustBundleStore['getAccepted']>>['resolver']
@@ -733,12 +777,11 @@ async function verifiedHistoricalTerminal(input: {
   return first
 }
 
-async function ensureNotFoundDoesNotContradictHistory(input: {
+function ensureNotFoundDoesNotContradictHistory(input: {
   history: ValidatedOperationHistory
-  resolver: Awaited<ReturnType<TrustBundleStore['getAccepted']>>['resolver']
   issuer: string
   trustedTime: number
-}): Promise<void> {
+}): void {
   const { history } = input
   for (const attempt of history.attempts) {
     if (attempt.archivedResult !== null) fail('operation_recovery_history_conflicts_with_not_found')
@@ -746,19 +789,16 @@ async function ensureNotFoundDoesNotContradictHistory(input: {
     try {
       const decoded = decodeCompactJws(attempt.response.toString('ascii'))
       if (decoded.header.typ === 'aikayun-license+jwt') fail('operation_recovery_history_conflicts_with_not_found')
-      if (decoded.header.typ === 'aikayun-license-operation+jwt' && decoded.claims.operation_id === history.operation.operationId &&
+      if (decoded.header.typ === 'aikayun-license-operation+jwt' &&
         ['committed', 'rejected', 'cancelled'].includes(String(decoded.claims.state))) {
-        if (decoded.claims.state === 'rejected' && decoded.claims.outcome_code === 'ACTIVATION_AUTHORIZATION_INVALID') {
-          try {
-            const verified = await verifyExpiredHistoricalOperationReceipt(attempt.response.toString('ascii'), {
-              resolver: input.resolver, issuer: input.issuer, trustedTime: input.trustedTime,
-            })
-            const bound = boundOperationReceiptClaims({
-              history, requestAttemptNo: attempt.row.attempt_no, requestNonceHash: attempt.row.request_nonce_hash,
-              requestDigest: attempt.row.request_body_digest, claims: verified.claims,
-            })
-            if (bound.committedAttemptNo === null) continue
-          } catch { /* Unverifiable history cannot be treated as the R3 exception. */ }
+        if (decoded.claims.state === 'rejected' && decoded.claims.outcome_code === 'ACTIVATION_AUTHORIZATION_INVALID' &&
+          isBoundUnpersistedR3RejectionShape({
+            history, attempt, issuer: input.issuer, trustedTime: input.trustedTime,
+            header: decoded.header, claims: decoded.claims,
+          })) {
+          // This only permits the caller to try the same operation after a signed not_found.
+          // A fresh current-signer rejection from its new Challenge is still required to settle it.
+          continue
         }
         fail('operation_recovery_history_conflicts_with_not_found')
       }
@@ -1280,8 +1320,7 @@ async function runOneRecoveryRequest(input: {
           return resultEvidence(operation, historicalTerminal.attemptNo, historicalTerminal.bound, 'none')
         }
       await ensureNotFoundDoesNotContradictHistory({
-        history: historyAfterResponse, resolver: accepted.resolver,
-        issuer: options.releaseConfig.expected_center_issuer, trustedTime,
+        history: historyAfterResponse, issuer: options.releaseConfig.expected_center_issuer, trustedTime,
       })
     }
     const resultDisposition = await archiveAndClassifyResult({

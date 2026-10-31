@@ -326,10 +326,13 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       return {
         schema, root, identityRoot: caseIdentityRoot, pendingRoot: casePendingRoot, pool: casePool, db: caseDb,
         trustStore: caseTrustStore, operation: pending, identity,
-        recoveryClientForCase(onTestCheckpoint?: (stage: LicenseRecoveryCheckpoint) => void | Promise<void>) {
+        recoveryClientForCase(
+          onTestCheckpoint?: (stage: LicenseRecoveryCheckpoint) => void | Promise<void>,
+          recoveryTrustStore: TrustBundleStore = caseTrustStore,
+        ) {
           return recoveryClient({
             db: caseDb, pool: casePool, identityRoot: caseIdentityRoot, pendingKeyRoot: casePendingRoot,
-            trustStore: caseTrustStore, ...(onTestCheckpoint === undefined ? {} : { onTestCheckpoint }),
+            trustStore: recoveryTrustStore, ...(onTestCheckpoint === undefined ? {} : { onTestCheckpoint }),
           })
         },
         activationClientForCase(
@@ -488,13 +491,13 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     await rm(info.activation_control_path, { force: true })
   }
 
-  async function issueCenterReplacementCode(licenseId: string): Promise<string> {
-    const origin = new URL(info.origin)
-    const body = Buffer.from(JSON.stringify({ license_id: licenseId }), 'utf8')
+  async function postCenterFixtureJson(path: string, value: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const target = new URL(path, info.origin)
+    const body = Buffer.from(JSON.stringify(value), 'utf8')
     return new Promise((resolveResult, reject) => {
       const request = httpsRequest({
-        hostname: origin.hostname, port: Number(origin.port), servername: origin.hostname,
-        path: '/__test/issue-activation-code', method: 'POST', ca: info.tls_ca, lookup: localTestLookup,
+        hostname: target.hostname, port: Number(target.port), servername: target.hostname,
+        path: target.pathname, method: 'POST', ca: info.tls_ca, lookup: localTestLookup,
         headers: { 'content-type': 'application/json', 'content-length': String(body.byteLength) },
       }, response => {
         const chunks: Buffer[] = []
@@ -503,19 +506,85 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
           const bytes = Buffer.concat(chunks)
           if (response.statusCode !== 200 || typeof response.headers['content-type'] !== 'string' ||
             response.headers['content-type'].split(';', 1)[0]!.trim().toLowerCase() !== 'application/json') {
-            reject(new Error(`Frozen-center replacement-code fixture endpoint failed (${response.statusCode}): ${bytes.toString('utf8')}`))
+            reject(new Error(`Frozen-center fixture endpoint ${path} failed (${response.statusCode}): ${bytes.toString('utf8')}\n${centerStderr}`))
             return
           }
           try {
-            const parsed = JSON.parse(bytes.toString('utf8')) as Record<string, unknown>
-            if (Object.keys(parsed).length !== 1 || typeof parsed.activation_code !== 'string') throw new Error('invalid response')
-            resolveResult(parsed.activation_code)
-          } catch { reject(new Error('Frozen-center replacement-code response was invalid')) }
+            const parsed: unknown = JSON.parse(bytes.toString('utf8'))
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid response')
+            resolveResult(parsed as Record<string, unknown>)
+          } catch { reject(new Error(`Frozen-center fixture response ${path} was invalid`)) }
         })
       })
       request.once('error', reject)
       request.end(body)
     })
+  }
+
+  async function rotateCenterTestSigner(
+    fixture: Awaited<ReturnType<typeof createRecoveryCase>>,
+    lifecycle: 'retired' | 'revoked',
+  ): Promise<{ candidate: Awaited<ReturnType<typeof verifyTrustBundleSignature>>; oldKid: string; oldVerifyUntil: number; newKid: string }> {
+    const prepared = await postCenterFixtureJson('/__test/prepare-signer-rotation', { lifecycle })
+    if (typeof prepared.bundle_jws !== 'string' || typeof prepared.old_kid !== 'string' ||
+      typeof prepared.old_verify_until !== 'number' || typeof prepared.new_kid !== 'string') {
+      throw new Error('Frozen-center signer rotation fixture response was incomplete')
+    }
+    const currentCandidate = await fixture.trustStore.getCandidateForTimeBootstrap()
+    if (!currentCandidate) throw new Error('Current trust bundle candidate is unavailable before signer rotation')
+    const anchor = await fetchTrustedTimeAnchor(releaseConfig, currentCandidate, {
+      testCa: info.tls_ca, testLookup: localTestLookup,
+    })
+    await fixture.trustStore.accept(prepared.bundle_jws, anchor.assertFresh)
+    await trustStore.accept(prepared.bundle_jws, anchor.assertFresh)
+    const rotated = await postCenterFixtureJson('/__test/activate-signer-rotation', {})
+    if (rotated.state !== 'succeeded' || rotated.active_kid !== prepared.new_kid) {
+      throw new Error('Frozen-center signer rotation did not activate the prepared key')
+    }
+    info.trust_bundle = prepared.bundle_jws
+    const candidate = await verifyTrustBundleSignature(prepared.bundle_jws, {
+      trustedRoot: releaseConfig.offline_root,
+      expectedCenterIssuer: releaseConfig.expected_center_issuer,
+    })
+    return { candidate, oldKid: prepared.old_kid, oldVerifyUntil: prepared.old_verify_until, newKid: prepared.new_kid }
+  }
+
+  function rejectHistoricalReceiptAtVerifyUntil(input: {
+    store: TrustBundleStore
+    kid: string
+    issuedAt: number
+    verifyUntil: number
+  }): { store: TrustBundleStore; rejectedHistoricalCalls: () => number } {
+    const originalGetAccepted = input.store.getAccepted.bind(input.store)
+    const wrapped = Object.create(input.store) as TrustBundleStore
+    let rejectedHistoricalCalls = 0
+    Object.defineProperty(wrapped, 'getAccepted', {
+      configurable: true,
+      value: async (trustedTime: Parameters<TrustBundleStore['getAccepted']>[0]) => {
+        const accepted = await originalGetAccepted(trustedTime)
+        const beyondRetention = await originalGetAccepted(() => input.verifyUntil)
+        const resolver = Object.freeze({
+          async resolveKey(keyInput: Parameters<typeof accepted.resolver.resolveKey>[0]) {
+            if (keyInput.kid === input.kid && keyInput.jwtTyp === 'aikayun-license-operation+jwt' &&
+              keyInput.issuedAt === input.issuedAt) {
+              rejectedHistoricalCalls += 1
+              return beyondRetention.resolver.resolveKey({ ...keyInput, trustedTime: input.verifyUntil })
+            }
+            return accepted.resolver.resolveKey(keyInput)
+          },
+        })
+        return Object.freeze({ ...accepted, resolver })
+      },
+    })
+    return { store: wrapped, rejectedHistoricalCalls: () => rejectedHistoricalCalls }
+  }
+
+  async function issueCenterReplacementCode(licenseId: string): Promise<string> {
+    const response = await postCenterFixtureJson('/__test/issue-activation-code', { license_id: licenseId })
+    if (Object.keys(response).length !== 1 || typeof response.activation_code !== 'string') {
+      throw new Error('Frozen-center replacement-code response was invalid')
+    }
+    return response.activation_code
   }
 
   async function storedRequestBody(input: {
@@ -1985,6 +2054,201 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       await fixture.close()
     }
   }, 60_000)
+
+  it('does not settle from a forged historical R3 receipt and requires a fresh current-signer continue rejection', async () => {
+    const scenario = info.activation_finalization_cases[0]!
+    const fixture = await createRecoveryCase({
+      name: 'forged-historical-r3-is-inert', license: scenario,
+      activationCode: randomBytes(32).toString('base64url'),
+    })
+    try {
+      await setCenterMode('forged_activation_rejection_signature')
+      await expect(fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)).rejects.toBeTruthy()
+      await clearCenterMode()
+
+      const forged = await readLicenseOperationAttemptResponse(fixture.db, fixture.pendingRoot, fixture.operation.operationId, 1)
+      const saved = await fixture.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', fixture.operation.operationId).executeTakeFirstOrThrow()
+      expect(saved).toMatchObject({ state: 'response_saved', encrypted_center_evidence: null, finalized_at: null })
+
+      const query = await fixture.recoveryClientForCase().queryPendingActivation(fixture.operation.operationId)
+      expect(query).toMatchObject({ state: 'not_found', signatureVerified: true, projected: false })
+      const afterNotFound = await fixture.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', fixture.operation.operationId).executeTakeFirstOrThrow()
+      expect(afterNotFound).toMatchObject({ state: 'response_saved', encrypted_center_evidence: null, finalized_at: null })
+
+      const recovered = await fixture.recoveryClientForCase().continuePendingActivation(fixture.operation.operationId)
+      expect(recovered.query).toMatchObject({ state: 'not_found', signatureVerified: true })
+      expect(recovered.continuation).toMatchObject({
+        state: 'rejected', outcomeCode: 'ACTIVATION_AUTHORIZATION_INVALID', signatureVerified: true,
+        committedAttemptNo: null, projected: false,
+      })
+      const terminal = await fixture.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', fixture.operation.operationId).executeTakeFirstOrThrow()
+      expect(terminal).toMatchObject({ state: 'terminal', response_attempt_no: 4 })
+      const currentRejection = await readLicenseOperationAttemptResponse(
+        fixture.db, fixture.pendingRoot, fixture.operation.operationId, 4,
+      )
+      expect(await readLicenseOperationCenterEvidence(fixture.db, fixture.pendingRoot, fixture.operation.operationId))
+        .toEqual(currentRejection)
+      expect(currentRejection).not.toEqual(forged)
+    } finally { await fixture.close() }
+  }, 90_000)
+
+  it.each([
+    { mode: 'misbound_activation_rejection_actor', name: 'actor' },
+    { mode: 'misbound_activation_rejection_intent', name: 'intent' },
+  ])('keeps Pending when historical R3 rejection has a mismatched $name', async ({ mode }) => {
+    const scenario = info.activation_finalization_cases[1]!
+    const fixture = await createRecoveryCase({
+      name: `misbound-historical-r3-${mode}`, license: scenario,
+      activationCode: randomBytes(32).toString('base64url'),
+    })
+    try {
+      await setCenterMode(mode)
+      await expect(fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)).rejects.toBeTruthy()
+      await clearCenterMode()
+      await expect(fixture.recoveryClientForCase().queryPendingActivation(fixture.operation.operationId))
+        .rejects.toMatchObject({ code: 'operation_recovery_history_conflicts_with_not_found' })
+      const operation = await fixture.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', fixture.operation.operationId).executeTakeFirstOrThrow()
+      expect(operation).toMatchObject({ state: 'response_saved', encrypted_center_evidence: null, finalized_at: null })
+      expect((await fixture.db.selectFrom('local_license_operation_attempts').select('attempt_no')
+        .where('operation_id', '=', fixture.operation.operationId).execute()).map(row => row.attempt_no)).toEqual([1, 2])
+    } finally { await clearCenterMode(); await fixture.close() }
+  }, 90_000)
+
+  it('preserves saved lease and archived committed-result conflicts against a signed not_found', async () => {
+    const leaseScenario = info.activation_finalization_cases[5]!
+    const leaseCode = await issueCenterReplacementCode(leaseScenario.license_id)
+    const leaseFixture = await createRecoveryCase({
+      name: 'not-found-conflicts-with-saved-lease',
+      license: { license_id: leaseScenario.license_id, activation_code: leaseCode }, activationCode: leaseCode,
+    })
+    try {
+      await leaseFixture.activationClientForCase().submitPendingActivation(leaseFixture.operation.operationId)
+      await setCenterMode('query_not_found')
+      await expect(leaseFixture.recoveryClientForCase().queryPendingActivation(leaseFixture.operation.operationId))
+        .rejects.toMatchObject({ code: 'operation_recovery_history_conflicts_with_not_found' })
+      const operation = await leaseFixture.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', leaseFixture.operation.operationId).executeTakeFirstOrThrow()
+      expect(operation).toMatchObject({ state: 'response_saved', encrypted_center_evidence: null, finalized_at: null })
+      const lease = await readLicenseOperationAttemptResponse(
+        leaseFixture.db, leaseFixture.pendingRoot, leaseFixture.operation.operationId, 1,
+      )
+      expect(decodeProtectedHeader(lease.toString('ascii')).typ).toBe('aikayun-license+jwt')
+    } finally { await clearCenterMode(); await leaseFixture.close() }
+
+    const resultScenario = info.activation_finalization_cases[1]!
+    const resultCode = await issueCenterReplacementCode(resultScenario.license_id)
+    const resultFixture = await createRecoveryCase({
+      name: 'not-found-conflicts-with-archived-result',
+      license: { license_id: resultScenario.license_id, activation_code: resultCode }, activationCode: resultCode,
+    })
+    try {
+      await setCenterMode('drop_after_commit')
+      await expect(resultFixture.activationClientForCase().submitPendingActivation(resultFixture.operation.operationId))
+        .rejects.toMatchObject({ code: 'activation_result_unknown' })
+      await clearCenterMode()
+      const committed = await resultFixture.recoveryClientForCase().queryPendingActivation(resultFixture.operation.operationId)
+      expect(committed).toMatchObject({ state: 'committed', committedAttemptNo: 1 })
+      const result = await readLicenseOperationAttemptResultJws(
+        resultFixture.db, resultFixture.pendingRoot, resultFixture.operation.operationId, 1,
+      )
+      expect(result).not.toBeNull()
+
+      await setCenterMode('query_not_found')
+      await expect(resultFixture.recoveryClientForCase().queryPendingActivation(resultFixture.operation.operationId))
+        .rejects.toMatchObject({ code: 'operation_recovery_history_conflicts_with_not_found' })
+      const operation = await resultFixture.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', resultFixture.operation.operationId).executeTakeFirstOrThrow()
+      expect(operation).toMatchObject({ state: 'response_saved', encrypted_center_evidence: null, finalized_at: null })
+    } finally { await clearCenterMode(); await resultFixture.close() }
+  }, 120_000)
+
+  it.each(['retired', 'revoked'] as const)(
+    'continues with a current signer after an unfinalized historical R3 signer is %s', async lifecycle => {
+      const scenario = info.activation_finalization_cases[lifecycle === 'retired' ? 2 : 6]!
+      const fixture = await createRecoveryCase({
+        name: `historical-r3-signer-${lifecycle}`, license: scenario,
+        activationCode: randomBytes(32).toString('base64url'),
+      })
+      try {
+        await expect(fixture.activationClientForCase(stage => {
+          if (stage === 'after_response_saved') throw new Error('fixture_pause_before_old_rejection_settlement')
+        }).submitPendingActivation(fixture.operation.operationId)).rejects.toBeTruthy()
+        const oldRejection = await readLicenseOperationAttemptResponse(
+          fixture.db, fixture.pendingRoot, fixture.operation.operationId, 1,
+        )
+        const oldClaims = decodeJwt(oldRejection.toString('ascii'))
+        const oldKid = String(decodeProtectedHeader(oldRejection.toString('ascii')).kid)
+        const beforeRotation = await fixture.db.selectFrom('local_license_operations').selectAll()
+          .where('operation_id', '=', fixture.operation.operationId).executeTakeFirstOrThrow()
+        expect(beforeRotation).toMatchObject({ state: 'response_saved', encrypted_center_evidence: null, finalized_at: null })
+
+        const rotated = await rotateCenterTestSigner(fixture, lifecycle)
+        expect(rotated.oldKid).toBe(oldKid)
+        const retiredRecord = rotated.candidate.claims.keys.find(key => key.kid === oldKid)
+        expect(retiredRecord).toBeDefined()
+        let recoveryTrustStore = fixture.trustStore
+        let lifecycleRejects = () => 0
+        if (lifecycle === 'retired') {
+          expect(retiredRecord!.verify_until).toBe(rotated.oldVerifyUntil)
+          expect(rotated.oldVerifyUntil).toBeGreaterThan(Math.floor(Date.now() / 1000))
+          const simulatedExpiry = rejectHistoricalReceiptAtVerifyUntil({
+            store: fixture.trustStore,
+            kid: oldKid,
+            issuedAt: Number(oldClaims.iat),
+            verifyUntil: rotated.oldVerifyUntil,
+          })
+          recoveryTrustStore = simulatedExpiry.store
+          lifecycleRejects = simulatedExpiry.rejectedHistoricalCalls
+        } else {
+          expect(retiredRecord!.revoked_at).not.toBeNull()
+          const current = await fixture.trustStore.getAccepted(() => Math.floor(Date.now() / 1000))
+          await expect(current.resolver.resolveKey({
+            kid: oldKid,
+            targetIssuer: releaseConfig.expected_center_issuer,
+            jwtTyp: 'aikayun-license-operation+jwt',
+            audience: 'aikayun-commerce',
+            trustedTime: Math.floor(Date.now() / 1000),
+            issuedAt: Number(oldClaims.iat),
+            expiresAt: Number(oldClaims.exp),
+          })).rejects.toThrow()
+        }
+
+        const recovered = await fixture.recoveryClientForCase(undefined, recoveryTrustStore)
+          .recoverPendingActivation(fixture.operation.operationId)
+        expect(recovered.query).toMatchObject({ state: 'not_found', signatureVerified: true })
+        expect(recovered.continuation).toMatchObject({
+          state: 'rejected', outcomeCode: 'ACTIVATION_AUTHORIZATION_INVALID',
+          committedAttemptNo: null, signatureVerified: true, projected: false,
+        })
+        if (lifecycle === 'retired') expect(lifecycleRejects()).toBeGreaterThan(0)
+        const terminal = await fixture.db.selectFrom('local_license_operations').selectAll()
+          .where('operation_id', '=', fixture.operation.operationId).executeTakeFirstOrThrow()
+        expect(terminal).toMatchObject({ state: 'terminal', response_attempt_no: 3 })
+        const newRejection = await readLicenseOperationAttemptResponse(
+          fixture.db, fixture.pendingRoot, fixture.operation.operationId, 3,
+        )
+        expect(await readLicenseOperationCenterEvidence(fixture.db, fixture.pendingRoot, fixture.operation.operationId))
+          .toEqual(newRejection)
+        expect(newRejection).not.toEqual(oldRejection)
+
+        const replacement = await createOrLoadActivationOperation(fixture.db, fixture.pendingRoot, {
+          operationId: randomUUID(), licenseId: scenario.license_id,
+          activationCode: await issueCenterReplacementCode(scenario.license_id),
+          databaseId: fixture.identity.databaseId!, instanceId: fixture.identity.instanceId!,
+          identityJkt: fixture.identity.identityJkt!, origin: null,
+        })
+        expect(replacement).toMatchObject({ state: 'pending', created: true })
+        expect((await fixture.activationClientForCase().submitPendingActivation(replacement.operationId)).purpose)
+          .toBe('verified_activation_lease_unprojected')
+        expect((await fixture.db.selectFrom('local_license_operations').select('state')
+          .where('operation_id', '=', fixture.operation.operationId).executeTakeFirstOrThrow()).state).toBe('terminal')
+      } finally { await clearCenterMode(); await fixture.close() }
+    }, 120_000,
+  )
 
   it('restarts safely after API SIGKILL at query/continue archive boundaries and unknown PostgreSQL commit acknowledgement', async () => {
     const cases = [
