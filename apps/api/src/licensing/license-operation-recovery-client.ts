@@ -7,7 +7,7 @@ import {
   verifyRFC9421Signature,
   verifyRFC9530DigestHeader,
 } from '@misskey-dev/node-http-message-signatures'
-import type { Kysely } from 'kysely'
+import { sql, type Kysely } from 'kysely'
 import { Client } from 'pg'
 import type { Pool } from 'pg'
 import type { Database, LocalLicenseOperationAttemptsTable } from '../db/types.js'
@@ -42,10 +42,12 @@ import {
   verifyLicenseChallenge,
   verifyCurrentLicenseLease,
   verifyExpiredHistoricalLease,
+  verifyExpiredHistoricalOperationReceipt,
   verifyLicenseOperationReceipt,
 } from './trust/evidence.js'
 import type { TrustedReleaseLicenseConfig } from './trusted-release-config.js'
 import { parseStrictJson } from './strict-json.js'
+import { decryptLicensePendingBytes, encryptLicensePendingBytes } from './pending-encryption-key.js'
 
 const COMPACT_JWS = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u
 const DIGEST = /^[A-Za-z0-9_-]{43}$/u
@@ -70,6 +72,9 @@ export type LicenseRecoveryCheckpoint =
   | 'after_http_response'
   | 'before_response_save'
   | 'after_response_saved'
+  | 'before_terminal_evidence_commit'
+  | 'after_terminal_row_update'
+  | 'after_terminal_evidence_commit'
 
 export class LicenseOperationRecoveryError extends Error {
   constructor(readonly code: string) {
@@ -633,7 +638,8 @@ function boundOperationReceiptClaims(input: {
   }
   if (typedOutcome === null) fail('operation_recovery_terminal_invalid')
   if (committedNo === null) {
-    if (typedState === 'rejected' && committedNonceHash === null && committedDigest === null && resultJws === null) {
+    if (typedState === 'rejected' && typedOutcome === 'ACTIVATION_AUTHORIZATION_INVALID' &&
+      committedNonceHash === null && committedDigest === null && resultJws === null) {
       const original = history.attempts.find(item => item.row.attempt_no === input.requestAttemptNo)
       if (!original || !['activation', 'continue'].includes(original.row.purpose) ||
         String(original.row.send_state) !== 'response_saved' || original.row.request_nonce_hash !== input.requestNonceHash ||
@@ -727,7 +733,13 @@ async function verifiedHistoricalTerminal(input: {
   return first
 }
 
-function ensureNotFoundDoesNotContradictHistory(history: ValidatedOperationHistory): void {
+async function ensureNotFoundDoesNotContradictHistory(input: {
+  history: ValidatedOperationHistory
+  resolver: Awaited<ReturnType<TrustBundleStore['getAccepted']>>['resolver']
+  issuer: string
+  trustedTime: number
+}): Promise<void> {
+  const { history } = input
   for (const attempt of history.attempts) {
     if (attempt.archivedResult !== null) fail('operation_recovery_history_conflicts_with_not_found')
     if (attempt.response === null) continue
@@ -736,6 +748,18 @@ function ensureNotFoundDoesNotContradictHistory(history: ValidatedOperationHisto
       if (decoded.header.typ === 'aikayun-license+jwt') fail('operation_recovery_history_conflicts_with_not_found')
       if (decoded.header.typ === 'aikayun-license-operation+jwt' && decoded.claims.operation_id === history.operation.operationId &&
         ['committed', 'rejected', 'cancelled'].includes(String(decoded.claims.state))) {
+        if (decoded.claims.state === 'rejected' && decoded.claims.outcome_code === 'ACTIVATION_AUTHORIZATION_INVALID') {
+          try {
+            const verified = await verifyExpiredHistoricalOperationReceipt(attempt.response.toString('ascii'), {
+              resolver: input.resolver, issuer: input.issuer, trustedTime: input.trustedTime,
+            })
+            const bound = boundOperationReceiptClaims({
+              history, requestAttemptNo: attempt.row.attempt_no, requestNonceHash: attempt.row.request_nonce_hash,
+              requestDigest: attempt.row.request_body_digest, claims: verified.claims,
+            })
+            if (bound.committedAttemptNo === null) continue
+          } catch { /* Unverifiable history cannot be treated as the R3 exception. */ }
+        }
         fail('operation_recovery_history_conflicts_with_not_found')
       }
     } catch (error) {
@@ -851,6 +875,175 @@ async function archiveAndClassifyResult(input: {
     // operation receipt remains the authority for this historical commit fact.
   }
   return 'historical_only'
+}
+
+export type LicenseOperationFinalizationCheckpoint =
+  | 'before_terminal_evidence_commit'
+  | 'after_terminal_row_update'
+  | 'after_terminal_evidence_commit'
+
+/** Re-read, re-verify, and atomically settle a persisted center-signed activation rejection. */
+export async function finalizeTrustedActivationRejection(input: {
+  options: LicenseOperationRecoveryClientOptions
+  operationId: string
+  evidenceAttemptNo: number
+  readTrustedTime: () => number
+  checkpoint?: (stage: LicenseOperationFinalizationCheckpoint) => void | Promise<void>
+}): Promise<void> {
+  const { options, operationId, evidenceAttemptNo } = input
+  if (!Number.isSafeInteger(evidenceAttemptNo) || evidenceAttemptNo < 1) fail('operation_terminal_evidence_invalid')
+  const issuer = options.releaseConfig.expected_center_issuer
+  const origin = new URL(options.releaseConfig.expected_center_origin)
+  const identity = await withVerifiedInstallationSigningContext(options.pool, options.identityRoot, async current => ({
+    databaseId: current.databaseId, instanceId: current.instanceId, identityJkt: current.identityJkt,
+  }))
+  const rawEvidence = await readLicenseOperationAttemptResponse(
+    options.db, options.pendingKeyRoot, operationId, evidenceAttemptNo,
+  )
+  const token = rawEvidence.toString('ascii')
+  if (!COMPACT_JWS.test(token) || !Buffer.from(token, 'ascii').equals(rawEvidence)) fail('operation_terminal_evidence_invalid')
+  const evidenceDigest = sha256Base64url(rawEvidence)
+  // Finish encryption before taking the PostgreSQL transaction. The ciphertext is committed
+  // atomically with the terminal state below, so no partially finalized evidence is exposed.
+  const encryptedEvidence = await encryptLicensePendingBytes(options.pendingKeyRoot, {
+    operationId, record: 'operation', field: 'center_evidence',
+  }, rawEvidence)
+
+  async function assertSameFinalizedEvidence(db: Kysely<Database>): Promise<void> {
+    const operation = await db.selectFrom('local_license_operations').selectAll()
+      .where('operation_id', '=', operationId).executeTakeFirst()
+    if (!operation || operation.state !== 'terminal' || operation.kind !== 'activation' || operation.expected_generation !== null ||
+      operation.database_id !== identity.databaseId || operation.instance_id !== identity.instanceId ||
+      operation.identity_jkt !== identity.identityJkt ||
+      operation.center_evidence_key_id === null || operation.encrypted_center_evidence === null ||
+      operation.center_evidence_digest !== evidenceDigest) fail('operation_terminal_evidence_conflict')
+    const archived = await decryptLicensePendingBytes(options.pendingKeyRoot, {
+      operationId, record: 'operation', field: 'center_evidence',
+    }, { keyId: operation.center_evidence_key_id, ciphertext: operation.encrypted_center_evidence })
+    if (!archived.equals(rawEvidence) || sha256Base64url(archived) !== operation.center_evidence_digest) {
+      fail('operation_terminal_evidence_conflict')
+    }
+    const attempt = await readLicenseOperationAttemptResponse(db, options.pendingKeyRoot, operationId, evidenceAttemptNo)
+    if (!attempt.equals(archived)) fail('operation_terminal_evidence_conflict')
+  }
+
+  const current = await options.db.selectFrom('local_license_operations').selectAll()
+    .where('operation_id', '=', operationId).executeTakeFirst()
+  if (current?.state === 'terminal') return assertSameFinalizedEvidence(options.db)
+  if (!current || current.state !== 'response_saved' || current.kind !== 'activation' || current.expected_generation !== null ||
+    current.database_id !== identity.databaseId || current.instance_id !== identity.instanceId ||
+    current.identity_jkt !== identity.identityJkt) fail('operation_terminal_evidence_binding_invalid')
+
+  const accepted = await options.trustStore.getAccepted(input.readTrustedTime)
+
+  try {
+    await options.db.transaction().execute(async trx => {
+      await sql`SELECT pg_advisory_xact_lock(hashtextextended(${operationId}, 0))`.execute(trx)
+      const operation = await trx.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', operationId).forUpdate().executeTakeFirst()
+      if (!operation) fail('operation_terminal_evidence_binding_invalid')
+      if (operation.state === 'terminal') return assertSameFinalizedEvidence(trx)
+      if (operation.state !== 'response_saved' || operation.kind !== 'activation' || operation.expected_generation !== null ||
+        operation.database_id !== identity.databaseId || operation.instance_id !== identity.instanceId ||
+        operation.identity_jkt !== identity.identityJkt) fail('operation_terminal_evidence_binding_invalid')
+      const binding = await trx.selectFrom('installation_binding').selectAll()
+        .where('singleton', '=', true).forUpdate().executeTakeFirst()
+      if (!binding || binding.binding_state !== 'ready' || binding.database_id !== operation.database_id ||
+        binding.instance_id !== operation.instance_id || binding.identity_jkt !== operation.identity_jkt) {
+        fail('operation_terminal_evidence_binding_invalid')
+      }
+      const history = await validateOperationHistory({
+        db: trx, pool: options.pool, pendingKeyRoot: options.pendingKeyRoot, operationId, issuer,
+        centerOrigin: origin, identity,
+      })
+      const target = history.attempts.find(attempt => attempt.row.attempt_no === evidenceAttemptNo)
+      if (!target || !target.response || String(target.row.send_state) !== 'response_saved' || !target.response.equals(rawEvidence)) {
+        fail('operation_terminal_evidence_binding_invalid')
+      }
+      const pointer = history.attempts.find(attempt => attempt.row.attempt_no === operation.response_attempt_no)
+      if (!pointer || !pointer.response || pointer.row.response_digest !== operation.response_digest ||
+        pointer.row.response_saved_at?.getTime() !== operation.response_saved_at?.getTime()) {
+        fail('operation_terminal_evidence_history_invalid')
+      }
+      const verified = await verifyLicenseOperationReceipt(target.response.toString('ascii'), {
+        resolver: accepted.resolver, issuer, trustedTime: input.readTrustedTime(),
+      })
+      if (verified.claims.state !== 'rejected') fail('operation_terminal_evidence_not_rejected')
+      const bound = boundOperationReceiptClaims({
+        history,
+        requestAttemptNo: evidenceAttemptNo,
+        requestNonceHash: target.row.request_nonce_hash,
+        requestDigest: target.row.request_body_digest,
+        claims: verified.claims,
+      })
+      if (bound.state !== 'rejected') fail('operation_terminal_evidence_not_rejected')
+
+      // A locally saved lease or a conflicting committed result permanently blocks rejection settlement.
+      for (const attempt of history.attempts) {
+        if (attempt.archivedResult !== null &&
+          (attempt.row.attempt_no !== bound.committedAttemptNo || bound.resultJws === null ||
+            !attempt.archivedResult.equals(Buffer.from(bound.resultJws, 'ascii')))) {
+          fail('operation_terminal_evidence_history_conflict')
+        }
+        if (!attempt.response) continue
+        if (attempt.row.attempt_no === evidenceAttemptNo) continue
+        let previous: { header: Record<string, unknown>; claims: Record<string, unknown> }
+        try { previous = decodeCompactJws(attempt.response.toString('ascii')) } catch { continue }
+        if (previous.header.typ === 'aikayun-license+jwt' ||
+          (previous.header.typ === 'aikayun-license-operation+jwt' &&
+            ['committed', 'cancelled'].includes(String(previous.claims.state)))) {
+          fail('operation_terminal_evidence_history_conflict')
+        }
+        if (previous.header.typ !== 'aikayun-license-operation+jwt' || previous.claims.state !== 'rejected') continue
+        if (bound.committedAttemptNo === attempt.row.attempt_no && bound.resultJws !== null &&
+          attempt.response.toString('ascii') === bound.resultJws) continue
+        let previousVerified: { claims: Readonly<Record<string, unknown>> }
+        try {
+          previousVerified = await verifyLicenseOperationReceipt(attempt.response.toString('ascii'), {
+            resolver: accepted.resolver, issuer, trustedTime: input.readTrustedTime(),
+          })
+        } catch {
+          try {
+            previousVerified = await verifyExpiredHistoricalOperationReceipt(attempt.response.toString('ascii'), {
+              resolver: accepted.resolver, issuer, trustedTime: input.readTrustedTime(),
+            })
+          } catch { continue }
+        }
+        const previousBound = boundOperationReceiptClaims({
+          history, requestAttemptNo: attempt.row.attempt_no, requestNonceHash: attempt.row.request_nonce_hash,
+          requestDigest: attempt.row.request_body_digest, claims: previousVerified.claims,
+        })
+        if (previousBound.state !== bound.state || previousBound.outcomeCode !== bound.outcomeCode ||
+          previousBound.committedAttemptNo !== bound.committedAttemptNo || previousBound.resultDigest !== bound.resultDigest) {
+          fail('operation_terminal_evidence_history_conflict')
+        }
+      }
+
+      const latestTrust = await options.trustStore.getAccepted(input.readTrustedTime)
+      if (latestTrust.artifactSha256 !== accepted.artifactSha256) fail('operation_trust_bundle_changed')
+      await input.checkpoint?.('before_terminal_evidence_commit')
+      const finalizedAt = await sql<{ now: Date }>`SELECT clock_timestamp() AS now`.execute(trx)
+      const updated = await trx.updateTable('local_license_operations').set({
+        state: 'terminal',
+        encrypted_center_evidence: encryptedEvidence.ciphertext,
+        center_evidence_key_id: encryptedEvidence.keyId,
+        center_evidence_digest: evidenceDigest,
+        finalized_at: finalizedAt.rows[0]!.now,
+      }).where('operation_id', '=', operationId).where('state', '=', 'response_saved')
+        .returning('operation_id').executeTakeFirst()
+      if (!updated) fail('operation_terminal_evidence_state_conflict')
+      await input.checkpoint?.('after_terminal_row_update')
+    })
+    await input.checkpoint?.('after_terminal_evidence_commit')
+    await assertSameFinalizedEvidence(options.db)
+  } catch (error) {
+    // A lost COMMIT acknowledgement is recovered only by reading and matching this operation's
+    // immutable terminal evidence. No second operation is ever created here.
+    const after = await options.db.selectFrom('local_license_operations').select('state')
+      .where('operation_id', '=', operationId).executeTakeFirst()
+    if (after?.state === 'terminal') return assertSameFinalizedEvidence(options.db)
+    throw error
+  }
 }
 
 function resultEvidence(
@@ -1072,12 +1265,34 @@ async function runOneRecoveryRequest(input: {
         issuer: options.releaseConfig.expected_center_issuer,
         trustedTime,
       })
-      if (historicalTerminal) return resultEvidence(operation, historicalTerminal.attemptNo, historicalTerminal.bound, 'none')
-      ensureNotFoundDoesNotContradictHistory(historyAfterResponse)
+        if (historicalTerminal) {
+          if (historicalTerminal.bound.state === 'rejected') {
+            const disposition = await archiveAndClassifyResult({
+              options, operationId, accepted, trustedTime, history: historyAfterResponse,
+              bound: historicalTerminal.bound,
+            })
+            await finalizeTrustedActivationRejection({
+              options, operationId, evidenceAttemptNo: historicalTerminal.attemptNo,
+              readTrustedTime: () => responseSample.assertFresh(), checkpoint,
+            })
+            return resultEvidence(operation, historicalTerminal.attemptNo, historicalTerminal.bound, disposition)
+          }
+          return resultEvidence(operation, historicalTerminal.attemptNo, historicalTerminal.bound, 'none')
+        }
+      await ensureNotFoundDoesNotContradictHistory({
+        history: historyAfterResponse, resolver: accepted.resolver,
+        issuer: options.releaseConfig.expected_center_issuer, trustedTime,
+      })
     }
     const resultDisposition = await archiveAndClassifyResult({
       options, operationId, accepted, trustedTime, history: historyAfterResponse, bound: checked,
     })
+    if (checked.state === 'rejected') {
+      await finalizeTrustedActivationRejection({
+        options, operationId, evidenceAttemptNo: attempt.attemptNo,
+        readTrustedTime: () => responseSample.assertFresh(), checkpoint,
+      })
+    }
     const latestBundle = await options.trustStore.getAccepted(responseSample.assertFresh)
     if (latestBundle.artifactSha256 !== accepted.artifactSha256) fail('operation_trust_bundle_changed')
     return resultEvidence(operation, attempt.attemptNo, checked, resultDisposition)

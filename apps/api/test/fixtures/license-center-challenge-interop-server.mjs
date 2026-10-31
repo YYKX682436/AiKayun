@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { sql } from 'kysely'
 import { createServer } from 'node:net'
 import { chmod, readFile, writeFile } from 'node:fs/promises'
@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url'
 
 const checkout = process.env.LICENSE_CENTER_CHECKOUT
 const infoPath = process.env.LICENSE_CENTER_INTEROP_INFO
-const expectedCommit = '6f554b51b867a15ad7747c6d002b548e016f65c6'
+const expectedCommit = 'a5cf99439e3bf92b65f19d60c013bca088cf221a'
 if (!checkout || !infoPath) throw new Error('interop fixture requires an isolated center checkout and output path')
 
 const centerImport = async (relativePath) => import(pathToFileURL(join(checkout, relativePath)).href)
@@ -148,8 +148,36 @@ try {
   const activationContinue = await issueActivationScenario()
   const activationRace = await issueActivationScenario()
   const activationProtocolResolution = await issueActivationScenario()
+  const activationCommittedConflict = await issueActivationScenario()
   const activationConcurrent = await issueActivationScenario()
   const activationRejected = await issueActivationScenario(true)
+  const activationRetryCases = []
+  for (const variant of ['wrong', 'expired', 'revoked', 'consumed', 'cross-license']) {
+    const target = await issueActivationScenario()
+    let rejectedCode
+    if (variant === 'wrong') rejectedCode = randomBytes(32).toString('base64url')
+    else if (variant === 'cross-license') rejectedCode = (await issueActivationScenario()).activation_code
+    else if (variant === 'expired') {
+      const now = new Date()
+      await db.updateTable('activation_codes').set({ revoked_at: now })
+        .where('token_hash', '=', createHash('sha256').update(target.activation_code).digest('base64url')).executeTakeFirstOrThrow()
+      rejectedCode = randomBytes(32).toString('base64url')
+      await db.insertInto('activation_codes').values({
+        id: randomUUID(), license_id: target.license_id,
+        token_hash: createHash('sha256').update(rejectedCode).digest('base64url'),
+        created_at: new Date(now.getTime() - 120_000), expires_at: new Date(now.getTime() - 60_000),
+        consumed_at: null, revoked_at: null,
+      }).execute()
+    } else {
+      const now = new Date()
+      await db.updateTable('activation_codes').set(variant === 'revoked' ? { revoked_at: now } : { consumed_at: now })
+        .where('token_hash', '=', createHash('sha256').update(target.activation_code).digest('base64url')).executeTakeFirstOrThrow()
+      rejectedCode = target.activation_code
+    }
+    activationRetryCases.push({ variant, license_id: target.license_id, rejected_code: rejectedCode })
+  }
+  const activationFinalizationCases = []
+  for (let index = 0; index < 6; index += 1) activationFinalizationCases.push(await issueActivationScenario())
   const activationExpiredChallenge = await issueActivationScenario()
   const crashActivationCases = []
   for (let index = 0; index < 7; index += 1) crashActivationCases.push(await issueActivationScenario())
@@ -163,6 +191,29 @@ try {
       try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { /* use current test center time */ }
       return mode === 'expired_challenge' ? new Date(Date.now() - 6 * 60 * 1000) : new Date()
     },
+  })
+  app.post('/__test/issue-activation-code', async (request, reply) => {
+    const body = request.body
+    if (!body || typeof body !== 'object' || typeof body.license_id !== 'string') {
+      return reply.code(400).send({ error: 'invalid test request' })
+    }
+    const license = await db.selectFrom('licenses').selectAll().where('id', '=', body.license_id).executeTakeFirst()
+    if (!license) return reply.code(404).send({ error: 'test license not found' })
+    const unresolved = await db.selectFrom('activation_codes').selectAll().where('license_id', '=', body.license_id)
+      .where('consumed_at', 'is', null).where('revoked_at', 'is', null).orderBy('created_at', 'asc').execute()
+    const valid = unresolved.filter(code => code.expires_at.getTime() > Date.now())
+    if (valid.length > 1) return reply.code(409).send({ error: 'ambiguous test codes' })
+    const codeInput = {
+      operationId: randomUUID(), licenseId: body.license_id, expectedRevision: license.revision.toString(),
+      reason: '隔离互操作测试结案后补发激活码', ...(valid[0] ? { replaceCodeId: valid[0].id } : {}),
+    }
+    const issued = await licenseAdmin.issueActivationCode({
+      ...codeInput, confirmedRequestDigest: issueActivationCodeRequestDigest(codeInput),
+    })
+    if (issued.state !== 'succeeded' || !issued.activationCode) {
+      return reply.code(409).send({ error: 'replacement rejected', outcome_code: issued.outcomeCode })
+    }
+    return reply.code(200).send({ activation_code: issued.activationCode })
   })
   let isolatedClientAddress = 0
   app.server.on('secureConnection', (socket) => {
@@ -241,12 +292,27 @@ try {
       })
   })
   app.addHook('preSerialization', async (request, reply, payload) => {
-    if (request.method !== 'POST' || request.url !== '/v1/operations/query') return payload
+    if (request.method !== 'POST' || !['/v1/operations/query', '/v1/operations/continue'].includes(request.url)) return payload
     let mode
     try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { return payload }
+    if (['other_unrecorded_rejection', 'expired_unrecorded_rejection'].includes(mode) && request.url === '/v1/operations/continue') {
+      const body = request.body
+      const challenge = decodeJwt(body.challenge)
+      const token = await signOperationReceipt({ ...runtime.signer, issuer: origin }, {
+        licenseId: body.license_id, identityJkt: body.identity_jkt, operationId: body.operation_id,
+        intentDigest: body.intent_digest, state: 'rejected',
+        outcomeCode: mode === 'other_unrecorded_rejection' ? 'LICENSE_REVOKED' : 'ACTIVATION_AUTHORIZATION_INVALID',
+        attemptNo: body.attempt_no,
+        requestNonceHash: createHash('sha256').update(challenge.server_nonce).digest('base64url'),
+        requestDigest: createHash('sha256').update(request.rawBody).digest('base64url'),
+        now: new Date(Date.now() - (mode === 'expired_unrecorded_rejection' ? 6 * 60 * 1000 : 0)),
+      })
+      return { operation_receipt: token }
+    }
+    if (request.url !== '/v1/operations/query') return payload
     const forgedModes = new Set([
       'forged_actor', 'forged_operation', 'forged_committed_attempt', 'forged_not_found_result',
-      'wrong_request_digest', 'wrong_receipt_signature', 'wrong_receipt_kid',
+      'wrong_request_digest', 'wrong_receipt_signature', 'wrong_receipt_kid', 'query_unrecorded_rejection',
     ])
     if (!forgedModes.has(mode)) return payload
     const body = request.body
@@ -258,22 +324,24 @@ try {
       identityJkt: mode === 'forged_actor' ? 'A'.repeat(43) : body.identity_jkt,
       operationId: mode === 'forged_operation' ? randomUUID() : body.operation_id,
       intentDigest: body.intent_digest,
-      state: mode === 'forged_not_found_result' ? 'not_found' : 'committed',
-      outcomeCode: mode === 'forged_not_found_result' ? 'OPERATION_NOT_FOUND' : 'ACTIVATED',
+      state: mode === 'forged_not_found_result' ? 'not_found'
+        : mode === 'query_unrecorded_rejection' ? 'rejected' : 'committed',
+      outcomeCode: mode === 'forged_not_found_result' ? 'OPERATION_NOT_FOUND'
+        : mode === 'query_unrecorded_rejection' ? 'ACTIVATION_AUTHORIZATION_INVALID' : 'ACTIVATED',
       attemptNo: body.attempt_no,
       requestNonceHash: challengeNonceHash,
-      requestDigest: mode === 'wrong_request_digest' ? 'B'.repeat(43) : requestDigest,
+      requestDigest: mode === 'wrong_request_digest' ? 'A'.repeat(43) : requestDigest,
       committedAttemptNo: mode === 'forged_committed_attempt' ? 999 : null,
-      committedRequestNonceHash: mode === 'forged_committed_attempt' ? 'C'.repeat(43) : null,
-      committedRequestDigest: mode === 'forged_committed_attempt' ? 'D'.repeat(43) : null,
+      committedRequestNonceHash: mode === 'forged_committed_attempt' ? 'A'.repeat(43) : null,
+      committedRequestDigest: mode === 'forged_committed_attempt' ? 'A'.repeat(43) : null,
       resultJws: mode === 'forged_not_found_result'
         ? `${Buffer.from('{"alg":"Ed25519","typ":"aikayun-license+jwt"}').toString('base64url')}.${Buffer.from('{"sub":"forged"}').toString('base64url')}.${Buffer.alloc(64, 1).toString('base64url')}`
         : null,
       now: new Date(),
     }
     const signer = mode === 'wrong_receipt_kid'
-      ? { ...runtime.signer, ...(await runtime.createOnlineKey()) }
-      : runtime.signer
+      ? { ...runtime.signer, ...(await runtime.createOnlineKey()), issuer: origin }
+      : { ...runtime.signer, issuer: origin }
     let token = await signOperationReceipt(signer, claims)
     if (mode === 'wrong_receipt_signature') {
       const parts = token.split('.')
@@ -285,14 +353,15 @@ try {
     return { operation_receipt: token }
   })
   app.addHook('onSend', async (request, reply, payload) => {
-    if (request.method !== 'POST' || reply.statusCode !== 200) return payload
+    if (request.method !== 'POST') return payload
     let mode
     try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { return payload }
     if (request.url === '/v1/activations' && mode === 'release_activation') {
       await writeFile(activationFinishedPath, 'finished', { mode: 0o600 })
     }
-    if ((request.url === '/v1/activations' && mode === 'drop_after_commit') ||
-      (request.url === '/v1/operations/continue' && mode === 'drop_continue_after_commit')) reply.raw.destroy()
+    if ((reply.statusCode === 200 && request.url === '/v1/activations' && mode === 'drop_after_commit') ||
+      (reply.statusCode === 200 && request.url === '/v1/operations/continue' && mode === 'drop_continue_after_commit') ||
+      (request.url === '/v1/activations' && mode === 'drop_activation_rejection' && reply.statusCode === 409)) reply.raw.destroy()
     return payload
   })
   await app.listen({ host: '127.0.0.1', port })
@@ -315,8 +384,11 @@ try {
     activation_continue: activationContinue,
     activation_race: activationRace,
     activation_protocol_resolution: activationProtocolResolution,
+    activation_committed_conflict: activationCommittedConflict,
     activation_concurrent: activationConcurrent,
     activation_rejected: activationRejected,
+    activation_retry_cases: activationRetryCases,
+    activation_finalization_cases: activationFinalizationCases,
     activation_expired_challenge: activationExpiredChallenge,
     crash_activation_cases: crashActivationCases,
     transport_activation_cases: transportActivationCases,

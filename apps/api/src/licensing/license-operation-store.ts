@@ -674,6 +674,30 @@ export async function readLicenseOperationAttemptResultJws(
   return raw
 }
 
+export async function readLicenseOperationCenterEvidence(
+  db: Kysely<Database>,
+  pendingKeyRoot: string,
+  operationId: string,
+): Promise<Buffer | null> {
+  const operation = await db.selectFrom('local_license_operations').selectAll()
+    .where('operation_id', '=', operationId).executeTakeFirst()
+  if (!operation) invalid('operation_unavailable')
+  if (operation.state !== 'terminal' && operation.state !== 'cancelled') {
+    if (operation.encrypted_center_evidence !== null || operation.center_evidence_key_id !== null ||
+      operation.center_evidence_digest !== null) invalid('operation_center_evidence_binding_mismatch')
+    return null
+  }
+  if (!operation.encrypted_center_evidence || !operation.center_evidence_key_id ||
+    !operation.center_evidence_digest || !digestPattern.test(operation.center_evidence_digest) || !operation.finalized_at) {
+    invalid('operation_center_evidence_binding_mismatch')
+  }
+  const evidence = await decryptLicensePendingBytes(pendingKeyRoot, {
+    operationId, record: 'operation', field: 'center_evidence',
+  }, { keyId: operation.center_evidence_key_id, ciphertext: operation.encrypted_center_evidence })
+  if (sha256Base64url(evidence) !== operation.center_evidence_digest) invalid('operation_center_evidence_digest_mismatch')
+  return evidence
+}
+
 export async function readLicenseOperationAttemptEnvelope(
   db: Kysely<Database>,
   pendingKeyRoot: string,

@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { chmod, copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -13,6 +13,7 @@ import { localLicenseOperationsMigration } from '../src/db/migrations/2026103000
 import { singleInitialActivationAttemptMigration } from '../src/db/migrations/202610300002_single_initial_activation_attempt.js'
 import { licenseOperationResultArchiveMigration } from '../src/db/migrations/202610300003_license_operation_result_archive.js'
 import { licenseResultArchivePresenceMigration } from '../src/db/migrations/202610300004_license_result_archive_presence.js'
+import { licenseOperationTrustedRejectionMigration } from '../src/db/migrations/202610310001_license_operation_trusted_rejection.js'
 import { ed25519IdentityJkt } from '../src/licensing/license-intent.js'
 import {
   allocateLicenseOperationAttempt,
@@ -24,6 +25,7 @@ import {
   readLicenseOperationAttemptEnvelope,
   readLicenseOperationAttemptResponse,
   readLicenseOperationAttemptResultJws,
+  readLicenseOperationCenterEvidence,
   readSavedLicenseOperationResponse,
   saveLicenseOperationResponse,
   saveLicenseOperationResultJws,
@@ -93,6 +95,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
     await singleInitialActivationAttemptMigration.up(db)
     await licenseOperationResultArchiveMigration.up(db)
     await licenseResultArchivePresenceMigration.up(db)
+    await licenseOperationTrustedRejectionMigration.up(db)
     const pendingRoot = await mkdtemp(join(tmpdir(), 'aikayun-license-pending-pg-'))
     pendingRoots.add(pendingRoot)
     await initializeTemporaryLicensePendingKey(pendingRoot, 'test')
@@ -528,7 +531,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
       await expect(sql`UPDATE local_license_operations SET response_attempt_no=1 WHERE operation_id=${input.operationId}::uuid`.execute(sandbox.db)).rejects.toBeDefined()
       await expect(sql`UPDATE local_license_operations SET state='projected', finalized_at=clock_timestamp() WHERE operation_id=${input.operationId}::uuid`.execute(sandbox.db)).rejects.toBeDefined()
       await expect(sql`UPDATE local_license_operations SET state='terminal', encrypted_center_evidence=decode('01','hex'),
-        center_evidence_key_id='center-v1', center_evidence_digest=${'E'.repeat(43)}, finalized_at=clock_timestamp()
+        center_evidence_key_id='center-v1', center_evidence_digest=NULL, finalized_at=clock_timestamp()
         WHERE operation_id=${input.operationId}::uuid`.execute(sandbox.db)).rejects.toBeDefined()
       await expect(sql`UPDATE local_license_operation_attempts SET send_state='prepared' WHERE operation_id=${input.operationId}::uuid AND attempt_no=1`.execute(sandbox.db)).rejects.toBeDefined()
       await expect(sql`DELETE FROM local_license_operations WHERE operation_id=${input.operationId}::uuid`.execute(sandbox.db)).rejects.toBeDefined()
@@ -547,6 +550,39 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
       const retained = await sandbox.db.selectFrom('local_license_operations').select('state')
         .where('operation_id', '=', input.operationId).executeTakeFirst()
       expect(retained?.state).toBe('response_saved')
+    })
+  })
+
+  it('keeps terminal operations irreversible, blocks late evidence writes, and releases the active activation binding', async () => {
+    await withSandbox(async sandbox => {
+      const input = activationInput()
+      const operation = await createOrLoadActivationOperation(sandbox.db, sandbox.pendingRoot, input)
+      const attempt = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(input.operationId, operation.intentDigest))
+      await markLicenseOperationAttemptSent(sandbox.db, input.operationId, attempt.attemptNo)
+      const response = Buffer.from('saved-signed-rejection-jws-placeholder')
+      await saveLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo, response)
+      await sql`UPDATE local_license_operations SET state='terminal',
+        encrypted_center_evidence=decode('010203','hex'), center_evidence_key_id='center-v1',
+        center_evidence_digest=${'H'.repeat(43)}, finalized_at=clock_timestamp()
+        WHERE operation_id=${input.operationId}::uuid`.execute(sandbox.db)
+      const terminal = await sandbox.db.selectFrom('local_license_operations').selectAll()
+        .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
+      expect(terminal.state).toBe('terminal')
+
+      await expect(sql`UPDATE local_license_operations SET state='response_saved', encrypted_center_evidence=NULL,
+        center_evidence_key_id=NULL, center_evidence_digest=NULL, finalized_at=NULL
+        WHERE operation_id=${input.operationId}::uuid`.execute(sandbox.db)).rejects.toBeDefined()
+      await expect(saveLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, input.operationId, attempt.attemptNo,
+        Buffer.from('different-late-response'))).rejects.toMatchObject({ code: 'attempt_response_conflict' })
+      await expect(allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(input.operationId, operation.intentDigest, testIdentityJkt, 'query', true)))
+        .rejects.toMatchObject({ code: 'operation_not_pending' })
+
+      const replacement = await createOrLoadActivationOperation(sandbox.db, sandbox.pendingRoot, {
+        ...input, operationId: newLicenseOperationId(),
+      })
+      expect(replacement).toMatchObject({ state: 'pending', created: true })
     })
   })
 
@@ -617,6 +653,16 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
       await markLicenseOperationAttemptSent(source.db, input.operationId, 1)
       const resultJws = Buffer.from(`${'a'.repeat(40)}.${'b'.repeat(40)}.${'c'.repeat(40)}`)
       await saveLicenseOperationResultJws(source.db, source.pendingRoot, input.operationId, 1, resultJws)
+      const centerEvidence = Buffer.from(`${'d'.repeat(40)}.${'e'.repeat(40)}.${'f'.repeat(40)}`)
+      await saveLicenseOperationResponse(source.db, source.pendingRoot, input.operationId, 1, centerEvidence)
+      const encryptedCenterEvidence = await encryptLicensePendingBytes(source.pendingRoot, {
+        operationId: input.operationId, record: 'operation', field: 'center_evidence',
+      }, centerEvidence)
+      await sql`UPDATE local_license_operations SET state='terminal',
+        encrypted_center_evidence=${encryptedCenterEvidence.ciphertext},
+        center_evidence_key_id=${encryptedCenterEvidence.keyId},
+        center_evidence_digest=${createHash('sha256').update(centerEvidence).digest('base64url')},
+        finalized_at=clock_timestamp() WHERE operation_id=${input.operationId}::uuid`.execute(source.db)
       const sourceOperation = await source.db.selectFrom('local_license_operations').selectAll()
         .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
       const sourceAttempt = await source.db.selectFrom('local_license_operation_attempts').selectAll()
@@ -656,10 +702,16 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         await singleInitialActivationAttemptMigration.up(restoredDb)
         await licenseOperationResultArchiveMigration.up(restoredDb)
         await licenseResultArchivePresenceMigration.up(restoredDb)
-        await restoredDb.insertInto('local_license_operations').values(sourceOperation).execute()
-        await sql.raw('ALTER TABLE local_license_operation_attempts DISABLE TRIGGER USER').execute(restoredDb)
-        await restoredDb.insertInto('local_license_operation_attempts').values(sourceAttempt).execute()
-        await sql.raw('ALTER TABLE local_license_operation_attempts ENABLE TRIGGER USER').execute(restoredDb)
+        await licenseOperationTrustedRejectionMigration.up(restoredDb)
+        await restoredDb.transaction().execute(async trx => {
+          await sql.raw('ALTER TABLE local_license_operations DISABLE TRIGGER USER').execute(trx)
+          await sql.raw('ALTER TABLE local_license_operation_attempts DISABLE TRIGGER USER').execute(trx)
+          await trx.insertInto('local_license_operations').values(sourceOperation).execute()
+          await trx.insertInto('local_license_operation_attempts').values(sourceAttempt).execute()
+          await sql.raw('SET CONSTRAINTS ALL IMMEDIATE').execute(trx)
+          await sql.raw('ALTER TABLE local_license_operation_attempts ENABLE TRIGGER USER').execute(trx)
+          await sql.raw('ALTER TABLE local_license_operations ENABLE TRIGGER USER').execute(trx)
+        })
         const sourceKey = join(source.pendingRoot, 'license-pending-aes-256-gcm.json')
         const restoredKey = join(restoredRoot, 'license-pending-aes-256-gcm.json')
         await copyFile(sourceKey, restoredKey)
@@ -672,6 +724,11 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         expect(await readActivationOperationPayload(restoredDb, restoredRoot, input.operationId))
           .toEqual({ activationCode: input.activationCode, origin: input.origin })
         expect(await readLicenseOperationAttemptResultJws(restoredDb, restoredRoot, input.operationId, 1)).toEqual(resultJws)
+        expect(await readLicenseOperationCenterEvidence(restoredDb, restoredRoot, input.operationId)).toEqual(centerEvidence)
+        const released = await createOrLoadActivationOperation(restoredDb, restoredRoot, {
+          ...input, operationId: newLicenseOperationId(),
+        })
+        expect(released).toMatchObject({ state: 'pending', created: true })
         await expect(restoredDb.updateTable('local_license_operation_attempts').set({ result_archived: false })
           .where('operation_id', '=', input.operationId).where('attempt_no', '=', 1).execute()).rejects.toThrow()
 
@@ -735,7 +792,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
           .rejects.toMatchObject({ code: 'pending_decryption_authentication_failed' })
         const retained = await restoredDb.selectFrom('local_license_operations').select('state')
           .where('operation_id', '=', input.operationId).executeTakeFirst()
-        expect(retained?.state).toBe('pending')
+        expect(retained?.state).toBe('terminal')
       } finally {
         await restoredDb.destroy()
         await adminPool.query(`DROP SCHEMA IF EXISTS "${restoredSchema}" CASCADE`)

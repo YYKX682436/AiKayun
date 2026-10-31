@@ -6,6 +6,7 @@ import {
   readLicenseOperationAttemptEnvelope,
   readLicenseOperationAttemptResponse,
   readLicenseOperationAttemptResultJws,
+  readLicenseOperationCenterEvidence,
   readSavedLicenseOperationResponse,
 } from './license-operation-store.js'
 import { loadLicensePendingKey } from './pending-encryption-key.js'
@@ -47,6 +48,10 @@ export async function verifyLicensePendingBackupPair(): Promise<{ operations: nu
       await readLicenseOperationAttemptResultJws(db, config.licensePendingKeyRoot, attempt.operation_id, attempt.attempt_no)
     }
     for (const operation of operations) {
+      const centerEvidence = await readLicenseOperationCenterEvidence(db, config.licensePendingKeyRoot, operation.operation_id)
+      if ((operation.state === 'terminal' || operation.state === 'cancelled') !== (centerEvidence !== null)) {
+        throw new Error('license_pending_restore_check_center_evidence_missing')
+      }
       if (operation.state === 'response_saved') {
         await readSavedLicenseOperationResponse(db, config.licensePendingKeyRoot, operation.operation_id)
       }

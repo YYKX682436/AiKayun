@@ -274,9 +274,30 @@ export async function verifyLicenseOperationReceipt(
   token: unknown,
   input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
 ): Promise<VerifiedOperationEvidence> {
-  const verified = await verifyPurpose(token, { ...input, typ: OPERATION_TYP, claims: OPERATION_CLAIMS })
+  return verifyOperationReceipt(token, input, false)
+}
+
+/** Historical verification is only for recognizing an expired R3 rejection before retrying. */
+export async function verifyExpiredHistoricalOperationReceipt(
+  token: unknown,
+  input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
+): Promise<{ readonly purpose: 'expired_r3_rejection_history'; readonly claims: Readonly<Record<string, unknown>> }> {
+  const verified = await verifyOperationReceipt(token, input, true)
+  return Object.freeze({ purpose: 'expired_r3_rejection_history', claims: verified.claims })
+}
+
+async function verifyOperationReceipt(
+  token: unknown,
+  input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
+  historical: boolean,
+): Promise<VerifiedOperationEvidence> {
+  const verified = await verifyPurpose(token, { ...input, typ: OPERATION_TYP, claims: OPERATION_CLAIMS, allowExpired: historical })
   const claims = verified.claims
   const iat = assertIntegerClaim(claims, 'iat', 1)
+  if (historical && (assertIntegerClaim(claims, 'exp', 1) > input.trustedTime ||
+    claims.state !== 'rejected' || claims.outcome_code !== 'ACTIVATION_AUTHORIZATION_INVALID')) {
+    throw new Error('Invalid historical R3 rejection')
+  }
   if (assertIntegerClaim(claims, 'v') !== 1 || claims.aud !== AUDIENCE || assertIntegerClaim(claims, 'exp', 1) !== iat + 5 * 60 ||
     !['not_found', 'committed', 'rejected', 'cancelled'].includes(String(claims.state))) throw new Error('Invalid license operation receipt')
   assertUuid(claims.sub, 'license id')

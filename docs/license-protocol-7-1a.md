@@ -172,13 +172,17 @@ challenge响应为 `typ=aikayun-license-challenge+jwt` 的JWS，含issuer/audien
 | 可证明未提交 | 同operation continue可执行；DB无commit的事务会回滚，原nonce过期也不妨碍新attempt |
 | query返回not_found | 仅瞬时观测，不能证明迟到请求不会提交；必须continue同operation，由中心锁串行化 |
 | 状态未知/中心不可达 | 本地pending保留，指数退避；不得新建operation或另耗code。已有可信lease到期后只禁新经营 |
-| 已终态rejected/cancelled | 原operation不再继续。用户纠正输入后才可建立新operation；中心先对原op原子终结/围栏，激活码未消费才可使用 |
+| 已终态rejected/cancelled | 原operation不再继续。中心持久化终态须经当前协议的双层回执校验；R3 的 `ACTIVATION_AUTHORIZATION_INVALID` 受限例外按下文本地可信拒绝结案规则处理 |
 
 每个新challenge会产生新server_nonce/client_nonce和递增attempt_no；业务operation_id与intent_digest始终不变。request body的授权业务字段不可改，签名证明、nonce、签名时间、challenge和attempt_no每次更新。对激活码：若原operation未提交/未消费，续接仍使用同一加密pending code；若已提交，operation先命中committed返回结果而不会重新消费code。不能因为普通query一次not_found就另发op。
 
 中心所有变更请求先验HTTP身份签名，再验challenge/nonce；认证后先取operation advisory锁，再按固定顺序取license行锁并查操作/activation/nonce/code。操作结果与终态墓碑在同一事务commit。迟到旧请求与新challenge续接不论哪一个先取同operation锁，都只能产生一条终态；后到者回放终态，若前者回滚则后到者可继续。nonce过期的请求只得retryable拒绝，不持有该nonce提交业务；新attempt必须绑定相同intent_digest与新challenge，业务意图及原attempt证据不能改写。该锁只提供数据库事务内串行，不是阻止客户完整克隆身份的物理防复制措施。
 
-query的not_found不被当作否定执行证明；同operation continue才是恢复活性路径。operation永久幂等墓碑（operation_id、intent_digest、terminal/result摘要）保留至少license生命周期+法务审计期，敏感密文可按规则清除。中心短期nonce按到期清理不影响operation墓碑。
+query的not_found不被当作否定执行证明；同operation continue才是恢复活性路径。R3 对新激活中无效、过期、撤销、已消费或跨license的 activation code 可能在持久化 operation/attempt 前返回签名 `ACTIVATION_AUTHORIZATION_INVALID`：直接 activation 可用 HTTP 409，continue 可用 HTTP 200。商城只在重新验签并绑定原 activation/continue attempt 的原始 JWS 后，才可本地结案；该签名必须绑定原 operation、原 intent、actor、attempt、nonce hash 与 request digest，且 `committed_attempt_no`、committed nonce/digest 和 `result_jws` 全为 null。此例外仅适用于该精确 R3 outcome，不把 HTTP 状态或普通 `not_found` 当拒绝证据。
+
+旧的、已过五分钟验签期限的 R3 无持久化拒绝，可在完整本地历史中用当前可信 resolver 重新验签其签名（忽略的仅是过期时间），并严格确认它是同一 R3 outcome、原 attempt 和无 committed tuple。若之后 query 返回签名 `not_found`，且没有任何已归档业务结果或矛盾 committed 历史，客户端可保持同一 operation/intent，取新 Challenge 后 continue，以请求新的当前拒绝回执。历史 `not_found` 本身从不结案；任何历史签名无效、身份/请求绑定不符、已有 committed 结果或冲突拒绝都阻断恢复及结案。可信拒绝结案必须先加密归档原始 JWS，再在 PostgreSQL 事务中锁定并重新验证完整请求/响应历史，原子写入 `terminal` 与加密证据。终态不可逆、不接收后续业务 attempt，且成功结案解除旧 activation 的本地唯一占位。其他中心持久化拒绝仍须验证外层 receipt 与其 committed `result_jws` 的双层提交证据。
+
+operation永久幂等墓碑（operation_id、intent_digest、terminal/result摘要）保留至少license生命周期+法务审计期，敏感密文可按规则清除。中心短期nonce按到期清理不影响operation墓碑。
 
 操作查询/continue结果外层是 `typ=aikayun-license-operation+jwt` 的标准JWS/JWT，含iss/aud/sub/jti/iat/exp（≤5m）、actor_jkt、operation_id、intent_digest、状态、查询attempt_no/nonce_hash/request_digest、terminal结果摘要；committed时另含原`committed_attempt_no`、原`request_nonce_hash`、原`request_digest`及原response JWS。原lease中的request nonce/digest仍绑定原activation attempt，不能强行改绑或重签延长；客户端先验外层新鲜回执并与本地永久attempt摘要逐项对照，再验内层原lease，然后比较当前generation/revision/拒新事实。未提交操作的签名拒绝结果要明确为terminal或retryable；只有中心在operation锁内记录的terminal状态才可让本地清理pending。
 

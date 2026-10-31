@@ -13,9 +13,9 @@
 
 中心 `queryOperation()` 与 `continueOperation()` 按其真实事务锁序对 operation 和 license 串行化。query 的签名 `not_found` 表示该次线性化查询未找到可见 operation，不能围栏仍可能到达的旧 activation 请求。continue 进入原 activation 处理与同一 operation 锁，最终只允许原 operation 产生一个终态；重放时返回中心持久化的原始 `response_jws`。operation receipt 同时绑定当前 query/continue 的请求元组，以及原始提交 attempt 的编号、nonce hash 和 request digest。
 
-冻结中心对不存在该 actor activation 的 license 会在 `queryOperation()` 的关联身份检查处先返回签名 `not_found`，此时可能尚未读取一个已拒绝的 activation operation。客户端因此检查全部本地历史；本地若有仍有效、完整绑定的中心签名 rejection，会返回这个已验证事实并停止，而不会把 query 的 `not_found` 当成新结论。若历史 rejection 已过验签时限，客户端不推断终态，并保持 fail closed。
+冻结中心对不存在该 actor activation 的 license 会在 `queryOperation()` 的关联身份检查处先返回签名 `not_found`，此时可能尚未读取一个已拒绝的 activation operation。此节描述的历史拒绝读取行为已由 ⑦-1B-2D-2 收窄并扩展：客户端可重新验签完整本地历史中的过期 R3 `ACTIVATION_AUTHORIZATION_INVALID` 回执，并在无任何 committed 结果或矛盾历史时用新 Challenge 继续同一 operation。`not_found` 仅触发同 operation 恢复，绝不构成结案证据。详见 [⑦-1B-2D-2 可信拒绝结案与重新激活](license-client-7-1b-2d-2.md)。
 
-冻结中心 `processActivation()` 对不存在、过期或已消费 activation code 可在写入 operation/attempt 之前返回未签名 HTTP 403。这个结果不具备安全终结原 operation 的证据。商城把 continue attempt 记为 `transport_unknown`，返回内部诊断 `requires_protocol_resolution`，保留 Pending 与活动唯一绑定。
+本阶段冻结中心 `processActivation()` 对不存在、过期或已消费 activation code 的错误仍记为 HTTP 错误边界；⑦-1B-2D-2 冻结的 R3 源码实测到另一受限路径：activation 返回 HTTP 409、continue 返回 HTTP 200，封套中的已签名 `ACTIVATION_AUTHORIZATION_INVALID` 可用于本地可信结案。未签名错误、超时、错误 JWS、其他无 committed tuple 的 outcome 仍然保留 Pending。
 
 ## 唯一 operation、共享 attempt 与发送顺序
 
@@ -41,7 +41,7 @@ query/continue 与原 activation 共用严格连续的 `attempt_no`。每一请�
 
 当前有效 lease 只有再次通过 current lease verifier 才会标记为 `current_lease`。过期 lease 只作为历史事实，返回 `historical_only`；若旧签名 key 已过正常验签保留期限，当前有效的中心 operation receipt 对其原始 `result_jws` 的精确绑定只证明历史提交，不将旧 lease 当作经营凭证。恢复接口的证据类型没有 `allow`、`grants` 或投影字段，并始终 `projected: false`。
 
-rejected/cancelled 只有完整验证并绑定的中心签名终态证据才可对外作为操作事实。直接 activation rejection 回执必须绑定原 activation attempt；历史响应超出正常验签时限时不会仅凭 JWS 外观断言终态。恢复流程不更新父 operation 的 terminal/cancelled/projected 状态、不删除激活码、不增加 generation、不清理 Pending，也不授予经营许可。
+rejected/cancelled 只有完整验证并绑定的中心签名终态证据才可对外作为操作事实。⑦-1B-2D-2 为失败 activation 增加本地 terminal 结案：直接或 continue 的 R3 无持久化拒绝只接受 `ACTIVATION_AUTHORIZATION_INVALID`，从本地持久化 JWS 和原始请求历史重新验签，不信任调用方布尔值；其他持久化业务拒绝仍需外层回执及 committed `result_jws` 双层校验。终态证据加密写入现有 operation 行，不开放经营许可、权益投影或订单门禁。
 
 ## 状态机与失败边界
 
@@ -59,7 +59,7 @@ rejected/cancelled 只有完整验证并绑定的中心签名终态证据才可�
 
 continue 只解决 query 线性化之后可能仍在途的原 activation 与原 operation 竞争；它不构成激活码错误的绕过。每次 API 调用最多一个 query，及可选一个 continue；没有无限自动循环、后台 worker 或定时器。所有新请求使用新的 Challenge 与 attempt，绝不重发崩溃前的 activation envelope。
 
-`requires_protocol_resolution` 是已知边界：中心未对无效、过期或已消费激活码提供可验证的终态 403 时，商城无法证明 operation 终结。操作、业务意图和激活码占位保持原样；not_found 不转成 terminal，不删唯一索引，不创建新 operation。后续中心最小协议修订建议：在同 operation 锁内，把确定性 code rejection 作为 `rejected` operation、`terminal_reject` attempt 与原始签名结果原子提交；query 对已经绑定的 actor/operation 在无 active activation 时也应能返回该终态。临时/基础设施错误仍应可由新 Challenge 续接。
+在 ⑦-1B-2D-2 的冻结中心 R3 范围内，签名 `ACTIVATION_AUTHORIZATION_INVALID` 是无持久化拒绝的精确例外；若历史回执已过期且 query 返回签名 `not_found`，客户端可继续原 operation 并请求新回执。`not_found` 本身永不结案。对其它无签名或不能严格绑定的错误，Pending 和原占位仍保持不变。
 
 ## 修改与限制
 

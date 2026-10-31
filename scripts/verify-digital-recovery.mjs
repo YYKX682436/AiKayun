@@ -122,7 +122,14 @@ try {
     assert.ok(line, 'license result archive missing from fixture')
     return Buffer.from(line.slice('RESULT_JWS='.length), 'base64url')
   }
-  const originalResultJws = fixtureResult(compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'seed'))
+  const fixtureCenterEvidence = output => {
+    const line = output.split('\n').find(value => value.startsWith('CENTER_EVIDENCE='))
+    assert.ok(line, 'terminal center evidence missing from fixture')
+    return Buffer.from(line.slice('CENTER_EVIDENCE='.length), 'base64url')
+  }
+  const seededLicensePending = compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'seed')
+  const originalResultJws = fixtureResult(seededLicensePending)
+  const originalCenterEvidence = fixtureCenterEvidence(seededLicensePending)
   assert.ok(!compose('logs', 'api').includes(pendingActivationCode), 'activation code leaked to API logs')
   const trustFixtureOutput = compose('exec', '-T', 'api', 'node', '/app/trust-store-compose-restore.mjs', 'import')
   const trustFixtureLine = trustFixtureOutput.split('\n').find(line => line.startsWith('TRUST_STORE_FIXTURE='))
@@ -285,7 +292,9 @@ try {
     const newId = compose('ps', '-q', service).trim()
     assert.notEqual(newId, oldId)
     await ready()
-    assert.deepEqual(fixtureResult(compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'verify')), originalResultJws)
+    const verifiedLicensePending = compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'verify')
+    assert.deepEqual(fixtureResult(verifiedLicensePending), originalResultJws)
+    assert.deepEqual(fixtureCenterEvidence(verifiedLicensePending), originalCenterEvidence)
     await verifyDownload()
     assert.equal(snapshot(), facts)
     proof.sigkill.push({ service, replaced: true, historyIdentical: true, sha256: digest })
@@ -306,7 +315,9 @@ ${await readFile(join(directory, 'backup', backups[0], 'SHA256SUMS'), 'utf8')}`
   assert.equal(missing.status, 410)
   command('bash', ['scripts/restore-test-compose-data.sh', join(directory, 'backup', backups[0])], { env: { ...env, ALLOW_TEST_DATABASE_RESTORE: 'YES' } })
   await ready()
-  assert.deepEqual(fixtureResult(compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'verify')), originalResultJws)
+  const restoredLicensePending = compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'verify')
+  assert.deepEqual(fixtureResult(restoredLicensePending), originalResultJws)
+  assert.deepEqual(fixtureCenterEvidence(restoredLicensePending), originalCenterEvidence)
   const restoredTrustMarker = compose('exec', '-T', 'api', 'node', '-e', `process.stdout.write(require('node:fs').readFileSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'),'utf8').trim())`).trim()
   assert.equal(restoredTrustMarker, trustStoreMarker)
   const trustRestoreOutput = compose('exec', '-T', '-e', `TRUST_STORE_TEST_FIXTURE=${JSON.stringify(trustFixture)}`,

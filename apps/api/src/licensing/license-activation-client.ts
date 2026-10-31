@@ -32,6 +32,7 @@ import { fetchTrustedTimeAnchor } from './trust/time-anchor-client.js'
 import { TrustBundleStore } from './trust/trust-bundle-store.js'
 import type { TrustedReleaseLicenseConfig } from './trusted-release-config.js'
 import { parseStrictJson } from './strict-json.js'
+import { finalizeTrustedActivationRejection } from './license-operation-recovery-client.js'
 
 const REQUEST_HEADER_NAMES = [
   'accept', 'connection', 'content-digest', 'content-length', 'content-type', 'host', 'signature', 'signature-input',
@@ -97,6 +98,9 @@ export type LicenseActivationCheckpoint =
   | 'after_http_response'
   | 'before_response_save'
   | 'after_response_saved'
+  | 'before_terminal_evidence_commit'
+  | 'after_terminal_row_update'
+  | 'after_terminal_evidence_commit'
 
 function fail(code: string): never {
   throw new LicenseActivationClientError(code)
@@ -534,6 +538,24 @@ export function createLicenseActivationClient(options: LicenseActivationClientOp
           const latestBundle = await options.trustStore.getAccepted(responseSample.assertFresh)
           assertTrustBundleUnchanged(accepted.artifactSha256, latestBundle.artifactSha256)
           await assertCurrentOperationAndIdentity(options, operation, identity, true)
+          if (verified.purpose === 'verified_activation_rejection_unprojected' &&
+            verified.outcomeCode === 'ACTIVATION_AUTHORIZATION_INVALID') {
+            await finalizeTrustedActivationRejection({
+              options: {
+                db: options.db,
+                pool: options.pool,
+                identityRoot: options.identityRoot,
+                pendingKeyRoot: options.pendingKeyRoot,
+                releaseConfig: options.releaseConfig,
+                trustStore: options.trustStore,
+                ...(options.testTls === undefined ? {} : { testTls: options.testTls }),
+              },
+              operationId,
+              evidenceAttemptNo: attempt.attemptNo,
+              readTrustedTime: () => responseSample.assertFresh(),
+              checkpoint,
+            })
+          }
           return verified
         })
       } catch (error) {

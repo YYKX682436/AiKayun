@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly center_commit='6f554b51b867a15ad7747c6d002b548e016f65c6'
+readonly center_commit='a5cf99439e3bf92b65f19d60c013bca088cf221a'
 readonly center_repository='https://github.com/YYKX682436/AiKayun-License.git'
 readonly postgres_image='postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873'
 readonly database_name='aikayun_3c2b_test'
