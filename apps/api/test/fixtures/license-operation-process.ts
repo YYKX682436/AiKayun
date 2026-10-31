@@ -69,7 +69,7 @@ function attemptInput(fixed: boolean, purpose: 'activation' | 'query' = 'activat
 
 if (mode === 'restore-check') {
   const result = await verifyLicensePendingBackupPair()
-  process.stdout.write(`verified operations=${result.operations} attempts=${result.attempts}\n`)
+  process.stdout.write(`verified operations=${result.operations} attempts=${result.attempts} projections=${result.projections}\n`)
 } else if (mode === 'commit-operation') {
   await createOrLoadActivationOperation(db, pendingRoot, input)
   process.kill(process.pid, 'SIGKILL')

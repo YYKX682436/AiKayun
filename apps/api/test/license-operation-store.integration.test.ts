@@ -15,6 +15,7 @@ import { licenseOperationResultArchiveMigration } from '../src/db/migrations/202
 import { licenseResultArchivePresenceMigration } from '../src/db/migrations/202610300004_license_result_archive_presence.js'
 import { licenseOperationTrustedRejectionMigration } from '../src/db/migrations/202610310001_license_operation_trusted_rejection.js'
 import { licenseOperationRecoveryAttemptsMigration } from '../src/db/migrations/202610310002_license_operation_recovery_attempts.js'
+import { instanceLicenseStateMigration } from '../src/db/migrations/202610310003_instance_license_state.js'
 import { buildRecoveryIntent, ed25519IdentityJkt } from '../src/licensing/license-intent.js'
 import {
   allocateLicenseOperationAttempt,
@@ -100,6 +101,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
     await licenseResultArchivePresenceMigration.up(db)
     await licenseOperationTrustedRejectionMigration.up(db)
     await licenseOperationRecoveryAttemptsMigration.up(db)
+    await instanceLicenseStateMigration.up(db)
     const pendingRoot = await mkdtemp(join(tmpdir(), 'aikayun-license-pending-pg-'))
     pendingRoots.add(pendingRoot)
     await initializeTemporaryLicensePendingKey(pendingRoot, 'test')
@@ -779,10 +781,31 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         center_evidence_key_id=${encryptedCenterEvidence.keyId},
         center_evidence_digest=${createHash('sha256').update(centerEvidence).digest('base64url')},
         finalized_at=clock_timestamp() WHERE operation_id=${input.operationId}::uuid`.execute(source.db)
+      const encryptedProjection = await encryptLicensePendingBytes(source.pendingRoot, {
+        operationId: input.operationId, attemptNo: 1, record: 'attempt', field: 'projection_lease_jws',
+      }, centerEvidence)
+      await source.db.updateTable('instance_license_state').set({
+        license_id: input.licenseId,
+        database_id: input.databaseId,
+        instance_id: input.instanceId,
+        identity_jkt: input.identityJkt,
+        activation_generation: '1',
+        entitlement_revision: '1',
+        credential_jti: randomUUID(),
+        credential_issued_at: '1800000000',
+        credential_expires_at: '1800000100',
+        credential_operation_id: input.operationId,
+        credential_attempt_no: 1,
+        credential_jws_digest: createHash('sha256').update(centerEvidence).digest('base64url'),
+        credential_encryption_key_id: encryptedProjection.keyId,
+        encrypted_credential_jws: encryptedProjection.ciphertext,
+      }).where('singleton', '=', true).execute()
       const sourceOperation = await source.db.selectFrom('local_license_operations').selectAll()
         .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
       const sourceAttempt = await source.db.selectFrom('local_license_operation_attempts').selectAll()
         .where('operation_id', '=', input.operationId).where('attempt_no', '=', 1).executeTakeFirstOrThrow()
+      const sourceProjection = await source.db.selectFrom('instance_license_state').selectAll()
+        .where('singleton', '=', true).executeTakeFirstOrThrow()
 
       const restoredSchema = `license_pending_restore_${randomUUID().replaceAll('-', '')}`
       schemas.add(restoredSchema)
@@ -820,11 +843,37 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         await licenseResultArchivePresenceMigration.up(restoredDb)
         await licenseOperationTrustedRejectionMigration.up(restoredDb)
         await licenseOperationRecoveryAttemptsMigration.up(restoredDb)
+        await instanceLicenseStateMigration.up(restoredDb)
         await restoredDb.transaction().execute(async trx => {
           await sql.raw('ALTER TABLE local_license_operations DISABLE TRIGGER USER').execute(trx)
           await sql.raw('ALTER TABLE local_license_operation_attempts DISABLE TRIGGER USER').execute(trx)
           await trx.insertInto('local_license_operations').values(sourceOperation).execute()
           await trx.insertInto('local_license_operation_attempts').values(sourceAttempt).execute()
+          await trx.updateTable('instance_license_state').set({
+            license_id: sourceProjection.license_id,
+            database_id: sourceProjection.database_id,
+            instance_id: sourceProjection.instance_id,
+            identity_jkt: sourceProjection.identity_jkt,
+            activation_generation: sourceProjection.activation_generation,
+            entitlement_revision: sourceProjection.entitlement_revision,
+            credential_jti: sourceProjection.credential_jti,
+            credential_issued_at: sourceProjection.credential_issued_at,
+            credential_expires_at: sourceProjection.credential_expires_at,
+            credential_operation_id: sourceProjection.credential_operation_id,
+            credential_attempt_no: sourceProjection.credential_attempt_no,
+            credential_jws_digest: sourceProjection.credential_jws_digest,
+            credential_encryption_key_id: sourceProjection.credential_encryption_key_id,
+            encrypted_credential_jws: sourceProjection.encrypted_credential_jws,
+            refusal_status: sourceProjection.refusal_status,
+            refusal_generation: sourceProjection.refusal_generation,
+            refusal_revision: sourceProjection.refusal_revision,
+            refusal_current_generation: sourceProjection.refusal_current_generation,
+            refusal_operation_id: sourceProjection.refusal_operation_id,
+            refusal_attempt_no: sourceProjection.refusal_attempt_no,
+            refusal_jws_digest: sourceProjection.refusal_jws_digest,
+            refusal_encryption_key_id: sourceProjection.refusal_encryption_key_id,
+            encrypted_refusal_jws: sourceProjection.encrypted_refusal_jws,
+          }).where('singleton', '=', true).execute()
           await sql.raw('SET CONSTRAINTS ALL IMMEDIATE').execute(trx)
           await sql.raw('ALTER TABLE local_license_operation_attempts ENABLE TRIGGER USER').execute(trx)
           await sql.raw('ALTER TABLE local_license_operations ENABLE TRIGGER USER').execute(trx)
@@ -836,12 +885,18 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
 
         const check = await runChild({ schema: restoredSchema, pendingRoot: restoredRoot } as Sandbox, 'restore-check', input)
         expect(check.code).toBe(0)
-        expect(check.stdout).toContain('verified operations=1 attempts=1')
+        expect(check.stdout).toContain('verified operations=1 attempts=1 projections=1')
         expect(check.stdout).not.toContain(input.activationCode)
         expect(await readActivationOperationPayload(restoredDb, restoredRoot, input.operationId))
           .toEqual({ activationCode: input.activationCode, origin: input.origin })
         expect(await readLicenseOperationAttemptResultJws(restoredDb, restoredRoot, input.operationId, 1)).toEqual(resultJws)
         expect(await readLicenseOperationCenterEvidence(restoredDb, restoredRoot, input.operationId)).toEqual(centerEvidence)
+        const restoredProjection = await restoredDb.selectFrom('instance_license_state').selectAll()
+          .where('singleton', '=', true).executeTakeFirstOrThrow()
+        expect(restoredProjection).toMatchObject({
+          license_id: input.licenseId, activation_generation: '1', entitlement_revision: '1',
+          credential_jws_digest: createHash('sha256').update(centerEvidence).digest('base64url'),
+        })
         const released = await createOrLoadActivationOperation(restoredDb, restoredRoot, {
           ...input, operationId: newLicenseOperationId(),
         })
@@ -889,6 +944,14 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
           }).where('operation_id', '=', input.operationId).where('attempt_no', '=', 1).execute()
         }
         await sql.raw('ALTER TABLE local_license_operation_attempts ENABLE TRIGGER USER').execute(restoredDb)
+        const corruptProjection = Buffer.from(sourceProjection.encrypted_credential_jws!)
+        corruptProjection[corruptProjection.length - 1] = corruptProjection[corruptProjection.length - 1]! ^ 1
+        await restoredDb.updateTable('instance_license_state').set({ encrypted_credential_jws: corruptProjection })
+          .where('singleton', '=', true).execute()
+        const corruptProjectionCheck = await runChild({ schema: restoredSchema, pendingRoot: restoredRoot }, 'restore-check', input)
+        expect(corruptProjectionCheck.code).not.toBe(0)
+        await restoredDb.updateTable('instance_license_state').set({ encrypted_credential_jws: sourceProjection.encrypted_credential_jws })
+          .where('singleton', '=', true).execute()
 
         const missingRoot = await mkdtemp(join(tmpdir(), 'aikayun-license-pending-missing-'))
         pendingRoots.add(missingRoot)

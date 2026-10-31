@@ -270,7 +270,24 @@ export async function verifyLicenseChallenge(
   input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
 ): Promise<VerifiedChallengeEvidence> {
   const verified = await verifyPurpose(token, { ...input, typ: CHALLENGE_TYP, claims: CHALLENGE_CLAIMS })
-  const claims = verified.claims
+  return validateChallengeEvidence(verified.header, verified.claims)
+}
+
+/** Historical challenge validation is for replaying the immutable request history of a saved result. */
+export async function verifyExpiredHistoricalLicenseChallenge(
+  token: unknown,
+  input: { resolver: TrustedSigningKeyResolver; issuer: string; trustedTime: number },
+): Promise<VerifiedChallengeEvidence> {
+  const verified = await verifyPurpose(token, {
+    ...input, typ: CHALLENGE_TYP, claims: CHALLENGE_CLAIMS, allowExpired: true,
+  })
+  if (assertIntegerClaim(verified.claims, 'exp', 1) > input.trustedTime) {
+    throw new Error('Historical challenge has not expired')
+  }
+  return validateChallengeEvidence(verified.header, verified.claims)
+}
+
+function validateChallengeEvidence(header: Record<string, unknown>, claims: Record<string, unknown>): VerifiedChallengeEvidence {
   const iat = assertIntegerClaim(claims, 'iat', 1)
   if (assertIntegerClaim(claims, 'v') !== 1 || claims.aud !== AUDIENCE || assertIntegerClaim(claims, 'exp', 1) !== iat + 5 * 60 ||
     !challengeOperations.includes(claims.operation as typeof challengeOperations[number])) throw new Error('Invalid license challenge')
@@ -284,7 +301,7 @@ export async function verifyLicenseChallenge(
   assertDigest(claims.server_nonce, 'server nonce')
   return Object.freeze({
     purpose: 'license_challenge',
-    signingKeyId: assertStringClaim(verified.header, 'kid', 43),
+    signingKeyId: assertStringClaim(header, 'kid', 43),
     claims: Object.freeze({ ...claims }),
     signatureVerified: true,
   })

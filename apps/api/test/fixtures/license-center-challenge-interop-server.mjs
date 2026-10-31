@@ -244,6 +244,9 @@ try {
     }
     return reply.code(200).send({ activation_code: issued.activationCode })
   })
+  app.post('/__test/issue-activation-scenario', async (_request, reply) => {
+    return reply.code(200).send(await issueActivationScenario())
+  })
   app.post('/__test/renew-license', async (request, reply) => {
     const body = request.body
     if (!body || typeof body !== 'object' || typeof body.license_id !== 'string') {
@@ -290,6 +293,22 @@ try {
       ...input, confirmedRequestDigest: changeLicenseStatusRequestDigest(input, 'license_revoke'),
     })
     return reply.code(200).send({ state: result.state, outcome_code: result.outcomeCode })
+  })
+  app.post('/__test/restore-license', async (request, reply) => {
+    const body = request.body
+    if (!body || typeof body !== 'object' || typeof body.license_id !== 'string') {
+      return reply.code(400).send({ error: 'invalid test request' })
+    }
+    const license = await db.selectFrom('licenses').select(['id', 'revision'])
+      .where('id', '=', body.license_id).executeTakeFirst()
+    if (!license) return reply.code(404).send({ error: 'test license not found' })
+    const input = { operationId: randomUUID(), licenseId: license.id,
+      expectedRevision: license.revision.toString(), reason: '隔离恢复互操作测试恢复权益' }
+    const result = await licenseAdmin.restoreLicense({
+      ...input, confirmedRequestDigest: changeLicenseStatusRequestDigest(input, 'license_restore'),
+    })
+    return reply.code(200).send({ state: result.state, outcome_code: result.outcomeCode,
+      revision: result.resultRevision, entitlement_revision: result.result.entitlement_revision })
   })
   app.post('/__test/supersede-license', async (request, reply) => {
     const body = request.body

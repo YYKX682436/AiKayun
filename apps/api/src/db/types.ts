@@ -95,6 +95,34 @@ export interface LocalLicenseOperationAttemptsTable {
   created_at: Generated<Date>
 }
 
+export interface InstanceLicenseStateTable {
+  singleton: Generated<boolean>
+  license_id: string | null
+  database_id: string | null
+  instance_id: string | null
+  identity_jkt: string | null
+  activation_generation: string | null
+  entitlement_revision: string | null
+  credential_jti: string | null
+  credential_issued_at: string | null
+  credential_expires_at: string | null
+  credential_operation_id: string | null
+  credential_attempt_no: number | null
+  credential_jws_digest: string | null
+  credential_encryption_key_id: string | null
+  encrypted_credential_jws: Buffer | null
+  refusal_status: 'revoked' | 'superseded' | null
+  refusal_generation: string | null
+  refusal_revision: string | null
+  refusal_current_generation: string | null
+  refusal_operation_id: string | null
+  refusal_attempt_no: number | null
+  refusal_jws_digest: string | null
+  refusal_encryption_key_id: string | null
+  encrypted_refusal_jws: Buffer | null
+  updated_at: Generated<Date>
+}
+
 export interface AdminProductCreationRequestsTable {
   idempotency_key: string
   administrator_id: string
@@ -1448,6 +1476,7 @@ export interface Database {
   installation_binding: InstallationBindingTable
   local_license_operations: LocalLicenseOperationsTable
   local_license_operation_attempts: LocalLicenseOperationAttemptsTable
+  instance_license_state: InstanceLicenseStateTable
   admin_users: AdminUsersTable
   admin_sessions: AdminSessionsTable
   admin_product_creation_requests: AdminProductCreationRequestsTable

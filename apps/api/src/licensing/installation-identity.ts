@@ -107,6 +107,7 @@ const identityMetadataTables = new Set([
   'kysely_migration_lock',
   'installation_identity_initializations',
   'installation_binding',
+  'instance_license_state',
 ])
 const defaultBootstrapRows: Record<string, Record<string, unknown>> = {
   storefront_customer_policy: {

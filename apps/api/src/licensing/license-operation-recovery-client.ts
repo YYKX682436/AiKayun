@@ -10,7 +10,7 @@ import {
 import { sql, type Kysely } from 'kysely'
 import { Client } from 'pg'
 import type { Pool } from 'pg'
-import type { Database, LocalLicenseOperationAttemptsTable } from '../db/types.js'
+import type { Database, LocalLicenseAttemptPurpose, LocalLicenseAttemptSendState, LocalLicenseOperationAttemptsTable } from '../db/types.js'
 import {
   LICENSE_CHALLENGE_PATH,
   LICENSE_LEASE_RENEW_PATH,
@@ -668,6 +668,89 @@ async function validateRecoveryOperationHistory(input: {
     }))
   }
   return Object.freeze({ operation, payload, attempts: Object.freeze(attempts) })
+}
+
+export interface PersistedLicenseProjectionHistory {
+  readonly operationId: string
+  readonly operationKind: 'activation' | 'recovery'
+  readonly intentDigest: string
+  readonly licenseId: string
+  readonly databaseId: string
+  readonly instanceId: string
+  readonly identityJkt: string
+  readonly expectedGeneration: string | null
+  readonly recoveryPayload: RecoveryOperationPayload | null
+  readonly attempts: readonly Readonly<{
+    attemptNo: number
+    purpose: LocalLicenseAttemptPurpose
+    sendState: LocalLicenseAttemptSendState
+    requestDigest: string
+    requestNonceHash: string
+    clientNonceHash: string
+    signatureCreatedAt: Date
+    challengeToken: string
+    response: Buffer | null
+    archivedResult: Buffer | null
+  }>[]
+}
+
+/**
+ * Rebuilds a persisted activation/recovery request history for the projection writer.
+ * The returned JWS bytes are still untrusted and must be reverified by that writer.
+ */
+export async function readPersistedLicenseProjectionHistory(input: {
+  options: LicenseOperationRecoveryClientOptions
+  operationId: string
+  identity: { databaseId: string; instanceId: string; identityJkt: string }
+}): Promise<PersistedLicenseProjectionHistory> {
+  const { options } = input
+  const parent = await options.db.selectFrom('local_license_operations').selectAll()
+    .where('operation_id', '=', input.operationId).executeTakeFirst()
+  if (!parent || !['activation', 'recovery'].includes(parent.kind) || parent.state !== 'response_saved' ||
+    parent.database_id !== input.identity.databaseId || parent.instance_id !== input.identity.instanceId ||
+    parent.identity_jkt !== input.identity.identityJkt || parent.expected_generation !== null && parent.kind === 'activation') {
+    fail('license_projection_operation_unavailable')
+  }
+  const identity = input.identity
+  const history = parent.kind === 'activation'
+    ? await validateOperationHistory({
+      db: options.db, pool: options.pool, pendingKeyRoot: options.pendingKeyRoot,
+      operationId: input.operationId, issuer: options.releaseConfig.expected_center_issuer,
+      centerOrigin: new URL(options.releaseConfig.expected_center_origin), identity,
+    })
+    : await validateRecoveryOperationHistory({
+      db: options.db, pendingKeyRoot: options.pendingKeyRoot,
+      operationId: input.operationId, issuer: options.releaseConfig.expected_center_issuer,
+      centerOrigin: new URL(options.releaseConfig.expected_center_origin), identity,
+    })
+  const pointer = history.attempts.find(attempt => attempt.row.attempt_no === parent.response_attempt_no)
+  if (!pointer?.response || pointer.row.response_digest !== parent.response_digest ||
+    pointer.row.response_saved_at?.getTime() !== parent.response_saved_at?.getTime()) {
+    fail('license_projection_response_pointer_invalid')
+  }
+  return Object.freeze({
+    operationId: history.operation.operationId,
+    operationKind: parent.kind as 'activation' | 'recovery',
+    intentDigest: history.operation.intentDigest,
+    licenseId: history.operation.licenseId,
+    databaseId: history.operation.databaseId,
+    instanceId: history.operation.instanceId,
+    identityJkt: history.operation.identityJkt,
+    expectedGeneration: parent.expected_generation,
+    recoveryPayload: parent.kind === 'recovery' ? (history as ValidatedRecoveryOperationHistory).payload : null,
+    attempts: Object.freeze(history.attempts.map(attempt => Object.freeze({
+      attemptNo: attempt.row.attempt_no,
+      purpose: attempt.row.purpose,
+      sendState: String(attempt.row.send_state) as LocalLicenseAttemptSendState,
+      requestDigest: attempt.row.request_body_digest,
+      requestNonceHash: attempt.row.request_nonce_hash,
+      clientNonceHash: attempt.row.client_nonce_hash,
+      signatureCreatedAt: attempt.row.signature_created_at,
+      challengeToken: String(attempt.requestBodyClaims.challenge),
+      response: attempt.response,
+      archivedResult: attempt.archivedResult,
+    }))),
+  })
 }
 
 function createTestAnchorOptions(testTls: TestLicenseTlsOptions | undefined) {
