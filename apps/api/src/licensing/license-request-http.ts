@@ -11,6 +11,7 @@ import { ByteSequence, parseDictionary, serializeDictionary } from 'structured-h
 
 export const LICENSE_CHALLENGE_PATH = '/v1/challenges'
 export const LICENSE_ACTIVATION_PATH = '/v1/activations'
+export const LICENSE_LEASE_RENEW_PATH = '/v1/leases/renew'
 export const LICENSE_OPERATION_QUERY_PATH = '/v1/operations/query'
 export const LICENSE_OPERATION_CONTINUE_PATH = '/v1/operations/continue'
 export const LICENSE_REQUEST_TIMEOUT_MS = 5_000
@@ -19,7 +20,7 @@ export const LICENSE_RESPONSE_BODY_LIMIT = 16 * 1024
 export const LICENSE_SIGNED_COMPONENTS = ['@method', '@target-uri', 'content-type', 'content-digest'] as const
 
 export type LicenseRequestPath = typeof LICENSE_CHALLENGE_PATH | typeof LICENSE_ACTIVATION_PATH |
-  typeof LICENSE_OPERATION_QUERY_PATH | typeof LICENSE_OPERATION_CONTINUE_PATH
+  typeof LICENSE_LEASE_RENEW_PATH | typeof LICENSE_OPERATION_QUERY_PATH | typeof LICENSE_OPERATION_CONTINUE_PATH
 
 export interface LicenseRequestIdentity {
   readonly identityJkt: string

@@ -73,3 +73,39 @@ export function buildActivationIntent(input: ActivationIntentInput): {
   if (typeof canonicalIntent !== 'string') throw new LicenseIntentError('activation_intent_canonicalization_failed')
   return { intentDigest: sha256Base64url(canonicalIntent), activationCodeSha256: activationCodeHash, canonicalIntent }
 }
+
+export interface RecoveryIntentInput {
+  licenseId: string
+  databaseId: string
+  instanceId: string
+  identityJkt: string
+  expectedGeneration: string
+  knownRevision: string
+  recoveryOfOperationId: string
+}
+
+/** Matches the authorization center's renewalIntentDigest(kind='recovery') field-for-field. */
+export function buildRecoveryIntent(input: RecoveryIntentInput): { intentDigest: string; canonicalIntent: string } {
+  const decimal = /^[1-9][0-9]{0,18}$/u
+  if (!decimal.test(input.expectedGeneration) || !decimal.test(input.knownRevision) ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(input.licenseId) ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(input.databaseId) ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(input.instanceId) ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(input.recoveryOfOperationId) ||
+    !/^[A-Za-z0-9_-]{43}$/u.test(input.identityJkt)) {
+    throw new LicenseIntentError('invalid_recovery_intent')
+  }
+  const canonicalIntent = canonicalize({
+    v: 1,
+    kind: 'recovery',
+    license_id: input.licenseId,
+    database_id: input.databaseId,
+    instance_id: input.instanceId,
+    identity_jkt: input.identityJkt,
+    expected_generation: input.expectedGeneration,
+    known_revision: input.knownRevision,
+    recovery_of_operation_id: input.recoveryOfOperationId,
+  })
+  if (typeof canonicalIntent !== 'string') throw new LicenseIntentError('recovery_intent_canonicalization_failed')
+  return { intentDigest: sha256Base64url(canonicalIntent), canonicalIntent }
+}

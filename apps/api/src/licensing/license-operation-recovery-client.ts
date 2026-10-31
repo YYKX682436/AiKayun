@@ -13,6 +13,7 @@ import type { Pool } from 'pg'
 import type { Database, LocalLicenseOperationAttemptsTable } from '../db/types.js'
 import {
   LICENSE_CHALLENGE_PATH,
+  LICENSE_LEASE_RENEW_PATH,
   LICENSE_OPERATION_CONTINUE_PATH,
   LICENSE_OPERATION_QUERY_PATH,
   createSignedLicenseRequest,
@@ -21,6 +22,8 @@ import {
 import type { TestLicenseTlsOptions } from './license-request-http.js'
 import {
   readActivationOperationPayload,
+  readRecoveryOperationPayload,
+  createOrLoadRecoveryOperation,
   readLicenseOperationAttemptEnvelope,
   readLicenseOperationAttemptResponse,
   readLicenseOperationAttemptResultJws,
@@ -30,10 +33,11 @@ import {
   markLicenseOperationAttemptSent,
   markLicenseOperationAttemptTransportResult,
 } from './license-operation-store.js'
+import type { RecoveryOperationPayload } from './license-operation-store.js'
 import { LocalLicenseOperationError } from './license-operation-store.js'
 import type { PendingActivationOperation } from './license-challenge-client.js'
 import { readPendingActivationOperation } from './license-challenge-client.js'
-import { ed25519IdentityJkt, sha256Base64url } from './license-intent.js'
+import { buildRecoveryIntent, ed25519IdentityJkt, sha256Base64url } from './license-intent.js'
 import { withVerifiedInstallationSigningContext } from './installation-identity.js'
 import { fetchTrustedTimeAnchor } from './trust/time-anchor-client.js'
 import type { TrustedTimeSample } from './trust/time-anchor-client.js'
@@ -44,6 +48,7 @@ import {
   verifyExpiredHistoricalLease,
   verifyExpiredHistoricalOperationReceipt,
   verifyLicenseOperationReceipt,
+  verifyLicenseStatusReceipt,
 } from './trust/evidence.js'
 import type { TrustedReleaseLicenseConfig } from './trusted-release-config.js'
 import { parseStrictJson } from './strict-json.js'
@@ -120,9 +125,41 @@ export interface RecoveredActivationOperation {
   readonly continuation: VerifiedOperationRecoveryEvidence | null
 }
 
+export type VerifiedCurrentLeaseRecoveryEvidence = Readonly<{
+  purpose: 'verified_current_lease_recovery_unprojected'
+  sourceOperationId: string
+  recoveryOperationId: string
+  licenseId: string
+  databaseId: string
+  instanceId: string
+  identityJkt: string
+  activationGeneration: string
+  entitlementRevision: string
+  requestAttemptNo: number
+  resultJwsDigest: string
+  signatureVerified: true
+  projected: false
+}>
+
+export type VerifiedRecoveryStatusEvidence = Readonly<{
+  purpose: 'verified_recovery_status_unprojected' | 'verified_recovery_rejection_unprojected'
+  sourceOperationId: string
+  recoveryOperationId: string
+  licenseId: string
+  identityJkt: string
+  requestAttemptNo: number
+  state: 'rejected'
+  outcomeCode: string
+  resultJwsDigest: string
+  signatureVerified: true
+  projected: false
+}>
+
+export type LicenseRecoveryOperationResult = VerifiedCurrentLeaseRecoveryEvidence | VerifiedRecoveryStatusEvidence
+
 interface BoundRecoveryChallenge {
   readonly purpose: 'verified_bound_operation_recovery_challenge'
-  readonly operation: 'query' | 'continue'
+  readonly operation: 'query' | 'continue' | 'recovery'
   readonly token: string
   readonly signingKeyId: string
   readonly clientNonce: string
@@ -143,11 +180,18 @@ interface ValidatedHistoricalAttempt {
   readonly archivedResult: Buffer | null
 }
 
-interface ValidatedOperationHistory {
-  readonly operation: PendingActivationOperation
+interface ValidatedOperationHistory extends OperationHistoryBase {
   readonly activationCode: string
   readonly origin: string | null
+}
+
+interface OperationHistoryBase {
+  readonly operation: PendingActivationOperation
   readonly attempts: readonly ValidatedHistoricalAttempt[]
+}
+
+interface ValidatedRecoveryOperationHistory extends OperationHistoryBase {
+  readonly payload: RecoveryOperationPayload
 }
 
 function fail(code: string): never {
@@ -158,6 +202,55 @@ function canonicalNonce(value: unknown): value is string {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{43}$/u.test(value)) return false
   const bytes = Buffer.from(value, 'base64url')
   return bytes.byteLength === 32 && bytes.toString('base64url') === value
+}
+
+async function readPendingRecoveryBinding(
+  options: LicenseOperationRecoveryClientOptions,
+  operationId: string,
+  identity: { databaseId: string; instanceId: string; identityJkt: string },
+): Promise<PendingActivationOperation> {
+  const row = await options.db.selectFrom('local_license_operations').selectAll()
+    .where('operation_id', '=', operationId).executeTakeFirst()
+  if (!row || row.kind !== 'recovery' || !['pending', 'response_saved'].includes(row.state) ||
+    row.expected_generation === null || row.database_id !== identity.databaseId ||
+    row.instance_id !== identity.instanceId || row.identity_jkt !== identity.identityJkt) {
+    fail('recovery_operation_unavailable')
+  }
+  const payload = await readRecoveryOperationPayload(options.db, options.pendingKeyRoot, operationId)
+  const reconstructed = buildRecoveryIntent({
+    licenseId: row.license_id,
+    databaseId: row.database_id,
+    instanceId: row.instance_id,
+    identityJkt: row.identity_jkt,
+    expectedGeneration: payload.expectedGeneration,
+    knownRevision: payload.knownRevision,
+    recoveryOfOperationId: payload.recoveryOfOperationId,
+  })
+  if (reconstructed.intentDigest !== row.intent_digest || row.expected_generation !== payload.expectedGeneration) {
+    fail('recovery_operation_unavailable')
+  }
+  return Object.freeze({
+    operationId: row.operation_id,
+    intentDigest: row.intent_digest,
+    licenseId: row.license_id,
+    databaseId: row.database_id,
+    instanceId: row.instance_id,
+    identityJkt: row.identity_jkt,
+  })
+}
+
+async function readPendingOperationBinding(
+  options: LicenseOperationRecoveryClientOptions,
+  operationId: string,
+  identity: { databaseId: string; instanceId: string; identityJkt: string },
+  kind: 'activation' | 'recovery',
+): Promise<PendingActivationOperation> {
+  if (kind === 'activation') {
+    return readPendingActivationOperation(options.db, options.pendingKeyRoot, operationId, identity, {
+      allowResponseSaved: true,
+    })
+  }
+  return readPendingRecoveryBinding(options, operationId, identity)
 }
 
 function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
@@ -328,7 +421,12 @@ function parseStoredRequest(input: {
   return { body, bodyClaims, challengeClaims: challenge.claims, target, headers }
 }
 
-function assertBoundChallenge(challenge: BoundRecoveryChallenge, operation: PendingActivationOperation, expected: 'query' | 'continue', trustedTime: number): void {
+function assertBoundChallenge(
+  challenge: BoundRecoveryChallenge,
+  operation: PendingActivationOperation,
+  expected: 'query' | 'continue' | 'recovery',
+  trustedTime: number,
+): void {
   if (challenge.purpose !== 'verified_bound_operation_recovery_challenge' || challenge.operation !== expected ||
     challenge.issuedAt > trustedTime || challenge.expiresAt <= trustedTime || challenge.expiresAt - challenge.issuedAt !== 300 ||
     !canonicalNonce(challenge.clientNonce) || !canonicalNonce(challenge.serverNonce) ||
@@ -427,6 +525,149 @@ async function validateOperationHistory(input: {
   return Object.freeze({ operation, activationCode: payload.activationCode, origin: payload.origin, attempts: Object.freeze(attempts) })
 }
 
+async function validateRecoveryOperationHistory(input: {
+  db: Kysely<Database>
+  pendingKeyRoot: string
+  operationId: string
+  issuer: string
+  centerOrigin: URL
+  identity: { databaseId: string; instanceId: string; identityJkt: string }
+}): Promise<ValidatedRecoveryOperationHistory> {
+  const row = await input.db.selectFrom('local_license_operations').selectAll()
+    .where('operation_id', '=', input.operationId).executeTakeFirst()
+  if (!row || row.kind !== 'recovery' || !['pending', 'response_saved'].includes(row.state) ||
+    row.expected_generation === null || row.database_id !== input.identity.databaseId ||
+    row.instance_id !== input.identity.instanceId || row.identity_jkt !== input.identity.identityJkt) {
+    fail('recovery_operation_unavailable')
+  }
+  const payload = await readRecoveryOperationPayload(input.db, input.pendingKeyRoot, input.operationId)
+  const intent = buildRecoveryIntent({
+    licenseId: row.license_id,
+    databaseId: row.database_id,
+    instanceId: row.instance_id,
+    identityJkt: row.identity_jkt,
+    expectedGeneration: payload.expectedGeneration,
+    knownRevision: payload.knownRevision,
+    recoveryOfOperationId: payload.recoveryOfOperationId,
+  })
+  if (intent.intentDigest !== row.intent_digest || row.expected_generation !== payload.expectedGeneration) {
+    fail('recovery_operation_binding_invalid')
+  }
+  const operation: PendingActivationOperation = Object.freeze({
+    operationId: row.operation_id,
+    intentDigest: row.intent_digest,
+    licenseId: row.license_id,
+    databaseId: row.database_id,
+    instanceId: row.instance_id,
+    identityJkt: row.identity_jkt,
+  })
+  const rows = await input.db.selectFrom('local_license_operation_attempts').selectAll()
+    .where('operation_id', '=', input.operationId).orderBy('attempt_no', 'asc').execute()
+  if (rows.some((attempt, index) => attempt.attempt_no !== index + 1) ||
+    rows.filter(attempt => attempt.purpose === 'recovery').length > 1) fail('operation_history_sequence_invalid')
+  const attempts: ValidatedHistoricalAttempt[] = []
+  for (const raw of rows) {
+    if (!['recovery', 'query', 'continue'].includes(raw.purpose) ||
+      !['prepared', 'sent', 'transport_unknown', 'transport_error', 'response_saved'].includes(raw.send_state)) {
+      fail('operation_history_state_invalid')
+    }
+    const attempt = raw as unknown as LocalLicenseOperationAttemptsTable
+    const stored = await readLicenseOperationAttemptEnvelope(input.db, input.pendingKeyRoot, input.operationId, raw.attempt_no)
+    if (stored.purpose !== raw.purpose || stored.sendState !== raw.send_state ||
+      stored.requestBodyDigest !== raw.request_body_digest || stored.requestNonceHash !== raw.request_nonce_hash ||
+      stored.clientNonceHash !== raw.client_nonce_hash || stored.identityJkt !== raw.identity_jkt ||
+      stored.intentDigest !== raw.intent_digest || stored.signingKeyId !== raw.signing_key_id ||
+      stored.signatureCreatedAt.getTime() !== raw.signature_created_at.getTime()) fail('operation_history_binding_invalid')
+    let envelopeValue: unknown
+    try { envelopeValue = parseStrictJson(stored.requestEnvelope) } catch { return fail('operation_history_request_envelope_invalid') }
+    if (!envelopeValue || typeof envelopeValue !== 'object' || Array.isArray(envelopeValue)) {
+      fail('operation_history_request_envelope_invalid')
+    }
+    const envelope = envelopeValue as Record<string, unknown>
+    const expectedTarget = raw.purpose === 'recovery' ? LICENSE_LEASE_RENEW_PATH
+      : raw.purpose === 'query' ? LICENSE_OPERATION_QUERY_PATH : LICENSE_OPERATION_CONTINUE_PATH
+    if (!exactKeys(envelope, ['schema', 'method', 'target', 'headers', 'body_base64url']) ||
+      envelope.schema !== 1 || envelope.method !== 'POST' || envelope.target !== expectedTarget ||
+      typeof envelope.body_base64url !== 'string' ||
+      !/^(?:[A-Za-z0-9_-]{2,})$/u.test(envelope.body_base64url) ||
+      !envelope.headers || typeof envelope.headers !== 'object' || Array.isArray(envelope.headers)) {
+      fail('operation_history_request_envelope_invalid')
+    }
+    const body = Buffer.from(envelope.body_base64url, 'base64url')
+    if (body.toString('base64url') !== envelope.body_base64url || sha256Base64url(body) !== raw.request_body_digest) {
+      fail('operation_history_request_digest_mismatch')
+    }
+    let bodyValue: unknown
+    try { bodyValue = parseStrictJson(body) } catch { return fail('operation_history_request_body_invalid') }
+    if (!bodyValue || typeof bodyValue !== 'object' || Array.isArray(bodyValue)) fail('operation_history_request_body_invalid')
+    const bodyClaims = bodyValue as Record<string, unknown>
+    const fields = raw.purpose === 'query' ? MUTATION_FIELDS
+      : [...MUTATION_FIELDS, 'expected_generation', 'known_revision', 'recovery_of_operation_id',
+        ...(raw.purpose === 'continue' ? ['kind'] : [])]
+    if (!exactKeys(bodyClaims, fields) || bodyClaims.operation_id !== operation.operationId ||
+      bodyClaims.intent_digest !== operation.intentDigest || bodyClaims.attempt_no !== raw.attempt_no ||
+      bodyClaims.license_id !== operation.licenseId || bodyClaims.database_id !== operation.databaseId ||
+      bodyClaims.instance_id !== operation.instanceId || bodyClaims.identity_jkt !== operation.identityJkt ||
+      typeof bodyClaims.challenge !== 'string' ||
+      (raw.purpose !== 'query' && (bodyClaims.expected_generation !== payload.expectedGeneration ||
+        bodyClaims.known_revision !== payload.knownRevision ||
+        bodyClaims.recovery_of_operation_id !== payload.recoveryOfOperationId ||
+        (raw.purpose === 'continue' && bodyClaims.kind !== 'recovery')))) {
+      fail('operation_history_request_binding_invalid')
+    }
+    const publicJwk = bodyClaims.public_jwk
+    if (!publicJwk || typeof publicJwk !== 'object' || Array.isArray(publicJwk) ||
+      !exactKeys(publicJwk as Record<string, unknown>, ['kty', 'crv', 'x']) ||
+      (publicJwk as Record<string, unknown>).kty !== 'OKP' ||
+      (publicJwk as Record<string, unknown>).crv !== 'Ed25519' ||
+      typeof (publicJwk as Record<string, unknown>).x !== 'string' ||
+      ed25519IdentityJkt(publicJwk as { kty: 'OKP'; crv: 'Ed25519'; x: string }) !== operation.identityJkt) {
+      fail('operation_history_request_binding_invalid')
+    }
+    const challenge = decodeCompactJws(bodyClaims.challenge)
+    const expectedStage = raw.purpose
+    if (!exactKeys(challenge.claims, CHALLENGE_CLAIMS) || challenge.header.typ !== 'aikayun-license-challenge+jwt' ||
+      challenge.header.alg !== 'Ed25519' || typeof challenge.header.kid !== 'string' || !DIGEST.test(challenge.header.kid) ||
+      challenge.claims.v !== 1 || challenge.claims.aud !== 'aikayun-commerce' || challenge.claims.iss !== input.issuer ||
+      challenge.claims.sub !== operation.instanceId || challenge.claims.operation_id !== operation.operationId ||
+      challenge.claims.intent_digest !== operation.intentDigest || challenge.claims.instance_id !== operation.instanceId ||
+      challenge.claims.identity_jkt !== operation.identityJkt || challenge.claims.operation !== expectedStage ||
+      !UUID.test(String(challenge.claims.jti)) || !Number.isSafeInteger(challenge.claims.iat) ||
+      challenge.claims.nbf !== challenge.claims.iat || !Number.isSafeInteger(challenge.claims.exp) ||
+      challenge.claims.exp !== Number(challenge.claims.iat) + 300 || !canonicalNonce(challenge.claims.client_nonce) ||
+      !canonicalNonce(challenge.claims.server_nonce) ||
+      sha256Base64url(String(challenge.claims.client_nonce)) !== raw.client_nonce_hash ||
+      sha256Base64url(String(challenge.claims.server_nonce)) !== raw.request_nonce_hash) {
+      fail('operation_history_challenge_invalid')
+    }
+    const headers = envelope.headers as Record<string, string>
+    await verifyPersistedRequestSignature({
+      origin: input.centerOrigin,
+      target: expectedTarget,
+      body,
+      headers,
+      identityJkt: operation.identityJkt,
+      publicJwk: publicJwk as Record<string, unknown>,
+      requestNonce: String(challenge.claims.server_nonce),
+      signatureCreatedAt: raw.signature_created_at,
+    })
+    const response = raw.send_state === 'response_saved'
+      ? await readLicenseOperationAttemptResponse(input.db, input.pendingKeyRoot, input.operationId, raw.attempt_no)
+      : null
+    const archivedResult = await readLicenseOperationAttemptResultJws(input.db, input.pendingKeyRoot, input.operationId, raw.attempt_no)
+    attempts.push(Object.freeze({
+      row: attempt,
+      requestBody: body,
+      requestBodyClaims: bodyClaims,
+      challengeClaims: challenge.claims,
+      requestEnvelope: stored.requestEnvelope,
+      response,
+      archivedResult,
+    }))
+  }
+  return Object.freeze({ operation, payload, attempts: Object.freeze(attempts) })
+}
+
 function createTestAnchorOptions(testTls: TestLicenseTlsOptions | undefined) {
   return testTls === undefined ? {} : {
     ...(testTls.ca === undefined ? {} : { testCa: testTls.ca }),
@@ -434,12 +675,14 @@ function createTestAnchorOptions(testTls: TestLicenseTlsOptions | undefined) {
   }
 }
 
-async function requestBoundChallenge(options: LicenseOperationRecoveryClientOptions, operationId: string,
-  operationType: 'query' | 'continue'): Promise<BoundRecoveryChallenge> {
+async function requestBoundChallenge(
+  options: LicenseOperationRecoveryClientOptions,
+  operationId: string,
+  operationType: 'query' | 'continue' | 'recovery',
+  operationKind: 'activation' | 'recovery' = 'activation',
+): Promise<BoundRecoveryChallenge> {
   return withVerifiedInstallationSigningContext(options.pool, options.identityRoot, async (identity) => {
-    const operation = await readPendingActivationOperation(options.db, options.pendingKeyRoot, operationId, identity, {
-      allowResponseSaved: true,
-    })
+    const operation = await readPendingOperationBinding(options, operationId, identity, operationKind)
     const candidate = await options.trustStore.getCandidateForTimeBootstrap()
     if (!candidate || candidate.claims.sub !== options.releaseConfig.expected_center_issuer) fail('operation_trust_bundle_unavailable')
     const anchorOptions = createTestAnchorOptions(options.testTls)
@@ -476,8 +719,9 @@ async function requestBoundChallenge(options: LicenseOperationRecoveryClientOpti
     } catch { fail('operation_challenge_request_failed') }
     const contentTypeHeader = response.headers['content-type']
     const contentType = Array.isArray(contentTypeHeader) ? contentTypeHeader[0] : contentTypeHeader
-    if (response.statusCode !== 201 || typeof contentType !== 'string' ||
-      contentType.split(';', 1)[0]!.trim().toLowerCase() !== 'application/json') fail('operation_challenge_response_invalid')
+    if (response.statusCode !== 201) fail(`operation_challenge_http_${response.statusCode}`)
+    if (typeof contentType !== 'string' ||
+      contentType.split(';', 1)[0]!.trim().toLowerCase() !== 'application/json') fail('operation_challenge_content_type_invalid')
     let envelope: unknown
     try { envelope = parseStrictJson(response.body) } catch { return fail('operation_challenge_response_invalid') }
     if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope) ||
@@ -504,9 +748,7 @@ async function requestBoundChallenge(options: LicenseOperationRecoveryClientOpti
       claims.exp <= trustedTime || claims.exp - claims.iat !== 300) fail('operation_challenge_binding_invalid')
     const finalBundle = await options.trustStore.getAccepted(verifySample.assertFresh)
     if (finalBundle.artifactSha256 !== acceptedAtResponse.artifactSha256) fail('operation_trust_bundle_changed')
-    const current = await readPendingActivationOperation(options.db, options.pendingKeyRoot, operationId, identity, {
-      allowResponseSaved: true,
-    })
+    const current = await readPendingOperationBinding(options, operationId, identity, operationKind)
     if (current.operationId !== operation.operationId || current.intentDigest !== operation.intentDigest ||
       current.licenseId !== operation.licenseId || current.databaseId !== operation.databaseId ||
       current.instanceId !== operation.instanceId || current.identityJkt !== operation.identityJkt) fail('operation_challenge_binding_invalid')
@@ -607,7 +849,7 @@ function parseOperationReceiptResponse(response: {
 }
 
 function boundOperationReceiptClaims(input: {
-  history: ValidatedOperationHistory
+  history: OperationHistoryBase
   requestAttemptNo: number
   requestNonceHash: string
   requestDigest: string
@@ -658,7 +900,7 @@ function boundOperationReceiptClaims(input: {
   }
   if (committedNonceHash === null || committedDigest === null || resultJws === null) fail('operation_recovery_commit_binding_invalid')
   const committed = history.attempts.find(item => item.row.attempt_no === committedNo)
-  if (!committed || !['activation', 'continue'].includes(committed.row.purpose) ||
+  if (!committed || !['activation', 'recovery', 'continue'].includes(committed.row.purpose) ||
     ['prepared', 'transport_error'].includes(String(committed.row.send_state)) ||
     committed.row.request_nonce_hash !== committedNonceHash || committed.row.request_body_digest !== committedDigest) {
     fail('operation_recovery_commit_binding_invalid')
@@ -671,6 +913,20 @@ function boundOperationReceiptClaims(input: {
       resultClaims.identity_jkt !== history.operation.identityJkt ||
       resultClaims.request_nonce !== committed.challengeClaims.server_nonce ||
       resultClaims.request_digest !== committed.row.request_body_digest) fail('operation_recovery_result_binding_invalid')
+  } else if (typedState === 'rejected' && originalResult.header.typ === 'aikayun-license-status+jwt') {
+    const resultClaims = originalResult.claims
+    const expectedGeneration = committed.requestBodyClaims.expected_generation
+    const statusOutcome: Record<string, string> = {
+      expired: 'SUBSCRIPTION_EXPIRED', revoked: 'LICENSE_REVOKED', superseded: 'ACTIVATION_SUPERSEDED',
+    }
+    if (resultClaims.sub !== history.operation.licenseId || resultClaims.instance_id !== history.operation.instanceId ||
+      resultClaims.identity_jkt !== history.operation.identityJkt ||
+      typeof expectedGeneration !== 'string' || resultClaims.activation_generation !== expectedGeneration ||
+      resultClaims.request_nonce !== committed.challengeClaims.server_nonce ||
+      resultClaims.request_digest !== committed.row.request_body_digest ||
+      typeof resultClaims.status !== 'string' || statusOutcome[resultClaims.status] !== typedOutcome) {
+      fail('operation_recovery_result_binding_invalid')
+    }
   } else if (typedState === 'rejected') {
     const resultClaims = originalResult.claims
     if (originalResult.header.typ !== 'aikayun-license-operation+jwt' || resultClaims.sub !== history.operation.licenseId ||
@@ -688,7 +944,7 @@ function boundOperationReceiptClaims(input: {
   }
   const savedResponse = committed.response
   if (savedResponse !== null) {
-    if (committed.row.purpose === 'activation') {
+    if (committed.row.purpose === 'activation' || committed.row.purpose === 'recovery') {
       if (!savedResponse.equals(Buffer.from(resultJws, 'ascii'))) fail('operation_recovery_history_result_conflict')
     } else {
       let previous: { claims: Record<string, unknown> }
@@ -707,7 +963,7 @@ function boundOperationReceiptClaims(input: {
  * Its untrusted claims may only identify the exact local request; they can never settle an operation.
  */
 function isBoundUnpersistedR3RejectionShape(input: {
-  history: ValidatedOperationHistory
+  history: OperationHistoryBase
   attempt: ValidatedHistoricalAttempt
   issuer: string
   trustedTime: number
@@ -742,7 +998,7 @@ function isBoundUnpersistedR3RejectionShape(input: {
 }
 
 async function verifiedHistoricalTerminal(input: {
-  history: ValidatedOperationHistory
+  history: OperationHistoryBase
   resolver: Awaited<ReturnType<TrustBundleStore['getAccepted']>>['resolver']
   issuer: string
   trustedTime: number
@@ -778,7 +1034,7 @@ async function verifiedHistoricalTerminal(input: {
 }
 
 function ensureNotFoundDoesNotContradictHistory(input: {
-  history: ValidatedOperationHistory
+  history: OperationHistoryBase
   issuer: string
   trustedTime: number
 }): void {
@@ -788,7 +1044,9 @@ function ensureNotFoundDoesNotContradictHistory(input: {
     if (attempt.response === null) continue
     try {
       const decoded = decodeCompactJws(attempt.response.toString('ascii'))
-      if (decoded.header.typ === 'aikayun-license+jwt') fail('operation_recovery_history_conflicts_with_not_found')
+      if (decoded.header.typ === 'aikayun-license+jwt' || decoded.header.typ === 'aikayun-license-status+jwt') {
+        fail('operation_recovery_history_conflicts_with_not_found')
+      }
       if (decoded.header.typ === 'aikayun-license-operation+jwt' &&
         ['committed', 'rejected', 'cancelled'].includes(String(decoded.claims.state))) {
         if (decoded.claims.state === 'rejected' && decoded.claims.outcome_code === 'ACTIVATION_AUTHORIZATION_INVALID' &&
@@ -813,7 +1071,7 @@ async function assertRecoveryChallengeCurrent(input: {
   options: LicenseOperationRecoveryClientOptions
   operation: PendingActivationOperation
   challenge: BoundRecoveryChallenge
-  expectedOperation: 'query' | 'continue'
+  expectedOperation: 'query' | 'continue' | 'recovery'
 }): Promise<void> {
   const trustedTime = input.challenge.timeSample.assertFresh()
   assertBoundChallenge(input.challenge, input.operation, input.expectedOperation, trustedTime)
@@ -854,7 +1112,7 @@ async function archiveAndClassifyResult(input: {
   operationId: string
   accepted: Awaited<ReturnType<TrustBundleStore['getAccepted']>>
   trustedTime: number
-  history: ValidatedOperationHistory
+  history: OperationHistoryBase
   bound: ReturnType<typeof boundOperationReceiptClaims>
 }): Promise<VerifiedOperationRecoveryEvidence['resultDisposition']> {
   const { bound, history } = input
@@ -1108,6 +1366,73 @@ function resultEvidence(
   })
 }
 
+async function confirmedActivationRecoveryFacts(input: {
+  options: LicenseOperationRecoveryClientOptions
+  activationOperationId: string
+  evidence: VerifiedOperationRecoveryEvidence
+}): Promise<RecoveryOperationPayload & { licenseId: string; databaseId: string; instanceId: string; identityJkt: string }> {
+  const { options, evidence } = input
+  const committedAttemptNo = evidence.committedAttemptNo
+  if (evidence.operationId !== input.activationOperationId || evidence.state !== 'committed' ||
+    committedAttemptNo === null || evidence.resultJwsDigest === null ||
+    (evidence.resultDisposition !== 'current_lease' && evidence.resultDisposition !== 'historical_only')) {
+    fail('recovery_source_not_committed')
+  }
+  return withVerifiedInstallationSigningContext(options.pool, options.identityRoot, async identity => {
+    const history = await validateOperationHistory({
+      db: options.db,
+      pool: options.pool,
+      pendingKeyRoot: options.pendingKeyRoot,
+      operationId: input.activationOperationId,
+      issuer: options.releaseConfig.expected_center_issuer,
+      centerOrigin: new URL(options.releaseConfig.expected_center_origin),
+      identity,
+    })
+    if (evidence.licenseId !== history.operation.licenseId || evidence.identityJkt !== history.operation.identityJkt ||
+      evidence.signatureVerified !== true || evidence.projected !== false) fail('recovery_source_receipt_binding_invalid')
+    const committed = history.attempts.find(item => item.row.attempt_no === committedAttemptNo)
+    if (!committed || !['activation', 'continue'].includes(committed.row.purpose) ||
+      ['prepared', 'transport_error'].includes(String(committed.row.send_state))) {
+      fail('recovery_source_commit_binding_invalid')
+    }
+    const result = await readLicenseOperationAttemptResultJws(options.db, options.pendingKeyRoot,
+      input.activationOperationId, committedAttemptNo)
+    if (!result || sha256Base64url(result) !== evidence.resultJwsDigest) fail('recovery_source_result_unavailable')
+    const decoded = decodeCompactJws(result.toString('ascii'))
+    const leaseClaimNames = [
+      'v', 'iss', 'aud', 'sub', 'jti', 'iat', 'nbf', 'exp', 'database_id', 'instance_id', 'identity_jkt',
+      'activation_generation', 'entitlement_revision', 'plan', 'subscription_end', 'renew_after', 'grants',
+      'request_nonce', 'request_digest',
+    ]
+    const claims = decoded.claims
+    if (!exactKeys(decoded.header, ['alg', 'kid', 'typ']) || decoded.header.alg !== 'Ed25519' ||
+      decoded.header.typ !== 'aikayun-license+jwt' || typeof decoded.header.kid !== 'string' || !DIGEST.test(decoded.header.kid)) {
+      fail('recovery_source_result_header_invalid')
+    }
+    if (!exactKeys(claims, leaseClaimNames)) fail('recovery_source_result_claims_shape_invalid')
+    if (claims.v !== 1 || claims.aud !== 'aikayun-commerce') fail('recovery_source_result_profile_invalid')
+    if (claims.iss !== options.releaseConfig.expected_center_issuer) fail('recovery_source_result_issuer_invalid')
+    if (claims.sub !== history.operation.licenseId) fail('recovery_source_result_license_invalid')
+    if (claims.database_id !== identity.databaseId) fail('recovery_source_result_database_invalid')
+    if (claims.instance_id !== identity.instanceId) fail('recovery_source_result_instance_invalid')
+    if (claims.identity_jkt !== identity.identityJkt) fail('recovery_source_result_identity_invalid')
+    if (claims.request_nonce !== committed.challengeClaims.server_nonce ||
+      claims.request_digest !== committed.row.request_body_digest) fail('recovery_source_result_request_binding_invalid')
+    if (!positiveRevision(claims.activation_generation) || !positiveRevision(claims.entitlement_revision)) {
+      fail('recovery_source_result_revision_invalid')
+    }
+    return {
+      recoveryOfOperationId: input.activationOperationId,
+      expectedGeneration: claims.activation_generation,
+      knownRevision: claims.entitlement_revision,
+      licenseId: history.operation.licenseId,
+      databaseId: identity.databaseId,
+      instanceId: identity.instanceId,
+      identityJkt: identity.identityJkt,
+    }
+  })
+}
+
 function mapHttpFailure(status: number, stage: 'query' | 'continue'): never {
   if (stage === 'continue' && status === 403) return fail('requires_protocol_resolution')
   return fail('operation_recovery_result_unknown')
@@ -1338,6 +1663,500 @@ async function runOneRecoveryRequest(input: {
   })
 }
 
+type RecoveryResponseType = 'license' | 'status_receipt' | 'operation_receipt'
+
+function parseRecoveryResponse(response: {
+  statusCode: number
+  headers: { 'content-type'?: string | string[] | undefined }
+  body: Buffer
+}, stage: 'recovery' | 'query' | 'continue'): { token: Buffer; type: RecoveryResponseType } {
+  const contentTypeHeader = response.headers['content-type']
+  const contentType = Array.isArray(contentTypeHeader) ? contentTypeHeader[0] : contentTypeHeader
+  if (typeof contentType !== 'string' || contentType.split(';', 1)[0]!.trim().toLowerCase() !== 'application/json' ||
+    (response.statusCode !== 200 && !(stage === 'recovery' && response.statusCode === 409))) {
+    fail('recovery_operation_response_unknown')
+  }
+  let parsed: unknown
+  try { parsed = parseStrictJson(response.body) } catch { return fail('recovery_operation_response_unknown') }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) fail('recovery_operation_response_unknown')
+  const envelope = parsed as Record<string, unknown>
+  if (stage !== 'recovery') {
+    if (!exactKeys(envelope, ['operation_receipt']) || typeof envelope.operation_receipt !== 'string') {
+      fail('recovery_operation_response_unknown')
+    }
+    const token = envelope.operation_receipt
+    if (token.length < 100 || token.length > 16 * 1024 || !COMPACT_JWS.test(token)) fail('recovery_operation_response_unknown')
+    return { token: Buffer.from(token, 'ascii'), type: 'operation_receipt' }
+  }
+  const matched = (['license', 'status_receipt', 'operation_receipt'] as const)
+    .filter(name => exactKeys(envelope, [name]) && typeof envelope[name] === 'string')
+  if (matched.length !== 1) fail('recovery_operation_response_unknown')
+  const type = matched[0]!
+  if ((response.statusCode === 200 && type !== 'license') ||
+    (response.statusCode === 409 && type === 'license')) fail('recovery_operation_response_unknown')
+  const token = envelope[type] as string
+  if (token.length < 100 || token.length > 16 * 1024 || !COMPACT_JWS.test(token)) fail('recovery_operation_response_unknown')
+  return { token: Buffer.from(token, 'ascii'), type }
+}
+
+function positiveRevision(value: unknown): value is string {
+  return typeof value === 'string' && /^[1-9][0-9]{0,18}$/u.test(value) && BigInt(value) <= 9_223_372_036_854_775_807n
+}
+
+async function verifyRecoveryLeaseResult(input: {
+  token: Buffer
+  operation: PendingActivationOperation
+  payload: RecoveryOperationPayload
+  attemptNo: number
+  requestDigest: string
+  requestNonce: string
+  resolver: Awaited<ReturnType<TrustBundleStore['getAccepted']>>['resolver']
+  issuer: string
+  trustedTime: number
+}): Promise<VerifiedCurrentLeaseRecoveryEvidence> {
+  const identity = {
+    status: 'ready' as const,
+    code: 'ready',
+    databaseId: input.operation.databaseId,
+    instanceId: input.operation.instanceId,
+    identityJkt: input.operation.identityJkt,
+    bindingState: 'ready' as const,
+  }
+  let lease
+  try {
+    lease = await verifyCurrentLicenseLease(input.token.toString('ascii'), {
+      resolver: input.resolver,
+      issuer: input.issuer,
+      trustedTime: input.trustedTime,
+      identity,
+    })
+  } catch { fail('recovery_operation_result_not_current') }
+  if (lease.licenseId !== input.operation.licenseId || lease.databaseId !== input.operation.databaseId ||
+    lease.instanceId !== input.operation.instanceId || lease.identityJkt !== input.operation.identityJkt ||
+    lease.activationGeneration !== input.payload.expectedGeneration ||
+    !positiveRevision(lease.entitlementRevision) || BigInt(lease.entitlementRevision) < BigInt(input.payload.knownRevision) ||
+    lease.requestNonce !== input.requestNonce || lease.requestDigest !== input.requestDigest || !lease.signatureVerified) {
+    fail('recovery_operation_result_binding_invalid')
+  }
+  return Object.freeze({
+    purpose: 'verified_current_lease_recovery_unprojected',
+    sourceOperationId: input.payload.recoveryOfOperationId,
+    recoveryOperationId: input.operation.operationId,
+    licenseId: lease.licenseId,
+    databaseId: lease.databaseId,
+    instanceId: lease.instanceId,
+    identityJkt: lease.identityJkt,
+    activationGeneration: lease.activationGeneration,
+    entitlementRevision: lease.entitlementRevision,
+    requestAttemptNo: input.attemptNo,
+    resultJwsDigest: sha256Base64url(input.token),
+    signatureVerified: true,
+    projected: false,
+  })
+}
+
+function recoveryStatusOutcome(status: unknown): string | null {
+  if (status === 'expired') return 'SUBSCRIPTION_EXPIRED'
+  if (status === 'revoked') return 'LICENSE_REVOKED'
+  if (status === 'superseded') return 'ACTIVATION_SUPERSEDED'
+  return null
+}
+
+function recoveryStatusEvidence(input: {
+  sourceOperationId: string
+  operationId: string
+  licenseId: string
+  identityJkt: string
+  attemptNo: number
+  outcomeCode: string
+  resultJwsDigest: string
+}): VerifiedRecoveryStatusEvidence {
+  return Object.freeze({
+    purpose: 'verified_recovery_status_unprojected',
+    sourceOperationId: input.sourceOperationId,
+    recoveryOperationId: input.operationId,
+    licenseId: input.licenseId,
+    identityJkt: input.identityJkt,
+    requestAttemptNo: input.attemptNo,
+    state: 'rejected',
+    outcomeCode: input.outcomeCode,
+    resultJwsDigest: input.resultJwsDigest,
+    signatureVerified: true,
+    projected: false,
+  })
+}
+
+async function verifyDirectRecoveryResponse(input: {
+  options: LicenseOperationRecoveryClientOptions
+  history: ValidatedRecoveryOperationHistory
+  attemptNo: number
+  response: { token: Buffer; type: RecoveryResponseType }
+  accepted: Awaited<ReturnType<TrustBundleStore['getAccepted']>>
+  trustedTime: number
+}): Promise<LicenseRecoveryOperationResult> {
+  const { history, response, options } = input
+  const attempt = history.attempts.find(item => item.row.attempt_no === input.attemptNo)
+  if (!attempt || attempt.row.purpose !== 'recovery' || String(attempt.row.send_state) !== 'response_saved') {
+    fail('recovery_operation_result_binding_invalid')
+  }
+  if (response.type === 'license') {
+    return verifyRecoveryLeaseResult({
+      token: response.token,
+      operation: history.operation,
+      payload: history.payload,
+      attemptNo: input.attemptNo,
+      requestDigest: attempt.row.request_body_digest,
+      requestNonce: String(attempt.challengeClaims.server_nonce),
+      resolver: input.accepted.resolver,
+      issuer: options.releaseConfig.expected_center_issuer,
+      trustedTime: input.trustedTime,
+    })
+  }
+  if (response.type === 'status_receipt') {
+    const verified = await verifyLicenseStatusReceipt(response.token.toString('ascii'), {
+      resolver: input.accepted.resolver,
+      issuer: options.releaseConfig.expected_center_issuer,
+      trustedTime: input.trustedTime,
+    })
+    const claims = verified.claims
+    const outcomeCode = recoveryStatusOutcome(claims.status)
+    if (!outcomeCode || claims.sub !== history.operation.licenseId ||
+      claims.instance_id !== history.operation.instanceId || claims.identity_jkt !== history.operation.identityJkt ||
+      claims.activation_generation !== history.payload.expectedGeneration ||
+      claims.request_nonce !== attempt.challengeClaims.server_nonce ||
+      claims.request_digest !== attempt.row.request_body_digest || !verified.signatureVerified) {
+      fail('recovery_operation_status_binding_invalid')
+    }
+    return recoveryStatusEvidence({
+      sourceOperationId: history.payload.recoveryOfOperationId,
+      operationId: history.operation.operationId,
+      licenseId: history.operation.licenseId,
+      identityJkt: history.operation.identityJkt,
+      attemptNo: input.attemptNo,
+      outcomeCode,
+      resultJwsDigest: sha256Base64url(response.token),
+    })
+  }
+  const verified = await verifyLicenseOperationReceipt(response.token.toString('ascii'), {
+    resolver: input.accepted.resolver,
+    issuer: options.releaseConfig.expected_center_issuer,
+    trustedTime: input.trustedTime,
+  })
+  const claims = verified.claims
+  if (claims.sub !== history.operation.licenseId || claims.actor_jkt !== history.operation.identityJkt ||
+    claims.operation_id !== history.operation.operationId || claims.intent_digest !== history.operation.intentDigest ||
+    claims.attempt_no !== input.attemptNo || claims.request_nonce_hash !== attempt.row.request_nonce_hash ||
+    claims.request_digest !== attempt.row.request_body_digest || claims.state !== 'rejected' ||
+    typeof claims.outcome_code !== 'string' || !verified.signatureVerified) {
+    fail('recovery_operation_receipt_binding_invalid')
+  }
+  return Object.freeze({
+    ...recoveryStatusEvidence({
+      sourceOperationId: history.payload.recoveryOfOperationId,
+      operationId: history.operation.operationId,
+      licenseId: history.operation.licenseId,
+      identityJkt: history.operation.identityJkt,
+      attemptNo: input.attemptNo,
+      outcomeCode: claims.outcome_code,
+      resultJwsDigest: sha256Base64url(response.token),
+    }),
+    purpose: 'verified_recovery_rejection_unprojected' as const,
+  })
+}
+
+async function verifyRecoveryOperationReceipt(input: {
+  options: LicenseOperationRecoveryClientOptions
+  history: ValidatedRecoveryOperationHistory
+  attemptNo: number
+  responseToken: Buffer
+  accepted: Awaited<ReturnType<TrustBundleStore['getAccepted']>>
+  trustedTime: number
+}): Promise<{ checked: ReturnType<typeof boundOperationReceiptClaims>; history: ValidatedRecoveryOperationHistory }> {
+  const verified = await verifyLicenseOperationReceipt(input.responseToken.toString('ascii'), {
+    resolver: input.accepted.resolver,
+    issuer: input.options.releaseConfig.expected_center_issuer,
+    trustedTime: input.trustedTime,
+  })
+  const history = await validateRecoveryOperationHistory({
+    db: input.options.db,
+    pendingKeyRoot: input.options.pendingKeyRoot,
+    operationId: input.history.operation.operationId,
+    issuer: input.options.releaseConfig.expected_center_issuer,
+    centerOrigin: new URL(input.options.releaseConfig.expected_center_origin),
+    identity: {
+      databaseId: input.history.operation.databaseId,
+      instanceId: input.history.operation.instanceId,
+      identityJkt: input.history.operation.identityJkt,
+    },
+  })
+  const currentAttempt = history.attempts.find(item => item.row.attempt_no === input.attemptNo)
+  if (!currentAttempt) fail('recovery_operation_attempt_unavailable')
+  const checked = boundOperationReceiptClaims({
+    history,
+    requestAttemptNo: input.attemptNo,
+    requestNonceHash: currentAttempt.row.request_nonce_hash,
+    requestDigest: currentAttempt.row.request_body_digest,
+    claims: verified.claims,
+  })
+  if (checked.resultJws && checked.committedAttemptNo !== null) {
+    const committed = history.attempts.find(item => item.row.attempt_no === checked.committedAttemptNo)
+    if (!committed) fail('operation_recovery_commit_binding_invalid')
+    const resultBytes = Buffer.from(checked.resultJws, 'ascii')
+    await saveLicenseOperationResultJws(input.options.db, input.options.pendingKeyRoot,
+      history.operation.operationId, checked.committedAttemptNo, resultBytes)
+    const saved = await readLicenseOperationAttemptResultJws(input.options.db, input.options.pendingKeyRoot,
+      history.operation.operationId, checked.committedAttemptNo)
+    if (!saved || !saved.equals(resultBytes)) fail('operation_result_archive_unknown')
+  }
+  return { checked, history }
+}
+
+async function assertRecoveryIdentityUnchanged(
+  options: LicenseOperationRecoveryClientOptions,
+  operation: PendingActivationOperation,
+): Promise<void> {
+  const current = await withVerifiedInstallationSigningContext(options.pool, options.identityRoot, async identity => ({
+    databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt,
+  }))
+  if (current.databaseId !== operation.databaseId || current.instanceId !== operation.instanceId ||
+    current.identityJkt !== operation.identityJkt) fail('operation_identity_changed')
+}
+
+async function resultFromRecoveryOperationReceipt(input: {
+  options: LicenseOperationRecoveryClientOptions
+  checked: ReturnType<typeof boundOperationReceiptClaims>
+  history: ValidatedRecoveryOperationHistory
+  accepted: Awaited<ReturnType<TrustBundleStore['getAccepted']>>
+  trustedTime: number
+  attemptNo: number
+}): Promise<LicenseRecoveryOperationResult | null> {
+  const { checked, history } = input
+  if (checked.state === 'not_found') {
+    await ensureNotFoundDoesNotContradictHistory({ history, issuer: input.options.releaseConfig.expected_center_issuer,
+      trustedTime: input.trustedTime })
+    return null
+  }
+  if (checked.state === 'cancelled') fail('recovery_operation_cancelled')
+  if (checked.state === 'rejected') {
+    const result = checked.resultJws
+    const committed = checked.committedAttemptNo === null ? undefined
+      : history.attempts.find(item => item.row.attempt_no === checked.committedAttemptNo)
+    if (!result || !committed) {
+      return recoveryStatusEvidence({
+        sourceOperationId: history.payload.recoveryOfOperationId,
+        operationId: history.operation.operationId,
+        licenseId: history.operation.licenseId,
+        identityJkt: history.operation.identityJkt,
+        attemptNo: input.attemptNo,
+        outcomeCode: checked.outcomeCode ?? 'RECOVERY_REJECTED',
+        resultJwsDigest: checked.resultDigest ?? '',
+      })
+    }
+    return recoveryStatusEvidence({
+      sourceOperationId: history.payload.recoveryOfOperationId,
+      operationId: history.operation.operationId,
+      licenseId: history.operation.licenseId,
+      identityJkt: history.operation.identityJkt,
+      attemptNo: checked.committedAttemptNo!,
+      outcomeCode: checked.outcomeCode ?? 'RECOVERY_REJECTED',
+      resultJwsDigest: checked.resultDigest!,
+    })
+  }
+  if (checked.state !== 'committed' || !checked.resultJws || checked.committedAttemptNo === null) {
+    fail('recovery_operation_result_binding_invalid')
+  }
+  const committed = history.attempts.find(item => item.row.attempt_no === checked.committedAttemptNo)
+  if (!committed) fail('operation_recovery_commit_binding_invalid')
+  const lease = await verifyRecoveryLeaseResult({
+    token: Buffer.from(checked.resultJws, 'ascii'),
+    operation: history.operation,
+    payload: history.payload,
+    attemptNo: checked.committedAttemptNo,
+    requestDigest: committed.row.request_body_digest,
+    requestNonce: String(committed.challengeClaims.server_nonce),
+    resolver: input.accepted.resolver,
+    issuer: input.options.releaseConfig.expected_center_issuer,
+    trustedTime: input.trustedTime,
+  })
+  return lease
+}
+
+async function runOneRecoveryOperationRequest(input: {
+  options: LicenseOperationRecoveryClientOptions
+  operationId: string
+  stage: 'recovery' | 'query' | 'continue'
+  checkpoint: (stage: LicenseRecoveryCheckpoint) => Promise<void>
+  assertLockHeld: () => Promise<void>
+}): Promise<LicenseRecoveryOperationResult | null> {
+  const { options, operationId, stage, checkpoint } = input
+  return withVerifiedInstallationSigningContext(options.pool, options.identityRoot, async identity => {
+    const origin = new URL(options.releaseConfig.expected_center_origin)
+    const historyBefore = await validateRecoveryOperationHistory({
+      db: options.db, pendingKeyRoot: options.pendingKeyRoot, operationId,
+      issuer: options.releaseConfig.expected_center_issuer, centerOrigin: origin, identity,
+    })
+    const operation = historyBefore.operation
+    const challenge = await requestBoundChallenge(options, operationId, stage, 'recovery')
+    await assertRecoveryChallengeCurrent({ options, operation, challenge, expectedOperation: stage })
+    await validateRecoveryOperationHistory({
+      db: options.db, pendingKeyRoot: options.pendingKeyRoot, operationId,
+      issuer: options.releaseConfig.expected_center_issuer, centerOrigin: origin, identity,
+    })
+    const path = stage === 'recovery' ? LICENSE_LEASE_RENEW_PATH
+      : stage === 'query' ? LICENSE_OPERATION_QUERY_PATH : LICENSE_OPERATION_CONTINUE_PATH
+    let requestDigest = ''
+    const attempt = await allocateLicenseOperationAttempt(options.db, options.pendingKeyRoot, {
+      operationId,
+      purpose: stage,
+      intentDigest: operation.intentDigest,
+      clientNonce: challenge.clientNonce,
+      requestNonce: challenge.serverNonce,
+      identityJkt: identity.identityJkt,
+      async buildRequest(attemptNo) {
+        const created = challenge.timeSample.assertFresh()
+        assertBoundChallenge(challenge, operation, stage, created)
+        const common = {
+          operation_id: operation.operationId,
+          intent_digest: operation.intentDigest,
+          attempt_no: attemptNo,
+          license_id: operation.licenseId,
+          database_id: operation.databaseId,
+          instance_id: operation.instanceId,
+          identity_jkt: operation.identityJkt,
+          public_jwk: identity.publicJwk,
+          challenge: challenge.token,
+        }
+        const requestBody = Buffer.from(JSON.stringify(stage === 'query' ? common : {
+          ...common,
+          expected_generation: historyBefore.payload.expectedGeneration,
+          known_revision: historyBefore.payload.knownRevision,
+          recovery_of_operation_id: historyBefore.payload.recoveryOfOperationId,
+          ...(stage === 'continue' ? { kind: 'recovery' } : {}),
+        }), 'utf8')
+        const signed = await createSignedLicenseRequest({ origin, path, body: requestBody,
+          identity, nonce: challenge.serverNonce, created })
+        requestDigest = sha256Base64url(signed.body)
+        const requestEnvelope = Buffer.from(JSON.stringify({
+          schema: 1, method: 'POST', target: path, headers: signed.headers,
+          body_base64url: signed.body.toString('base64url'),
+        }), 'utf8')
+        await checkpoint('before_attempt_commit')
+        return { requestBody: signed.body, signingKeyId: identity.identityJkt,
+          signatureCreatedAt: new Date(created * 1000), requestEnvelope }
+      },
+    })
+    await checkpoint('after_attempt_commit')
+    if (attempt.reused || attempt.state !== 'prepared' || attempt.requestBodyDigest !== requestDigest) {
+      fail('operation_attempt_already_exists')
+    }
+    await markLicenseOperationAttemptSent(options.db, operationId, attempt.attemptNo)
+    await checkpoint('after_sent_commit')
+    const storedHistory = await validateRecoveryOperationHistory({
+      db: options.db, pendingKeyRoot: options.pendingKeyRoot, operationId,
+      issuer: options.releaseConfig.expected_center_issuer, centerOrigin: origin, identity,
+    })
+    const storedAttempt = storedHistory.attempts.find(item => item.row.attempt_no === attempt.attemptNo)
+    if (!storedAttempt || storedAttempt.row.purpose !== stage || storedAttempt.row.request_body_digest !== attempt.requestBodyDigest ||
+      storedAttempt.challengeClaims.server_nonce !== challenge.serverNonce ||
+      storedAttempt.challengeClaims.client_nonce !== challenge.clientNonce) fail('recovery_operation_attempt_persistence_invalid')
+    try {
+      const sendTime = challenge.timeSample.assertFresh()
+      assertBoundChallenge(challenge, operation, stage, sendTime)
+      const accepted = await options.trustStore.getAccepted(challenge.timeSample.assertFresh)
+      const signingAt = storedAttempt.row.signature_created_at.getTime() / 1000
+      if (accepted.artifactSha256 !== challenge.trustBundleDigest || sendTime >= signingAt + 60) {
+        fail('operation_challenge_expired')
+      }
+      const current = await readPendingRecoveryBinding(options, operationId, identity)
+      if (current.intentDigest !== operation.intentDigest || current.licenseId !== operation.licenseId) {
+        fail('operation_binding_changed')
+      }
+      await assertRecoveryChallengeCurrent({ options, operation, challenge, expectedOperation: stage })
+    } catch (error) {
+      await markLicenseOperationAttemptTransportResult(options.db, operationId, attempt.attemptNo, 'transport_error')
+      throw error
+    }
+    let response
+    try {
+      await checkpoint('before_http_send')
+      await input.assertLockHeld()
+      response = await postSignedLicenseRequest({ origin, path,
+        signed: signedRequestFromStoredEnvelope(storedAttempt.requestEnvelope),
+        ...(options.testTls === undefined ? {} : { testTls: options.testTls }) })
+      await input.assertLockHeld()
+      await checkpoint('after_http_response')
+      await input.assertLockHeld()
+    } catch {
+      await markLicenseOperationAttemptTransportResult(options.db, operationId, attempt.attemptNo, 'transport_unknown')
+      fail('operation_recovery_result_unknown')
+    }
+    if (response.statusCode !== 200 && !(stage === 'recovery' && response.statusCode === 409)) {
+      await markLicenseOperationAttemptTransportResult(options.db, operationId, attempt.attemptNo, 'transport_unknown')
+      fail('operation_recovery_result_unknown')
+    }
+    let parsedResponse: { token: Buffer; type: RecoveryResponseType }
+    try {
+      parsedResponse = parseRecoveryResponse(response, stage)
+    } catch (error) {
+      await markLicenseOperationAttemptTransportResult(options.db, operationId, attempt.attemptNo, 'transport_unknown')
+      throw error
+    }
+    await checkpoint('before_response_save')
+    try {
+      await saveLicenseOperationResponse(options.db, options.pendingKeyRoot, operationId, attempt.attemptNo, parsedResponse.token)
+      const persisted = await readLicenseOperationAttemptResponse(options.db, options.pendingKeyRoot, operationId, attempt.attemptNo)
+      if (!persisted.equals(parsedResponse.token)) fail('operation_response_archive_mismatch')
+    } catch {
+      try {
+        await saveLicenseOperationResponse(options.db, options.pendingKeyRoot, operationId, attempt.attemptNo, parsedResponse.token)
+        const persisted = await readLicenseOperationAttemptResponse(options.db, options.pendingKeyRoot, operationId, attempt.attemptNo)
+        if (!persisted.equals(parsedResponse.token)) fail('operation_response_archive_mismatch')
+      } catch { fail('operation_response_archive_unknown') }
+    }
+    if (stage === 'recovery') {
+      await saveLicenseOperationResultJws(options.db, options.pendingKeyRoot, operationId, attempt.attemptNo, parsedResponse.token)
+      const archived = await readLicenseOperationAttemptResultJws(options.db, options.pendingKeyRoot, operationId, attempt.attemptNo)
+      if (!archived || !archived.equals(parsedResponse.token)) fail('operation_result_archive_unknown')
+    }
+    await checkpoint('after_response_saved')
+    const responseCandidate = await options.trustStore.getCandidateForTimeBootstrap()
+    if (!responseCandidate || responseCandidate.claims.sub !== options.releaseConfig.expected_center_issuer) {
+      fail('operation_trust_bundle_unavailable')
+    }
+    const responseSample = await fetchTrustedTimeAnchor(options.releaseConfig, responseCandidate,
+      createTestAnchorOptions(options.testTls))
+    const trustedTime = responseSample.assertFresh()
+    const accepted = await options.trustStore.getAccepted(responseSample.assertFresh)
+    if (accepted.artifactSha256 !== challenge.trustBundleDigest) fail('operation_trust_bundle_changed')
+    if (stage === 'recovery') {
+      const history = await validateRecoveryOperationHistory({
+        db: options.db, pendingKeyRoot: options.pendingKeyRoot, operationId,
+        issuer: options.releaseConfig.expected_center_issuer, centerOrigin: origin, identity,
+      })
+      const result = await verifyDirectRecoveryResponse({
+        options, history, attemptNo: attempt.attemptNo, response: parsedResponse, accepted, trustedTime,
+      })
+      const latest = await options.trustStore.getAccepted(responseSample.assertFresh)
+      if (latest.artifactSha256 !== accepted.artifactSha256) fail('operation_trust_bundle_changed')
+      await assertRecoveryIdentityUnchanged(options, operation)
+      return result
+    }
+    if (parsedResponse.type !== 'operation_receipt') fail('recovery_operation_response_unknown')
+    const verified = await verifyRecoveryOperationReceipt({
+      options, history: storedHistory, attemptNo: attempt.attemptNo, responseToken: parsedResponse.token,
+      accepted, trustedTime,
+    })
+    const result = await resultFromRecoveryOperationReceipt({
+      options, checked: verified.checked, history: verified.history, accepted, trustedTime,
+      attemptNo: attempt.attemptNo,
+    })
+    const latest = await options.trustStore.getAccepted(responseSample.assertFresh)
+    if (latest.artifactSha256 !== accepted.artifactSha256) fail('operation_trust_bundle_changed')
+    await assertRecoveryIdentityUnchanged(options, operation)
+    return result
+  })
+}
+
 export function createLicenseOperationRecoveryClient(options: LicenseOperationRecoveryClientOptions) {
   if ((options.testTls !== undefined || options.onTestCheckpoint !== undefined) && process.env.NODE_ENV !== 'test') {
     fail('license_test_transport_forbidden')
@@ -1354,7 +2173,7 @@ export function createLicenseOperationRecoveryClient(options: LicenseOperationRe
     })
     return runOneRecoveryRequest({ options, operationId, stage: 'query', checkpoint, assertLockHeld })
   }
-  return Object.freeze({
+  const client = {
     async queryPendingActivation(operationId: string): Promise<VerifiedOperationRecoveryEvidence> {
       try {
         return await withRecoveryOperationLock(options.pool, operationId, assertHeld => queryLocked(operationId, assertHeld))
@@ -1395,5 +2214,38 @@ export function createLicenseOperationRecoveryClient(options: LicenseOperationRe
     async recoverPendingActivation(operationId: string): Promise<RecoveredActivationOperation> {
       return this.continuePendingActivation(operationId)
     },
-  })
+    async recoverCurrentLease(activationOperationId: string): Promise<LicenseRecoveryOperationResult> {
+      try {
+        const source = await this.continuePendingActivation(activationOperationId)
+        const confirmed = source.continuation ?? source.query
+        const facts = await confirmedActivationRecoveryFacts({
+          options, activationOperationId, evidence: confirmed,
+        })
+        return await withRecoveryOperationLock(options.pool, activationOperationId, async assertLockHeld => {
+          const recovery = await createOrLoadRecoveryOperation(options.db, options.pendingKeyRoot, facts)
+          await assertLockHeld()
+          const attemptCount = await options.db.selectFrom('local_license_operation_attempts').select('attempt_no')
+            .where('operation_id', '=', recovery.operationId).execute()
+          const firstStage = attemptCount.length === 0 ? 'recovery' as const : 'query' as const
+          let result = await runOneRecoveryOperationRequest({
+            options, operationId: recovery.operationId, stage: firstStage, checkpoint, assertLockHeld,
+          })
+          if (result === null) {
+            result = await runOneRecoveryOperationRequest({
+              options, operationId: recovery.operationId, stage: 'continue', checkpoint, assertLockHeld,
+            })
+          }
+          if (result === null) fail('recovery_operation_not_found')
+          return result
+        })
+      } catch (error) {
+        if (error instanceof LicenseOperationRecoveryError) throw error
+        if (error instanceof LocalLicenseOperationError) fail(error.code)
+        const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : undefined
+        if (code && /^[a-z][a-z0-9_]{1,80}$/u.test(code)) fail(code)
+        fail('operation_recovery_failed')
+      }
+    },
+  }
+  return Object.freeze(client)
 }

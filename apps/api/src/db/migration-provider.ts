@@ -49,6 +49,7 @@ import { singleInitialActivationAttemptMigration } from './migrations/2026103000
 import { licenseOperationResultArchiveMigration } from './migrations/202610300003_license_operation_result_archive.js'
 import { licenseResultArchivePresenceMigration } from './migrations/202610300004_license_result_archive_presence.js'
 import { licenseOperationTrustedRejectionMigration } from './migrations/202610310001_license_operation_trusted_rejection.js'
+import { licenseOperationRecoveryAttemptsMigration } from './migrations/202610310002_license_operation_recovery_attempts.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -102,6 +103,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610300003_license_operation_result_archive': licenseOperationResultArchiveMigration,
       '202610300004_license_result_archive_presence': licenseResultArchivePresenceMigration,
       '202610310001_license_operation_trusted_rejection': licenseOperationTrustedRejectionMigration,
+      '202610310002_license_operation_recovery_attempts': licenseOperationRecoveryAttemptsMigration,
     }
   }
 }

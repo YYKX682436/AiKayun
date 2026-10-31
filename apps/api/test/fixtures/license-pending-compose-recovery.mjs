@@ -6,8 +6,11 @@ import { createDatabase } from 'file:///app/dist/db/pool.js'
 import {
   allocateLicenseOperationAttempt,
   createOrLoadActivationOperation,
+  createOrLoadRecoveryOperation,
   markLicenseOperationAttemptSent,
   readActivationOperationPayload,
+  readRecoveryOperationPayload,
+  readLicenseOperationAttemptEnvelope,
   readLicenseOperationAttemptResponse,
   readLicenseOperationAttemptResultJws,
   readLicenseOperationCenterEvidence,
@@ -119,6 +122,53 @@ try {
       committed_request_digest: savedAttempt.request_body_digest, result_jws: resultJws.toString('ascii'),
     })
     await saveLicenseOperationResponse(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId, attempt.attemptNo, responseJws)
+    const recovery = await createOrLoadRecoveryOperation(db, process.env.LICENSE_PENDING_KEY_ROOT, {
+      licenseId,
+      recoveryOfOperationId: operationId,
+      expectedGeneration: '1',
+      knownRevision: '1',
+      instanceId: binding.instance_id,
+      databaseId: binding.database_id,
+      identityJkt: binding.identity_jkt,
+    })
+    const recoveryClientNonce = Buffer.alloc(32, 0x72).toString('base64url')
+    const recoveryRequestNonce = Buffer.alloc(32, 0x73).toString('base64url')
+    await allocateLicenseOperationAttempt(db, process.env.LICENSE_PENDING_KEY_ROOT, {
+      operationId: recovery.operationId,
+      purpose: 'recovery',
+      intentDigest: recovery.intentDigest,
+      clientNonce: recoveryClientNonce,
+      requestNonce: recoveryRequestNonce,
+      identityJkt: binding.identity_jkt,
+      buildRequest(attemptNo) {
+        const requestBody = Buffer.from(JSON.stringify({
+          operation_id: recovery.operationId,
+          intent_digest: recovery.intentDigest,
+          attempt_no: attemptNo,
+          license_id: licenseId,
+          database_id: binding.database_id,
+          instance_id: binding.instance_id,
+          identity_jkt: binding.identity_jkt,
+          public_jwk: publicJwk,
+          challenge: 'synthetic-recovery-challenge'.padEnd(128, 'x'),
+          expected_generation: '1',
+          known_revision: '1',
+          recovery_of_operation_id: operationId,
+        }), 'utf8')
+        return {
+          requestBody,
+          signingKeyId: binding.identity_jkt,
+          signatureCreatedAt: new Date('2026-10-30T00:00:00.000Z'),
+          requestEnvelope: Buffer.from(JSON.stringify({
+            schema: 1,
+            method: 'POST',
+            target: '/v1/leases/renew',
+            headers: { accept: 'application/json', 'content-type': 'application/json' },
+            body_base64url: requestBody.toString('base64url'),
+          }), 'utf8'),
+        }
+      },
+    })
     const encryptedEvidence = await encryptLicensePendingBytes(process.env.LICENSE_PENDING_KEY_ROOT, {
       operationId, record: 'operation', field: 'center_evidence',
     }, responseJws)
@@ -135,6 +185,13 @@ try {
   } else if (mode === 'verify') {
     const payload = await readActivationOperationPayload(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId)
     assert.deepEqual(payload, { activationCode, origin })
+    const recovery = await db.selectFrom('local_license_operations').selectAll().where('kind', '=', 'recovery').executeTakeFirstOrThrow()
+    assert.deepEqual(await readRecoveryOperationPayload(db, process.env.LICENSE_PENDING_KEY_ROOT, recovery.operation_id), {
+      recoveryOfOperationId: operationId, expectedGeneration: '1', knownRevision: '1',
+    })
+    assert.equal((await readLicenseOperationAttemptEnvelope(
+      db, process.env.LICENSE_PENDING_KEY_ROOT, recovery.operation_id, 1,
+    )).purpose, 'recovery')
     const response = await readLicenseOperationAttemptResponse(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId, 1)
     const centerEvidence = await readLicenseOperationCenterEvidence(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId)
     assert.ok(centerEvidence)

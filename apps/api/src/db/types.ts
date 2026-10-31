@@ -66,7 +66,7 @@ export interface LocalLicenseOperationsTable {
   finalized_at: Date | null
 }
 
-export type LocalLicenseAttemptPurpose = 'activation' | 'query' | 'continue'
+export type LocalLicenseAttemptPurpose = 'activation' | 'query' | 'continue' | 'recovery'
 export type LocalLicenseAttemptSendState = 'prepared' | 'sent' | 'transport_unknown' | 'transport_error' | 'response_saved'
 export interface LocalLicenseOperationAttemptsTable {
   operation_id: string

@@ -3,6 +3,7 @@ import { readConfig } from '../config.js'
 import { createDatabase } from '../db/pool.js'
 import {
   readActivationOperationPayload,
+  readRecoveryOperationPayload,
   readLicenseOperationAttemptEnvelope,
   readLicenseOperationAttemptResponse,
   readLicenseOperationAttemptResultJws,
@@ -35,9 +36,14 @@ export async function verifyLicensePendingBackupPair(): Promise<{ operations: nu
     const attempts = await db.selectFrom('local_license_operation_attempts').selectAll()
       .orderBy('operation_id').orderBy('attempt_no').execute()
     for (const operation of operations) {
-      if (operation.kind !== 'activation') throw new Error('license_pending_restore_check_unsupported_operation_kind')
-      // Recomputes the center-compatible intent digest from the decrypted business payload.
-      await readActivationOperationPayload(db, config.licensePendingKeyRoot, operation.operation_id)
+      // Recomputes the center-compatible immutable intent from each encrypted operation payload.
+      if (operation.kind === 'activation') {
+        await readActivationOperationPayload(db, config.licensePendingKeyRoot, operation.operation_id)
+      } else if (operation.kind === 'recovery') {
+        await readRecoveryOperationPayload(db, config.licensePendingKeyRoot, operation.operation_id)
+      } else {
+        throw new Error('license_pending_restore_check_unsupported_operation_kind')
+      }
     }
     for (const attempt of attempts) {
       await readLicenseOperationAttemptEnvelope(db, config.licensePendingKeyRoot, attempt.operation_id, attempt.attempt_no)

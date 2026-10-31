@@ -77,6 +77,7 @@ beforeAll(async () => {
     '202610300003_license_operation_result_archive',
     '202610300004_license_result_archive_presence',
     '202610310001_license_operation_trusted_rejection',
+    '202610310002_license_operation_recovery_attempts',
   ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])

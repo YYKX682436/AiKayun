@@ -3,8 +3,10 @@ set -euo pipefail
 
 readonly center_commit='a5cf99439e3bf92b65f19d60c013bca088cf221a'
 readonly center_repository='https://github.com/YYKX682436/AiKayun-License.git'
+readonly local_center_source='/Users/muchen/Documents/ChatGPT/AiKayun-License'
 readonly postgres_image='postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873'
 readonly database_name='aikayun_3c2b_test'
+readonly test_filter="${1:-}"
 readonly task_id="$(date +%s)-$$"
 readonly container_name="aikayun-license-interop-${task_id}"
 readonly temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/aikayun-license-interop.XXXXXX")"
@@ -16,10 +18,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-git clone --quiet --no-checkout "$center_repository" "$center_checkout"
-git -C "$center_checkout" fetch --quiet --depth 1 origin "$center_commit"
-git -C "$center_checkout" checkout --quiet --detach FETCH_HEAD
-[[ "$(git -C "$center_checkout" rev-parse HEAD)" == "$center_commit" ]]
+if [[ -d "$local_center_source/.git" && "$(git -C "$local_center_source" rev-parse HEAD)" == "$center_commit" ]]; then
+  git clone --quiet --local --no-checkout "$local_center_source" "$center_checkout"
+  git -C "$center_checkout" checkout --quiet --detach "$center_commit"
+  center_source_commit="$(git -C "$local_center_source" rev-parse HEAD)"
+else
+  git clone --quiet --no-checkout "$center_repository" "$center_checkout"
+  git -C "$center_checkout" fetch --quiet --depth 1 origin "$center_commit"
+  git -C "$center_checkout" checkout --quiet --detach FETCH_HEAD
+  center_source_commit="$(git -C "$center_checkout" rev-parse HEAD)"
+fi
+[[ "$center_source_commit" == "$center_commit" ]]
 
 pnpm install --frozen-lockfile
 (cd "$center_checkout" && npm ci)
@@ -44,7 +53,16 @@ for attempt in {1..60}; do
 done
 
 pnpm build:packages
-NODE_ENV=test \
-TEST_DATABASE_URL="postgres://license:license-test-only@127.0.0.1:${postgres_port}/${database_name}" \
-LICENSE_CENTER_CHECKOUT="$center_checkout" \
-pnpm --filter @aikayun/api exec vitest run test/license-center-challenge.interop.test.ts
+export NODE_ENV=test
+export TEST_DATABASE_URL="postgres://license:license-test-only@127.0.0.1:${postgres_port}/${database_name}"
+export LICENSE_CENTER_CHECKOUT="$center_checkout"
+if [[ -n "$test_filter" ]]; then
+  pnpm --filter @aikayun/api exec vitest run \
+    test/license-center-challenge.interop.test.ts \
+    test/license-operation-store.integration.test.ts \
+    --testNamePattern "$test_filter"
+else
+  pnpm --filter @aikayun/api exec vitest run \
+    test/license-center-challenge.interop.test.ts \
+    test/license-operation-store.integration.test.ts
+fi

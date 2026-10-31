@@ -15,7 +15,7 @@ const [
   { createTestSigningRuntime }, { createDatabase, migrateToLatest }, { createApp }, offlineTrust,
   { trustBundleArtifactDigest },
   { initializeSignerRequestDigest, acceptSignerTrustBundleRequestDigest, rotateSignerRequestDigest },
-  { createAdminService, createLicenseRequestDigest, issueActivationCodeRequestDigest, changeLicenseStatusRequestDigest },
+  { createAdminService, createLicenseRequestDigest, issueActivationCodeRequestDigest, changeLicenseStatusRequestDigest, renewLicenseRequestDigest },
   { signOperationReceipt, signLicenseLease }, { decodeJwt },
 ] = await Promise.all([
   centerImport('test/support/runtime.ts'),
@@ -191,6 +191,18 @@ try {
   const activationFinalizationCases = []
   for (let index = 0; index < 7; index += 1) activationFinalizationCases.push(await issueActivationScenario())
   const activationExpiredChallenge = await issueActivationScenario()
+  const recoveryExpiredRenewed = await issueActivationScenario()
+  const recoveryRetiredSigner = await issueActivationScenario()
+  const recoveryRevokedSigner = await issueActivationScenario()
+  const recoveryRevokedLicense = await issueActivationScenario()
+  const recoveryExpiredSubscription = await issueActivationScenario()
+  const recoverySuperseded = await issueActivationScenario()
+  const recoveryWrongIdentity = await issueActivationScenario()
+  const recoveryLostResponse = await issueActivationScenario()
+  const recoveryContinue = await issueActivationScenario()
+  const recoveryCrash = await issueActivationScenario()
+  const recoveryTamper = await issueActivationScenario()
+  const recoveryTimeout = await issueActivationScenario()
   const crashActivationCases = []
   for (let index = 0; index < 7; index += 1) crashActivationCases.push(await issueActivationScenario())
   const transportActivationCases = []
@@ -226,6 +238,76 @@ try {
       return reply.code(409).send({ error: 'replacement rejected', outcome_code: issued.outcomeCode })
     }
     return reply.code(200).send({ activation_code: issued.activationCode })
+  })
+  app.post('/__test/renew-license', async (request, reply) => {
+    const body = request.body
+    if (!body || typeof body !== 'object' || typeof body.license_id !== 'string') {
+      return reply.code(400).send({ error: 'invalid test request' })
+    }
+    const license = await db.selectFrom('licenses').select(['id', 'revision'])
+      .where('id', '=', body.license_id).executeTakeFirst()
+    if (!license) return reply.code(404).send({ error: 'test license not found' })
+    const input = {
+      operationId: randomUUID(), licenseId: license.id, expectedRevision: license.revision.toString(),
+      businessReference: `interop-renewal-${randomUUID()}`, reason: '隔离恢复互操作修订权益',
+    }
+    const result = await licenseAdmin.renewLicense({
+      ...input, confirmedRequestDigest: renewLicenseRequestDigest(input),
+    })
+    if (result.state !== 'succeeded') return reply.code(409).send({ outcome_code: result.outcomeCode })
+    return reply.code(200).send({
+      revision: result.resultRevision,
+      entitlement_revision: result.result.entitlement_revision,
+    })
+  })
+  app.post('/__test/expire-license', async (request, reply) => {
+    const body = request.body
+    if (!body || typeof body !== 'object' || typeof body.license_id !== 'string') {
+      return reply.code(400).send({ error: 'invalid test request' })
+    }
+    const updated = await db.updateTable('licenses').set({
+      confirmed_subscription_end: new Date(Date.now() - 60_000),
+    }).where('id', '=', body.license_id).returning('id').executeTakeFirst()
+    if (!updated) return reply.code(404).send({ error: 'test license not found' })
+    return reply.code(200).send({ state: 'expired' })
+  })
+  app.post('/__test/revoke-license', async (request, reply) => {
+    const body = request.body
+    if (!body || typeof body !== 'object' || typeof body.license_id !== 'string') {
+      return reply.code(400).send({ error: 'invalid test request' })
+    }
+    const license = await db.selectFrom('licenses').select(['id', 'revision'])
+      .where('id', '=', body.license_id).executeTakeFirst()
+    if (!license) return reply.code(404).send({ error: 'test license not found' })
+    const input = { operationId: randomUUID(), licenseId: license.id,
+      expectedRevision: license.revision.toString(), reason: '隔离恢复互操作撤销权益' }
+    const result = await licenseAdmin.revokeLicense({
+      ...input, confirmedRequestDigest: changeLicenseStatusRequestDigest(input, 'license_revoke'),
+    })
+    return reply.code(200).send({ state: result.state, outcome_code: result.outcomeCode })
+  })
+  app.post('/__test/supersede-license', async (request, reply) => {
+    const body = request.body
+    if (!body || typeof body !== 'object' || typeof body.license_id !== 'string') {
+      return reply.code(400).send({ error: 'invalid test request' })
+    }
+    await db.transaction().execute(async trx => {
+      await trx.updateTable('license_activations').set({ state: 'retired', retired_at: new Date() })
+        .where('license_id', '=', body.license_id).where('state', '=', 'active').executeTakeFirstOrThrow()
+      await sql`UPDATE licenses SET current_generation = current_generation + 1 WHERE id = ${body.license_id}`.execute(trx)
+    })
+    return reply.code(200).send({ state: 'superseded' })
+  })
+  app.post('/__test/break-activation-identity', async (request, reply) => {
+    const body = request.body
+    if (!body || typeof body !== 'object' || typeof body.license_id !== 'string') {
+      return reply.code(400).send({ error: 'invalid test request' })
+    }
+    await db.transaction().execute(async trx => {
+      await trx.updateTable('license_activations').set({ database_id: randomUUID() })
+        .where('license_id', '=', body.license_id).executeTakeFirstOrThrow()
+    })
+    return reply.code(200).send({ state: 'mismatched' })
   })
   app.post('/__test/prepare-signer-rotation', async (request, reply) => {
     const body = request.body
@@ -362,7 +444,7 @@ try {
         throw new Error('Expired-result fixture requires a committed activation lease')
       }
       const old = decodeJwt(operation.response_jws)
-      const expired = await signLicenseLease(runtime.signer, {
+      const expired = await signLicenseLease({ ...runtime.signer, issuer: origin }, {
         licenseId: old.sub,
         instanceId: old.instance_id,
         databaseId: old.database_id,
@@ -385,9 +467,17 @@ try {
       })
   })
   app.addHook('preSerialization', async (request, reply, payload) => {
+    if (request.method === 'POST' && request.url === '/v1/leases/renew') {
+      let mode
+      try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { return payload }
+      if (mode === 'delay_recovery_response_after_commit') {
+        await new Promise(resolve => setTimeout(resolve, 6_000))
+      }
+    }
     if (request.method !== 'POST' || !['/v1/operations/query', '/v1/operations/continue'].includes(request.url)) return payload
     let mode
-    try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { return payload }
+    let control
+    try { control = JSON.parse(await readFile(activationControlPath, 'utf8')); mode = control.mode } catch { return payload }
     if (['other_unrecorded_rejection', 'expired_unrecorded_rejection'].includes(mode) && request.url === '/v1/operations/continue') {
       const body = request.body
       const challenge = decodeJwt(body.challenge)
@@ -406,9 +496,11 @@ try {
     const forgedModes = new Set([
       'forged_actor', 'forged_operation', 'forged_committed_attempt', 'forged_not_found_result',
       'wrong_request_digest', 'wrong_receipt_signature', 'wrong_receipt_kid', 'query_unrecorded_rejection', 'query_not_found',
+      'recovery_query_not_found',
     ])
     if (!forgedModes.has(mode)) return payload
     const body = request.body
+    if (mode === 'recovery_query_not_found' && body.operation_id !== control.operation_id) return payload
     const challenge = decodeJwt(body.challenge)
     const requestDigest = createHash('sha256').update(request.rawBody).digest('base64url')
     const challengeNonceHash = createHash('sha256').update(challenge.server_nonce).digest('base64url')
@@ -417,9 +509,9 @@ try {
       identityJkt: mode === 'forged_actor' ? 'A'.repeat(43) : body.identity_jkt,
       operationId: mode === 'forged_operation' ? randomUUID() : body.operation_id,
       intentDigest: body.intent_digest,
-      state: ['forged_not_found_result', 'query_not_found'].includes(mode) ? 'not_found'
+      state: ['forged_not_found_result', 'query_not_found', 'recovery_query_not_found'].includes(mode) ? 'not_found'
         : mode === 'query_unrecorded_rejection' ? 'rejected' : 'committed',
-      outcomeCode: ['forged_not_found_result', 'query_not_found'].includes(mode) ? 'OPERATION_NOT_FOUND'
+      outcomeCode: ['forged_not_found_result', 'query_not_found', 'recovery_query_not_found'].includes(mode) ? 'OPERATION_NOT_FOUND'
         : mode === 'query_unrecorded_rejection' ? 'ACTIVATION_AUTHORIZATION_INVALID' : 'ACTIVATED',
       attemptNo: body.attempt_no,
       requestNonceHash: challengeNonceHash,
@@ -434,7 +526,7 @@ try {
     }
     const signer = mode === 'wrong_receipt_kid'
       ? { ...runtime.signer, ...(await runtime.createOnlineKey()), issuer: origin }
-      : mode === 'query_not_found'
+      : ['query_not_found', 'recovery_query_not_found'].includes(mode)
         ? { ...runtime.signer, ...currentOnlineKey, issuer: origin }
       : { ...runtime.signer, issuer: origin }
     let token = await signOperationReceipt(signer, claims)
@@ -486,6 +578,8 @@ try {
     }
     if ((reply.statusCode === 200 && request.url === '/v1/activations' && mode === 'drop_after_commit') ||
       (reply.statusCode === 200 && request.url === '/v1/operations/continue' && mode === 'drop_continue_after_commit') ||
+      (reply.statusCode === 200 && request.url === '/v1/leases/renew' && mode === 'drop_recovery_after_commit') ||
+      (reply.statusCode === 200 && request.url === '/v1/operations/continue' && mode === 'drop_recovery_continue_after_commit') ||
       (request.url === '/v1/activations' && mode === 'drop_activation_rejection' && reply.statusCode === 409)) reply.raw.destroy()
     return payload
   })
@@ -515,6 +609,18 @@ try {
     activation_retry_cases: activationRetryCases,
     activation_finalization_cases: activationFinalizationCases,
     activation_expired_challenge: activationExpiredChallenge,
+    recovery_expired_renewed: recoveryExpiredRenewed,
+    recovery_retired_signer: recoveryRetiredSigner,
+    recovery_revoked_signer: recoveryRevokedSigner,
+    recovery_revoked_license: recoveryRevokedLicense,
+    recovery_expired_subscription: recoveryExpiredSubscription,
+    recovery_superseded: recoverySuperseded,
+    recovery_wrong_identity: recoveryWrongIdentity,
+    recovery_lost_response: recoveryLostResponse,
+    recovery_continue: recoveryContinue,
+    recovery_crash: recoveryCrash,
+    recovery_tamper: recoveryTamper,
+    recovery_timeout: recoveryTimeout,
     crash_activation_cases: crashActivationCases,
     transport_activation_cases: transportActivationCases,
   }), { mode: 0o600, flag: 'wx' })

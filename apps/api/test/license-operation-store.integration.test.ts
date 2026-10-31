@@ -14,14 +14,17 @@ import { singleInitialActivationAttemptMigration } from '../src/db/migrations/20
 import { licenseOperationResultArchiveMigration } from '../src/db/migrations/202610300003_license_operation_result_archive.js'
 import { licenseResultArchivePresenceMigration } from '../src/db/migrations/202610300004_license_result_archive_presence.js'
 import { licenseOperationTrustedRejectionMigration } from '../src/db/migrations/202610310001_license_operation_trusted_rejection.js'
-import { ed25519IdentityJkt } from '../src/licensing/license-intent.js'
+import { licenseOperationRecoveryAttemptsMigration } from '../src/db/migrations/202610310002_license_operation_recovery_attempts.js'
+import { buildRecoveryIntent, ed25519IdentityJkt } from '../src/licensing/license-intent.js'
 import {
   allocateLicenseOperationAttempt,
   createOrLoadActivationOperation,
+  createOrLoadRecoveryOperation,
   markLicenseOperationAttemptSent,
   markLicenseOperationAttemptTransportResult,
   newLicenseOperationId,
   readActivationOperationPayload,
+  readRecoveryOperationPayload,
   readLicenseOperationAttemptEnvelope,
   readLicenseOperationAttemptResponse,
   readLicenseOperationAttemptResultJws,
@@ -96,6 +99,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
     await licenseOperationResultArchiveMigration.up(db)
     await licenseResultArchivePresenceMigration.up(db)
     await licenseOperationTrustedRejectionMigration.up(db)
+    await licenseOperationRecoveryAttemptsMigration.up(db)
     const pendingRoot = await mkdtemp(join(tmpdir(), 'aikayun-license-pending-pg-'))
     pendingRoots.add(pendingRoot)
     await initializeTemporaryLicensePendingKey(pendingRoot, 'test')
@@ -248,6 +252,118 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
       const rowBytes = Buffer.concat([rows[0]!.encrypted_intent_payload]).toString('utf8')
       expect(rowBytes).not.toContain(input.activationCode)
       expect(rows[0]!.intent_digest).toBe(first.intentDigest)
+    })
+  })
+
+  it('persists one encrypted recovery intent and validates its renewal request attempt', async () => {
+    await withSandbox(async sandbox => {
+      const sourceInput = activationInput()
+      const source = await createOrLoadActivationOperation(sandbox.db, sandbox.pendingRoot, sourceInput)
+      const original = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(sourceInput.operationId, source.intentDigest))
+      await markLicenseOperationAttemptSent(sandbox.db, sourceInput.operationId, original.attemptNo)
+      await saveLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, sourceInput.operationId,
+        original.attemptNo, Buffer.from('source.signed.result'))
+
+      const recoveryInput = {
+        licenseId: sourceInput.licenseId,
+        recoveryOfOperationId: sourceInput.operationId,
+        expectedGeneration: '1',
+        knownRevision: '2',
+        databaseId: sourceInput.databaseId,
+        instanceId: sourceInput.instanceId,
+        identityJkt: sourceInput.identityJkt,
+      }
+      const recovery = await createOrLoadRecoveryOperation(sandbox.db, sandbox.pendingRoot, recoveryInput)
+      const replay = await createOrLoadRecoveryOperation(sandbox.db, sandbox.pendingRoot, recoveryInput)
+      expect(recovery).toMatchObject({ created: true, state: 'pending', expectedGeneration: '1', knownRevision: '2' })
+      expect(replay).toMatchObject({ created: false, operationId: recovery.operationId, intentDigest: recovery.intentDigest })
+      expect(recovery.operationId).not.toBe(sourceInput.operationId)
+      expect(await readRecoveryOperationPayload(sandbox.db, sandbox.pendingRoot, recovery.operationId)).toEqual({
+        recoveryOfOperationId: sourceInput.operationId, expectedGeneration: '1', knownRevision: '2',
+      })
+      expect(recovery.intentDigest).toBe(buildRecoveryIntent({
+        licenseId: sourceInput.licenseId,
+        databaseId: sourceInput.databaseId,
+        instanceId: sourceInput.instanceId,
+        identityJkt: sourceInput.identityJkt,
+        expectedGeneration: '1',
+        knownRevision: '2',
+        recoveryOfOperationId: sourceInput.operationId,
+      }).intentDigest)
+
+      const clientNonce = randomBytes(32).toString('base64url')
+      const requestNonce = randomBytes(32).toString('base64url')
+      const challenge = 'recovery-test-challenge'.padEnd(128, 'x')
+      let requestDigest = ''
+      const attempt = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot, {
+        operationId: recovery.operationId,
+        purpose: 'recovery',
+        intentDigest: recovery.intentDigest,
+        clientNonce,
+        requestNonce,
+        identityJkt: recoveryInput.identityJkt,
+        buildRequest(attemptNo) {
+          const body = Buffer.from(JSON.stringify({
+            operation_id: recovery.operationId,
+            intent_digest: recovery.intentDigest,
+            attempt_no: attemptNo,
+            license_id: sourceInput.licenseId,
+            database_id: sourceInput.databaseId,
+            instance_id: sourceInput.instanceId,
+            identity_jkt: sourceInput.identityJkt,
+            public_jwk: testPublicJwk,
+            challenge,
+            expected_generation: '1',
+            known_revision: '2',
+            recovery_of_operation_id: sourceInput.operationId,
+          }), 'utf8')
+          requestDigest = createHash('sha256').update(body).digest('base64url')
+          return {
+            requestBody: body,
+            signingKeyId: recoveryInput.identityJkt,
+            signatureCreatedAt: new Date('2026-10-31T00:00:00.000Z'),
+            requestEnvelope: Buffer.from(JSON.stringify({
+              schema: 1, method: 'POST', target: '/v1/leases/renew', body_base64url: body.toString('base64url'),
+              headers: { accept: 'application/json', 'content-type': 'application/json' },
+            }), 'utf8'),
+          }
+        },
+      })
+      expect(attempt).toMatchObject({ operationId: recovery.operationId, attemptNo: 1, reused: false })
+      const restored = await readLicenseOperationAttemptEnvelope(sandbox.db, sandbox.pendingRoot, recovery.operationId, 1)
+      expect(restored).toMatchObject({ purpose: 'recovery', requestBodyDigest: requestDigest })
+      const attempts = await sandbox.db.selectFrom('local_license_operation_attempts').select(['purpose', 'attempt_no'])
+        .where('operation_id', '=', recovery.operationId).execute()
+      expect(attempts).toEqual([{ purpose: 'recovery', attempt_no: 1 }])
+      expect(await sandbox.db.selectFrom('local_license_operations').select('operation_id').execute()).toHaveLength(2)
+    })
+  })
+
+  it('reloads the committed recovery operation after PostgreSQL commit acknowledgement is lost', async () => {
+    await withSandbox(async sandbox => {
+      const sourceInput = activationInput()
+      const source = await createOrLoadActivationOperation(sandbox.db, sandbox.pendingRoot, sourceInput)
+      const original = await allocateLicenseOperationAttempt(sandbox.db, sandbox.pendingRoot,
+        attemptInput(sourceInput.operationId, source.intentDigest))
+      await markLicenseOperationAttemptSent(sandbox.db, sourceInput.operationId, original.attemptNo)
+      await saveLicenseOperationResponse(sandbox.db, sandbox.pendingRoot, sourceInput.operationId,
+        original.attemptNo, Buffer.from('source.signed.result'))
+      const recoveryInput = {
+        licenseId: sourceInput.licenseId,
+        recoveryOfOperationId: sourceInput.operationId,
+        expectedGeneration: '1',
+        knownRevision: '1',
+        databaseId: sourceInput.databaseId,
+        instanceId: sourceInput.instanceId,
+        identityJkt: sourceInput.identityJkt,
+      }
+      await expect(createOrLoadRecoveryOperation(
+        loseCommitAcknowledgementAfterPostgresCommit(sandbox.db), sandbox.pendingRoot, recoveryInput,
+      )).rejects.toThrow('injected_unknown_commit_acknowledgement')
+      const recovered = await createOrLoadRecoveryOperation(sandbox.db, sandbox.pendingRoot, recoveryInput)
+      expect(recovered).toMatchObject({ created: false, state: 'pending' })
+      expect(await sandbox.db.selectFrom('local_license_operations').select('operation_id').execute()).toHaveLength(2)
     })
   })
 
@@ -703,6 +819,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         await licenseOperationResultArchiveMigration.up(restoredDb)
         await licenseResultArchivePresenceMigration.up(restoredDb)
         await licenseOperationTrustedRejectionMigration.up(restoredDb)
+        await licenseOperationRecoveryAttemptsMigration.up(restoredDb)
         await restoredDb.transaction().execute(async trx => {
           await sql.raw('ALTER TABLE local_license_operations DISABLE TRIGGER USER').execute(trx)
           await sql.raw('ALTER TABLE local_license_operation_attempts DISABLE TRIGGER USER').execute(trx)
