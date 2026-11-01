@@ -95,6 +95,11 @@ test('an alternate deployment applies its logo and purple primary, then isolates
     contentType: 'application/json',
     body: JSON.stringify({ data: { admin: { email: 'theme-test@example.com' } } }),
   }))
+  await page.route('**/api/v1/admin/license-status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ data: { status: 'active', allowedUntil: null, retryable: false } }),
+  }))
   await expect(page.getByRole('button', { name: '安全登录' })).toBeEnabled({ timeout: 15_000 })
   await page.getByLabel('管理员邮箱').fill('theme-test@example.com')
   await page.getByLabel('密码').fill('theme-test-password')

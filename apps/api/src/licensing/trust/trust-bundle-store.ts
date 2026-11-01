@@ -1,6 +1,8 @@
 import { constants as fsConstants } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { mkdir, open, readFile, rename, unlink, lstat, readdir } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, unlink, lstat, readdir, link } from 'node:fs/promises';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { acquireKernelFileLock } from './kernel-file-lock.js';
 import { join, resolve } from 'node:path';
 import { hostname } from 'node:os';
 import type { CryptoKey } from 'jose';
@@ -20,6 +22,10 @@ import type {
   RootAuthenticatedTrustBundleCandidate,
   TrustedOfflineRootPin,
 } from './trust-bundle.js';
+import type { TrustDatabaseCoordinator } from './trust-database-coordinator.js';
+import { trustedBundleStateDigest } from './trust-database-coordinator.js';
+import type { Transaction } from 'kysely';
+import type { Database } from '../../db/types.js';
 
 const STATE_FILE_NAME = 'trust-bundle-state.json';
 // Upgrade the old marker path in place: its old schema is rejected, never treated as a fresh install.
@@ -34,6 +40,27 @@ const CHECKPOINT_FIELDS = [
 const PENDING_FIELDS = ['accepted_at', 'previous_version', 'previous_artifact_sha256', 'next'] as const;
 const digestPattern = /^[A-Za-z0-9_-]{43}$/;
 const directoryQueues = new Map<string, Promise<void>>();
+
+interface TrustTransactionScope {
+  closed?: boolean;
+  directory?: string;
+  release?: () => Promise<void>;
+}
+const transactionScope = new AsyncLocalStorage<TrustTransactionScope>();
+
+/** The scope starts without a file lock. Admission acquires it after its DB locks. */
+export async function withTrustTransactionScope<T>(work: () => Promise<T>): Promise<T> {
+  if (transactionScope.getStore()) throw new Error('Nested trust transaction scopes are not supported');
+  const scope: TrustTransactionScope = {};
+  return transactionScope.run(scope, async () => {
+    try { return await work(); } finally {
+      scope.closed = true;
+      const release = scope.release;
+      delete scope.release;
+      await release?.();
+    }
+  });
+}
 
 export type TrustStoreWriteStage =
   | 'checkpoint_prepare_before_write'
@@ -67,6 +94,8 @@ export interface TrustBundleStoreOptions {
   expectedCenterIssuer: string;
   /** Supplied by the trusted release artifact; never inferred from a downloaded package. */
   minimumBundleVersion: string;
+  /** Required by production callers so reads and updates share the PostgreSQL trust head. */
+  coordinator?: TrustDatabaseCoordinator;
   /** Deterministic fault injection for filesystem recovery tests. */
   faultAt?: (stage: TrustStoreWriteStage) => void | Promise<void>;
 }
@@ -338,6 +367,7 @@ export class TrustBundleStore {
   readonly expectedCenterIssuer: string;
   readonly minimumBundleVersion: string;
   private readonly faultAt: ((stage: TrustStoreWriteStage) => void | Promise<void>) | undefined;
+  private readonly coordinator: TrustDatabaseCoordinator | undefined;
 
   constructor(options: TrustBundleStoreOptions) {
     this.directory = resolve(options.directory);
@@ -348,6 +378,14 @@ export class TrustBundleStore {
     this.expectedCenterIssuer = options.expectedCenterIssuer;
     this.minimumBundleVersion = assertMinimumBundleVersion(options.minimumBundleVersion);
     this.faultAt = options.faultAt;
+    this.coordinator = options.coordinator;
+  }
+
+  withCoordinator(coordinator: TrustDatabaseCoordinator): TrustBundleStore {
+    if (this.coordinator === coordinator) return this;
+    return new TrustBundleStore({ directory: this.directory, trustedRoot: this.trustedRoot,
+      expectedCenterIssuer: this.expectedCenterIssuer, minimumBundleVersion: this.minimumBundleVersion,
+      coordinator, ...(this.faultAt === undefined ? {} : { faultAt: this.faultAt }) })
   }
 
   async accept(token: unknown, trustedTime: TrustedTimeSource): Promise<AcceptedTrustBundle> {
@@ -360,6 +398,17 @@ export class TrustBundleStore {
       throw new Error('Trust bundle is below the release-pinned minimum version');
     }
 
+    if (this.coordinator) {
+      return this.coordinator.accept(
+        { token: candidate.token, artifactSha256: candidate.artifactSha256 },
+        () => this.getAcceptedLocal(trustedTime),
+        () => this.acceptLocal(candidate, trustedTime),
+      );
+    }
+    return this.acceptLocal(candidate, trustedTime);
+  }
+
+  private async acceptLocal(candidate: RootAuthenticatedTrustBundleCandidate, trustedTime: TrustedTimeSource): Promise<AcceptedTrustBundle> {
     return this.withWriteLock(async () => {
       let now = readTrustedTime(trustedTime)
       assertTrustBundleValidAt(candidate, now)
@@ -428,6 +477,18 @@ export class TrustBundleStore {
   }
 
   async getAccepted(trustedTime: TrustedTimeSource): Promise<AcceptedTrustBundle> {
+    if (!this.coordinator) return this.getAcceptedLocal(trustedTime);
+    return this.coordinator.withRead(async head => {
+      if (!head.headDigest || !head.headVersion) throw new Error('database_trust_bundle_head_not_initialized');
+      const accepted = await this.getAcceptedLocal(trustedTime);
+      if (accepted.bundleVersion !== head.headVersion || trustedBundleStateDigest(accepted) !== head.headDigest) {
+        throw new Error('trust_bundle_store_does_not_match_database_head');
+      }
+      return accepted;
+    });
+  }
+
+  private async getAcceptedLocal(trustedTime: TrustedTimeSource): Promise<AcceptedTrustBundle> {
     return this.withWriteLock(async () => {
       const checkpoint = await this.recoverCheckpoint();
       if (!checkpoint?.committed) throw new Error('No accepted trust bundle is persisted');
@@ -444,6 +505,69 @@ export class TrustBundleStore {
 
   /** Root-authenticated candidate for nonce-bound time bootstrap only; never returns an operational resolver. */
   async getCandidateForTimeBootstrap(): Promise<RootAuthenticatedTrustBundleCandidate | null> {
+    if (!this.coordinator) return this.getCandidateForTimeBootstrapLocal();
+    return this.coordinator.withRead(async head => {
+      if (head.headDigest === null) {
+        const candidate = await this.getCandidateForTimeBootstrapLocal();
+        if (candidate) throw new Error('trust_bundle_exists_without_database_head');
+        return null;
+      }
+      if (!head.headVersion) throw new Error('database_trust_bundle_head_malformed');
+      const persisted = await this.getPersistedTrustStateLocal();
+      if (!persisted || persisted.bundleVersion !== head.headVersion || persisted.digest !== head.headDigest) {
+        throw new Error('trust_bundle_store_does_not_match_database_head');
+      }
+      const candidate = await this.getCandidateForTimeBootstrapLocal();
+      if (!candidate || candidate.artifactSha256 !== persisted.artifactSha256) {
+        throw new Error('trust_bundle_candidate_is_not_the_database_head');
+      }
+      return candidate;
+    });
+  }
+
+  /** Read-only selection for the explicit one-time DB-head bootstrap command. */
+  async getCandidateForDatabaseHeadBootstrap(): Promise<RootAuthenticatedTrustBundleCandidate> {
+    if (!this.coordinator) throw new Error('trust_bundle_database_coordinator_required')
+    return this.coordinator.withRead(async state => {
+      if (state.pendingArtifactSha256 !== null) throw new Error('trust_bundle_update_pending')
+      if (state.headDigest !== null) {
+        const current = await this.getAcceptedLocal(() => Math.max(1, Math.floor(Date.now() / 1000)))
+        if (current.bundleVersion !== state.headVersion || trustedBundleStateDigest(current) !== state.headDigest) {
+          throw new Error('trust_bundle_store_does_not_match_database_head')
+        }
+      }
+      const candidate = await this.getCandidateForTimeBootstrapLocal()
+      if (!candidate) throw new Error('trust_bundle_not_initialized')
+      return candidate
+    })
+  }
+
+  /** Explicit, idempotent bootstrap for an installation upgraded with an existing signed bundle. */
+  async initializeDatabaseHead(trustedTime: TrustedTimeSource): Promise<AcceptedTrustBundle> {
+    readTrustedTime(trustedTime)
+    if (!this.coordinator) throw new Error('trust_bundle_database_coordinator_required')
+    return this.coordinator.bootstrap(() => this.getAcceptedLocal(trustedTime))
+  }
+
+  private async getPersistedTrustStateLocal(): Promise<{ bundleVersion: string; artifactSha256: string; digest: string } | null> {
+    return this.withWriteLock(async () => {
+      const checkpoint = await this.recoverCheckpoint();
+      const record = checkpoint?.committed;
+      if (!record) return null;
+      return {
+        bundleVersion: record.bundle_version,
+        artifactSha256: record.artifact_sha256,
+        digest: trustedBundleStateDigest({ artifactSha256: record.artifact_sha256, bundleVersion: record.bundle_version,
+          revokedKids: record.revoked_kids, retiredKids: record.retired_kids }),
+      };
+    });
+  }
+
+  async withDatabaseTransaction<T>(trx: Transaction<Database>, work: () => Promise<T>): Promise<T> {
+    return this.coordinator ? this.coordinator.withTransaction(trx, work) : work();
+  }
+
+  private async getCandidateForTimeBootstrapLocal(): Promise<RootAuthenticatedTrustBundleCandidate | null> {
     return this.withWriteLock(async () => {
       await this.ensurePrivateDirectory()
       const checkpoint = await this.readCheckpoint()
@@ -514,7 +638,7 @@ export class TrustBundleStore {
     revokedKids: readonly string[],
     retiredKids: readonly string[],
   ): Promise<void> {
-    await this.withWriteLock(async () => {
+    const checkFile = async () => this.withWriteLock(async () => {
       const checkpoint = await this.recoverCheckpoint();
       const current = checkpoint?.committed;
       if (!current || current.artifact_sha256 !== candidate.artifactSha256 ||
@@ -522,6 +646,15 @@ export class TrustBundleStore {
         current.retired_kids.join(',') !== retiredKids.join(',')) {
         throw new Error('Trust key resolver is stale after a bundle or revocation update');
       }
+    });
+    if (!this.coordinator) return checkFile();
+    await this.coordinator.withRead(async head => {
+      const expectedDigest = trustedBundleStateDigest({ artifactSha256: candidate.artifactSha256,
+        bundleVersion: candidate.claims.bundle_version, revokedKids, retiredKids });
+      if (head.headDigest !== expectedDigest || head.headVersion !== candidate.claims.bundle_version) {
+        throw new Error('Trust key resolver is stale after a database trust-head update');
+      }
+      await checkFile();
     });
   }
 
@@ -784,7 +917,7 @@ export class TrustBundleStore {
   }
 
   private async cleanupAtomicTemps(): Promise<void> {
-    const temporaryPattern = /^\.(?:trust-bundle-state\.json|trust-bundle-store\.marker\.json)-[0-9]+-[a-f0-9]{24}\.tmp$/;
+    const temporaryPattern = /^\.(?:trust-bundle-state\.json|trust-bundle-store\.marker\.json|trust-bundle-write-lock)-[0-9]+-[a-f0-9]{24}\.tmp$/;
     let removedTemporary = false;
     for (const name of await readdir(this.directory)) {
       if (!name.endsWith('.tmp')) continue;
@@ -804,42 +937,80 @@ export class TrustBundleStore {
     }
   }
 
+  /** Called only after admission has locked binding then license state. */
+  async holdForTransaction(): Promise<void> {
+    const scope = transactionScope.getStore();
+    if (!scope || scope.closed) throw new Error('Trust admission requires an enclosing transaction scope');
+    if (scope.release) {
+      if (scope.directory !== this.directory) throw new Error('A transaction cannot mix trust directories');
+      return;
+    }
+    const release = await this.acquireExclusiveLock();
+    if (scope.closed) { await release(); throw new Error('Trust transaction scope has closed'); }
+    scope.directory = this.directory;
+    scope.release = release;
+  }
+
   private async withWriteLock<T>(work: () => Promise<T>): Promise<T> {
+    const scope = transactionScope.getStore();
+    if (scope?.release && scope.directory === this.directory) return work();
+    const release = await this.acquireExclusiveLock();
+    try { return await work(); } finally { await release(); }
+  }
+
+  private async acquireExclusiveLock(): Promise<() => Promise<void>> {
     const directory = this.directory;
     const previous = directoryQueues.get(directory) ?? Promise.resolve();
-    let release!: () => void;
-    const hold = new Promise<void>((resolveHold) => { release = resolveHold; });
+    let releaseQueue!: () => void;
+    const hold = new Promise<void>((resolveHold) => { releaseQueue = resolveHold; });
     const tail = previous.catch(() => undefined).then(() => hold);
     directoryQueues.set(directory, tail);
     await previous.catch(() => undefined);
+    let releaseKernel: (() => Promise<void>) | undefined;
+    let legacyAcquired = false;
     try {
+      await this.ensurePrivateDirectory();
+      releaseKernel = await acquireKernelFileLock(directory);
       await this.acquireFilesystemLock();
-      try {
-        await this.cleanupAtomicTemps();
-        return await work();
-      } finally { await this.releaseFilesystemLock(); }
-    } finally {
-      release();
+      legacyAcquired = true;
+      await this.cleanupAtomicTemps();
+    } catch (error) {
+      if (legacyAcquired) await this.releaseFilesystemLock().catch(() => undefined);
+      await releaseKernel?.().catch(() => undefined);
+      releaseQueue();
       if (directoryQueues.get(directory) === tail) directoryQueues.delete(directory);
+      throw error;
     }
+    return async () => {
+      try {
+        try { await this.releaseFilesystemLock(); } finally { await releaseKernel?.(); }
+      } finally {
+        releaseQueue();
+        if (directoryQueues.get(directory) === tail) directoryQueues.delete(directory);
+      }
+    };
   }
 
   private async acquireFilesystemLock(): Promise<void> {
     await this.ensurePrivateDirectory();
     const path = join(this.directory, '.trust-bundle-write.lock');
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      const temporary = join(this.directory, `.trust-bundle-write-lock-${process.pid}-${randomBytes(12).toString('hex')}.tmp`);
       try {
-        const handle = await open(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0), 0o600);
+        // Publish a complete v2 marker atomically. Legacy readers reject the
+        // additional field; no reader can mistake an interrupted partial write
+        // for a stale v2 marker.
+        const handle = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0), 0o600);
         try {
-          await handle.writeFile(JSON.stringify({ pid: process.pid, host: hostname() }));
+          await handle.writeFile(JSON.stringify({ pid: process.pid, host: hostname(), lock_schema: 2 }));
           await handle.sync();
-        } finally {
-          await handle.close();
-        }
+        } finally { await handle.close(); }
+        try { await link(temporary, path); } finally { await unlink(temporary).catch(() => undefined); }
         const directoryHandle = await open(this.directory, fsConstants.O_RDONLY);
         try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
         return;
       } catch (error) {
+        await unlink(temporary).catch(() => undefined);
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         const metadata = await lstat(path);
         if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 512 || !isPrivateStateFileMode(metadata.mode)) {
@@ -850,17 +1021,28 @@ export class TrustBundleStore {
           throw new Error('Trust bundle writer lock is malformed', { cause: error });
         }
         const lock = parsed as Record<string, unknown>;
-        exactFields(lock, ['pid', 'host']);
-        if (!Number.isSafeInteger(lock['pid']) || (lock['pid'] as number) < 1 || typeof lock['host'] !== 'string') {
-          throw new Error('Trust bundle writer lock is malformed', { cause: error });
+        if (lock['lock_schema'] === 2) {
+          exactFields(lock, ['pid', 'host', 'lock_schema']);
+          if (!Number.isSafeInteger(lock['pid']) || (lock['pid'] as number) < 1 || typeof lock['host'] !== 'string') {
+            throw new Error('Trust bundle writer lock is malformed', { cause: error });
+          }
+          // Every v2 writer holds the same kernel lock. Our possession of it
+          // proves that the previous v2 owner has closed its file description.
+        } else {
+          exactFields(lock, ['pid', 'host']);
+          if (!Number.isSafeInteger(lock['pid']) || (lock['pid'] as number) < 1 || typeof lock['host'] !== 'string') {
+            throw new Error('Trust bundle writer lock is malformed', { cause: error });
+          }
+          // A legacy writer does not honor the kernel lock. Preserve the old
+          // conservative recovery rule and never remove another host's lock.
+          if (lock['host'] !== hostname()) throw new Error('Trust bundle store has an active writer on another host', { cause: error });
+          let alive = true;
+          try { process.kill(lock['pid'] as number, 0); } catch (probeError) {
+            if ((probeError as NodeJS.ErrnoException).code === 'ESRCH') alive = false;
+            else if ((probeError as NodeJS.ErrnoException).code !== 'EPERM') throw probeError;
+          }
+          if (alive) throw new Error('Trust bundle store already has an active writer', { cause: error });
         }
-        if (lock['host'] !== hostname()) throw new Error('Trust bundle store has an active writer on another host', { cause: error });
-        let alive = true;
-        try { process.kill(lock['pid'] as number, 0); } catch (probeError) {
-          if ((probeError as NodeJS.ErrnoException).code === 'ESRCH') alive = false;
-          else if ((probeError as NodeJS.ErrnoException).code !== 'EPERM') throw probeError;
-        }
-        if (alive) throw new Error('Trust bundle store already has an active writer', { cause: error });
         await unlink(path);
         const directoryHandle = await open(this.directory, fsConstants.O_RDONLY);
         try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }

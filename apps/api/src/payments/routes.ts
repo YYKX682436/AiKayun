@@ -37,6 +37,7 @@ import { requireAdmin, verifyCsrf } from '../auth/admin.js'
 import { verifyDoubleSubmitCsrf } from '../auth/security.js'
 import { assertCustomerSession, assertGuestSession, guestSessionCookie } from '../commerce/orders.js'
 import type { Database, PaymentAttemptStatus, PaymentProviderRequestState } from '../db/types.js'
+import type { NewObligationGate } from '../licensing/new-obligation-gate.js'
 import { decryptPaymentConfig, encryptPaymentConfig, parsePaymentConfig, serializePaymentConfig } from './credentials.js'
 import { registerPaymentChannelRoutes } from './channels.js'
 import { recordWalletOrderPayment } from '../finance/wallet.js'
@@ -825,7 +826,7 @@ async function buildTopUpPage(db: Kysely<Database>, customerId: string, page: nu
 
 async function createTopUpAttempt(
   db: Kysely<Database>, config: AppConfig, provider: PaymentProviderAdapter,
-  customer: AuthenticatedCustomer, body: CreateWalletTopUpBody,
+  customer: AuthenticatedCustomer, body: CreateWalletTopUpBody, gate: NewObligationGate,
 ): Promise<NewAttemptResult> {
   let amount: string
   try { amount = normalizeWalletAmount(body.amount) } catch {
@@ -835,7 +836,7 @@ async function createTopUpAttempt(
     type: 'wallet_top_up', customerId: customer.id, amount,
     channelId: body.channelId, paymentMethod: body.paymentMethod,
   }))
-  return await db.transaction().execute(async (trx) => {
+  return await gate.withTransactionScope(() => db.transaction().execute(async (trx) => {
     await assertCustomerSession(trx, customer, true)
     const wallet = await trx.selectFrom('wallet_accounts').select('customer_id')
       .where('customer_id', '=', customer.id).forUpdate().executeTakeFirst()
@@ -872,9 +873,6 @@ async function createTopUpAttempt(
       .orderBy('created_at', 'desc').orderBy('id', 'desc').executeTakeFirst()
     if (active) throw new PaymentRouteError(409, 'TOP_UP_IN_PROGRESS', '已有充值尚未确认，请先恢复或核对该记录。')
 
-    const nowRow = await sql<{ now: Date }>`SELECT clock_timestamp() AS now`.execute(trx)
-    const now = nowRow.rows[0]!.now
-    const expiresAt = new Date(now.getTime() + paymentAttemptLifetimeMs)
     const channel = await trx.selectFrom('payment_channels').selectAll()
       .where('id', '=', body.channelId).forShare().executeTakeFirst()
     if (!channel || !channel.enabled || channel.provider_type !== provider.id
@@ -895,6 +893,11 @@ async function createTopUpAttempt(
     if (!credentials.merchantId || !credentials.merchantKey) {
       throw new PaymentRouteError(503, 'PAYMENT_CHANNEL_NOT_CONFIGURED', '支付通道凭据暂时不可用。')
     }
+    await gate.assertNewObligationAllowed(trx, 'create_top_up')
+    // A competing license update can hold the gate locks for a long time.
+    // Start the payment window only after that wait and the final license check.
+    const nowRow = await sql<{ now: Date }>`SELECT clock_timestamp() AS now`.execute(trx)
+    const expiresAt = new Date(nowRow.rows[0]!.now.getTime() + paymentAttemptLifetimeMs)
     const attemptId = randomUUID()
     const merchantNo = merchantOrderNo()
     await trx.insertInto('payment_attempts').values({
@@ -932,11 +935,12 @@ async function createTopUpAttempt(
       credentials: { merchantId: credentials.merchantId, merchantKey: credentials.merchantKey },
       merchantOrderNo: merchantNo, expiresAt, amount, productName: '钱包充值', paymentMethod: body.paymentMethod,
     }
-  })
+  }))
 }
 
 export function registerPaymentRoutes(
   app: FastifyInstance, db: Kysely<Database>, config: AppConfig, provider: PaymentProviderAdapter,
+  gate: NewObligationGate,
 ): void {
   registerPaymentChannelRoutes(app, db, config, provider)
   const optionalCustomerAuth = optionalCustomer(db, config)
@@ -1074,7 +1078,7 @@ export function registerPaymentRoutes(
     try {
       if (!request.customer) throw new PaymentRouteError(401, 'UNAUTHORIZED', '请登录后充值。')
       const body = request.body as CreateWalletTopUpBody
-      const result = await createTopUpAttempt(db, config, provider, request.customer, body)
+      const result = await createTopUpAttempt(db, config, provider, request.customer, body, gate)
       if (result.shouldStartProviderRequest) {
         await startProviderRequest(db, config, provider, result, null, body.paymentMethod, request.ip)
       } else if (result.shouldRecover) {

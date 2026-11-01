@@ -29,6 +29,7 @@ async function attachAdmin(page: Page): Promise<void> {
     sameSite: 'Lax',
   }])
   await page.goto('/admin/login')
+  await expectClientMounted(page, '[data-admin-login-ready="true"]')
 }
 
 async function createProduct(page: Page, name: string): Promise<Product> {
@@ -74,6 +75,7 @@ async function registerCustomer(page: Page, username: string): Promise<void> {
   await page.getByLabel('确认密码').fill(customerPassword)
   await page.getByRole('button', { name: '创建账户' }).click()
   await expect(page).toHaveURL(/\/account$/u)
+  await expect(page.getByRole('button', { name: '退出登录' })).toBeEnabled()
 }
 
 async function addProductToCart(page: Page, product: Product, quantity = 1): Promise<void> {
@@ -137,6 +139,14 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     await expectClientMounted(page, '[data-storefront-ready="true"]')
     await page.getByRole('link', { name: '查看结算报价' }).click()
     await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
+    const checkoutBlocked = async (route: import('@playwright/test').Route) => await route.fulfill({
+      status: 403, json: { error: { code: 'LICENSE_NEW_OBLIGATION_BLOCKED', message: '店铺暂停新订单。',
+        details: { status: 'expired', allowedUntil: null, retryable: true } }, meta: { requestId: 'browser-license-test' } },
+    })
+    await page.route('**/api/v1/checkout/orders', checkoutBlocked)
+    await page.getByRole('button', { name: '提交订单' }).click()
+    await expect(page.getByRole('alert')).toContainText('店铺暂时无法接受新的订单或充值')
+    await page.unroute('**/api/v1/checkout/orders', checkoutBlocked)
     await page.getByRole('button', { name: '提交订单' }).click()
     await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
     const orderId = page.url().split('/').at(-1)!
@@ -199,10 +209,17 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     await expect(page.getByRole('heading', { name: '我的钱包', exact: true })).toBeVisible()
     await expect(page.locator('[data-wallet-ready="true"]')).toBeAttached()
     await page.getByLabel('充值金额').fill('2.00')
+    const topUpUnavailable = async (route: import('@playwright/test').Route) => await route.fulfill({
+      status: 503, json: { error: { code: 'LICENSE_STATE_UNAVAILABLE', message: '状态不可用。',
+        details: { status: 'unavailable', allowedUntil: null, retryable: true } }, meta: { requestId: 'browser-license-test' } },
+    })
+    await page.route('**/api/v1/customer/wallet/top-ups', topUpUnavailable)
+    await page.getByRole('button', { name: '创建充值支付' }).click()
+    await expect(page.getByRole('alert')).toContainText('店铺经营状态暂时无法确认')
+    await page.unroute('**/api/v1/customer/wallet/top-ups', topUpUnavailable)
     await page.getByRole('button', { name: '创建充值支付' }).click()
     await expect(page.getByRole('heading', { name: '充值处理中' })).toBeVisible()
     await expect(page.getByAltText('钱包充值支付二维码')).toBeVisible()
-
     const walletFixturePort = process.env.ZPAY_FIXTURE_PORT ?? '3099'
     const walletFixtureBaseUrl = `http://127.0.0.1:${walletFixturePort}`
     const topUpOrdersResponse = await page.request.get(`${walletFixtureBaseUrl}/__fixture/orders`)
@@ -220,6 +237,12 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     )
     expect(topUpCallbackResponse.status()).toBe(200)
     expect(await topUpCallbackResponse.text()).toBe('success')
+    await page.route('**/api/v1/customer/wallet/top-ups', topUpUnavailable)
+    const recovery = page.waitForResponse(response => /\/api\/v1\/customer\/wallet\/top-ups\/[0-9a-f-]+\/refresh$/iu.test(response.url())
+      && response.request().method() === 'POST')
+    await page.getByRole('button', { name: '安全恢复充值状态' }).click()
+    expect((await recovery).status()).toBe(200)
+    await page.unroute('**/api/v1/customer/wallet/top-ups', topUpUnavailable)
     await page.reload()
     await expect(page.getByText('可用现金', { exact: true })).toBeVisible()
     await expect(page.getByText('¥2.00', { exact: true }).first()).toBeVisible()

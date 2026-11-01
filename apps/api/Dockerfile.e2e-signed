@@ -1,0 +1,16 @@
+# Test-only image; never used by the production Compose configuration.
+FROM node:24.22.0-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f
+WORKDIR /workspace
+RUN apk add --no-cache git && corepack enable && corepack prepare pnpm@10.29.3 --activate \
+  && git config --global --add safe.directory /license-center
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc tsconfig.base.json ./
+COPY packages/contracts/package.json packages/contracts/package.json
+COPY packages/money/package.json packages/money/package.json
+COPY apps/api/package.json apps/api/package.json
+COPY apps/web/package.json apps/web/package.json
+RUN pnpm install --frozen-lockfile --filter @aikayun/api...
+COPY packages/contracts packages/contracts
+COPY packages/money packages/money
+COPY apps/api apps/api
+RUN pnpm --filter @aikayun/contracts build && pnpm --filter @aikayun/money build
+CMD ["sh", "apps/api/test/fixtures/prepare-signed-center.sh", "test/fixtures/signed-business-playwright-server.ts"]

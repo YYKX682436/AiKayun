@@ -1294,6 +1294,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
       delete prePaymentMigrations['202611010002_instance_license_expired_refusal']
       delete prePaymentMigrations['202611010003_license_operation_renewal_attempts']
       delete prePaymentMigrations['202611010004_license_renewal_retry']
+      delete prePaymentMigrations['202611010005_trusted_bundle_head']
       const prePaymentProvider = { getMigrations: async () => prePaymentMigrations }
       const currentMigrator = new Migrator({ db, provider: prePaymentProvider })
       const upgradeResult = await currentMigrator.migrateToLatest()

@@ -45,6 +45,7 @@ const selectedPaymentMethod = ref<ExternalPaymentMethod>('alipay')
 const topUpBusy = ref(false)
 const refreshingAttemptId = ref('')
 const errorMessage = ref('')
+const topUpLicenseError = ref('')
 const successMessage = ref('')
 const qrDataUrl = ref('')
 const qrError = ref('')
@@ -184,6 +185,7 @@ async function createTopUp() {
   if (!canCreateTopUp.value || !selectedChannelId.value) return
   topUpBusy.value = true
   errorMessage.value = ''
+  topUpLicenseError.value = ''
   successMessage.value = ''
   const identityAtStart = identity.value
   try {
@@ -204,7 +206,11 @@ async function createTopUp() {
     await Promise.all([refreshWallet(), refreshTopUps(), refreshLedger()])
   } catch (error) {
     if (identityAtStart !== identity.value) return
-    errorMessage.value = error instanceof Error ? error.message : '充值状态尚未确认，请查看充值记录后恢复。'
+    if (error instanceof CustomerApiError && ['LICENSE_NEW_OBLIGATION_BLOCKED', 'LICENSE_STATE_UNAVAILABLE'].includes(error.code)) {
+      topUpLicenseError.value = error.message
+    } else {
+      errorMessage.value = error instanceof Error ? error.message : '充值状态尚未确认，请查看充值记录后恢复。'
+    }
   } finally {
     topUpBusy.value = false
   }
@@ -931,6 +937,14 @@ watch(activeQrAction, async (value) => {
                 </p>
               </div>
             </template>
+            <UAlert
+              v-if="topUpLicenseError"
+              class="mb-4"
+              color="error"
+              variant="soft"
+              :title="topUpLicenseError"
+              role="alert"
+            />
             <UAlert
               v-if="!wallet.topUpEnabled"
               color="neutral"

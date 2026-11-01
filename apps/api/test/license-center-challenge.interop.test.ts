@@ -5,8 +5,9 @@ import { createServer as createHttpsServer, request as httpsRequest } from 'node
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { Kysely, PostgresDialect } from 'kysely'
+import { Kysely, PostgresDialect, sql } from 'kysely'
 import type { Transaction } from 'kysely'
 import { Pool } from 'pg'
 import { calculateJwkThumbprint, decodeJwt, decodeProtectedHeader } from 'jose'
@@ -18,6 +19,7 @@ import { createLicenseOperationRecoveryClient, LicenseOperationRecoveryError } f
 import { finalizeTrustedActivationRejection } from '../src/licensing/license-operation-recovery-client.js'
 import type { LicenseRecoveryCheckpoint } from '../src/licensing/license-operation-recovery-client.js'
 import { createLicenseStateProjectionClient } from '../src/licensing/license-state-projection.js'
+import { createNewObligationGate, LicenseNewObligationError } from '../src/licensing/new-obligation-gate.js'
 import { startLicenseRenewalWorker } from '../src/licensing/license-renewal-worker.js'
 import type { FastifyBaseLogger } from 'fastify'
 import type { LicenseProjectionCheckpoint } from '../src/licensing/license-state-projection.js'
@@ -38,6 +40,7 @@ import { trustedLicenseTimeWatermarkMigration } from '../src/db/migrations/20261
 import { instanceLicenseExpiredRefusalMigration } from '../src/db/migrations/202611010002_instance_license_expired_refusal.js'
 import { licenseOperationRenewalAttemptsMigration } from '../src/db/migrations/202611010003_license_operation_renewal_attempts.js'
 import { licenseRenewalRetryMigration } from '../src/db/migrations/202611010004_license_renewal_retry.js'
+import { trustedBundleHeadMigration } from '../src/db/migrations/202611010005_trusted_bundle_head.js'
 import type { Database } from '../src/db/types.js'
 import { initializeInstallationIdentity, withVerifiedInstallationSigningContext } from '../src/licensing/installation-identity.js'
 import { createOrLoadActivationOperation, createOrLoadRenewalOperation } from '../src/licensing/license-operation-store.js'
@@ -57,6 +60,7 @@ import { TrustBundleStore } from '../src/licensing/trust/trust-bundle-store.js'
 import { verifyTrustBundleSignature } from '../src/licensing/trust/trust-bundle.js'
 import { fetchTrustedTimeAnchor } from '../src/licensing/trust/time-anchor-client.js'
 import { TrustedCenterUnavailableError } from '../src/licensing/trust/time-anchor-client.js'
+import { createTrustDatabaseCoordinator } from '../src/licensing/trust/trust-database-coordinator.js'
 import type { LookupFunction } from 'node:net'
 
 const expectedCenterCommit = 'a5cf99439e3bf92b65f19d60c013bca088cf221a'
@@ -204,6 +208,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       await instanceLicenseExpiredRefusalMigration.up(apiDb)
       await licenseOperationRenewalAttemptsMigration.up(apiDb)
       await licenseRenewalRetryMigration.up(apiDb)
+    await trustedBundleHeadMigration.up(apiDb)
     identitySnapshot = await initializeInstallationIdentity(apiPool, { identityRoot, mode: 'fresh' })
     if (identitySnapshot.status !== 'ready' || !identitySnapshot.databaseId || !identitySnapshot.instanceId || !identitySnapshot.identityJkt) {
       throw new Error('Isolated 3A instance identity did not initialize')
@@ -357,6 +362,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       await instanceLicenseExpiredRefusalMigration.up(caseDb)
       await licenseOperationRenewalAttemptsMigration.up(caseDb)
       await licenseRenewalRetryMigration.up(caseDb)
+      await trustedBundleHeadMigration.up(caseDb)
       const identity = await initializeInstallationIdentity(casePool, { identityRoot: caseIdentityRoot, mode: 'fresh' })
       if (!identity.databaseId || !identity.instanceId || !identity.identityJkt) throw new Error('Recovery fixture identity is missing')
       await initializeTemporaryLicensePendingKey(casePendingRoot, 'test')
@@ -381,6 +387,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
         trustedRoot: releaseConfig.offline_root,
         expectedCenterIssuer: releaseConfig.expected_center_issuer,
         minimumBundleVersion: releaseConfig.minimum_bundle_version,
+        coordinator: createTrustDatabaseCoordinator({ db: caseDb, identityRoot: caseIdentityRoot }),
       })
       await caseTrustStore.accept(info.trust_bundle, anchor.assertFresh)
       return {
@@ -417,6 +424,17 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       await rm(root, { recursive: true, force: true }).catch(() => undefined)
       throw error
     }
+  }
+
+  function gateFor(fixture: Awaited<ReturnType<typeof createRecoveryCase>>) {
+    return createNewObligationGate({ db: fixture.db, pool: fixture.pool,
+      identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
+      trustStoreRoot: join(fixture.root, 'trust'), test: { releaseConfig, trustStore: fixture.trustStore } })
+  }
+
+  function runGate(fixture: Awaited<ReturnType<typeof createRecoveryCase>>, kind: 'create_order' | 'create_top_up') {
+    const gate = gateFor(fixture)
+    return gate.withTransactionScope(() => fixture.db.transaction().execute(trx => gate.assertNewObligationAllowed(trx, kind)))
   }
 
   function runActivationCrashChild(input: {
@@ -754,6 +772,27 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       expectedCenterIssuer: releaseConfig.expected_center_issuer,
     })
     return { candidate, oldKid: prepared.old_kid, oldVerifyUntil: prepared.old_verify_until, newKid: prepared.new_kid }
+  }
+
+  async function acceptPreparedBundleWithoutRotatingCenter(
+    fixture: Awaited<ReturnType<typeof createRecoveryCase>>,
+    lifecycle: 'retired' | 'revoked',
+  ): Promise<{ bundleJws: string; bundleVersion: string }> {
+    const prepared = await postCenterFixtureJson('/__test/prepare-signer-rotation', { lifecycle })
+    if (typeof prepared.bundle_jws !== 'string' || typeof prepared.bundle_version !== 'string') {
+      throw new Error('Frozen-center signed bundle preparation was incomplete')
+    }
+    const current = await fixture.trustStore.getCandidateForTimeBootstrap()
+    if (!current) throw new Error('Current trust bundle candidate is unavailable')
+    const anchor = await fetchTrustedTimeAnchor(releaseConfig, current, {
+      testCa: info.tls_ca, testLookup: localTestLookup,
+    })
+    await fixture.trustStore.accept(prepared.bundle_jws, anchor.assertFresh)
+    return { bundleJws: prepared.bundle_jws, bundleVersion: prepared.bundle_version }
+  }
+
+  async function cancelPreparedSignerRotation(): Promise<void> {
+    await postCenterFixtureJson('/__test/cancel-signer-rotation', {})
   }
 
   function rejectHistoricalReceiptAtVerifyUntil(input: {
@@ -2367,7 +2406,8 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     const scenario = info[licenseKey]
     const fixture = await createRecoveryCase({ name: `recovery-untrusted-direct-${mode}`, license: scenario })
     try {
-      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      await retryTransientChallenge(() =>
+        fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId))
       await setCenterMode(mode)
       await expect(fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId))
         .rejects.toMatchObject({ code: error })
@@ -2665,7 +2705,8 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     const scenario = await issueCenterActivationScenario()
     const fixture = await createRecoveryCase({ name: 'renewal-not-found-continue', license: scenario })
     try {
-      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      await retryTransientChallenge(() =>
+        fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId))
       const projection = createLicenseStateProjectionClient({ db: fixture.db, pool: fixture.pool,
         identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
         releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions() })
@@ -2676,7 +2717,8 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
         .rejects.toMatchObject({ code: 'operation_recovery_result_unknown' })
       const operation = await fixture.db.selectFrom('local_license_operations').selectAll().where('kind', '=', 'renewal').executeTakeFirstOrThrow()
       expect((await centerPool.query('SELECT 1 FROM license_operations WHERE operation_id = $1', [operation.operation_id])).rowCount).toBe(0)
-      const recovered = await fixture.recoveryClientForCase().resumeRenewal(operation.operation_id)
+      const recovered = await retryTransientChallenge(() =>
+        fixture.recoveryClientForCase().resumeRenewal(operation.operation_id))
       expect(recovered.recoveryOperationId).toBe(operation.operation_id)
       const attempts = await fixture.db.selectFrom('local_license_operation_attempts').select(['purpose', 'attempt_no'])
         .where('operation_id', '=', operation.operation_id).orderBy('attempt_no').execute()
@@ -2863,6 +2905,10 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       await projection.projectPersistedOperation(fixture.operation.operationId)
       const rotation = await rotateCenterTestSigner(fixture, 'revoked')
       expect((await projection.getLicenseSnapshot()).canCreateOrder).toBe(false)
+      for (const kind of ['create_order', 'create_top_up'] as const) {
+        await expect(runGate(fixture, kind))
+          .rejects.toMatchObject({ statusCode: 503, code: 'LICENSE_STATE_UNAVAILABLE' })
+      }
       await renewCenterLicense(scenario.license_id)
       const result = await fixture.recoveryClientForCase().renewLicense({ licenseId: scenario.license_id,
         databaseId: fixture.identity.databaseId!, instanceId: fixture.identity.instanceId!, identityJkt: fixture.identity.identityJkt!,
@@ -3270,6 +3316,9 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     let releaseProjectionResolve!: () => void
     const bindingLocked = new Promise<void>(resolve => { bindingLockedResolve = resolve })
     const releaseProjection = new Promise<void>(resolve => { releaseProjectionResolve = resolve })
+    let admitting: Promise<void> | undefined
+    let projecting: Promise<{ outcome: string }> | undefined
+    let admissionOutcome = 'pending'
     const lockClient = await fixture.pool.connect()
     try {
       await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
@@ -3285,8 +3334,39 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       })
       await lockClient.query('BEGIN')
       await lockClient.query("SET LOCAL lock_timeout = '750ms'")
-      const projecting = projection.projectPersistedOperation(fixture.operation.operationId)
+      projecting = projection.projectPersistedOperation(fixture.operation.operationId)
       await bindingLocked
+      const gate = gateFor(fixture)
+      admitting = gate.withTransactionScope(() => fixture.db.transaction().execute(async trx => {
+        await sql`SELECT set_config('application_name', 'license-gate-lock-order-test', true)`.execute(trx)
+        await gate.assertNewObligationAllowed(trx, 'create_order')
+      })).then(() => { admissionOutcome = 'resolved' }, error => {
+        admissionOutcome = `rejected:${error instanceof Error ? error.message : String(error)}`
+        throw error
+      })
+      void admitting.catch(() => undefined)
+      let admissionWaited = false
+      let activity: Array<{ wait_event_type: string | null; wait_event: string | null; query: string; blockers: number[] }> = []
+      for (let i = 0; i < 100; i += 1) {
+        await lockClient.query('SELECT pg_stat_clear_snapshot()')
+        const wait = await lockClient.query<{ wait_event_type: string | null; wait_event: string | null; query: string; blockers: number[] }>(`
+          SELECT wait_event_type, wait_event, query, pg_blocking_pids(pid) AS blockers FROM pg_stat_activity
+          WHERE application_name = 'license-gate-lock-order-test'
+        `)
+        activity = wait.rows
+        if (wait.rows.some(row => row.wait_event_type === 'Lock' && row.blockers.length > 0)) {
+          admissionWaited = true
+          break
+        }
+        await new Promise(resolveResult => setTimeout(resolveResult, 25))
+      }
+      if (!admissionWaited) {
+        await lockClient.query('SELECT pg_stat_clear_snapshot()')
+        const diagnostics = await lockClient.query(`SELECT pid, application_name, state, wait_event_type, wait_event,
+          pg_blocking_pids(pid) AS blockers, query FROM pg_stat_activity
+          WHERE datname = current_database() AND pid <> pg_backend_pid()`)
+        activity = diagnostics.rows
+      }
       let projectionRowLockAcquired = false
       try {
         await lockClient.query('SELECT singleton FROM instance_license_state WHERE singleton = true FOR UPDATE')
@@ -3298,11 +3378,275 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
         releaseProjectionResolve()
       }
       expect(projectionRowLockAcquired).toBe(true)
-      expect((await projecting).outcome).toBe('applied')
+      expect(admissionWaited, `admission=${admissionOutcome}; activity=${JSON.stringify(activity)}`).toBe(true)
+      await expect(projecting).resolves.toMatchObject({ outcome: 'applied' })
+      await expect(admitting).resolves.toBeUndefined()
     } finally {
       releaseProjectionResolve()
+      await admitting?.catch(() => undefined)
+      await projecting?.catch(() => undefined)
       lockClient.release()
       await fixture.close()
+    }
+  }, 90_000)
+
+  it('checks the signed cutoff after a real PostgreSQL binding lock wait before admitting an obligation', async () => {
+    const scenario = await issueCenterActivationScenario()
+    const fixture = await createRecoveryCase({ name: 'obligation-lock-expiry', license: scenario })
+    const blocker = await fixture.pool.connect()
+    let attempt: Promise<unknown> | undefined
+    try {
+      await shortenCenterSubscription(scenario.license_id, 12)
+      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      const projection = createLicenseStateProjectionClient({ db: fixture.db, pool: fixture.pool,
+        identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
+        releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions() })
+      await projection.projectPersistedOperation(fixture.operation.operationId)
+      const gate = createNewObligationGate({ db: fixture.db, pool: fixture.pool,
+        identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
+        trustStoreRoot: join(fixture.root, 'trust'), test: { releaseConfig, trustStore: fixture.trustStore } })
+      await gate.withTransactionScope(() => fixture.db.transaction().execute(trx => gate.assertNewObligationAllowed(trx, 'create_order')))
+      const state = await fixture.db.selectFrom('instance_license_state').select('credential_expires_at')
+        .where('singleton', '=', true).executeTakeFirstOrThrow()
+      const deadlineMs = Number(state.credential_expires_at) * 1000
+      expect(deadlineMs).toBeGreaterThan(Date.now())
+
+      await blocker.query('BEGIN')
+      await blocker.query('SELECT singleton FROM installation_binding WHERE singleton = true FOR UPDATE')
+      let completed: unknown = undefined
+      attempt = gate.withTransactionScope(() => fixture.db.transaction().execute(async trx => {
+        await gate.assertNewObligationAllowed(trx, 'create_order')
+      })).then(() => { completed = null; return null }, error => { completed = error; return error as unknown })
+      let observedWaiting = false
+      for (let i = 0; i < 100 && Date.now() < deadlineMs; i += 1) {
+        await blocker.query('SELECT pg_stat_clear_snapshot()')
+        const wait = await blocker.query<{ waiting: boolean }>(`SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid))
+        ) AS waiting`)
+        if (wait.rows[0]?.waiting) { observedWaiting = true; break }
+        await new Promise(resolveResult => setTimeout(resolveResult, 50))
+      }
+      if (!observedWaiting) {
+        const activity = await blocker.query(`SELECT wait_event_type, wait_event, query FROM pg_stat_activity
+          WHERE datname = current_database() AND pid <> pg_backend_pid()`)
+        throw new Error(`Expected lock wait; completed=${String(completed)} activity=${JSON.stringify(activity.rows)}`)
+      }
+      await new Promise(resolveResult => setTimeout(resolveResult, Math.max(0, deadlineMs - Date.now() + 150)))
+      await blocker.query('COMMIT')
+      const error = await attempt
+      expect(error).toBeInstanceOf(LicenseNewObligationError)
+      expect(error).toMatchObject({ statusCode: 403, code: 'LICENSE_NEW_OBLIGATION_BLOCKED',
+        details: { status: 'expired' } })
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => undefined)
+      await attempt?.catch(() => undefined)
+      blocker.release()
+      await fixture.close()
+    }
+  }, 90_000)
+
+  it('holds the accepted trust state through PostgreSQL commit against another process', async () => {
+    const scenario = await issueCenterActivationScenario()
+    const fixture = await createRecoveryCase({ name: 'obligation-trust-commit', license: scenario })
+    let releaseCommit!: () => void
+    let insertedResolve!: () => void
+    const inserted = new Promise<void>(resolveResult => { insertedResolve = resolveResult })
+    const commit = new Promise<void>(resolveResult => { releaseCommit = resolveResult })
+    let child: ReturnType<typeof spawn> | undefined
+    try {
+      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      const projection = createLicenseStateProjectionClient({ db: fixture.db, pool: fixture.pool,
+        identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
+        releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions() })
+      await projection.projectPersistedOperation(fixture.operation.operationId)
+      await fixture.pool.query('CREATE TABLE admission_commit_probe (id integer PRIMARY KEY)')
+      const gate = gateFor(fixture)
+      const admitted = gate.withTransactionScope(() => fixture.db.transaction().execute(async trx => {
+        await gate.assertNewObligationAllowed(trx, 'create_order')
+        await sql`INSERT INTO admission_commit_probe (id) VALUES (1)`.execute(trx)
+        insertedResolve()
+        await commit
+      }))
+      await inserted
+      expect((await fixture.pool.query('SELECT * FROM admission_commit_probe')).rows).toEqual([])
+      child = spawn(process.execPath, ['--import', 'tsx', fileURLToPath(new URL('./fixtures/license-gate-trust-contender.ts', import.meta.url)),
+        join(fixture.root, 'trust'), releaseConfigPath, infoPath, fixture.schema, fixture.identityRoot],
+      { env: { ...process.env, NODE_ENV: 'test', TEST_DATABASE_URL: testDatabaseUrl! }, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] })
+      let stderr = '', accepted = false
+      child.stderr!.on('data', chunk => { stderr += String(chunk) })
+      const ready = new Promise<void>((resolveResult, reject) => {
+        child!.on('message', message => {
+          if (message && typeof message === 'object' && 'accepted' in message) accepted = true
+          if (message && typeof message === 'object' && 'ready' in message) resolveResult()
+        })
+        child!.once('exit', code => { if (code !== 0) reject(new Error(`Trust contender exited: ${stderr}`)) })
+      })
+      await ready
+      await new Promise(resolveResult => setTimeout(resolveResult, 300))
+      expect(accepted).toBe(false)
+      releaseCommit()
+      await admitted
+      const deadline = Date.now() + 10_000
+      while (!accepted && Date.now() < deadline) await new Promise(resolveResult => setTimeout(resolveResult, 25))
+      expect(accepted, stderr).toBe(true)
+      expect((await fixture.pool.query('SELECT id FROM admission_commit_probe')).rows).toEqual([{ id: 1 }])
+    } finally {
+      releaseCommit()
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      await fixture.close()
+    }
+  }, 90_000)
+
+  it('keeps signer revocation behind an in-flight COMMIT after the API is killed', async () => {
+    const scenario = await issueCenterActivationScenario()
+    const fixture = await createRecoveryCase({ name: 'obligation-unknown-commit', license: scenario })
+    const blocker = await fixture.pool.connect()
+    let child: ReturnType<typeof spawn> | undefined
+    let blockerHeld = false
+    let accepting: Promise<unknown> | undefined
+    let preparedBundle: string | undefined
+    try {
+      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      const projection = createLicenseStateProjectionClient({ db: fixture.db, pool: fixture.pool,
+        identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
+        releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions() })
+      await projection.projectPersistedOperation(fixture.operation.operationId)
+      const prepared = await postCenterFixtureJson('/__test/prepare-signer-rotation', { lifecycle: 'revoked' })
+      if (typeof prepared.bundle_jws !== 'string' || typeof prepared.bundle_version !== 'string') {
+        throw new Error('Missing signed revoked bundle')
+      }
+      preparedBundle = prepared.bundle_jws
+      await fixture.pool.query(`CREATE TABLE admission_commit_crash_probe (id integer PRIMARY KEY);
+        CREATE FUNCTION admission_commit_crash_wait() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_advisory_xact_lock(8191, 47641); RETURN NEW; END $$;
+        CREATE CONSTRAINT TRIGGER admission_commit_crash_trigger AFTER INSERT ON admission_commit_crash_probe
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION admission_commit_crash_wait()`)
+      await blocker.query('SELECT pg_advisory_lock(8191, 47641)')
+      blockerHeld = true
+      child = spawn(process.execPath, ['--import', 'tsx', fileURLToPath(new URL('./fixtures/license-gate-commit-crash.ts', import.meta.url)),
+        fixture.schema, fixture.identityRoot, fixture.pendingRoot, join(fixture.root, 'trust'), releaseConfigPath],
+      { env: { ...process.env, NODE_ENV: 'test', TEST_DATABASE_URL: testDatabaseUrl! }, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] })
+      let stderr = ''
+      child.stderr!.on('data', chunk => { stderr += String(chunk) })
+      const pid = await new Promise<number>((resolveResult, reject) => {
+        child!.on('message', message => {
+          if (message && typeof message === 'object' && 'inserted' in message && 'pid' in message && typeof message.pid === 'number') {
+            resolveResult(message.pid)
+          }
+        })
+        child!.once('exit', (code, signal) => reject(new Error(`Commit child exited prematurely: ${code ?? signal}; ${stderr}`)))
+      })
+      const waiting = async () => (await blocker.query<{ waiting: boolean }>(`SELECT EXISTS (
+        SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND state = 'active'
+        AND query = 'commit' AND wait_event_type = 'Lock' AND wait_event = 'advisory'
+      ) AS waiting`, [pid])).rows[0]?.waiting === true
+      const deadline = Date.now() + 10_000
+      while (!await waiting() && Date.now() < deadline) await new Promise(resolveResult => setTimeout(resolveResult, 25))
+      expect(await waiting(), stderr).toBe(true)
+      const exit = new Promise<void>(resolveResult => { child!.once('exit', () => resolveResult()) })
+      child.kill('SIGKILL')
+      await exit
+      expect(await waiting()).toBe(true)
+      // A signed trust update must wait for the PostgreSQL transaction, even
+      // though the original API process no longer holds its file descriptor.
+      let accepted = false
+      accepting = fixture.trustStore.accept(prepared.bundle_jws, () => Math.floor(Date.now() / 1000))
+        .then(result => { accepted = true; return result })
+      await new Promise(resolveResult => setTimeout(resolveResult, 1500))
+      expect(await waiting()).toBe(true)
+      const acceptedBeforeCommitEnded = accepted
+      await blocker.query('SELECT pg_advisory_unlock(8191, 47641)')
+      blockerHeld = false
+      await accepting
+      const commitDeadline = Date.now() + 10_000
+      let rows = (await fixture.pool.query('SELECT id FROM admission_commit_crash_probe')).rows
+      while (rows.length === 0 && Date.now() < commitDeadline) {
+        await new Promise(resolveResult => setTimeout(resolveResult, 25))
+        rows = (await fixture.pool.query('SELECT id FROM admission_commit_crash_probe')).rows
+      }
+      expect(rows).toEqual([{ id: 1 }])
+      expect(acceptedBeforeCommitEnded, 'trust update completed before the admission COMMIT ended').toBe(false)
+    } finally {
+      if (blockerHeld) await blocker.query('SELECT pg_advisory_unlock(8191, 47641)').catch(() => undefined)
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      await accepting?.catch(() => undefined)
+      blocker.release()
+      await fixture.close()
+      if (preparedBundle) await cancelPreparedSignerRotation()
+    }
+  }, 90_000)
+
+  it('refuses a stale second trust directory after a signer revocation', async () => {
+    const scenario = await issueCenterActivationScenario()
+    const fixture = await createRecoveryCase({ name: 'obligation-stale-trust', license: scenario })
+    try {
+      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      const projection = createLicenseStateProjectionClient({ db: fixture.db, pool: fixture.pool,
+        identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
+        releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions() })
+      await projection.projectPersistedOperation(fixture.operation.operationId)
+      const staleRoot = join(fixture.root, 'stale-trust')
+      await cp(join(fixture.root, 'trust'), staleRoot, { recursive: true })
+      const staleStore = new TrustBundleStore({ directory: staleRoot, trustedRoot: releaseConfig.offline_root,
+        expectedCenterIssuer: releaseConfig.expected_center_issuer, minimumBundleVersion: releaseConfig.minimum_bundle_version })
+      await acceptPreparedBundleWithoutRotatingCenter(fixture, 'revoked')
+      await expect(runGate(fixture, 'create_order')).rejects.toMatchObject({ code: 'LICENSE_STATE_UNAVAILABLE' })
+      const staleGate = createNewObligationGate({ db: fixture.db, pool: fixture.pool, identityRoot: fixture.identityRoot,
+        pendingKeyRoot: fixture.pendingRoot, trustStoreRoot: staleRoot, test: { releaseConfig, trustStore: staleStore } })
+      // A stale copy must fail closed rather than admit with an old signer.
+      await expect(staleGate.withTransactionScope(() => fixture.db.transaction().execute(trx =>
+        staleGate.assertNewObligationAllowed(trx, 'create_order')))).rejects.toBeInstanceOf(LicenseNewObligationError)
+    } finally { await cancelPreparedSignerRotation(); await fixture.close() }
+  }, 90_000)
+
+  it('keeps a killed Trust Store publication pending and resumes it after restart', async () => {
+    const scenario = await issueCenterActivationScenario()
+    const fixture = await createRecoveryCase({ name: 'obligation-trust-update-restart', license: scenario })
+    let child: ReturnType<typeof spawn> | undefined
+    let preparedBundle: string | undefined
+    try {
+      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      const projection = createLicenseStateProjectionClient({ db: fixture.db, pool: fixture.pool,
+        identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
+        releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions() })
+      await projection.projectPersistedOperation(fixture.operation.operationId)
+      const prepared = await postCenterFixtureJson('/__test/prepare-signer-rotation', { lifecycle: 'revoked' })
+      if (typeof prepared.bundle_jws !== 'string') throw new Error('Missing signed revoked bundle')
+      preparedBundle = prepared.bundle_jws
+      const bundlePath = join(fixture.root, 'pending-revocation.json')
+      await writeFile(bundlePath, JSON.stringify({ bundle_jws: prepared.bundle_jws }), { mode: 0o600, flag: 'wx' })
+      child = spawn(process.execPath, ['--import', 'tsx', fileURLToPath(new URL('./fixtures/license-gate-trust-contender.ts', import.meta.url)),
+        join(fixture.root, 'trust'), releaseConfigPath, bundlePath, fixture.schema, fixture.identityRoot, 'state_after_file_fsync'],
+      { env: { ...process.env, NODE_ENV: 'test', TEST_DATABASE_URL: testDatabaseUrl! }, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] })
+      let stderr = ''
+      child.stderr!.on('data', chunk => { stderr += String(chunk) })
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveResult, reject) => {
+        child!.once('error', reject)
+        child!.once('exit', (code, signal) => resolveResult({ code, signal }))
+      })
+      expect(exit.signal, stderr).toBe('SIGKILL')
+      const pending = await fixture.db.selectFrom('instance_license_state')
+        .select(['trust_bundle_pending_artifact_sha256', 'trust_bundle_pending_token'])
+        .where('singleton', '=', true).executeTakeFirstOrThrow()
+      expect(pending.trust_bundle_pending_artifact_sha256).toBeTruthy()
+      expect(pending.trust_bundle_pending_token).toBe(prepared.bundle_jws)
+      await expect(runGate(fixture, 'create_order')).rejects.toMatchObject({
+        statusCode: 503, code: 'LICENSE_STATE_UNAVAILABLE',
+      })
+
+      // Reapplying the same center-signed artifact completes the durable transition;
+      // a different pending artifact remains refused by the coordinator.
+      await fixture.trustStore.accept(prepared.bundle_jws, () => Math.floor(Date.now() / 1000))
+      const recovered = await fixture.db.selectFrom('instance_license_state')
+        .select(['trust_bundle_head_digest', 'trust_bundle_head_version', 'trust_bundle_pending_artifact_sha256'])
+        .where('singleton', '=', true).executeTakeFirstOrThrow()
+      expect(recovered.trust_bundle_head_digest).toMatch(/^[A-Za-z0-9_-]{43}$/u)
+      expect(recovered.trust_bundle_head_version).toBe(prepared.bundle_version)
+      expect(recovered.trust_bundle_pending_artifact_sha256).toBeNull()
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      await fixture.close()
+      if (preparedBundle) await cancelPreparedSignerRotation()
     }
   }, 90_000)
 
@@ -3311,16 +3655,18 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       const scenario = await issueCenterActivationScenario()
       const fixture = await createRecoveryCase({ name: `projection-no-authority-${mode}`, license: scenario })
       try {
-        await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+        await retryTransientChallenge(() =>
+          fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId))
         await setCenterMode('drop_recovery_after_commit')
-        await expect(fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId))
+        await expect(retryTransientChallenge(() =>
+          fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId)))
           .rejects.toMatchObject({ code: 'operation_recovery_result_unknown' })
         const recovery = await fixture.db.selectFrom('local_license_operations').selectAll()
           .where('kind', '=', 'recovery').executeTakeFirstOrThrow()
         if (mode === 'recovery_query_not_found') {
           await setCenterModeForOperation(mode, recovery.operation_id)
           let switchedToLostContinue = false
-          await expect(fixture.recoveryClientForCase(async stage => {
+          await expect(retryTransientChallenge(() => fixture.recoveryClientForCase(async stage => {
             if (stage === 'after_response_saved' && !switchedToLostContinue) {
               const savedRecoveryQuery = await fixture.db.selectFrom('local_license_operation_attempts')
                 .select('attempt_no').where('operation_id', '=', recovery.operation_id)
@@ -3331,7 +3677,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
                 await setCenterMode('drop_continue_after_commit')
               }
             }
-          }).recoverCurrentLease(fixture.operation.operationId))
+          }).recoverCurrentLease(fixture.operation.operationId)))
             .rejects.toMatchObject({ code: 'operation_recovery_result_unknown' })
           expect(switchedToLostContinue).toBe(true)
         } else {
@@ -3460,6 +3806,11 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       expect(await projection.getLicenseSnapshot()).toMatchObject({
         status: 'offline_valid', canCreateOrder: true, canCreateTopUp: true,
       })
+      const offlineGate = gateFor(fixture)
+      for (const kind of ['create_order', 'create_top_up'] as const) {
+        await expect(offlineGate.withTransactionScope(() => fixture.db.transaction().execute(trx => offlineGate.assertNewObligationAllowed(trx, kind))))
+          .resolves.toBeUndefined()
+      }
 
       // Restore the process-local contact fact for later cases; snapshot itself made no request.
       await fetchTrustedTimeAnchor(releaseConfig, candidate, {
@@ -3697,6 +4048,11 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       expect(await projection.getLicenseSnapshot()).toMatchObject({
         status: 'clock_suspect', reason: 'watermark_missing', canCreateOrder: false,
       })
+      for (const kind of ['create_order', 'create_top_up'] as const) {
+        await expect(runGate(fixture, kind))
+          .rejects.toMatchObject({ statusCode: 403, code: 'LICENSE_NEW_OBLIGATION_BLOCKED',
+            details: { status: 'clock_suspect' } })
+      }
     } finally { await fixture.close() }
   }, 90_000)
 
@@ -3730,6 +4086,10 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
         expect(await projection.getLicenseSnapshot()).toMatchObject({
           status, canCreateOrder: false, canCreateTopUp: false,
         })
+        for (const kind of ['create_order', 'create_top_up'] as const) {
+          await expect(runGate(fixture, kind))
+            .rejects.toMatchObject({ statusCode: 403, code: 'LICENSE_NEW_OBLIGATION_BLOCKED', details: { status } })
+        }
       } finally { await fixture.close() }
     },
   )
@@ -4653,7 +5013,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       const pending = await fixture.db.selectFrom('local_license_operations').selectAll()
         .where('kind', '=', 'renewal').executeTakeFirstOrThrow()
       await setCenterMode('expire_recent_saved_result')
-      const historical = await client.resumeRenewal(pending.operation_id)
+      const historical = await retryTransientChallenge(() => client.resumeRenewal(pending.operation_id))
       await clearCenterMode()
       expect(historical.recoveryOperationId).toBe(pending.operation_id)
       expect(await projection.projectPersistedOperation(pending.operation_id)).toMatchObject({ outcome: 'historical_only' })

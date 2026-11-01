@@ -56,6 +56,7 @@ import { trustedLicenseTimeWatermarkMigration } from './migrations/202611010001_
 import { instanceLicenseExpiredRefusalMigration } from './migrations/202611010002_instance_license_expired_refusal.js'
 import { licenseOperationRenewalAttemptsMigration } from './migrations/202611010003_license_operation_renewal_attempts.js'
 import { licenseRenewalRetryMigration } from './migrations/202611010004_license_renewal_retry.js'
+import { trustedBundleHeadMigration } from './migrations/202611010005_trusted_bundle_head.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -116,6 +117,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202611010002_instance_license_expired_refusal': instanceLicenseExpiredRefusalMigration,
       '202611010003_license_operation_renewal_attempts': licenseOperationRenewalAttemptsMigration,
       '202611010004_license_renewal_retry': licenseRenewalRetryMigration,
+      '202611010005_trusted_bundle_head': trustedBundleHeadMigration,
     }
   }
 }

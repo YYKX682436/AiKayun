@@ -70,6 +70,37 @@ export async function preparePurchaseOrderAttachments(
   return prepared
 }
 
+/** Discard this request's unbound archives after a definite transaction rejection.
+ * A committed deleting state protects a concurrently retained object before unlinking;
+ * a failed unlink leaves the row for the existing reconciler to retry. */
+export async function discardPreparedPurchaseOrderAttachments(
+  db: Kysely<Database>,
+  storage: PurchaseOrderAttachmentStorage,
+  prepared: readonly PreparedPurchaseOrderAttachment[],
+): Promise<void> {
+  for (const object of prepared) {
+    const marked = await db.transaction().execute(async trx => {
+      const row = await trx.selectFrom('purchase_order_attachment_objects').select(['id', 'status', 'storage_key'])
+        .where('id', '=', object.objectId).forUpdate().executeTakeFirst()
+      if (!row || row.status !== 'prepared' || row.storage_key !== object.storageKey) return false
+      const bound = await trx.selectFrom('order_item_purchase_attachments').select('archive_object_id')
+        .where('archive_object_id', '=', row.id).executeTakeFirst()
+      if (bound) return false
+      await trx.updateTable('purchase_order_attachment_objects').set({ status: 'deleting', updated_at: new Date() })
+        .where('id', '=', row.id).where('status', '=', 'prepared').execute()
+      return true
+    })
+    if (!marked) continue
+    try {
+      await storage.remove(object.objectId, object.storageKey)
+      await db.deleteFrom('purchase_order_attachment_objects').where('id', '=', object.objectId)
+        .where('status', '=', 'deleting').execute()
+    } catch {
+      // The existing reconciler retries committed deleting rows.
+    }
+  }
+}
+
 export async function persistOrderPurchaseSnapshotInTransaction(
   trx: Transaction<Database>,
   config: AppConfig,

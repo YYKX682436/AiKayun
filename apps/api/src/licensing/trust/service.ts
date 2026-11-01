@@ -4,6 +4,7 @@ import { verifyTrustBundleSignature } from './trust-bundle.js'
 import type { RootAuthenticatedTrustBundleCandidate } from './trust-bundle.js'
 import { fetchTrustedTimeAnchor } from './time-anchor-client.js'
 import type { TrustedTimeSample } from './time-anchor-client.js'
+import type { TrustDatabaseCoordinator } from './trust-database-coordinator.js'
 import { loadEmbeddedTrustedReleaseLicenseConfig } from '../trusted-release-config.js'
 import type { TrustedReleaseLicenseConfig } from '../trusted-release-config.js'
 import { verifyCurrentLicenseLease } from './evidence.js'
@@ -98,18 +99,23 @@ export function createLicenseTrustService(options: LicenseTrustServiceOptions) {
   return Object.freeze(service)
 }
 
-export async function getEmbeddedLicenseTrustCapabilityStatus(storeDirectory: string): Promise<LicenseTrustCapabilityStatus> {
+export async function getEmbeddedLicenseTrustCapabilityStatus(
+  storeDirectory: string, coordinator?: TrustDatabaseCoordinator,
+): Promise<LicenseTrustCapabilityStatus> {
   const config = await loadEmbeddedTrustedReleaseLicenseConfig()
   if (!config) return { status: 'trust_uninitialized' }
-  const service = createLicenseTrustService({ config, store: createReleaseBoundTrustStore(config, storeDirectory) })
+  const service = createLicenseTrustService({ config, store: createReleaseBoundTrustStore(config, storeDirectory, coordinator) })
   return service.status()
 }
 
-export function createReleaseBoundTrustStore(config: TrustedReleaseLicenseConfig, directory: string): TrustBundleStore {
+export function createReleaseBoundTrustStore(
+  config: TrustedReleaseLicenseConfig, directory: string, coordinator?: TrustDatabaseCoordinator,
+): TrustBundleStore {
   return new TrustBundleStore({
     directory,
     trustedRoot: config.offline_root,
     expectedCenterIssuer: config.expected_center_issuer,
     minimumBundleVersion: config.minimum_bundle_version,
+    ...(coordinator === undefined ? {} : { coordinator }),
   })
 }

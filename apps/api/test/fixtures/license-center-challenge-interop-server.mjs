@@ -425,6 +425,10 @@ try {
     await writeFile(infoPath, JSON.stringify(info), { mode: 0o600 })
     return reply.code(200).send({ state: 'succeeded', active_kid: rotated.activeSigningKid, bundle_version: rotated.bundleVersion })
   })
+  app.post('/__test/cancel-signer-rotation', async (_request, reply) => {
+    pendingSignerRotation = undefined
+    return reply.code(200).send({ state: 'cancelled' })
+  })
   let isolatedClientAddress = 0
   app.server.on('secureConnection', (socket) => {
     // Keep the real center rate-limit hooks while isolating each in-process test client.

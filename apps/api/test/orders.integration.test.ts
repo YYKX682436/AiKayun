@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
-import { sql, type Kysely, type Transaction } from 'kysely'
+import { Kysely, PostgresDialect, sql, type Transaction } from 'kysely'
 import { Migrator } from 'kysely/migration'
 import type { FastifyInstance, InjectOptions } from 'fastify'
-import { createApp } from '../src/app.js'
+import { Pool } from 'pg'
+import { createApp } from './fixtures/create-app-with-license.js'
 import { readConfig } from '../src/config.js'
 import { hashPassword } from '../src/auth/password.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
@@ -11,10 +15,12 @@ import { createDatabase } from '../src/db/pool.js'
 import type { Database, ProductInventoryMode, ProductStatus } from '../src/db/types.js'
 import { expireDueUnpaidOrders } from '../src/commerce/orders.js'
 import { startUnpaidOrderExpiryWorker } from '../src/commerce/unpaid-order-expiry.js'
-import { startCodePoolDeliveryWorker } from '../src/commerce/code-pool-delivery-worker.js'
+import { runDigitalDeliveryRecoveryPass, startCodePoolDeliveryWorker } from '../src/commerce/code-pool-delivery-worker.js'
 import type { AppConfig } from '../src/config.js'
 import { codePoolFingerprint, decryptCodePoolContent } from '../src/commerce/code-pool-crypto.js'
 import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
+import { createSignedBusinessLicense } from './fixtures/signed-business-license.js'
+import { startZpayHttpFixture } from './fixtures/zpay-http-server.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const testOrigin = 'http://localhost:3000'
@@ -25,6 +31,8 @@ let app: FastifyInstance
 let db: Kysely<Database>
 let appConfig: AppConfig
 let initialCodePoolKeyRing: AppConfig['codePoolEncryptionKeyRing']
+let licensePool: Pool
+let licenseFixture: Awaited<ReturnType<typeof createSignedBusinessLicense>>
 let nextIp = 1
 
 type Customer = { id: string; username: string; cookie: string; csrfToken: string; csrfCookie: string }
@@ -691,21 +699,30 @@ beforeAll(async () => {
   if (migrated.error) throw migrated.error
   const repeated = await migrator.migrateToLatest()
   if (repeated.error) throw repeated.error
+  const centerCheckout = process.env.LICENSE_CENTER_CHECKOUT
+  if (!centerCheckout) throw new Error('LICENSE_CENTER_CHECKOUT is required for the signed business license fixture')
+  licensePool = new Pool({ connectionString: testDatabaseUrl })
+  licenseFixture = await createSignedBusinessLicense({ db, pool: licensePool, databaseUrl: testDatabaseUrl, centerCheckout })
   appConfig = readConfig({
     ...process.env,
     DATABASE_URL: testDatabaseUrl,
     NODE_ENV: 'test',
     PUBLIC_ORIGIN: testOrigin,
     COOKIE_SECURE: 'false',
+    INSTANCE_IDENTITY_ROOT: licenseFixture.options.identityRoot,
+    LICENSE_PENDING_KEY_ROOT: licenseFixture.options.pendingKeyRoot,
     CODE_POOL_ENCRYPTION_KEY_RING: JSON.stringify({
       activeKeyId: 'test-v1',
       keys: { 'test-v1': Buffer.alloc(32, 0x51).toString('base64') },
     }),
   })
   initialCodePoolKeyRing = appConfig.codePoolEncryptionKeyRing
-  app = await createApp({ db, config: appConfig, logger: false })
+  app = await createApp({ db, config: appConfig, logger: false, licenseForTests: {
+    releaseConfig: licenseFixture.options.releaseConfig, trustStore: licenseFixture.options.trustStore, pool: licensePool,
+  } })
   await app.ready()
-})
+
+}, 120_000)
 
 afterEach(() => {
   if (appConfig) appConfig.codePoolEncryptionKeyRing = initialCodePoolKeyRing
@@ -713,10 +730,46 @@ afterEach(() => {
 
 afterAll(async () => {
   if (app) await app.close()
+  if (licenseFixture) await licenseFixture.close()
+  if (licensePool) await licensePool.end()
   if (db) await db.destroy()
 })
 
 describe('real order creation and lifecycle on PostgreSQL', () => {
+  it('fails closed for a new order without release trust while preserving the signed-era replay and conflict', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ mode: 'quantity', stock: 3 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoted = await quote(items, customer)
+    const body = { idempotencyKey: randomUUID(), quoteToken: quoted.json().data.quoteToken, items }
+    const created = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders(customer), payload: body })
+    expect(created.statusCode).toBe(201)
+    const orderId = created.json().data.order.id
+    const noReleaseTrust = await createApp({ db, config: appConfig, logger: false })
+    await noReleaseTrust.ready()
+    try {
+      const replay = await injectInto(noReleaseTrust, { method: 'POST', url: '/api/v1/checkout/orders',
+        headers: customerHeaders(customer), payload: body })
+      expect(replay.statusCode).toBe(200)
+      expect(replay.json().data).toMatchObject({ created: false, order: { id: orderId } })
+      const conflict = await injectInto(noReleaseTrust, { method: 'POST', url: '/api/v1/checkout/orders',
+        headers: customerHeaders(customer), payload: { ...body, items: [{ ...items[0], quantity: 2 }] } })
+      expect(conflict.statusCode).toBe(409)
+      expect(conflict.json().error.code).toBe('ORDER_IDEMPOTENCY_CONFLICT')
+      const freshQuote = await quote(items, customer)
+      const deniedKey = randomUUID()
+      const denied = await injectInto(noReleaseTrust, { method: 'POST', url: '/api/v1/checkout/orders',
+        headers: customerHeaders(customer), payload: { ...body, idempotencyKey: deniedKey, quoteToken: freshQuote.json().data.quoteToken } })
+      expect(denied.statusCode).toBe(503)
+      expect(denied.json().error.code).toBe('LICENSE_STATE_UNAVAILABLE')
+      expect(await db.selectFrom('orders').select('id').where('idempotency_key', '=', deniedKey).execute()).toHaveLength(0)
+      expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
+        .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(1)
+    } finally { await noReleaseTrust.close() }
+  })
+
   it('keeps payment-attempt insertion in order-first lock order against timeout closure', async () => {
     const admin = await createAdmin()
     const customer = await createCustomer()
@@ -1021,7 +1074,7 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     const orderId = created.json().data.order.id as string
     await attachPendingPaymentWithoutExpiry(orderId, '1.20')
 
-    expect(await expireDueUnpaidOrders(db, new Date(Date.now() + 60 * 60_000))).toBe(0)
+    await expireDueUnpaidOrders(db, new Date(Date.now() + 60 * 60_000))
     expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
       .toBe('pending_payment')
     expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
@@ -2596,6 +2649,8 @@ describe('per-SKU encrypted code-pool fulfillment on PostgreSQL', () => {
       db,
       config: { ...appConfig, codePoolEncryptionKeyRing: ring('test-v2') },
       logger: false,
+      licenseForTests: { releaseConfig: licenseFixture.options.releaseConfig,
+        trustStore: licenseFixture.options.trustStore, pool: licensePool },
     })
     await secondInstance.ready()
     const parallelOperationId = randomUUID()
@@ -3927,4 +3982,193 @@ describe('purchase limit acceptance on PostgreSQL', () => {
     expect(stale.statusCode).toBe(409)
     expect(stale.json().error.code).toBe('PRODUCT_REVISION_CONFLICT')
   })
+  it('preserves an existing order and idempotency after the frozen center revocation is projected', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ mode: 'quantity', stock: 3 })
+    await enableManual(catalog, admin)
+    const items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoted = await quote(items, customer)
+    const key = randomUUID()
+    const first = await createOrder(items, quoted.json().data.quoteToken, customer, key)
+    expect(first.statusCode).toBe(201)
+    const orderId = first.json().data.order.id
+    await licenseFixture.revokeAndProject()
+    const replay = await createOrder(items, quoted.json().data.quoteToken, customer, key)
+    expect(replay.statusCode).toBe(200)
+    expect(replay.json().data).toMatchObject({ created: false, order: { id: orderId } })
+    const conflict = await createOrder([{ skuId: catalog.skuId, quantity: 2 }], quoted.json().data.quoteToken, customer, key)
+    expect(conflict.statusCode).toBe(409)
+    expect(conflict.json().error.code).toBe('ORDER_IDEMPOTENCY_CONFLICT')
+    const freshQuote = await quote(items, customer)
+    const deniedKey = randomUUID()
+    const denied = await createOrder(items, freshQuote.json().data.quoteToken, customer, deniedKey)
+    expect(denied.statusCode).toBe(403)
+    expect(denied.json().error.code).toBe('LICENSE_NEW_OBLIGATION_BLOCKED')
+    expect(await db.selectFrom('orders').select('id').where('idempotency_key', '=', deniedKey).execute()).toHaveLength(0)
+    expect((await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie } })).statusCode).toBe(200)
+    expect((await inject({ method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer) })).statusCode).toBe(200)
+  }, 90_000)
+  it('preserves order and top-up replay after the original signed subscription deadline', async () => {
+    const originalDb = db, originalApp = app, originalConfig = appConfig
+    const schema = `expiry_${randomUUID().replaceAll('-', '')}`
+    await sql.raw(`CREATE SCHEMA "${schema}"`).execute(originalDb)
+    const casePool = new Pool({ connectionString: testDatabaseUrl, options: `-c search_path=${schema}`, max: 10 })
+    const caseDb = new Kysely<Database>({ dialect: new PostgresDialect({ pool: casePool }) })
+    const privateRoot = await mkdtemp(join(tmpdir(), 'aikayun-expiry-file-'))
+    let caseApp: FastifyInstance | undefined
+    let license: Awaited<ReturnType<typeof createSignedBusinessLicense>> | undefined
+    let provider: Awaited<ReturnType<typeof startZpayHttpFixture>> | undefined
+    try {
+      const migration = await new Migrator({ db: caseDb, provider: new AppMigrationProvider(), migrationTableSchema: schema }).migrateToLatest()
+      if (migration.error) throw migration.error
+      license = await createSignedBusinessLicense({ db: caseDb, pool: casePool, databaseUrl: testDatabaseUrl!,
+        centerCheckout: process.env.LICENSE_CENTER_CHECKOUT!, subscriptionSeconds: 35 })
+      const cutoff = (await license.projection.getLicenseSnapshot()).allowedUntil
+      if (!cutoff) throw new Error('Signed test lease has no deadline')
+      provider = await startZpayHttpFixture({ merchantCredentials: { expiryMerchant: 'expiry-merchant-test-key' } })
+      const config = { ...originalConfig, privateFileRoot: privateRoot, identityRoot: license.options.identityRoot,
+        licensePendingKeyRoot: license.options.pendingKeyRoot,
+        paymentCredentialKeyRing: { activeKeyId: 'expiry', keys: { expiry: Buffer.alloc(32, 0x63) } } }
+      caseApp = await createApp({ db: caseDb, config, logger: false, paymentProviderBaseUrlForTests: provider.baseUrl,
+        licenseForTests: { releaseConfig: license.options.releaseConfig, trustStore: license.options.trustStore, pool: casePool } })
+      await caseApp.ready()
+      db = caseDb; app = caseApp; appConfig = config
+      await db.updateTable('storefront_customer_policy').set({ wallet_top_up_enabled: true,
+        wallet_top_up_min_amount: '1.00', wallet_top_up_max_amount: '1000.00' }).where('singleton', '=', true).execute()
+      const admin = await createAdmin(), customer = await createCustomer(), other = await createCustomer()
+      const channel = await inject({ method: 'POST', url: '/api/v1/admin/payment-channels', headers: adminHeaders(admin),
+        payload: { providerType: 'zpay_epay_v1', name: 'Expiry fixture', enabled: true,
+          paymentMethods: ['alipay'], displayOrder: 10, merchantId: 'expiryMerchant', merchantKey: 'expiry-merchant-test-key' } })
+      expect(channel.statusCode, channel.body).toBe(201)
+      const channelId = channel.json().data.channel.id as string
+      const topUpBody = { idempotencyKey: randomUUID(), amount: '10.00', channelId, paymentMethod: 'alipay' }
+      const topUp = await inject({ method: 'POST', url: '/api/v1/customer/wallet/top-ups', headers: customerHeaders(customer), payload: topUpBody })
+      expect(topUp.statusCode, topUp.body).toBe(201)
+      const topUpId = topUp.json().data.items[0].id
+      const catalog = await createCatalog({ mode: 'quantity', stock: 3 })
+      await enableManual(catalog, admin)
+      const items = [{ skuId: catalog.skuId, quantity: 1 }], orderKey = randomUUID()
+      const quoted = await quote(items, customer)
+      const order = await createOrder(items, quoted.json().data.quoteToken, customer, orderKey)
+      expect(order.statusCode, order.body).toBe(201)
+      const orderId = order.json().data.order.id
+      const fileCatalog = await createCatalog({ price: '0.00', mode: 'unlimited' })
+      const boundary = `expiry-${randomUUID()}`
+      const fileBytes = Buffer.from('existing purchased file after license expiry\n')
+      const uploadBody = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="expiry.txt"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+        fileBytes, Buffer.from(`\r\n--${boundary}--\r\n`),
+      ])
+      const fileConfigUrl = `/api/v1/admin/products/${fileCatalog.productId}/variants/${fileCatalog.skuId}/private-files`
+      const upload = await inject({ method: 'POST', url: `${fileConfigUrl}/uploads`, headers: {
+        ...adminHeaders(admin), 'content-type': `multipart/form-data; boundary=${boundary}`, 'content-length': String(uploadBody.length),
+      }, payload: uploadBody })
+      expect(upload.statusCode, upload.body).toBe(201)
+      const fileConfig = await inject({ method: 'GET', url: fileConfigUrl, headers: { cookie: admin.cookie } })
+      expect(fileConfig.statusCode, fileConfig.body).toBe(200)
+      const version = await inject({ method: 'POST', url: `${fileConfigUrl}/versions`, headers: adminHeaders(admin),
+        payload: { expectedRevision: fileConfig.json().data.configurationRevision,
+          uploadId: upload.json().data.uploadId, displayFilename: 'expiry.txt' } })
+      expect(version.statusCode, version.body).toBe(200)
+      const readiness = await inject({ method: 'PUT', url: `${fileConfigUrl}/readiness`, headers: adminHeaders(admin),
+        payload: { expectedRevision: version.json().data.configurationRevision, enabled: true } })
+      expect(readiness.statusCode, readiness.body).toBe(200)
+      const fileItems = [{ skuId: fileCatalog.skuId, quantity: 1 }]
+      const fileQuote = await quote(fileItems, customer)
+      expect(fileQuote.json().data.canContinue).toBe(true)
+      const fileOrder = await createOrder(fileItems, fileQuote.json().data.quoteToken, customer)
+      expect(fileOrder.statusCode, fileOrder.body).toBe(201)
+      const fileOrderId = fileOrder.json().data.order.id as string
+      const fileItemId = fileOrder.json().data.order.items[0].id as string
+      const freshQuote = await quote(items, customer)
+      expect(Date.parse(cutoff)).toBeGreaterThan(Date.now())
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, Date.parse(cutoff) - Date.now() + 150)))
+      const replay = await createOrder(items, quoted.json().data.quoteToken, customer, orderKey)
+      expect(replay.statusCode).toBe(200)
+      expect(replay.json().data.order.id).toBe(orderId)
+      const conflict = await createOrder([{ skuId: catalog.skuId, quantity: 2 }], quoted.json().data.quoteToken, customer, orderKey)
+      expect(conflict.statusCode).toBe(409)
+      expect(conflict.json().error.code).toBe('ORDER_IDEMPOTENCY_CONFLICT')
+      const deniedOrder = await createOrder(items, freshQuote.json().data.quoteToken, customer)
+      expect(deniedOrder.statusCode, deniedOrder.body).toBe(403)
+      expect(deniedOrder.json().error.code).toBe('LICENSE_NEW_OBLIGATION_BLOCKED')
+      const replayTopUp = await inject({ method: 'POST', url: '/api/v1/customer/wallet/top-ups', headers: customerHeaders(customer), payload: topUpBody })
+      expect(replayTopUp.statusCode, replayTopUp.body).toBe(200)
+      expect(replayTopUp.json().data.items[0].id).toBe(topUpId)
+      const conflictTopUp = await inject({ method: 'POST', url: '/api/v1/customer/wallet/top-ups', headers: customerHeaders(customer),
+        payload: { ...topUpBody, amount: '11.00' } })
+      expect(conflictTopUp.statusCode).toBe(409)
+      expect(conflictTopUp.json().error.code).toBe('TOP_UP_IDEMPOTENCY_CONFLICT')
+      const deniedKey = randomUUID(), providerBefore = provider.stats()
+      const deniedTopUp = await inject({ method: 'POST', url: '/api/v1/customer/wallet/top-ups', headers: customerHeaders(other),
+        payload: { ...topUpBody, idempotencyKey: deniedKey } })
+      expect(deniedTopUp.statusCode, deniedTopUp.body).toBe(403)
+      expect(deniedTopUp.json().error.code).toBe('LICENSE_NEW_OBLIGATION_BLOCKED')
+      expect(provider.stats()).toEqual(providerBefore)
+      expect(await db.selectFrom('payment_attempts').select('id').where('idempotency_key', '=', deniedKey).execute()).toHaveLength(0)
+
+      // Existing obligations remain actionable after the original deadline.
+      const paymentBody = { idempotencyKey: randomUUID(), channelId, paymentMethod: 'alipay' }
+      const payment = await inject({ method: 'POST', url: `/api/v1/orders/${orderId}/payments`,
+        headers: customerHeaders(customer), payload: paymentBody })
+      expect(payment.statusCode, payment.body).toBe(201)
+      const paymentReplay = await inject({ method: 'POST', url: `/api/v1/orders/${orderId}/payments`,
+        headers: customerHeaders(customer), payload: paymentBody })
+      expect(paymentReplay.statusCode, paymentReplay.body).toBe(200)
+      const paymentId = payment.json().data.attempt.id as string
+      const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+        .where('id', '=', paymentId).executeTakeFirstOrThrow()).merchant_order_no!
+      const callback = provider.setPaid(merchantNo)
+      expect((await inject({ method: 'GET', url: `/api/v1/payments/callback/zpay?${new URLSearchParams(callback).toString()}` })).body).toBe('success')
+      const itemId = order.json().data.order.items[0].id as string
+      const delivery = await inject({ method: 'POST', url: `/api/v1/admin/orders/${orderId}/items/${itemId}/fulfillments`,
+        headers: adminHeaders(admin), payload: { operationId: randomUUID(), deliveries: [{ content: 'existing obligation' }] } })
+      expect(delivery.statusCode, delivery.body).toBe(200)
+      const refund = await inject({ method: 'POST', url: `/api/v1/customer/orders/${orderId}/refunds`,
+        headers: customerHeaders(customer), payload: { idempotencyKey: randomUUID(), amount: catalog.price, reason: 'deadline regression' } })
+      expect(refund.statusCode, refund.body).toBe(201)
+      const refundId = refund.json().data.refunds.items[0].id as string
+      const approvedRefund = await inject({ method: 'POST', url: `/api/v1/admin/orders/${orderId}/refunds/${refundId}/approve`,
+        headers: adminHeaders(admin), payload: { idempotencyKey: randomUUID() } })
+      expect(approvedRefund.statusCode, approvedRefund.body).toBe(200)
+      const topUpMerchant = (await db.selectFrom('payment_attempts').select('merchant_order_no')
+        .where('id', '=', topUpId).executeTakeFirstOrThrow()).merchant_order_no!
+      const topUpCallback = provider.setPaid(topUpMerchant)
+      expect((await inject({ method: 'GET', url: `/api/v1/payments/callback/zpay?${new URLSearchParams(topUpCallback).toString()}` })).body).toBe('success')
+      const wallet = await inject({ method: 'GET', url: '/api/v1/customer/wallet', headers: { cookie: customer.cookie } })
+      expect(wallet.statusCode, wallet.body).toBe(200)
+      expect(wallet.json().data.cashAvailable).toBe('11.20')
+      const withdrawalSettings = await inject({ method: 'PUT', url: '/api/v1/admin/withdrawals/settings', headers: adminHeaders(admin),
+        payload: { enabled: true, minAmount: '1.00', maxAmount: '100.00', fixedFee: '0.00', percentFee: '0.0000', methods: ['alipay'] } })
+      expect(withdrawalSettings.statusCode, withdrawalSettings.body).toBe(200)
+      const withdrawal = await inject({ method: 'POST', url: '/api/v1/customer/wallet/withdrawals', headers: customerHeaders(customer),
+        payload: { idempotencyKey: randomUUID(), amount: '5.00', payoutMethod: 'alipay',
+          recipient: { account: 'expiry@example.test', accountName: 'Expiry test' } } })
+      expect(withdrawal.statusCode, withdrawal.body).toBe(201)
+      const withdrawalId = withdrawal.json().data.withdrawal.id as string
+      const cancel = await inject({ method: 'POST', url: `/api/v1/customer/wallet/withdrawals/${withdrawalId}/cancel`,
+        headers: customerHeaders(customer), payload: { idempotencyKey: randomUUID() } })
+      expect(cancel.statusCode, cancel.body).toBe(200)
+      expect(cancel.json().data.withdrawal.status).toBe('cancelled')
+      await runDigitalDeliveryRecoveryPass(db, config)
+      const fileDelivery = await db.selectFrom('order_item_fulfillment_deliveries as delivery')
+        .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'delivery.fulfillment_attempt_id')
+        .select('delivery.id').where('attempt.order_item_id', '=', fileItemId).executeTakeFirstOrThrow()
+      const download = await inject({ method: 'GET',
+        url: `/api/v1/customer/orders/${fileOrderId}/items/${fileItemId}/deliveries/${fileDelivery.id}/file`,
+        headers: { cookie: customer.cookie } })
+      expect(download.statusCode, download.body).toBe(200)
+      expect(download.rawPayload).toEqual(fileBytes)
+    } finally {
+      db = originalDb; app = originalApp; appConfig = originalConfig
+      if (caseApp) await caseApp.close()
+      if (provider) await provider.close()
+      if (license) await license.close()
+      await caseDb.destroy()
+      await sql.raw(`DROP SCHEMA "${schema}" CASCADE`).execute(originalDb)
+      await rm(privateRoot, { recursive: true, force: true })
+    }
+  }, 90_000)
+
 })

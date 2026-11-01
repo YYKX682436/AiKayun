@@ -1,10 +1,10 @@
 import { randomUUID, createHash, randomBytes } from 'node:crypto'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { sql } from 'kysely'
-import type { Kysely } from 'kysely'
+import { Kysely, PostgresDialect, sql } from 'kysely'
 import { Migrator } from 'kysely/migration'
 import type { FastifyInstance, InjectOptions } from 'fastify'
-import { createApp } from '../src/app.js'
+import { Pool } from 'pg'
+import { createApp } from './fixtures/create-app-with-license.js'
 import { readConfig } from '../src/config.js'
 import { hashPassword } from '../src/auth/password.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
@@ -14,6 +14,7 @@ import { createZpaySignature } from '../src/payments/zpay-epay.js'
 import { expireDueUnpaidOrders } from '../src/commerce/orders.js'
 import { startZpayHttpFixture } from './fixtures/zpay-http-server.js'
 import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
+import { createSignedBusinessLicense } from './fixtures/signed-business-license.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
   ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
@@ -36,6 +37,8 @@ let api2BaseUrl: string
 let nextIp = 1
 let admin: { id: string; cookie: string; csrfCookie: string; csrfToken: string }
 let channelId: string
+let licensePool: Pool
+let licenseFixture: Awaited<ReturnType<typeof createSignedBusinessLicense>>
 
 type Customer = { id: string; cookie: string; csrfCookie: string; csrfToken: string }
 type Owner = Customer | { id: string; cookie: string; csrfCookie: string; csrfToken: string; guest: true }
@@ -324,39 +327,67 @@ beforeAll(async () => {
   if (migrated.error) throw migrated.error
   const repeated = await migrator.migrateToLatest()
   if (repeated.error) throw repeated.error
+  const centerCheckout = process.env.LICENSE_CENTER_CHECKOUT
+  if (!centerCheckout) throw new Error('Payment integration tests require the frozen LICENSE_CENTER_CHECKOUT')
+  licensePool = new Pool({ connectionString: testDatabaseUrl, max: 8 })
+  licenseFixture = await createSignedBusinessLicense({ db, pool: licensePool, databaseUrl: testDatabaseUrl, centerCheckout })
   await db.updateTable('storefront_customer_policy').set({ guest_checkout_enabled: true }).where('singleton', '=', true).execute()
 
   const ringJson = JSON.stringify({ activeKeyId: 'test-a', keys: { 'test-a': encryptionKeyA.toString('base64') } })
-  config = readConfig({
+  config = { ...readConfig({
     ...process.env,
     DATABASE_URL: testDatabaseUrl,
     NODE_ENV: 'test',
     PUBLIC_ORIGIN: testOrigin,
     COOKIE_SECURE: 'false',
     PAYMENT_CREDENTIAL_KEY_RING: ringJson,
-  })
+  }), identityRoot: licenseFixture.options.identityRoot, licensePendingKeyRoot: licenseFixture.options.pendingKeyRoot }
   fixture = await startZpayHttpFixture({ merchantCredentials: { [merchantId]: merchantKey } })
-  app = await createApp({ db, config, logger: false, paymentProviderBaseUrlForTests: fixture.baseUrl })
+  const licenseForTests = { releaseConfig: licenseFixture.options.releaseConfig, trustStore: licenseFixture.options.trustStore, pool: licensePool }
+  app = await createApp({ db, config, logger: false, paymentProviderBaseUrlForTests: fixture.baseUrl, licenseForTests })
   await app.ready()
   secondDb = createDatabase()
-  secondApp = await createApp({ db: secondDb, config, logger: false, paymentProviderBaseUrlForTests: fixture.baseUrl })
+  secondApp = await createApp({ db: secondDb, config, logger: false, paymentProviderBaseUrlForTests: fixture.baseUrl, licenseForTests })
   await secondApp.ready()
   const secondAddress = await secondApp.listen({ host: '127.0.0.1', port: 0 })
   api2BaseUrl = secondAddress
 
   admin = await createAdmin()
   channelId = await createPaymentChannel()
-})
+}, 120_000)
 
 afterAll(async () => {
   if (secondApp) await secondApp.close()
   if (app) await app.close()
   if (fixture) await fixture.close()
+  if (licenseFixture) await licenseFixture.close()
+  if (licensePool) await licensePool.end()
   if (secondDb) await secondDb.destroy()
   if (db) await db.destroy()
 })
 
 describe('online payment settlement through a real local HTTP provider and PostgreSQL', () => {
+  it('rejects signed test injection when the actual PostgreSQL database is not isolated', async () => {
+    const otherUrl = new URL(testDatabaseUrl)
+    otherUrl.pathname = '/postgres'
+    const otherPool = new Pool({ connectionString: otherUrl.toString(), max: 1 })
+    const otherDb = new Kysely<Database>({ dialect: new PostgresDialect({
+      pool: otherPool,
+    }) })
+    try {
+      // The supplied config and injection pool still point to the test database.
+      // The guard must check the business connection's real database, not the URL or config.
+      await expect(createApp({ db: otherDb, config, logger: false, licenseForTests: {
+        releaseConfig: licenseFixture.options.releaseConfig, trustStore: licenseFixture.options.trustStore, pool: licensePool,
+      } })).rejects.toThrow('license_gate_test_database_required')
+      await expect(createApp({ db, config, logger: false, licenseForTests: {
+        releaseConfig: licenseFixture.options.releaseConfig, trustStore: licenseFixture.options.trustStore, pool: otherPool,
+      } })).rejects.toThrow('license_gate_test_database_mismatch')
+    } finally {
+      await otherDb.destroy()
+    }
+  })
+
   it('keeps merchant secrets out of admin and public API responses and audits channel changes', async () => {
     const adminList = await inject({ method: 'GET', url: '/api/v1/admin/payment-channels', headers: adminHeaders() })
     expect(adminList.statusCode).toBe(200)
@@ -1102,6 +1133,38 @@ describe('online payment settlement through a real local HTTP provider and Postg
       .where('payment_attempts.order_id', '=', rejectedOrder).execute()).toHaveLength(0)
   })
 
+  it('starts the top-up payment window after a real wait for the license state lock', async () => {
+    await db.updateTable('storefront_customer_policy').set({
+      wallet_top_up_enabled: true, wallet_top_up_min_amount: '1.00', wallet_top_up_max_amount: '1000.00',
+    }).where('singleton', '=', true).execute()
+    const customer = await createCustomer()
+    let release!: () => void
+    let acquired!: () => void
+    const held = new Promise<void>(resolve => { acquired = resolve })
+    const released = new Promise<void>(resolve => { release = resolve })
+    const locker = db.transaction().execute(async trx => {
+      await trx.selectFrom('instance_license_state').select('singleton').where('singleton', '=', true).forUpdate().executeTakeFirstOrThrow()
+      acquired()
+      await released
+    })
+    await held
+    const request = createWalletTopUp(customer, { amount: '10.00' })
+    let releaseTime!: number
+    try {
+      await waitForPgLockWaits(1, 'FROM "instance_license_state"')
+      await sql`SELECT pg_sleep(0.25)`.execute(db)
+      const now = await sql<{ now: Date }>`SELECT clock_timestamp() AS now`.execute(db)
+      releaseTime = now.rows[0]!.now.getTime()
+    } finally {
+      release()
+      await locker
+    }
+    const result = await request
+    expect(result.response.statusCode, result.response.body).toBe(201)
+    const attempt = await db.selectFrom('payment_attempts').select('expires_at').where('id', '=', result.attemptId).executeTakeFirstOrThrow()
+    expect(attempt.expires_at!.getTime()).toBeGreaterThanOrEqual(releaseTime + 10 * 60_000 - 25)
+  })
+
   it('creates customer-only top-ups and credits cash once from an exact provider receipt', async () => {
     await db.updateTable('storefront_customer_policy').set({
       wallet_top_up_enabled: true, wallet_top_up_min_amount: '1.00', wallet_top_up_max_amount: '1000.00',
@@ -1229,19 +1292,21 @@ describe('online payment settlement through a real local HTTP provider and Postg
 
     const orderId = await createOrder(customer, `钱包余额与在线组合-${randomUUID().slice(0, 8)}`, { amount: '100.00' })
     const idem = randomUUID()
-    const [first, concurrent] = await Promise.all([
-      createPayment(orderId, customer, { walletAmount: '50.00', idempotencyKey: idem }),
-      createPayment(orderId, customer, { walletAmount: '50.00', idempotencyKey: randomUUID() }),
-    ])
-    expect(first.statusCode).toBe(201)
-    expect(concurrent.statusCode).toBe(200)
-    expect(concurrent.json().data.attempt.id).toBe(first.json().data.attempt.id)
-    const attemptId = first.json().data.attempt.id as string
-    expect(first.json().data.attempt).toMatchObject({ source: 'external', amount: '50.00', walletGiftAmount: '20.00', walletCashAmount: '30.00' })
+    const paymentKeys = [idem, randomUUID()]
+    const outcomes = await Promise.all(paymentKeys.map(idempotencyKey =>
+      createPayment(orderId, customer, { walletAmount: '50.00', idempotencyKey })))
+    const created = outcomes.find(result => result.statusCode === 201)
+    const reused = outcomes.find(result => result.statusCode === 200)
+    expect(created).toBeDefined()
+    expect(reused).toBeDefined()
+    expect(reused!.json().data.attempt.id).toBe(created!.json().data.attempt.id)
+    const createdKey = paymentKeys[outcomes.indexOf(created!)]!
+    const attemptId = created!.json().data.attempt.id as string
+    expect(created!.json().data.attempt).toMatchObject({ source: 'external', amount: '50.00', walletGiftAmount: '20.00', walletCashAmount: '30.00' })
     const frozen = await db.selectFrom('wallet_accounts').select(['cash_available', 'cash_frozen', 'gift_available', 'gift_frozen'])
       .where('customer_id', '=', customer.id).executeTakeFirstOrThrow()
     expect(frozen).toEqual({ cash_available: '0.00', cash_frozen: '30.00', gift_available: '0.00', gift_frozen: '20.00' })
-    expect(await db.selectFrom('wallet_ledger_entries').select('id').where('wallet_operation_id', '=', idem).where('action', '=', 'freeze').execute())
+    expect(await db.selectFrom('wallet_ledger_entries').select('id').where('wallet_operation_id', '=', createdKey).where('action', '=', 'freeze').execute())
       .toHaveLength(2)
     expect(await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', attemptId).execute())
       .toHaveLength(0)
@@ -1261,7 +1326,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
     expect(receipts.every(receipt => receipt.disposition === 'on_time')).toBe(true)
     expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
       .toBe('processing')
-    expect(await db.selectFrom('wallet_operations').select('id').where('resolves_operation_id', '=', idem).execute())
+    expect(await db.selectFrom('wallet_operations').select('id').where('resolves_operation_id', '=', createdKey).execute())
       .toHaveLength(1)
     await expectWalletMatchesLedger(customer.id)
   })
@@ -1992,4 +2057,38 @@ describe('online payment settlement through a real local HTTP provider and Postg
       .where('payment_attempts.order_id', '=', orderId).executeTakeFirstOrThrow())
       .toEqual({ refunded_amount: '0.00', refund_reserved_amount: '0.00' })
   })
+
+  it('blocks new top-ups after signed revocation while preserving replay, conflict and payment of an existing order', async () => {
+    await db.updateTable('storefront_customer_policy').set({
+      wallet_top_up_enabled: true, wallet_top_up_min_amount: '1.00', wallet_top_up_max_amount: '1000.00',
+    }).where('singleton', '=', true).execute()
+    const customer = await createCustomer()
+    const key = randomUUID()
+    const created = await createWalletTopUp(customer, { amount: '10.00', idempotencyKey: key })
+    expect(created.response.statusCode, created.response.body).toBe(201)
+    const orderId = await createOrder(customer)
+    await licenseFixture.revokeAndProject()
+
+    const replay = await createWalletTopUp(customer, { amount: '10.00', idempotencyKey: key })
+    expect(replay.response.statusCode, replay.response.body).toBe(200)
+    expect(replay.attemptId).toBe(created.attemptId)
+    const conflict = await createWalletTopUp(customer, { amount: '11.00', idempotencyKey: key })
+    expect(conflict.response.statusCode).toBe(409)
+    expect(conflict.response.json().error.code).toBe('TOP_UP_IDEMPOTENCY_CONFLICT')
+
+    const other = await createCustomer()
+    const blockedKey = randomUUID()
+    const providerBefore = fixture.stats()
+    const secretsBefore = await db.selectFrom('payment_attempt_secrets').select('payment_attempt_id').execute()
+    const statesBefore = await db.selectFrom('payment_attempt_provider_state').select('payment_attempt_id').execute()
+    const blocked = await createWalletTopUp(other, { amount: '10.00', idempotencyKey: blockedKey })
+    expect(blocked.response.statusCode, blocked.response.body).toBe(403)
+    expect(blocked.response.json().error.code).toBe('LICENSE_NEW_OBLIGATION_BLOCKED')
+    expect(fixture.stats()).toEqual(providerBefore)
+    expect(await db.selectFrom('payment_attempts').select('id').where('idempotency_key', '=', blockedKey).execute()).toHaveLength(0)
+    expect(await db.selectFrom('payment_attempt_secrets').select('payment_attempt_id').execute()).toHaveLength(secretsBefore.length)
+    expect(await db.selectFrom('payment_attempt_provider_state').select('payment_attempt_id').execute()).toHaveLength(statesBefore.length)
+    expect(await db.selectFrom('wallet_ledger_entries').select('id').where('customer_id', '=', other.id).execute()).toHaveLength(0)
+    expect((await createPayment(orderId, customer)).statusCode).toBe(201)
+  }, 30_000)
 })

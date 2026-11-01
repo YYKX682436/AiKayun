@@ -66,8 +66,9 @@ import { validatePurchaseFormDefinition } from '@aikayun/contracts'
 import { PurchaseOrderDecryptionError, PurchaseOrderKeyUnavailableError } from './purchase-form-crypto.js'
 import { selectCheckoutProcurementSources } from './procurement-source-selection.js'
 import { lockCheckoutProcurementSources, persistCheckoutProcurementSource } from './procurement-identity.js'
-import { preparePurchaseOrderAttachments, persistOrderPurchaseSnapshotInTransaction,
+import { discardPreparedPurchaseOrderAttachments, preparePurchaseOrderAttachments, persistOrderPurchaseSnapshotInTransaction,
   type PreparedPurchaseOrderAttachment } from './purchase-order-attachments.js'
+import { LicenseNewObligationError, type NewObligationGate } from '../licensing/new-obligation-gate.js'
 import { CodePoolDecryptionError, CodePoolKeyUnavailableError, decryptCodePoolContent } from './code-pool-crypto.js'
 import {
   decryptFixedDeliveryPayload,
@@ -121,6 +122,9 @@ function postgresConstraint(error: unknown): string | undefined {
 }
 
 function handleOrderError(error: unknown, reply: FastifyReply, requestId: string) {
+  if (error instanceof LicenseNewObligationError) {
+    throw error
+  }
   if (error instanceof CodePoolKeyUnavailableError) {
     return reply.code(503).send(failure('CODE_POOL_KEY_UNAVAILABLE', '服务暂时无法解密此订单的交付凭证，请稍后重试。', requestId))
   }
@@ -576,6 +580,7 @@ async function createOrderTransaction(
   guestToken: string | undefined,
   config: AppConfig,
   preparedByLine: ReadonlyMap<string, PreparedPurchaseOrderAttachment[]>,
+  gate: NewObligationGate,
   expectedGuestSessionId?: string,
 ): Promise<{ created: boolean; order: OrderDetail }> {
   const v2 = 'version' in body && body.version === 2
@@ -625,6 +630,7 @@ async function createOrderTransaction(
   const procurementSources = await lockCheckoutProcurementSources(trx,
     selectCheckoutProcurementSources(), currentQuote.items.map(item => item.skuId))
 
+  await gate.assertNewObligationAllowed(trx, 'create_order')
   const orderId = randomUUID()
   await trx.insertInto('orders').values({
     id: orderId,
@@ -703,12 +709,13 @@ async function createOrderWithRetry(
   customer: AuthenticatedCustomer | null,
   guestToken: string | undefined,
   config: AppConfig,
+  gate: NewObligationGate,
   expectedGuestSessionId?: string,
 ): Promise<{ created: boolean; order: OrderDetail }> {
   const preparedByLine = new Map<string, PreparedPurchaseOrderAttachment[]>()
   if ('version' in body && body.version === 2) {
     const requestHash = purchaseLineRequestHash(body.items)
-    const preflight = await db.transaction().execute(async (trx) => {
+    const preflight = await gate.withTransactionScope(() => db.transaction().execute(async (trx) => {
       let ownerType: 'customer' | 'guest'
       let ownerId: string
       if (customer) {
@@ -738,8 +745,11 @@ async function createOrderWithRetry(
         throw new CheckoutConflict(limitExceeded ? 'PURCHASE_LIMIT_EXCEEDED' : 'ORDER_NOT_ELIGIBLE',
           '所选购买行当前不满足下单条件，请核对最新报价后重新提交。', purchaseQuote.quote)
       }
+      // This early check only avoids unnecessary archive work. The locked check
+      // in the final order transaction remains authoritative.
+      await gate.assertNewObligationAllowed(trx, 'create_order')
       return { existing: null, lines: purchaseQuote.lines }
-    })
+    }))
     if (preflight.existing) return { created: false, order: preflight.existing }
     const draftStorage = new PurchaseAttachmentStorage(config.privateFileRoot)
     const orderStorage = new PurchaseOrderAttachmentStorage(config.privateFileRoot)
@@ -751,11 +761,22 @@ async function createOrderWithRetry(
     }
   }
   const maxAttempts = 3
+  const discardPrepared = async () => {
+    try {
+      await discardPreparedPurchaseOrderAttachments(db,
+        new PurchaseOrderAttachmentStorage(config.privateFileRoot), [...preparedByLine.values()].flat())
+    } catch {
+      // A failed cleanup remains recoverable by the existing reconciler.
+    }
+  }
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      return await db.transaction().execute(trx => createOrderTransaction(trx, body, customer,
-        guestToken, config, preparedByLine, expectedGuestSessionId))
+      const result = await gate.withTransactionScope(() => db.transaction().execute(trx => createOrderTransaction(trx, body, customer,
+        guestToken, config, preparedByLine, gate, expectedGuestSessionId)))
+      if (!result.created) await discardPrepared()
+      return result
     } catch (error) {
+      if (error instanceof LicenseNewObligationError) await discardPrepared()
       if (!retryableSqlStates.has(postgresCode(error) ?? '') || attempt === maxAttempts) {
         if (retryableSqlStates.has(postgresCode(error) ?? '')) {
           throw new OrderError(409, 'ORDER_CONCURRENT_CONFLICT', '订单数据正在并发变化，请刷新报价后重试。')
@@ -1247,7 +1268,7 @@ async function adminOrderDetail(db: Kysely<Database>, orderId: string, config: A
   }
 }
 
-export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, config: AppConfig): void {
+export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, config: AppConfig, gate: NewObligationGate): void {
   const optionalCustomerAuth = optionalCustomer(db, config)
   const requireCustomerAuth = requireCustomer(db, config)
   const customerCsrf = verifyDoubleSubmitCsrf(config, CUSTOMER_CSRF_COOKIE)
@@ -1362,7 +1383,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
         200: ApiSuccessSchemaOf(CreateOrderResultSchema),
         201: ApiSuccessSchemaOf(CreateOrderResultSchema),
         400: ApiErrorSchema, 401: ApiErrorSchema, 403: ApiErrorSchema,
-        409: CheckoutOrderErrorSchema, 422: ApiErrorSchema, 429: ApiErrorSchema,
+        409: CheckoutOrderErrorSchema, 422: ApiErrorSchema, 429: ApiErrorSchema, 503: ApiErrorSchema,
       },
     },
   }, async (request, reply) => {
@@ -1373,6 +1394,7 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
         request.customer,
         request.customer ? undefined : request.cookies[guestSessionCookie],
         config,
+        gate,
         request.headers['x-aikayun-guest-session-id'] as string | undefined,
       )
       reply.header('cache-control', 'no-store')

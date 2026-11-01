@@ -8,7 +8,7 @@ import { sql, type Kysely } from 'kysely'
 import { Migrator } from 'kysely/migration'
 import type { FastifyInstance } from 'fastify'
 import sharp from 'sharp'
-import { createApp } from '../src/app.js'
+import { createApp, currentSignedBusinessLicense } from './fixtures/signed-business-test-app.js'
 import { hashToken } from '../src/auth/security.js'
 import { readConfig, type AppConfig } from '../src/config.js'
 import { createDatabase } from '../src/db/pool.js'
@@ -581,7 +581,7 @@ describe('⑥-4B-1 isolated procurement identities', () => {
     const quote = await app.inject({ method: 'POST', url: '/api/v1/checkout/quote', headers, payload: { version: 2, items } })
     expect(quote.statusCode, quote.body).toBe(200)
     const body = { version: 2, items, idempotencyKey: randomUUID(), quoteToken: quote.json().data.quoteToken as string }
-    const killed = await startPurchaseArchiveCrashApi(config, checkpoint)
+    const killed = await startPurchaseArchiveCrashApi(config, checkpoint, currentSignedBusinessLicense())
     const originalRequest = fetch(killed.ready.url + '/api/v1/checkout/orders', { method: 'POST', headers: {
       ...headers, 'content-type': 'application/json',
     }, body: JSON.stringify(body) }).then(async response => ({ status: response.status, text: await response.text() }),
@@ -611,7 +611,7 @@ describe('⑥-4B-1 isolated procurement identities', () => {
       expect(snapshotRefs.rows[0]!.count).toBe('0')
     }
 
-    const restarted = await startPurchaseArchiveCrashApi(config)
+    const restarted = await startPurchaseArchiveCrashApi(config, undefined, currentSignedBusinessLicense())
     expect(restarted.ready.pid).not.toBe(killed.ready.pid)
     expect(restarted.ready.backendPid).not.toBe(killed.ready.backendPid)
     const response = await fetch(restarted.ready.url + '/api/v1/checkout/orders', { method: 'POST', headers: {

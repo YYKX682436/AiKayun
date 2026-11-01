@@ -5,6 +5,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { isDeepStrictEqual } from 'node:util'
 import type { KeyObject } from 'node:crypto'
 import type { Pool, PoolClient } from 'pg'
+import type { Transaction } from 'kysely'
+import type { Database } from '../db/types.js'
 import { calculateJwkThumbprint } from 'jose'
 
 export type InstallationInitializationMode = 'fresh' | 'adopt_existing'
@@ -710,8 +712,14 @@ async function compareIdentity(
   client: PoolClient,
   root: string,
 ): Promise<InstallationIdentitySnapshot> {
-  const journal = await readJournal(client)
-  const binding = await readBinding(client)
+  return compareIdentityData(root, await readJournal(client), await readBinding(client))
+}
+
+async function compareIdentityData(
+  root: string,
+  journal: InitializationJournal | undefined,
+  binding: BindingRow | undefined,
+): Promise<InstallationIdentitySnapshot> {
   const currentPath = join(root, currentDirectoryName)
   let currentExists = false
   const rootEntries = await readdir(root)
@@ -956,6 +964,24 @@ export async function verifyInstallationIdentity(
   } finally {
     client.release()
   }
+}
+
+/** Verify identity without acquiring a second database connection inside a business transaction. */
+export async function verifyInstallationIdentityInTransaction(
+  tx: Transaction<Database>, identityRoot: string,
+): Promise<{ databaseId: string; instanceId: string; identityJkt: string }> {
+  const root = await requireIdentityRoot(identityRoot, [])
+  const journal = await tx.selectFrom('installation_identity_initializations')
+    .select(['operation_id', 'mode', 'state']).where('singleton', '=', true).executeTakeFirst()
+  const binding = await tx.selectFrom('installation_binding')
+    .select(['database_id', 'instance_id', 'identity_jkt', 'binding_revision', 'binding_state'])
+    .where('singleton', '=', true).executeTakeFirst()
+  const snapshot = await compareIdentityData(root, journal, binding)
+  if (snapshot.status !== 'ready' || !snapshot.databaseId || !snapshot.instanceId || !snapshot.identityJkt) {
+    throw new InstallationIdentityError(snapshot.status === 'ready' ? 'identity_mismatch' : snapshot.status,
+      snapshot.code, 'A fully verified installation identity is required for license admission')
+  }
+  return { databaseId: snapshot.databaseId, instanceId: snapshot.instanceId, identityJkt: snapshot.identityJkt }
 }
 
 /**

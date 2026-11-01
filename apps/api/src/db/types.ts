@@ -123,6 +123,10 @@ export interface InstanceLicenseStateTable {
   trusted_time_high_water_ms: string | null
   renewal_retry_count: Generated<number>
   renewal_retry_after: Date | null
+  trust_bundle_head_digest: string | null
+  trust_bundle_head_version: string | null
+  trust_bundle_pending_artifact_sha256: string | null
+  trust_bundle_pending_token: string | null
   updated_at: Generated<Date>
 }
 

@@ -50,6 +50,19 @@ jobs:
           cache: pnpm
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
+      - name: Prepare frozen license center for isolated signed tests
+        env:
+          LICENSE_CENTER_READ_TOKEN: ${{ secrets.LICENSE_CENTER_READ_TOKEN }}
+        run: |
+          test -n "$LICENSE_CENTER_READ_TOKEN"
+          center_dir="$RUNNER_TEMP/aikayun-license-center-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export GIT_ASKPASS="$GITHUB_WORKSPACE/scripts/github-readonly-askpass.sh"
+          export GIT_TERMINAL_PROMPT=0
+          git clone --quiet --no-checkout https://github.com/YYKX682436/AiKayun-License.git "$center_dir"
+          git -C "$center_dir" checkout --quiet --detach a5cf99439e3bf92b65f19d60c013bca088cf221a
+          test "$(git -C "$center_dir" rev-parse HEAD)" = a5cf99439e3bf92b65f19d60c013bca088cf221a
+          (cd "$center_dir" && npm ci)
+          printf 'LICENSE_CENTER_CHECKOUT=%s\n' "$center_dir" >> "$GITHUB_ENV"
       - name: Lint
         run: pnpm lint
       - name: Type check
@@ -92,7 +105,20 @@ jobs:
           done
           curl --fail --silent http://localhost:8080/ | grep -q '暂无可展示的商品'
           docker compose exec -T -e ADMIN_INITIAL_EMAIL=browser-test@example.com -e 'ADMIN_INITIAL_PASSWORD=Only-For-E2E-Tests-2026!!' api node dist/admin-init.js
+      - name: Run full Compose browser suite with signed test license
+        env:
+          COMPOSE_FILE: compose.yaml:compose.e2e.yaml:compose.e2e.signed.yaml
+        run: |
+          docker compose up -d --build --force-recreate api payment-fixture
+          for attempt in $(seq 1 90); do
+            if curl --fail --silent http://localhost:8080/api/v1/health/ready >/dev/null && curl --fail --silent http://localhost:3099/__fixture/health >/dev/null; then break; fi
+            sleep 2
+          done
+          curl --fail --silent http://localhost:8080/api/v1/health/ready
+          curl --fail --silent http://localhost:3099/__fixture/health
           TEST_DATABASE_URL="postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@127.0.0.1:$PG_PORT/$POSTGRES_DB" PLAYWRIGHT_BASE_URL=http://localhost:8080 PLAYWRIGHT_EXTERNAL_SERVER=true pnpm --filter @aikayun/web exec playwright test
+      - name: Restore production API before persistence check
+        run: docker compose up -d --build --force-recreate api payment-fixture
       - name: Verify PostgreSQL data survives Compose rebuild
         run: |
           docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "CREATE TABLE compose_persistence_check (marker text PRIMARY KEY); INSERT INTO compose_persistence_check VALUES ('persisted');"
@@ -117,3 +143,6 @@ jobs:
       - name: Remove CI containers and volumes
         if: always()
         run: docker compose down -v --remove-orphans
+      - name: Remove frozen test checkout
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/aikayun-license-center-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"

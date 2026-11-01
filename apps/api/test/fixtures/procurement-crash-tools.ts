@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { AppConfig } from '../../src/config.js'
+import type { TrustedReleaseLicenseConfig } from '../../src/licensing/trusted-release-config.js'
 
 type Message = Record<string, unknown>
 
@@ -139,7 +140,9 @@ export async function startProcurementCrashProcess(config: AppConfig, checkpoint
   }
 }
 
-export async function startPurchaseArchiveCrashApi(config: AppConfig, checkpoint?: string) {
+export async function startPurchaseArchiveCrashApi(config: AppConfig, checkpoint: string | undefined, license: {
+  releaseConfig: TrustedReleaseLicenseConfig; identityRoot: string; pendingKeyRoot: string; trustRoot: string
+}) {
   const fixture = fileURLToPath(new URL('./purchase-archive-crash-api.ts', import.meta.url))
   const child = fork(fixture, [], {
     execArgv: ['--import', 'tsx'],
@@ -150,6 +153,7 @@ export async function startPurchaseArchiveCrashApi(config: AppConfig, checkpoint
       MEDIA_ROOT: config.mediaRoot, PRIVATE_FILE_ROOT: config.privateFileRoot,
       PAYMENT_CREDENTIAL_KEY_RING: ringValue(config.paymentCredentialKeyRing),
       CODE_POOL_ENCRYPTION_KEY_RING: ringValue(config.codePoolEncryptionKeyRing),
+      PURCHASE_ARCHIVE_TEST_PUBLIC_LICENSE: JSON.stringify(license),
       PURCHASE_ARCHIVE_CRASH_CHECKPOINT: checkpoint ?? '',
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],

@@ -5,6 +5,24 @@ definePageMeta({ layout: 'admin', middleware: 'admin-auth' })
 useSeoMeta({ title: '管理概览' })
 
 const { data: session } = await useFetch<ApiSuccess<AdminSession>>('/api/v1/admin/session')
+const { data: license, error: licenseError, refresh: refreshLicense } = await useFetch<ApiSuccess<{
+  status: string
+  allowedUntil: string | null
+  retryable: boolean
+}>>('/api/v1/admin/license-status')
+const licenseStatus = computed(() => {
+  switch (license.value?.data.status) {
+    case 'active': return '正常'
+    case 'offline_valid': return '离线有效'
+    case 'unactivated': return '未激活'
+    case 'expired': case 'offline_expired': return '已过期'
+    case 'revoked': return '已撤销'
+    case 'superseded': return '已被替代'
+    case 'clock_suspect': return '时间异常'
+    case 'identity_mismatch': return '安装身份异常'
+    default: return '暂时无法确认'
+  }
+})
 const busy = ref(false)
 const logoutError = ref('')
 
@@ -112,6 +130,49 @@ async function logout() {
                 已验证
               </UBadge>
             </div>
+          </UCard>
+        </section>
+
+        <section
+          aria-labelledby="license-title"
+          class="mt-10 border-t border-default pt-8"
+        >
+          <h2
+            id="license-title"
+            class="text-lg font-semibold text-highlighted"
+          >
+            经营授权状态
+          </h2>
+          <UCard class="mt-4 max-w-2xl">
+            <p
+              v-if="licenseError"
+              role="status"
+              class="text-sm text-muted"
+            >
+              授权状态暂时无法读取。
+            </p>
+            <template v-else>
+              <p class="font-medium text-highlighted">
+                {{ licenseStatus }}
+              </p>
+              <p
+                v-if="license?.data.allowedUntil"
+                class="mt-2 text-sm text-muted"
+              >
+                有效截止：{{ license.data.allowedUntil }}
+              </p>
+              <p class="mt-2 text-sm text-muted">
+                新订单和充值以提交时的授权检查为准；已有业务继续处理。
+              </p>
+            </template>
+            <UButton
+              class="mt-4"
+              color="neutral"
+              variant="outline"
+              @click="refreshLicense()"
+            >
+              刷新状态
+            </UButton>
           </UCard>
         </section>
 

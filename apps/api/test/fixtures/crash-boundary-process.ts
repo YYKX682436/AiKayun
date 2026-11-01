@@ -4,8 +4,10 @@ import { Pool } from 'pg'
 import { Kysely, PostgresDialect } from 'kysely'
 import type { Database } from '../../src/db/types.js'
 import { readConfig } from '../../src/config.js'
-import { createApp } from '../../src/app.js'
+import { createApp } from './create-app-with-license.js'
 import { runDigitalDeliveryRecoveryPass } from '../../src/commerce/code-pool-delivery-worker.js'
+import { validateTrustedReleaseLicenseConfig } from '../../src/licensing/trusted-release-config.js'
+import { createReleaseBoundTrustStore } from '../../src/licensing/trust/service.js'
 
 const config = readConfig()
 const databaseName = new URL(process.env.DATABASE_URL!).pathname.slice(1)
@@ -65,7 +67,18 @@ pool.on('connect', (client) => {
   }) as typeof client.query
 })
 const db = new Kysely<Database>({ dialect: new PostgresDialect({ pool }) })
-const app = await createApp({ db, config, logger: checkpoint === 'capture_logs' })
+const input = JSON.parse(process.env.CRASH_TEST_PUBLIC_LICENSE || 'null') as {
+  releaseConfig: unknown; identityRoot: string; pendingKeyRoot: string; trustRoot: string
+} | null
+if (!input) throw new Error('Missing test-only public license configuration')
+const releaseConfig = await validateTrustedReleaseLicenseConfig(input.releaseConfig)
+const trustStore = createReleaseBoundTrustStore(releaseConfig, input.trustRoot)
+// The checkpoint wrapper supports Kysely's promise queries, while test app
+// initialization uses pool.query's callback overload on this separate pool.
+const licensePool = new Pool({ ...config.database, max: 2, application_name: 'aikayun-phase55-crash-license-test' })
+const app = await createApp({ db, config: { ...config, identityRoot: input.identityRoot,
+  licensePendingKeyRoot: input.pendingKeyRoot }, logger: checkpoint === 'capture_logs',
+  licenseForTests: { releaseConfig, trustStore, pool: licensePool } })
 app.get('/__test/resources', async () => ({ memory: process.memoryUsage(), cpu: process.cpuUsage(), resource: process.resourceUsage() }))
 await app.listen({ host: '127.0.0.1', port: 0 })
 process.send!({ ready: app.listeningOrigin })

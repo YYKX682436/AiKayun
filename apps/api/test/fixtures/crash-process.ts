@@ -2,6 +2,7 @@ import { fork } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { once } from 'node:events'
 import type { AppConfig } from '../../src/config.js'
+import { currentSignedBusinessLicense } from './signed-business-test-app.js'
 
 export async function startCrashProcess(config: AppConfig, checkpoint: string, targetOperation?: string) {
   const encodeRing = (ring: AppConfig['codePoolEncryptionKeyRing']) => ring ? JSON.stringify({
@@ -20,6 +21,7 @@ export async function startCrashProcess(config: AppConfig, checkpoint: string, t
       SUPPLIER_HTTP_TEST_ALLOWLIST: config.supplierHttpTestAllowlist.join(','),
       CRASH_CHECKPOINT: checkpoint,
       CRASH_TARGET_OPERATION: targetOperation,
+      CRASH_TEST_PUBLIC_LICENSE: JSON.stringify(currentSignedBusinessLicense()),
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   })

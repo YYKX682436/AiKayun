@@ -9,6 +9,7 @@ import { loadEmbeddedTrustedReleaseLicenseConfig } from './trusted-release-confi
 import { createReleaseBoundTrustStore } from './trust/service.js'
 import type { TrustedReleaseLicenseConfig } from './trusted-release-config.js'
 import type { TrustBundleStore } from './trust/trust-bundle-store.js'
+import { createTrustDatabaseCoordinator } from './trust/trust-database-coordinator.js'
 import type { TestLicenseTlsOptions } from './license-request-http.js'
 import type { LicenseRecoveryCheckpoint } from './license-operation-recovery-client.js'
 import { withVerifiedInstallationSigningContext } from './installation-identity.js'
@@ -71,6 +72,7 @@ export function startLicenseRenewalWorker(options: LicenseRenewalWorkerOptions):
       const lock = await session.query<{ acquired: boolean }>('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired', [LOCK_KEY])
       locked = lock.rows[0]?.acquired === true
       if (!locked || stopped || lost) return
+      const trustCoordinator = createTrustDatabaseCoordinator({ db: options.db, identityRoot: options.identityRoot })
       const assertHeld = async () => {
         if (lost) throw new Error('license_renewal_worker_lock_lost')
         await session.query('SELECT 1')
@@ -78,7 +80,7 @@ export function startLicenseRenewalWorker(options: LicenseRenewalWorkerOptions):
       }
       const clientOptions = {
         db: options.db, pool: options.pool, identityRoot: options.identityRoot, pendingKeyRoot: options.pendingKeyRoot,
-        releaseConfig: config, trustStore: options.test?.trustStore ?? createReleaseBoundTrustStore(config, options.trustStoreRoot),
+        releaseConfig: config, trustStore: options.test?.trustStore ?? createReleaseBoundTrustStore(config, options.trustStoreRoot, trustCoordinator),
         ...(options.test ? { testTls: options.test.tls } : {}),
         ...(options.test?.onCheckpoint ? { onTestCheckpoint: options.test.onCheckpoint } : {}),
       }
@@ -139,7 +141,7 @@ export function startLicenseRenewalWorker(options: LicenseRenewalWorkerOptions):
           ...(options.test.tls.ca === undefined ? {} : { testCa: options.test.tls.ca }),
           ...(options.test.tls.lookup === undefined ? {} : { testLookup: options.test.tls.lookup }),
         } : {})
-        await options.db.transaction().execute(async tx => {
+        await options.db.transaction().execute(async tx => clientOptions.trustStore.withDatabaseTransaction(tx, async () => {
           const binding = await tx.selectFrom('installation_binding').selectAll().where('singleton', '=', true).forUpdate().executeTakeFirst()
           if (!binding || binding.binding_state !== 'ready' || binding.database_id !== identity.databaseId ||
             binding.instance_id !== identity.instanceId || binding.identity_jkt !== identity.identityJkt) {
@@ -152,7 +154,7 @@ export function startLicenseRenewalWorker(options: LicenseRenewalWorkerOptions):
             ...(options.test?.databaseTimeMs === undefined ? {} : { databaseTimeMs: options.test.databaseTimeMs }) })
           await clientOptions.trustStore.getAccepted(() => time.trustedTimeSeconds)
           sample.assertFresh()
-        })
+        }))
       })
       const projection = createLicenseStateProjectionClient(clientOptions)
       const clearRetryIfProjected = async (operationId: string) => {

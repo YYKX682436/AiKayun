@@ -473,7 +473,7 @@ async function replayPendingV2(context: CheckoutOperationContext): Promise<void>
       quote.value = error.currentQuote
       quoteGeneration.value = context.pageGeneration
       submitError.value = `${error.message} 已显示最新报价，请再次确认。`
-    } else if (error instanceof PendingOwnerConflictError || (error instanceof CustomerApiError && error.code === 'GUEST_SESSION_CHANGED')) {
+    } else if (error instanceof PendingOwnerConflictError || (error instanceof CustomerApiError && ['GUEST_SESSION_CHANGED', 'LICENSE_NEW_OBLIGATION_BLOCKED', 'LICENSE_STATE_UNAVAILABLE'].includes(error.code))) {
       submitError.value = error.message
     } else {
       submitError.value = '上次提交结果尚未确认。保留原请求标识，继续重试会先核对原订单。'

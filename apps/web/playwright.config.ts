@@ -31,7 +31,7 @@ export default defineConfig({
     screenshot: 'only-on-failure',
     ...devices['Desktop Chrome'],
   },
-  globalSetup: './test/e2e/global-setup.ts',
+  globalSetup: './test/e2e/global-setup-signed.ts',
   webServer: useExternalServer ? undefined : [
     {
       command: 'pnpm --filter @aikayun/api exec tsx test/fixtures/kayixin-v3-server.ts --serve',
@@ -63,12 +63,13 @@ export default defineConfig({
       },
     },
     {
-      command: 'pnpm --filter @aikayun/api dev',
+      command: 'pnpm --filter @aikayun/api exec tsx test/fixtures/signed-business-playwright-server.ts',
       url: `http://127.0.0.1:${apiPort}/api/v1/health/live`,
       reuseExistingServer: false,
       timeout: 120_000,
       env: {
         DATABASE_URL: testDatabaseUrl,
+        TEST_DATABASE_URL: testDatabaseUrl,
         API_PORT: apiPort,
         NODE_ENV: 'test',
         PUBLIC_ORIGIN: baseURL,

@@ -15,6 +15,7 @@
     "identity:init": "tsx src/licensing/installation-identity-cli.ts init",
     "identity:verify": "tsx src/licensing/installation-identity-cli.ts verify",
     "license-pending-key:init": "tsx src/licensing/pending-encryption-key-cli.ts init",
+    "license-trust-head:init": "tsx src/licensing/trust/trust-bundle-head-cli.ts",
     "license-pending:restore-check": "tsx src/licensing/license-pending-restore-check.ts",
     "media:check": "tsx src/media/reconcile-cli.ts --check",
     "private-files:check": "tsx src/media/private-file-reconcile-cli.ts --check",

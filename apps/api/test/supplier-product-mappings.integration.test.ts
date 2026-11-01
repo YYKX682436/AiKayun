@@ -1,9 +1,11 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { Pool } from 'pg'
 import { sql, type Kysely } from 'kysely'
 import { Migrator } from 'kysely/migration'
 import type { FastifyInstance, InjectOptions } from 'fastify'
-import { createApp } from '../src/app.js'
+import { createApp } from './fixtures/create-app-with-license.js'
+import { createSignedBusinessLicense } from './fixtures/signed-business-license.js'
 import { hashPassword } from '../src/auth/password.js'
 import { hashToken } from '../src/auth/security.js'
 import { readConfig, type AppConfig } from '../src/config.js'
@@ -49,6 +51,8 @@ type FixtureProductData = {
 let app: FastifyInstance
 let db: Kysely<Database>
 let config: AppConfig
+let licensePool: Pool
+let licenseFixture: Awaited<ReturnType<typeof createSignedBusinessLicense>>
 let fixture: Awaited<ReturnType<typeof startKayixinV3Fixture>>
 let adminCookie = ''
 let adminHeaders: Record<string, string> = {}
@@ -167,9 +171,25 @@ beforeAll(async () => {
   await sql`CREATE SCHEMA public`.execute(db)
   const migrated = await new Migrator({ db, provider: new LegacySupplierMappingMigrationProvider() }).migrateToLatest()
   if (migrated.error) throw migrated.error
+  const appMigrations = await new AppMigrationProvider().getMigrations()
+  const licenseMigrationNames = Object.keys(appMigrations)
+    .filter(name => /^(?:20261029|20261030|20261031|20261101)/u.test(name)).sort()
+  for (const name of licenseMigrationNames) {
+    const migration = appMigrations[name]
+    if (!migration?.up) throw new Error(`Missing license migration: ${name}`)
+    await migration.up(db)
+  }
   await db.insertInto('admin_users').values({ id: adminId, email: `supplier-map-${adminId.slice(0, 8)}@example.test`,
     password_hash: await hashPassword(adminPassword) }).execute()
-  app = await createApp({ db, config, logger: false }); await app.ready()
+  const centerCheckout = process.env.LICENSE_CENTER_CHECKOUT
+  if (!centerCheckout) throw new Error('Supplier mapping order tests require the frozen license center')
+  licensePool = new Pool({ connectionString: databaseUrl, max: 8 })
+  licenseFixture = await createSignedBusinessLicense({ db, pool: licensePool, databaseUrl, centerCheckout })
+  config = { ...config, identityRoot: licenseFixture.options.identityRoot,
+    licensePendingKeyRoot: licenseFixture.options.pendingKeyRoot }
+  app = await createApp({ db, config, logger: false, licenseForTests: {
+    releaseConfig: licenseFixture.options.releaseConfig, trustStore: licenseFixture.options.trustStore, pool: licensePool,
+  } }); await app.ready()
   const csrf = await inject({ method: 'GET', url: '/api/v1/admin/auth/csrf' })
   const csrfCookie = cookie(csrf, 'aikayun_admin_csrf')
   const login = await inject({ method: 'POST', url: '/api/v1/admin/auth/login', headers: {
@@ -211,7 +231,7 @@ beforeAll(async () => {
   })
 })
 
-afterAll(async () => { await app?.close(); await db?.destroy(); await fixture?.close() })
+afterAll(async () => { await app?.close(); await licenseFixture?.close(); await licensePool?.end(); await db?.destroy(); await fixture?.close() })
 
 describe('⑥-2C-2 supplier product mapping preparation on PostgreSQL', () => {
   it('keeps guest and customer identities outside admin mapping routes and requires CSRF for writes', async () => {

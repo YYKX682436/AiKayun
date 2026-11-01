@@ -390,6 +390,8 @@ describe('⑥-2B R1 ordered purchase snapshot manifest gates', () => {
       migrationName: '202611010003_license_operation_renewal_attempts', status: 'Success',
     }), expect.objectContaining({
       migrationName: '202611010004_license_renewal_retry', status: 'Success',
+    }), expect.objectContaining({
+      migrationName: '202611010005_trusted_bundle_head', status: 'Success',
     })])
     expect(await durableRows()).toEqual(before)
     const repeated = await migrator.migrateToLatest()

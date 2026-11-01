@@ -50,7 +50,8 @@ await writeFile(overridePath, JSON.stringify({ services: { api: {
 const env = {
   ...process.env,
   COMPOSE_PROJECT_NAME: project,
-  COMPOSE_FILE: `${join(workspace, 'compose.yaml')}:${join(workspace, 'compose.e2e.yaml')}:${overridePath}`,
+  COMPOSE_FILE: `${join(workspace, 'compose.yaml')}:${join(workspace, 'compose.e2e.yaml')}:${join(workspace, 'compose.e2e.recovery-signed.yaml')}:${overridePath}`,
+  SIGNED_RECOVERY_API_PORT: await port(),
   POSTGRES_USER: 'aikayun', POSTGRES_PASSWORD: randomBytes(24).toString('hex'), POSTGRES_DB: 'aikayun_digital_recovery_test',
   PG_PORT: await port(), HTTP_PORT: httpPort, HTTPS_PORT: await port(), API_PORT: await port(),
   ZPAY_FIXTURE_PORT: supplierPort, HTTP_BIND_ADDRESS: '127.0.0.1', SITE_ADDRESS: ':80', PUBLIC_ORIGIN: origin,
@@ -75,8 +76,8 @@ async function until(action, description, timeout = 120_000) {
 const ready = () => until(async () => (await fetch(`${origin}/api/v1/health/ready`)).ok, 'isolated API readiness')
 const jar = () => new Map()
 const headers = (cookies, token) => ({ origin, cookie: [...cookies].map(([name, value]) => `${name}=${value}`).join('; '), ...(token ? { 'x-csrf-token': token } : {}) })
-async function request(path, { cookies, token, body, method = 'GET', expected = 200 } = {}) {
-  const response = await fetch(`${origin}${path}`, { method, headers: {
+async function request(path, { cookies, token, body, method = 'GET', expected = 200, requestOrigin = origin } = {}) {
+  const response = await fetch(`${requestOrigin}${path}`, { method, headers: {
     ...(cookies ? headers(cookies, token) : {}), ...(body && !(body instanceof FormData) ? { 'content-type': 'application/json' } : {}),
   }, ...(body ? { body: body instanceof FormData ? body : JSON.stringify(body) } : {}) })
   for (const cookie of response.headers.getSetCookie()) {
@@ -228,8 +229,15 @@ try {
     body: { username: `restore-${randomUUID().slice(0, 12)}`, password: 'Isolated-Customer-Password-2026!!' } })
   const quote = await request('/api/v1/checkout/quote', { cookies: customer, token: customerCsrf, method: 'POST', body: { items } })
   assert.equal(quote.canContinue, true)
+  // Admission uses a second, test-only API with real signed center evidence and
+  // the already initialized identity/key. All subsequent recovery remains on
+  // the production API, including its fail-closed behavior and SIGKILL tests.
+  compose('--profile', 'signed-recovery', 'up', '-d', '--build', '--no-deps', 'signed-api')
+  const signedOrigin = `http://127.0.0.1:${env.SIGNED_RECOVERY_API_PORT}`
+  await until(async () => (await fetch(`${signedOrigin}/api/v1/health/ready`)).ok, 'signed admission fixture')
   const created = await request('/api/v1/checkout/orders', { cookies: customer, token: customerCsrf, method: 'POST', expected: 201,
-    body: { items, quoteToken: quote.quoteToken, idempotencyKey: randomUUID() } })
+    requestOrigin: signedOrigin, body: { items, quoteToken: quote.quoteToken, idempotencyKey: randomUUID() } })
+  compose('stop', 'signed-api')
   const orderId = created.order.id
   await request(`/api/v1/orders/${orderId}/payments`, { cookies: customer, token: customerCsrf, method: 'POST', expected: 201,
     body: { idempotencyKey: randomUUID(), channelId: channel.channel.id, paymentMethod: 'alipay' } })

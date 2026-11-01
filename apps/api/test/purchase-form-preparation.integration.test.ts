@@ -11,7 +11,7 @@ import { Pool } from 'pg'
 import type { FastifyInstance } from 'fastify'
 import { Migrator } from 'kysely/migration'
 import sharp from 'sharp'
-import { createApp } from '../src/app.js'
+import { createApp } from './fixtures/create-app-with-license.js'
 import { hashPassword } from '../src/auth/password.js'
 import { hashToken } from '../src/auth/security.js'
 import type { AuthenticatedCustomer } from '../src/auth/customer.js'
@@ -49,6 +49,7 @@ import { purchaseLineContentIdentity } from '../src/commerce/purchase-lines.js'
 import { PrivateFileStorage } from '../src/media/private-file-storage.js'
 import { reconcilePrivateFiles } from '../src/media/private-file-reconcile.js'
 import type { PurchaseFormDefinition } from '@aikayun/contracts'
+import { createSignedBusinessLicense } from './fixtures/signed-business-license.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const origin = 'http://localhost:3000'
@@ -65,6 +66,8 @@ let adminCookie: string
 let adminCsrfToken: string
 let adminCsrfCookie: string
 let nextIp = 1
+let licensePool: Pool
+let licenseFixture: Awaited<ReturnType<typeof createSignedBusinessLicense>>
 
 type OwnerCustomer = Pick<AuthenticatedCustomer, 'id' | 'sessionId'> & { username: string; token: string }
 type Guest = { id: string; token: string }
@@ -288,6 +291,10 @@ beforeAll(async () => {
   const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
   const migrated = await migrator.migrateToLatest()
   if (migrated.error) throw migrated.error
+  const centerCheckout = process.env.LICENSE_CENTER_CHECKOUT
+  if (!centerCheckout) throw new Error('LICENSE_CENTER_CHECKOUT is required for signed business license tests')
+  licensePool = new Pool({ connectionString: testDatabaseUrl })
+  licenseFixture = await createSignedBusinessLicense({ db, pool: licensePool, databaseUrl: testDatabaseUrl, centerCheckout })
   const rotatedRing = JSON.stringify({ activeKeyId: 'draft-b', keys: { 'draft-a': keyA.toString('base64'), 'draft-b': keyB.toString('base64') } })
   const baseEnv = {
     ...process.env,
@@ -297,6 +304,8 @@ beforeAll(async () => {
     NODE_ENV: 'test',
     PUBLIC_ORIGIN: origin,
     COOKIE_SECURE: 'false',
+    INSTANCE_IDENTITY_ROOT: licenseFixture.options.identityRoot,
+    LICENSE_PENDING_KEY_ROOT: licenseFixture.options.pendingKeyRoot,
     PAYMENT_CREDENTIAL_KEY_RING: JSON.stringify({ activeKeyId: 'draft-a', keys: { 'draft-a': keyA.toString('base64') } }),
     CODE_POOL_ENCRYPTION_KEY_RING: JSON.stringify({ activeKeyId: 'code-pool-test', keys: { 'code-pool-test': Buffer.alloc(32, 0x68).toString('base64') } }),
   }
@@ -306,16 +315,20 @@ beforeAll(async () => {
   await db.insertInto('admin_users').values({
     id: adminId, email: `purchase-forms-${adminId.slice(0, 8)}@example.test`, password_hash: await hashPassword('integration-admin-password'),
   }).execute()
-  app = await createApp({ db, config: configA, logger: false })
+  app = await createApp({ db, config: configA, logger: false, licenseForTests: {
+    releaseConfig: licenseFixture.options.releaseConfig, trustStore: licenseFixture.options.trustStore, pool: licensePool,
+  } })
   await app.ready()
   const admin = await makeAdminSession()
   adminCookie = admin.cookie
   adminCsrfToken = admin.csrfToken
   adminCsrfCookie = admin.csrfCookie
-})
+}, 120_000)
 
 afterAll(async () => {
   if (app) await app.close()
+  if (licenseFixture) await licenseFixture.close()
+  if (licensePool) await licensePool.end()
   if (db) await db.destroy()
   if (privateRoot) await rm(privateRoot, { recursive: true, force: true })
   if (publicRoot) await rm(publicRoot, { recursive: true, force: true })
@@ -1832,14 +1845,82 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     expect(quote.json().data.canContinue).toBe(true)
     const body = { version: 2, items, idempotencyKey: randomUUID(),
       quoteToken: quote.json().data.quoteToken as string }
-    const first = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: body })
-    expect(first.statusCode, JSON.stringify(first.json())).toBe(201)
-    const firstOrder = first.json().data.order as { id: string; items: Array<{ id: string }> }
+    const originalDescriptor = Object.getOwnPropertyDescriptor(db, 'transaction')
+    const originalTransaction = db.transaction.bind(db)
+    let transactionCount = 0
+    Object.defineProperty(db, 'transaction', { configurable: true, value: () => {
+      const builder = originalTransaction()
+      return { execute: async <T>(callback: (trx: Transaction<Database>) => Promise<T>): Promise<T> => {
+        transactionCount += 1
+        const result = await builder.execute(callback)
+        if (transactionCount === 2) throw new Error('test lost acknowledgement after order COMMIT')
+        return result
+      } }
+    } })
+    try {
+      const first = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: body })
+      expect(first.statusCode).toBe(500)
+    } finally {
+      if (originalDescriptor) Object.defineProperty(db, 'transaction', originalDescriptor)
+      else Reflect.deleteProperty(db, 'transaction')
+    }
+    expect(transactionCount).toBe(2)
+    const committed = await db.selectFrom('orders').select('id').where('idempotency_key', '=', body.idempotencyKey).executeTakeFirstOrThrow()
+    const recovered = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: body })
+    expect(recovered.statusCode, JSON.stringify(recovered.json())).toBe(200)
+    const firstOrder = recovered.json().data.order as { id: string; items: Array<{ id: string }> }
+    expect(firstOrder.id).toBe(committed.id)
     expect(firstOrder.items).toHaveLength(1)
     const archivedBefore = await db.selectFrom('purchase_order_attachment_objects').selectAll()
       .where('source_draft_id', '=', draft.id).execute()
     expect(archivedBefore).toHaveLength(1)
     expect(archivedBefore[0]?.status).toBe('retained')
+
+    const currentQuote = await inject({ method: 'POST', url: '/api/v1/checkout/quote', headers,
+      payload: { version: 2, items } })
+    expect(currentQuote.statusCode).toBe(200)
+    const newBody = { ...body, idempotencyKey: randomUUID(), quoteToken: currentQuote.json().data.quoteToken as string }
+    const beforeFiles = (await orderStorage.scanFiles()).map(file => file.path).sort()
+    const unavailableApp = await createApp({ db, config: configA, logger: false })
+    await unavailableApp.ready()
+    try {
+      const denied = await unavailableApp.inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: newBody })
+      expect(denied.statusCode).toBe(503)
+      expect(denied.json().error.code).toBe('LICENSE_STATE_UNAVAILABLE')
+      expect((await orderStorage.scanFiles()).map(file => file.path).sort()).toEqual(beforeFiles)
+    } finally { await unavailableApp.close() }
+
+    // Pause precisely during archive preparation, after preflight committed and before
+    // the final order transaction. A real signed center revocation wins this race.
+    let storedResolve!: () => void
+    let resumeResolve!: () => void
+    const stored = new Promise<void>(resolve => { storedResolve = resolve })
+    const resume = new Promise<void>(resolve => { resumeResolve = resolve })
+    const originalStore = PurchaseOrderAttachmentStorage.prototype.store
+    PurchaseOrderAttachmentStorage.prototype.store = async function (...args) {
+      const key = await originalStore.apply(this, args)
+      storedResolve()
+      await resume
+      return key
+    }
+    let pending: ReturnType<typeof inject> | undefined
+    try {
+      pending = inject({ method: 'POST', url: '/api/v1/checkout/orders', headers, payload: newBody })
+      await stored
+      await licenseFixture.revokeAndProject()
+      resumeResolve()
+      const denied = await pending
+      expect(denied.statusCode, JSON.stringify(denied.json())).toBe(403)
+      expect(denied.json().error.code).toBe('LICENSE_NEW_OBLIGATION_BLOCKED')
+      expect(await db.selectFrom('orders').select('id').where('idempotency_key', '=', newBody.idempotencyKey).execute()).toHaveLength(0)
+      expect(await db.selectFrom('purchase_order_attachment_objects').selectAll()
+        .where('source_draft_id', '=', draft.id).execute()).toEqual(archivedBefore)
+      expect((await orderStorage.scanFiles()).map(file => file.path).sort()).toEqual(beforeFiles)
+    } finally {
+      resumeResolve()
+      PurchaseOrderAttachmentStorage.prototype.store = originalStore
+      if (pending) await pending
+    }
 
     await requestPurchaseDraftDeletion(db, owner, draft.id, saved.revision)
     await reconcilePurchaseDrafts(db, draftStorage, { repair: true })

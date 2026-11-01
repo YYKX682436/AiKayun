@@ -50,7 +50,11 @@ function normalizeError(error: unknown): CustomerApiError {
   if (status === 409 && body?.error?.currentQuote) {
     return new CheckoutConflictError(status, code, serverMessage ?? '报价已变化，请核对最新内容后继续。', body.error.currentQuote)
   }
-  const message = code === 'INVALID_CREDENTIALS'
+  const message = code === 'LICENSE_NEW_OBLIGATION_BLOCKED'
+    ? '店铺暂时无法接受新的订单或充值，请稍后再试。已有订单和充值仍可继续处理。'
+    : code === 'LICENSE_STATE_UNAVAILABLE'
+      ? '店铺经营状态暂时无法确认，请稍后再试。已有订单和充值仍可继续处理。'
+    : code === 'INVALID_CREDENTIALS'
     ? '用户名或密码不正确。'
     : code === 'USERNAME_TAKEN'
       ? '该用户名已被使用，请换一个用户名。'

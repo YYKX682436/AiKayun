@@ -15,6 +15,11 @@ export const ApiErrorSchema = Type.Object({
     code: Type.String(),
     message: Type.String(),
     fieldIds: Type.Optional(Type.Array(Type.String({ format: 'uuid' }), { maxItems: 60 })),
+    details: Type.Optional(Type.Object({
+      status: Type.String(),
+      allowedUntil: Type.Union([Type.String({ format: 'date-time' }), Type.Null()]),
+      retryable: Type.Boolean(),
+    }, { additionalProperties: false })),
   }),
   meta: RequestMetaSchema,
 })

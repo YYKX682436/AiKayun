@@ -5,7 +5,9 @@ import { Pool, type PoolClient } from 'pg'
 import { Kysely, PostgresDialect, sql } from 'kysely'
 import type { Database } from '../../src/db/types.js'
 import { readConfig } from '../../src/config.js'
-import { createApp } from '../../src/app.js'
+import { createApp } from './create-app-with-license.js'
+import { validateTrustedReleaseLicenseConfig } from '../../src/licensing/trusted-release-config.js'
+import { createReleaseBoundTrustStore } from '../../src/licensing/trust/service.js'
 
 const config = readConfig()
 const databaseName = new URL(process.env.DATABASE_URL || '').pathname.slice(1)
@@ -70,12 +72,24 @@ pool.on('connect', (client: PoolClient) => {
 
 const db = new Kysely<Database>({ dialect: new PostgresDialect({ pool }) })
 const backend = await sql<{ pid: number }>`SELECT pg_backend_pid() AS pid`.execute(db)
-const app = await createApp({ db, config, logger: false })
+const input = JSON.parse(process.env.PURCHASE_ARCHIVE_TEST_PUBLIC_LICENSE || 'null') as {
+  releaseConfig: unknown; identityRoot: string; pendingKeyRoot: string; trustRoot: string
+} | null
+if (!input) throw new Error('Missing test-only public license configuration')
+const releaseConfig = await validateTrustedReleaseLicenseConfig(input.releaseConfig)
+const trustStore = createReleaseBoundTrustStore(releaseConfig, input.trustRoot)
+// Keep the driver's callback-based pool.query off the checkpoint-wrapped pool,
+// whose wrapper intentionally implements Kysely's promise query overload only.
+const licensePool = new Pool({ ...config.database, max: 2, application_name: 'aikayun-purchase-archive-license-' + process.pid })
+const app = await createApp({ db, config: { ...config, identityRoot: input.identityRoot,
+  licensePendingKeyRoot: input.pendingKeyRoot }, logger: false,
+  licenseForTests: { releaseConfig, trustStore, pool: licensePool } })
 await app.listen({ host: '127.0.0.1', port: 0 })
 process.send!({ ready: { url: app.listeningOrigin, pid: process.pid, backendPid: backend.rows[0]!.pid } })
 
 async function stop(): Promise<void> {
   await app.close().catch(() => undefined)
+  await licensePool.end().catch(() => undefined)
   await db.destroy().catch(() => undefined)
   process.disconnect?.()
 }
