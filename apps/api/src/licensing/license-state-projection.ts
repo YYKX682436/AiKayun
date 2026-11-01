@@ -8,6 +8,7 @@ import { parseStrictJson } from './strict-json.js'
 import {
   decryptLicensePendingBytes,
   encryptLicensePendingBytes,
+  loadLicensePendingKey,
 } from './pending-encryption-key.js'
 import type { LicenseOperationRecoveryClientOptions, PersistedLicenseProjectionHistory } from './license-operation-recovery-client.js'
 import {
@@ -17,6 +18,7 @@ import {
 } from './license-operation-recovery-client.js'
 import { fetchTrustedTimeAnchor, getTrustedCenterContactState } from './trust/time-anchor-client.js'
 import { advanceLicenseTrustedTime, LicenseClockSuspectError } from './license-trusted-time.js'
+import { readTrustedTimeWatermark } from './trusted-time-watermark.js'
 import {
   verifyCurrentLicenseLease,
   verifyExpiredHistoricalLease,
@@ -604,6 +606,19 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
           const row = await tx.selectFrom('instance_license_state').selectAll()
             .where('singleton', '=', true).forUpdate().executeTakeFirst()
           if (!row) return denied('invalid_credential', 'license_state_unavailable')
+          if (row.license_id === null && row.credential_jti === null && row.refusal_status === null &&
+            row.trusted_time_high_water_ms === null) {
+            await loadLicensePendingKey(options.pendingKeyRoot)
+            const watermark = await readTrustedTimeWatermark(options.pendingKeyRoot, {
+              databaseId: identity.databaseId,
+              instanceId: identity.instanceId,
+              identityJkt: identity.identityJkt,
+            })
+            if (watermark.status === 'missing') return denied('unactivated', 'no_accepted_license_lease')
+            return denied('clock_suspect', watermark.status === 'valid'
+              ? 'watermark_database_missing'
+              : 'watermark_identity_mismatch')
+          }
           let time
           try {
             const testTime = options.onTrustedTimeTestOverride?.()

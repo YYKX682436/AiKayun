@@ -3045,6 +3045,65 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     } finally { await fixture.close() }
   }, 90_000)
 
+  it('keeps a first unactivated snapshot watermark-free through a future DB clock and projects the original activation after correction', async () => {
+    const scenario = await issueCenterActivationScenario()
+    const fixture = await createRecoveryCase({ name: 'license-first-snapshot-future-clock-repro', license: scenario })
+    try {
+      const futureDatabaseTimeMs = Date.now() + 24 * 60 * 60 * 1000
+      const futureClock = createLicenseStateProjectionClient({
+        db: fixture.db, pool: fixture.pool, identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
+        releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions(),
+        onTrustedTimeTestOverride: () => ({ databaseTimeMs: futureDatabaseTimeMs, ignoreProcessAnchor: true }),
+      })
+      expect(await futureClock.getLicenseSnapshot()).toMatchObject({
+        status: 'unactivated', canCreateOrder: false, canCreateTopUp: false,
+      })
+      const projectedRow = await fixture.db.selectFrom('instance_license_state').select('trusted_time_high_water_ms')
+        .where('singleton', '=', true).executeTakeFirstOrThrow()
+      expect(projectedRow.trusted_time_high_water_ms).toBeNull()
+      const watermarkPath = join(fixture.pendingRoot, trustedTimeWatermarkFileName)
+      await expect(readFile(watermarkPath)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      const correctedClock = createLicenseStateProjectionClient({
+        db: fixture.db, pool: fixture.pool, identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
+        releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions(),
+        onTrustedTimeTestOverride: () => ({ databaseTimeMs: Date.now(), ignoreProcessAnchor: true }),
+      })
+      expect(await correctedClock.getLicenseSnapshot()).toMatchObject({
+        status: 'unactivated', canCreateOrder: false, canCreateTopUp: false,
+      })
+      expect((await fixture.db.selectFrom('instance_license_state').select('trusted_time_high_water_ms')
+        .where('singleton', '=', true).executeTakeFirstOrThrow()).trusted_time_high_water_ms).toBeNull()
+      await expect(readFile(watermarkPath)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      const operationsBefore = await centerPool.query<{ count: string }>(
+        'SELECT count(*)::text AS count FROM license_operations WHERE license_id = $1', [scenario.license_id],
+      )
+      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      const correctedProjection = createLicenseStateProjectionClient({
+        db: fixture.db, pool: fixture.pool, identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
+        releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions(),
+      })
+      expect(await correctedProjection.projectPersistedOperation(fixture.operation.operationId))
+        .toMatchObject({ outcome: 'applied', activationGeneration: '1', entitlementRevision: '1' })
+      expect((await correctedProjection.projectPersistedOperation(fixture.operation.operationId)).outcome).toBe('idempotent')
+      expect((await fixture.db.selectFrom('local_license_operations').select('state')
+        .where('operation_id', '=', fixture.operation.operationId).executeTakeFirstOrThrow()).state).toBe('response_saved')
+      const activeGeneration = await centerPool.query<{ generation: string }>(
+        `SELECT generation::text AS generation FROM license_activations WHERE license_id = $1 AND state = 'active'`,
+        [scenario.license_id],
+      )
+      expect(activeGeneration.rows[0]?.generation).toBe('1')
+      const operationsAfter = await centerPool.query<{ count: string }>(
+        'SELECT count(*)::text AS count FROM license_operations WHERE license_id = $1', [scenario.license_id],
+      )
+      expect(Number(operationsAfter.rows[0]?.count)).toBe(Number(operationsBefore.rows[0]?.count) + 1)
+      expect((await fixture.db.selectFrom('instance_license_state').select('trusted_time_high_water_ms')
+        .where('singleton', '=', true).executeTakeFirstOrThrow()).trusted_time_high_water_ms).not.toBeNull()
+      expect(await readFile(watermarkPath)).toBeTruthy()
+    } finally { await fixture.close() }
+  }, 90_000)
+
   it('uses the exact seven-day half-open lease boundary with the persistent watermark and isolated PostgreSQL clock', async () => {
     const scenario = await issueCenterActivationScenario()
     const fixture = await createRecoveryCase({ name: 'license-snapshot-lease-boundary', license: scenario })
