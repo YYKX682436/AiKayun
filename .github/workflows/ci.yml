@@ -109,6 +109,7 @@ jobs:
         env:
           COMPOSE_FILE: compose.yaml:compose.e2e.yaml:compose.e2e.signed.yaml
         run: |
+          trap 'diagnostic_exit_code=$?; if [ "$diagnostic_exit_code" -ne 0 ]; then docker compose ps -a || true; docker compose logs --tail=180 api payment-fixture || true; fi; exit "$diagnostic_exit_code"' EXIT
           docker compose up -d --build --force-recreate api payment-fixture
           for attempt in $(seq 1 90); do
             if curl --fail --silent http://localhost:8080/api/v1/health/ready >/dev/null && curl --fail --silent http://localhost:3099/__fixture/health >/dev/null; then break; fi
