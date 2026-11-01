@@ -8,10 +8,6 @@ readonly repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly postgres_image='postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873'
 readonly database_name='aikayun_3c2b_test'
 readonly test_filter="${1:-}"
-readonly task_id="$(date +%s)-$$"
-readonly container_name="aikayun-license-interop-${task_id}"
-readonly temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/aikayun-license-interop.XXXXXX")"
-readonly center_checkout="${temporary_root}/license-center"
 
 if [[ "${GITHUB_ACTIONS:-}" == 'true' && -z "${LICENSE_CENTER_READ_TOKEN:-}" ]]; then
   echo 'GitHub Actions needs LICENSE_CENTER_READ_TOKEN (read-only Contents access to AiKayun-License) to fetch the frozen private center.' >&2
@@ -21,6 +17,11 @@ if [[ -n "${LICENSE_CENTER_READ_TOKEN:-}" ]]; then
   export GIT_ASKPASS="${repository_root}/scripts/github-readonly-askpass.sh"
   export GIT_TERMINAL_PROMPT=0
 fi
+
+readonly task_id="$(date +%s)-$$"
+readonly container_name="aikayun-license-interop-${task_id}"
+readonly temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/aikayun-license-interop.XXXXXX")"
+readonly center_checkout="${temporary_root}/license-center"
 
 cleanup() {
   docker rm --force "$container_name" >/dev/null 2>&1 || true
