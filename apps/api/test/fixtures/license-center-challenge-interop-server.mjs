@@ -41,6 +41,7 @@ let currentOnlineKey
 let currentTrustKeys
 let pendingSignerRotation
 let shuttingDown = false
+let startupStage = 'initialization'
 
 async function availablePort() {
   const server = createServer()
@@ -68,6 +69,7 @@ process.once('SIGTERM', () => { void shutdown() })
 process.once('SIGINT', () => { void shutdown() })
 
 try {
+  startupStage = 'create isolated signing runtime'
   const port = await availablePort()
   const origin = `https://license.example.test:${port}`
   const activationControlPath = join(dirname(infoPath), 'activation-control.json')
@@ -94,8 +96,10 @@ try {
     keys: [initialKeyRecord],
   }, runtime.offlineRootPublicJwk)
   const bundle = await offlineTrust.signTrustBundle(claims, runtime.offlineRootPrivateKey, runtime.offlineRootPublicJwk)
+  startupStage = 'migrate isolated center database'
   db = createDatabase(runtime.config.databaseUrl)
   await migrateToLatest(db)
+  startupStage = 'initialize isolated center signer'
   const admin = runtime.createAdminService(db)
   const initializeRequest = {
     operationId: randomUUID(),
@@ -124,6 +128,7 @@ try {
   }), { mode: 0o600, flag: 'wx' })
   await chmod(policyPath, 0o600)
   licenseAdmin = await createAdminService(policyPath)
+  startupStage = 'issue isolated center fixtures'
 
   async function issueActivationScenario(revokeAfterIssue = false) {
     const licenseId = randomUUID()
@@ -683,6 +688,7 @@ try {
     return payload
   })
   await app.listen({ host: '127.0.0.1', port })
+  startupStage = 'write isolated center metadata'
   const databaseName = new URL(runtime.config.databaseUrl).pathname.slice(1)
   await writeFile(infoPath, JSON.stringify({
     source_commit: expectedCommit,
@@ -729,8 +735,15 @@ try {
     transport_activation_cases: transportActivationCases,
   }), { mode: 0o600, flag: 'wx' })
   process.stdout.write('READY\n')
-} catch {
-  process.stderr.write('Isolated authorization center fixture failed to start.\n')
+} catch (error) {
+  const message = String(error?.message ?? error)
+    .replace(/postgres(?:ql)?:\/\/[^\s"'`]+/gi, '[database-url]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[jwt]')
+    .replace(/[\r\n\t]+/g, ' ')
+    .slice(0, 300)
+  const code = typeof error?.code === 'string' ? ` (${error.code})` : ''
+  const frames = String(error?.stack ?? '').split('\n').slice(1, 4).join(' ').replace(/[\r\n\t]+/g, ' ').slice(0, 300)
+  process.stderr.write(`Isolated authorization center fixture failed during ${startupStage}: ${error?.name ?? 'Error'}${code}: ${message}${frames ? `; ${frames}` : ''}\n`)
   await cleanup()
   process.exitCode = 1
 }

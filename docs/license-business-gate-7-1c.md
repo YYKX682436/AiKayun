@@ -34,6 +34,8 @@ pnpm --filter @aikayun/api run license-trust-head:init -- --initialize-current-t
 
 新建隔离测试授权时，fixture 先接受 root 签名的信任包，再投影签名 lease；该流程和生产 Store 使用同一个数据库摘要协调器。订单与充值集成测试共用 fixture，不逐项重做激活流程。一个显式故障回归在 `COMMIT` 等待 PostgreSQL advisory 锁时 SIGKILL API，并观察 signer 撤销一直等到事务结束；另一个接受真实撤销包后验证旧目录拒绝；第三个在写入信任文件后 SIGKILL 并通过重试同一个 signed bundle 恢复。
 
+Compose 浏览器验收通过独立 PostgreSQL 18 服务和冻结中心只读 checkout 运行。中心隔离管理员策略只接受 loopback PostgreSQL URL，因此 signed fixture 在 API 测试进程中建立仅绑定 `127.0.0.1` 的临时 TCP 转发，转到同一隔离 PostgreSQL 服务；商城 API 仍直连其测试 DB。子进程关闭后转发器也关闭。仅 E2E 签名镜像安装 `openssl` 生成中心 HTTPS 测试证书，未改动授权中心源码或发行配置。
+
 可信时间仍沿用 3D-2 记录的 DB、文件及系统时钟协同回滚边界。本阶段未实现 time-reset、安装身份迁移系统、生产部署或 ⑦-2。
 
 ## 验收状态
@@ -42,5 +44,6 @@ pnpm --filter @aikayun/api run license-trust-head:init -- --initialize-current-t
 - `pnpm lint` 无错误；仅保留 `apps/web/pages/products/[id].vue` 的 7 条既有格式警告。API/Web 类型检查、API/Web 生产构建通过；unit 测试 16/16 通过。
 - API 集成测试 37 个文件、675/675 项通过，其中冻结授权中心 HTTPS Challenge、签名证据与恢复互操作 135 项全部通过。
 - 真实浏览器测试通过：主 Chromium 套件 93/93、brand-alt 1/1、SSR 错误/重试 3/3、dev-preview 1/1、production-brand 1/1。
+- 使用冻结中心签名证据的完整 Compose 浏览器套件通过：93 项中 84 项通过，9 项按现有集成服务条件跳过；支付回调测试使用本机隔离宿主 API 端口执行。
 - PostgreSQL 锁竞争回归在真实 PG 18 中通过：测试通过 `pg_stat_activity` / `pg_blocking_pids()` 观察订单准入连接在 `installation_binding` 行锁等待；授权过期边界测试持锁越过签名截止时间后返回 403。另有 SIGKILL、未知 COMMIT、撤销并发、Trust Store 写入中断及重试恢复用例通过。
 - 全套通过时，仍只有 7 条上述 lint warning；正式发行根仍为 `null`，所以当前构建会拒绝所有新的订单与充值，直至正式签名发行配置和规范 Trust Store 初始化完成。跨宿主机共享 Trust Store、time-reset、身份迁移、生产部署和 ⑦-2 均不在本阶段范围。

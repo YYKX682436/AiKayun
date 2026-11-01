@@ -2,7 +2,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { request as httpsRequest } from 'node:https'
-import type { LookupFunction } from 'node:net'
+import { createConnection, createServer, type LookupFunction } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { Kysely } from 'kysely'
@@ -21,6 +21,44 @@ import { fetchTrustedTimeAnchor } from '../../src/licensing/trust/time-anchor-cl
 import { createTrustDatabaseCoordinator } from '../../src/licensing/trust/trust-database-coordinator.js'
 
 const centerCommit = 'a5cf99439e3bf92b65f19d60c013bca088cf221a'
+
+async function exposeTestDatabaseOnLoopback(databaseUrl: string) {
+  const target = new URL(databaseUrl)
+  const targetHost = target.hostname.replace(/^\[|\]$/g, '')
+  const targetPort = Number(target.port || 5432)
+  if (['localhost', '127.0.0.1', '::1'].includes(targetHost)) {
+    return { databaseUrl, close: async () => undefined }
+  }
+
+  // The frozen center's isolated admin policy only accepts loopback database URLs.
+  // In Compose, bind a private test-only relay to loopback while forwarding to the
+  // disposable PostgreSQL service. The production API continues using its own URL.
+  const server = createServer((client) => {
+    const upstream = createConnection({ host: targetHost, port: targetPort })
+    const closePair = () => { client.destroy(); upstream.destroy() }
+    client.once('error', closePair)
+    upstream.once('error', closePair)
+    client.pipe(upstream)
+    upstream.pipe(client)
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === 'string') {
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    throw new Error('Could not bind the isolated center database relay')
+  }
+  target.hostname = '127.0.0.1'
+  target.port = String(address.port)
+  return {
+    databaseUrl: target.toString(),
+    close: async () => await new Promise<void>((resolve, reject) => {
+      server.close(error => error ? reject(error) : resolve())
+    }),
+  }
+}
 
 /**
  * Disposable, actually signed center evidence for migrated PostgreSQL test databases.
@@ -47,6 +85,7 @@ export async function createSignedBusinessLicense(input: {
   const trustRoot = join(root, 'trust')
   const infoPath = join(root, 'center-info.json')
   let child: ReturnType<typeof spawn> | undefined
+  let databaseRelay: Awaited<ReturnType<typeof exposeTestDatabaseOnLoopback>> | undefined
   let stderr = ''
   async function close() {
     if (child && child.exitCode === null && child.signalCode === null) {
@@ -56,6 +95,7 @@ export async function createSignedBusinessLicense(input: {
         child!.kill('SIGTERM')
       })
     }
+    await databaseRelay?.close().catch(() => undefined)
     await rm(root, { recursive: true, force: true })
   }
   try {
@@ -63,10 +103,11 @@ export async function createSignedBusinessLicense(input: {
     await mkdir(trustRoot, { mode: 0o700 })
     const loader = join(input.centerCheckout, 'node_modules/tsx/dist/loader.mjs')
     await stat(loader)
+    databaseRelay = await exposeTestDatabaseOnLoopback(input.databaseUrl)
     child = spawn(process.execPath, ['--import', loader, resolve(import.meta.dirname, 'license-center-challenge-interop-server.mjs')], {
       cwd: input.centerCheckout,
       env: { ...process.env, NODE_ENV: 'test', LICENSE_CENTER_CHECKOUT: input.centerCheckout,
-        LICENSE_CENTER_INTEROP_INFO: infoPath, LICENSE_TEST_DATABASE_URL: input.databaseUrl },
+        LICENSE_CENTER_INTEROP_INFO: infoPath, LICENSE_TEST_DATABASE_URL: databaseRelay.databaseUrl },
       stdio: ['ignore', 'ignore', 'pipe'],
     })
     child.stderr!.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })
