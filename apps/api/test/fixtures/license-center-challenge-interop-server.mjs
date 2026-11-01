@@ -283,7 +283,7 @@ try {
   app.post('/__test/set-subscription-end', async (request, reply) => {
     const body = request.body
     if (!body || typeof body !== 'object' || typeof body.license_id !== 'string' ||
-      !Number.isSafeInteger(body.seconds_from_now) || body.seconds_from_now < 60 || body.seconds_from_now > 2_592_000) {
+      !Number.isSafeInteger(body.seconds_from_now) || body.seconds_from_now < 3 || body.seconds_from_now > 2_592_000) {
       return reply.code(400).send({ error: 'invalid test request' })
     }
     const updated = await db.updateTable('licenses').set({
@@ -437,11 +437,18 @@ try {
     if (request.method !== 'POST') return
     let mode
     try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { return }
+    if (request.url === '/v1/time-anchor' && ['anchor_rate_limit', 'anchor_server_error'].includes(mode)) {
+      return reply.code(mode === 'anchor_rate_limit' ? 429 : 503).send({ error: { code: 'ISOLATED_TEST_ANCHOR_ERROR' } })
+    }
     if (request.url === '/v1/operations/query' && mode === 'query_server_error') {
       return reply.code(503).send({ error: { code: 'ISOLATED_TEST_QUERY_ERROR' } })
     }
     if (request.url === '/v1/operations/query' && mode === 'query_rate_limit') {
       return reply.code(429).send({ error: { code: 'ISOLATED_TEST_RATE_LIMIT' } })
+    }
+    if (request.url === '/v1/leases/renew' && ['renewal_rate_limit', 'renewal_server_error', 'renewal_disconnect'].includes(mode)) {
+      if (mode === 'renewal_disconnect') { reply.hijack(); reply.raw.destroy(); return }
+      return reply.code(mode === 'renewal_rate_limit' ? 429 : 503).send({ error: { code: 'ISOLATED_TEST_RENEWAL_ERROR' } })
     }
     if (request.url !== '/v1/activations') return
     if (mode === 'drop_after_commit') return
@@ -474,7 +481,8 @@ try {
   app.addHook('preHandler', async (request) => {
     let mode
     try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { return }
-    if (request.method !== 'POST' || request.url !== '/v1/operations/query' || mode !== 'expire_saved_result') return
+    if (request.method !== 'POST' || request.url !== '/v1/operations/query' ||
+      !['expire_saved_result', 'expire_recent_saved_result'].includes(mode)) return
       const operation = await db.selectFrom('license_operations').selectAll()
         .where('operation_id', '=', request.body.operation_id).executeTakeFirst()
       if (!operation || operation.state !== 'committed' || operation.response_type !== 'license') {
@@ -489,10 +497,10 @@ try {
         generation: old.activation_generation,
         entitlementRevision: old.entitlement_revision,
         plan: old.plan,
-        subscriptionEnd: new Date(old.subscription_end * 1000),
+        subscriptionEnd: new Date(mode === 'expire_recent_saved_result' ? (old.iat - 60) * 1000 : old.subscription_end * 1000),
         requestNonce: old.request_nonce,
         requestDigest: old.request_digest,
-        now: new Date(old.iat * 1000 - 8 * 24 * 60 * 60 * 1000),
+        now: new Date(old.iat * 1000 - (mode === 'expire_recent_saved_result' ? 120 : 8 * 24 * 60 * 60) * 1000),
       })
       await db.transaction().execute(async (trx) => {
         await sql.raw('ALTER TABLE license_operations DISABLE TRIGGER license_operations_immutable').execute(trx)
@@ -595,7 +603,7 @@ try {
       let mode
       try { mode = JSON.parse(await readFile(activationControlPath, 'utf8')).mode } catch { return payload }
       if (['forged_recovery_signature', 'wrong_recovery_kid', 'misbound_recovery_request',
-        'different_bound_recovery_lease'].includes(mode) &&
+        'different_bound_recovery_lease', 'misbound_recovery_identity', 'misbound_recovery_generation'].includes(mode) &&
         payload && typeof payload === 'object' && typeof payload.license === 'string') {
         const parts = payload.license.split('.')
         if (mode === 'forged_recovery_signature') {
@@ -613,8 +621,8 @@ try {
             licenseId: claims.sub,
             databaseId: claims.database_id,
             instanceId: claims.instance_id,
-            identityJkt: claims.identity_jkt,
-            generation: claims.activation_generation,
+            identityJkt: mode === 'misbound_recovery_identity' ? 'A'.repeat(43) : claims.identity_jkt,
+            generation: mode === 'misbound_recovery_generation' ? '2' : claims.activation_generation,
             entitlementRevision: claims.entitlement_revision,
             plan: claims.plan,
             subscriptionEnd: new Date(claims.subscription_end * 1000),

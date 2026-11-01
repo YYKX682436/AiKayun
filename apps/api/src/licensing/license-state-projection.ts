@@ -57,7 +57,7 @@ export interface LicenseStateProjectionResult {
   readonly entitlementRevision: string | null
   readonly credentialId: string | null
   readonly credentialExpiresAt: string | null
-  readonly refusalStatus: 'revoked' | 'superseded' | null
+  readonly refusalStatus: 'expired' | 'revoked' | 'superseded' | null
   readonly refusalGeneration: string | null
   readonly refusalRevision: string | null
   readonly evidenceDigest: string | null
@@ -103,7 +103,7 @@ type VerifiedCandidate =
     source: CandidateSource
     digest: string
     issuedAt: number
-    status: 'revoked' | 'superseded'
+    status: 'expired' | 'revoked' | 'superseded'
     generation: string
     revision: string
     currentGeneration: string
@@ -165,7 +165,7 @@ async function candidateSources(input: {
         purpose: attempt.purpose, raw, queryReceiptJws: null })
     }
   }
-  if (history.operationKind === 'recovery') {
+  if (history.operationKind === 'recovery' || history.operationKind === 'renewal') {
     for (const attempt of history.attempts) {
       if (!['query', 'continue'].includes(attempt.purpose) || attempt.sendState !== 'response_saved') continue
       try {
@@ -179,7 +179,7 @@ async function candidateSources(input: {
         })
         if (!verified || !exactJws(verified.resultJws)) continue
         const bindingAttempt = history.attempts.find(item => item.attemptNo === verified.committedAttemptNo)
-        if (!bindingAttempt || !['recovery', 'continue'].includes(bindingAttempt.purpose)) continue
+        if (!bindingAttempt || !['recovery', 'renewal', 'continue'].includes(bindingAttempt.purpose)) continue
         output.push({ history, attemptNo: attempt.attemptNo, bindingAttemptNo: bindingAttempt.attemptNo,
           purpose: bindingAttempt.purpose, raw: verified.resultJws, queryReceiptJws: verified.receiptJws })
       } catch (error) {
@@ -249,6 +249,7 @@ async function verifyCandidate(input: {
   if (header.typ === 'aikayun-license+jwt') {
     if (history.operationKind === 'activation' && !['activation', 'continue'].includes(source.purpose)) return null
     if (history.operationKind === 'recovery' && !['recovery', 'continue'].includes(source.purpose)) return null
+    if (history.operationKind === 'renewal' && !['renewal', 'continue'].includes(source.purpose)) return null
     try {
       const identitySnapshot = {
         status: 'ready' as const, code: 'ready', bindingState: 'ready' as const,
@@ -282,15 +283,15 @@ async function verifyCandidate(input: {
         lease.requestNonce !== challengeClaims.server_nonce || lease.requestDigest !== attempt.requestDigest) return null
       if (history.operationKind === 'activation' &&
         (!['activation', 'continue'].includes(source.purpose) || lease.activationGeneration !== '1')) return null
-      if (history.operationKind === 'recovery' &&
+      if ((history.operationKind === 'recovery' || history.operationKind === 'renewal') &&
         (history.recoveryPayload === null || lease.activationGeneration !== history.recoveryPayload.expectedGeneration ||
           BigInt(lease.entitlementRevision) < BigInt(history.recoveryPayload.knownRevision))) return null
       return Object.freeze({ kind: 'lease', source, digest, issuedAt: lease.issuedAt,
         expiresAt: lease.expiresAt, lease })
     } catch { return null }
   }
-  if (header.typ !== 'aikayun-license-status+jwt' || history.operationKind !== 'recovery' ||
-    !['recovery', 'continue'].includes(source.purpose) || history.recoveryPayload === null) return null
+  if (header.typ !== 'aikayun-license-status+jwt' || !['recovery', 'renewal'].includes(history.operationKind) ||
+    !['recovery', 'renewal', 'continue'].includes(source.purpose) || history.recoveryPayload === null) return null
   try {
     const decoded = JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString('utf8')) as Record<string, unknown>
     const expired = typeof decoded.exp === 'number' && decoded.exp <= trustedTime
@@ -302,7 +303,7 @@ async function verifyCandidate(input: {
         resolver: accepted.resolver, issuer: accepted.centerIssuer, trustedTime,
       })
     const claims = status.claims
-    if (claims.status !== 'revoked' && claims.status !== 'superseded') return null
+    if (claims.status !== 'expired' && claims.status !== 'revoked' && claims.status !== 'superseded') return null
     const generation = positiveDecimal(claims.activation_generation, 'status_generation')
     const revision = positiveDecimal(claims.entitlement_revision, 'status_revision')
     const currentGeneration = positiveDecimal(claims.current_generation, 'status_current_generation')
@@ -463,6 +464,34 @@ async function readAndVerifyStoredEvidence(input: {
   }
 }
 
+/** Identify stored evidence explicitly invalidated by the current root-authenticated bundle. */
+async function storedEvidenceSignerIsRevoked(input: {
+  options: LicenseStateProjectionOptions
+  row: InstanceLicenseStateRow
+  accepted: AcceptedTrustBundle
+  kind: 'lease' | 'refusal'
+}): Promise<boolean> {
+  const row = input.row
+  const lease = input.kind === 'lease'
+  const operationId = lease ? row.credential_operation_id : row.refusal_operation_id
+  const attemptNo = lease ? row.credential_attempt_no : row.refusal_attempt_no
+  const keyId = lease ? row.credential_encryption_key_id : row.refusal_encryption_key_id
+  const ciphertext = lease ? row.encrypted_credential_jws : row.encrypted_refusal_jws
+  const digest = lease ? row.credential_jws_digest : row.refusal_jws_digest
+  if (!operationId || !attemptNo || !keyId || !ciphertext) return false
+  try {
+    const raw = await decryptLicensePendingBytes(input.options.pendingKeyRoot, {
+      operationId, attemptNo, record: 'attempt', field: lease ? 'projection_lease_jws' : 'projection_rejection_jws',
+    }, { keyId, ciphertext })
+    if (createHash('sha256').update(raw).digest('base64url') !== digest) return false
+    const token = exactJws(raw)
+    if (!token) return false
+    const header = decodeProtectedHeader(token)
+    return header.typ === (lease ? 'aikayun-license+jwt' : 'aikayun-license-status+jwt') && typeof header.kid === 'string' &&
+      input.accepted.revokedKids.includes(header.kid)
+  } catch { return false }
+}
+
 function canReplaceCredential(row: InstanceLicenseStateRow, candidate: Extract<VerifiedCandidate, { kind: 'lease' }>):
   'accept' | 'same' | 'stale' {
   const lease = candidate.lease
@@ -479,7 +508,8 @@ function canReplaceCredential(row: InstanceLicenseStateRow, candidate: Extract<V
     return revision === currentRevision && candidate.digest === row.credential_jws_digest ? 'same' : 'stale'
   }
   if (row.refusal_status === 'superseded') return 'stale'
-  if (row.refusal_status === 'revoked' && BigInt(lease.entitlementRevision) <= BigInt(row.refusal_revision!)) return 'stale'
+  if ((row.refusal_status === 'revoked' || row.refusal_status === 'expired') &&
+    BigInt(lease.entitlementRevision) <= BigInt(row.refusal_revision!)) return 'stale'
   if (revision < currentRevision) return 'stale'
   if (revision > currentRevision) return 'accept'
   const issuedAt = Number(row.credential_issued_at)
@@ -546,6 +576,9 @@ async function applyCandidate(input: {
   if (candidate.status === 'superseded' && BigInt(candidate.currentGeneration) <= BigInt(candidate.generation)) {
     return { row: input.row, changed: false, evidenceDigest: null }
   }
+  // At one revision a signed revocation must never be downgraded to expiry by an older response.
+  if (input.row.refusal_status === 'revoked' && candidate.status === 'expired' &&
+    candidate.revision === input.row.refusal_revision) return { row: input.row, changed: false, evidenceDigest: null }
   if (input.row.refusal_status === candidate.status && input.row.refusal_revision === candidate.revision) {
     return { row: input.row, changed: false, evidenceDigest: input.row.refusal_jws_digest }
   }
@@ -719,11 +752,19 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
               revision: currentRow.entitlement_revision!,
             }
           }
+          let refusalSubscriptionEnd: number | null = null
           if (currentRow.refusal_status !== null) {
-            await readAndVerifyStoredEvidence({
-              options, tx, row: currentRow, identity: localIdentity, kind: 'refusal', accepted,
-              trustedTime: time.trustedTimeSeconds,
-            })
+            const supersededRevokedRefusal = currentRow.refusal_status !== 'superseded' && leaseValues !== null &&
+              BigInt(leaseValues.revision) > BigInt(currentRow.refusal_revision!) &&
+              await storedEvidenceSignerIsRevoked({ options, row: currentRow, accepted, kind: 'refusal' })
+            try {
+              await readAndVerifyStoredEvidence({
+                options, tx, row: currentRow, identity: localIdentity, kind: 'refusal', accepted,
+                trustedTime: time.trustedTimeSeconds,
+              })
+            } catch (error) {
+              if (!supersededRevokedRefusal) throw error
+            }
             const token = await decryptLicensePendingBytes(options.pendingKeyRoot, {
               operationId: currentRow.refusal_operation_id!, attemptNo: currentRow.refusal_attempt_no!,
               record: 'attempt', field: 'projection_rejection_jws',
@@ -739,7 +780,7 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
             if (typeof expiry !== 'number' || !Number.isSafeInteger(expiry)) {
               return denied('invalid_credential', 'saved_refusal_invalid')
             }
-            const status = expiry <= time.trustedTimeSeconds
+            const status = supersededRevokedRefusal ? { claims } : expiry <= time.trustedTimeSeconds
               ? await verifyExpiredHistoricalStatusReceipt(encoded, {
                 resolver: accepted.resolver, issuer: accepted.centerIssuer, trustedTime: time.trustedTimeSeconds,
               })
@@ -752,15 +793,18 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
               status.claims.current_generation !== currentRow.refusal_current_generation) {
               return denied('invalid_credential', 'saved_refusal_mismatch')
             }
+            refusalSubscriptionEnd = Number(status.claims.subscription_end)
           }
           const latest = await options.trustStore.getAccepted(() => time.trustedTimeSeconds)
           if (latest.artifactSha256 !== accepted.artifactSha256) {
             return denied('invalid_credential', 'trust_store_changed')
           }
           const refusalBlocks = currentRow.refusal_status === 'superseded' ||
-            currentRow.refusal_status === 'revoked' &&
+            (currentRow.refusal_status === 'revoked' || currentRow.refusal_status === 'expired') &&
               (!leaseValues || BigInt(leaseValues.revision) <= BigInt(currentRow.refusal_revision!))
-          const allowedUntil = leaseValues === null ? null : Math.min(leaseValues.expiresAt, leaseValues.subscriptionEnd)
+          const allowedUntil = leaseValues === null ? null : Math.min(leaseValues.expiresAt, leaseValues.subscriptionEnd,
+            refusalBlocks && currentRow.refusal_status === 'expired' && refusalSubscriptionEnd !== null
+              ? refusalSubscriptionEnd : Number.POSITIVE_INFINITY)
           const dates = {
             allowedUntil: allowedUntil === null ? null : new Date(allowedUntil * 1000).toISOString(),
             nextRenewalAt: leaseValues === null ? null : new Date(leaseValues.renewAfter * 1000).toISOString(),
@@ -768,7 +812,8 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
             entitlementRevision: currentRow.entitlement_revision,
           }
           if (currentRow.refusal_status === 'superseded') return denied('superseded', 'accepted_superseded_evidence', dates)
-          if (refusalBlocks) return denied('revoked', 'accepted_revocation_not_superseded', dates)
+          if (refusalBlocks && currentRow.refusal_status === 'revoked') return denied('revoked', 'accepted_revocation_not_superseded', dates)
+          if (refusalBlocks && currentRow.refusal_status === 'expired') return denied('expired', 'accepted_subscription_expiry_not_superseded', dates)
           if (!leaseValues || allowedUntil === null) return denied('invalid_credential', 'no_current_lease', dates)
           if (time.trustedTimeMs >= allowedUntil * 1000) {
             if (time.trustedTimeMs >= leaseValues.subscriptionEnd * 1000) {
@@ -795,13 +840,71 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
   }
   return Object.freeze({
     getLicenseSnapshot,
+    /** Narrow, fail-closed eligibility to seek fresh evidence; never grants a license. */
+    async canRenewAfterSignerRevocation(): Promise<boolean> {
+      try {
+        return await withVerifiedInstallationSigningContext(options.pool, options.identityRoot, async identity =>
+          options.db.transaction().execute(async tx => {
+            const binding = await tx.selectFrom('installation_binding').selectAll()
+              .where('singleton', '=', true).forUpdate().executeTakeFirst()
+            if (!binding || binding.binding_state !== 'ready' || binding.database_id !== identity.databaseId ||
+              binding.instance_id !== identity.instanceId || binding.identity_jkt !== identity.identityJkt) return false
+            const row = await tx.selectFrom('instance_license_state').selectAll()
+              .where('singleton', '=', true).forUpdate().executeTakeFirst()
+            if (!row?.license_id || (!row.credential_jti && !row.refusal_status) || row.refusal_status === 'superseded' ||
+              row.database_id !== identity.databaseId || row.instance_id !== identity.instanceId ||
+              row.identity_jkt !== identity.identityJkt) return false
+            const localIdentity = { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt }
+            const time = await advanceLicenseTrustedTime({ tx, row, pendingRoot: options.pendingKeyRoot, identity: localIdentity })
+            const accepted = await options.trustStore.getAccepted(() => time.trustedTimeSeconds)
+            if (accepted.centerIssuer !== options.releaseConfig.expected_center_issuer) return false
+            let sawRevokedSigner = false
+            const evidenceKinds: Array<'lease' | 'refusal'> = []
+            if (row.credential_jti) evidenceKinds.push('lease')
+            if (row.refusal_status !== null) evidenceKinds.push('refusal')
+            for (const kind of evidenceKinds) {
+              // A revoked query receipt cannot currently establish this source; leave it fail closed.
+              await readAndVerifyStoredEvidence({ options, tx, row, identity: localIdentity, kind, accepted,
+                trustedTime: time.trustedTimeSeconds })
+              const revoked = await storedEvidenceSignerIsRevoked({ options, row, accepted, kind })
+              if (revoked) { sawRevokedSigner = true; continue }
+              const lease = kind === 'lease'
+              const raw = await decryptLicensePendingBytes(options.pendingKeyRoot, {
+                operationId: (lease ? row.credential_operation_id : row.refusal_operation_id)!,
+                attemptNo: (lease ? row.credential_attempt_no : row.refusal_attempt_no)!, record: 'attempt',
+                field: lease ? 'projection_lease_jws' : 'projection_rejection_jws',
+              }, { keyId: (lease ? row.credential_encryption_key_id : row.refusal_encryption_key_id)!,
+                ciphertext: (lease ? row.encrypted_credential_jws : row.encrypted_refusal_jws)! })
+              const token = exactJws(raw)
+              if (!token) return false
+              const claims = parseStrictJson(Buffer.from(token.split('.')[1]!, 'base64url')) as Record<string, unknown>
+              if (!claims || !Number.isSafeInteger(claims.exp)) return false
+              const expired = Number(claims.exp) <= time.trustedTimeSeconds
+              if (lease) {
+                const identitySnapshot = { status: 'ready' as const, code: 'ready', bindingState: 'ready' as const, ...localIdentity }
+                if (expired) await verifyExpiredHistoricalLease(token, { resolver: accepted.resolver, issuer: accepted.centerIssuer,
+                  trustedTime: time.trustedTimeSeconds, identity: identitySnapshot })
+                else await verifyCurrentLicenseLease(token, { resolver: accepted.resolver, issuer: accepted.centerIssuer,
+                  trustedTime: time.trustedTimeSeconds, identity: identitySnapshot })
+              } else if (expired) await verifyExpiredHistoricalStatusReceipt(token, {
+                resolver: accepted.resolver, issuer: accepted.centerIssuer, trustedTime: time.trustedTimeSeconds,
+              })
+              else await verifyLicenseStatusReceipt(token, {
+                resolver: accepted.resolver, issuer: accepted.centerIssuer, trustedTime: time.trustedTimeSeconds,
+              })
+            }
+            const latest = await options.trustStore.getAccepted(() => time.trustedTimeSeconds)
+            return sawRevokedSigner && latest.artifactSha256 === accepted.artifactSha256
+          }))
+      } catch { return false }
+    },
     /** The only write entrypoint: all candidate bytes are loaded from and rebound to persisted operation history. */
     async projectPersistedOperation(operationId: string): Promise<LicenseStateProjectionResult> {
       if (!UUID.test(operationId)) fail('license_projection_operation_id_invalid')
       return withVerifiedInstallationSigningContext(options.pool, options.identityRoot, async identity => {
         const target = await options.db.selectFrom('local_license_operations').selectAll()
           .where('operation_id', '=', operationId).executeTakeFirst()
-        if (!target || !['activation', 'recovery'].includes(target.kind) ||
+        if (!target || !['activation', 'recovery', 'renewal'].includes(target.kind) ||
           target.database_id !== identity.databaseId || target.instance_id !== identity.instanceId ||
           target.identity_jkt !== identity.identityJkt) fail('license_projection_operation_unavailable')
         const candidateBundle = await options.trustStore.getCandidateForTimeBootstrap()
@@ -814,7 +917,7 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
             ...(options.testTls.lookup === undefined ? {} : { testLookup: options.testTls.lookup }),
           })
 
-        const transactionCommit: { fingerprint?: string; result?: LicenseStateProjectionResult; acceptedArtifactSha256?: string } = {}
+        const transactionCommit: { fingerprint?: string; result?: LicenseStateProjectionResult; acceptedArtifactSha256?: string; renewalFinalized?: boolean } = {}
         let transactionOutcome: { result: LicenseStateProjectionResult; fingerprint: string }
         try {
           transactionOutcome = await options.db.transaction().execute(async tx => {
@@ -845,24 +948,41 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
           if (accepted.centerIssuer !== options.releaseConfig.expected_center_issuer) fail('license_projection_trust_mismatch')
           transactionCommit.acceptedArtifactSha256 = accepted.artifactSha256
           row = await tx.selectFrom('instance_license_state').selectAll().where('singleton', '=', true).executeTakeFirstOrThrow()
+          let revokedLeaseSourceError: unknown
+          const oldCredentialDigest = row.credential_jws_digest
           if (row.license_id !== null && row.credential_jti !== null) {
-            await readAndVerifyStoredEvidence({
-              options, tx, row,
-              identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
-              kind: 'lease', accepted, trustedTime,
-            })
+            try {
+              await readAndVerifyStoredEvidence({
+                options, tx, row,
+                identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
+                kind: 'lease', accepted, trustedTime,
+              })
+            } catch (error) {
+              if (target.kind !== 'renewal' || !(await storedEvidenceSignerIsRevoked({ options, row, accepted, kind: 'lease' }))) throw error
+              revokedLeaseSourceError = error
+            }
           }
+          let revokedRefusalSourceError: unknown
           if (row.license_id !== null && row.refusal_status !== null) {
-            await readAndVerifyStoredEvidence({
-              options, tx, row,
-              identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
-              kind: 'refusal', accepted, trustedTime,
-            })
+            try {
+              await readAndVerifyStoredEvidence({
+                options, tx, row,
+                identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
+                kind: 'refusal', accepted, trustedTime,
+              })
+            } catch (error) {
+              if (target.kind !== 'renewal' || row.refusal_status === 'superseded' ||
+                !(await storedEvidenceSignerIsRevoked({ options, row, accepted, kind: 'refusal' }))) throw error
+              revokedRefusalSourceError = error
+            }
           }
           const rows = await tx.selectFrom('local_license_operations').select(['operation_id', 'kind'])
             .where('license_id', '=', target.license_id).where('database_id', '=', identity.databaseId)
             .where('instance_id', '=', identity.instanceId).where('identity_jkt', '=', identity.identityJkt)
-            .where('state', '=', 'response_saved').where('kind', 'in', ['activation', 'recovery'])
+            .where(eb => eb.or([
+              eb('state', '=', 'response_saved'),
+              eb.and([eb('state', '=', 'projected'), eb('operation_id', '=', operationId)]),
+            ])).where('kind', 'in', ['activation', 'recovery', 'renewal'])
             .orderBy('created_at', 'asc').execute()
           const candidates: CandidateSource[] = []
           for (const item of rows) {
@@ -870,10 +990,17 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
               options: { ...options, db: tx }, operationId: item.operation_id,
               identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
             })
-            candidates.push(...await candidateSources({
-              options: { ...options, db: tx }, history, accepted, trustedTime,
-              identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
-            }))
+            try {
+              candidates.push(...await candidateSources({
+                options: { ...options, db: tx }, history, accepted, trustedTime,
+                identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
+              }))
+            } catch (error) {
+              // An immutable conflicting archive on a different operation cannot invalidate a
+              // newly verified result. The requested operation itself must still fail closed.
+              if (item.operation_id === operationId || !(error instanceof LicenseOperationRecoveryError) ||
+                error.code !== 'operation_recovery_history_result_conflict') throw error
+            }
           }
           const verified: VerifiedCandidate[] = []
           for (const source of candidates) {
@@ -906,7 +1033,10 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
                     BigInt(a.lease.entitlementRevision) > BigInt(b.lease.entitlementRevision) ? 1 : a.issuedAt - b.issuedAt)
           const refusalCandidates = verified.filter((item): item is Extract<VerifiedCandidate, { kind: 'refusal' }> => item.kind === 'refusal')
             .sort((a, b) => {
-              if (a.status !== b.status) return a.status === 'superseded' ? -1 : 1
+              if (a.status !== b.status) {
+                const rank = { superseded: 0, expired: 1, revoked: 2 }
+                return rank[a.status] - rank[b.status]
+              }
               if (BigInt(a.revision) < BigInt(b.revision)) return -1
               if (BigInt(a.revision) > BigInt(b.revision)) return 1
               return a.issuedAt - b.issuedAt
@@ -925,6 +1055,36 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
             if (applied.changed) { changed = true; evidenceDigest = applied.evidenceDigest }
             else if (applied.evidenceDigest) evidenceDigest = applied.evidenceDigest
           }
+          // The revoked lease can never grant permission. Only a newly verified, newer target
+          // renewal may replace its unavailable source; all refusal watermarks still apply.
+          if (revokedLeaseSourceError && (current.credential_jws_digest === oldCredentialDigest ||
+            current.credential_operation_id !== operationId)) throw revokedLeaseSourceError
+          if (revokedRefusalSourceError && (current.credential_operation_id !== operationId ||
+            current.credential_jws_digest === oldCredentialDigest ||
+            BigInt(current.entitlement_revision!) <= BigInt(row.refusal_revision!))) throw revokedRefusalSourceError
+          // Release the active renewal only after its own signed result has been verified and
+          // incorporated or superseded by a newer accepted watermark in this transaction.
+          if (target.kind === 'renewal' && target.state === 'response_saved') {
+            const settled = verified.some(candidate => {
+              if (candidate.source.history.operationId !== operationId || current.license_id === null ||
+                current.license_id !== candidate.source.history.licenseId ||
+                current.activation_generation !== (candidate.kind === 'lease' ? candidate.lease.activationGeneration : candidate.generation)) return false
+              if (candidate.kind === 'lease') {
+                // An expired verified lease is historical evidence only, but its committed
+                // operation is complete and must not prevent a new renewal from being created.
+                return candidate.expiresAt <= trustedTime ||
+                  BigInt(current.entitlement_revision!) >= BigInt(candidate.lease.entitlementRevision)
+              }
+              if (candidate.status === 'superseded') return current.refusal_status === 'superseded'
+              return (current.refusal_revision !== null && BigInt(current.refusal_revision) >= BigInt(candidate.revision)) ||
+                BigInt(current.entitlement_revision!) > BigInt(candidate.revision)
+            })
+            if (settled) {
+              await tx.updateTable('local_license_operations').set({ state: 'projected', finalized_at: new Date() })
+                .where('operation_id', '=', operationId).where('state', '=', 'response_saved').executeTakeFirst()
+              transactionCommit.renewalFinalized = true
+            }
+          }
           const outcome = changed ? 'applied' : historical ? 'historical_only' : verified.length ? 'idempotent' : 'no_evidence'
           const result = resultFromRow(current, outcome, evidenceDigest)
           const fingerprint = rowFingerprint(current)
@@ -941,6 +1101,11 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
             .where('singleton', '=', true).executeTakeFirst()
           if (!after || !transactionCommit.fingerprint || !transactionCommit.result || !transactionCommit.acceptedArtifactSha256 ||
             rowFingerprint(after) !== transactionCommit.fingerprint) throw error
+          if (transactionCommit.renewalFinalized) {
+            const committed = await options.db.selectFrom('local_license_operations').select('state')
+              .where('operation_id', '=', operationId).executeTakeFirst()
+            if (committed?.state !== 'projected') throw error
+          }
           const latest = await options.trustStore.getAccepted(sample.assertFresh)
           if (latest.artifactSha256 !== transactionCommit.acceptedArtifactSha256) fail('license_projection_trust_changed')
           const recovered = transactionCommit.result

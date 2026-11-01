@@ -109,3 +109,18 @@ export function buildRecoveryIntent(input: RecoveryIntentInput): { intentDigest:
   if (typeof canonicalIntent !== 'string') throw new LicenseIntentError('recovery_intent_canonicalization_failed')
   return { intentDigest: sha256Base64url(canonicalIntent), canonicalIntent }
 }
+
+export type RenewalIntentInput = Omit<RecoveryIntentInput, 'recoveryOfOperationId'>
+
+/** Matches the frozen center renewal intent without a recovery source. */
+export function buildRenewalIntent(input: RenewalIntentInput): { intentDigest: string; canonicalIntent: string } {
+  // Share validation of the common identity and revision fields.
+  buildRecoveryIntent({ ...input, recoveryOfOperationId: '00000000-0000-4000-8000-000000000000' })
+  const canonicalIntent = canonicalize({
+    v: 1, kind: 'renewal', license_id: input.licenseId, database_id: input.databaseId,
+    instance_id: input.instanceId, identity_jkt: input.identityJkt,
+    expected_generation: input.expectedGeneration, known_revision: input.knownRevision,
+  })
+  if (typeof canonicalIntent !== 'string') throw new LicenseIntentError('renewal_intent_canonicalization_failed')
+  return { intentDigest: sha256Base64url(canonicalIntent), canonicalIntent }
+}

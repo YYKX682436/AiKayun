@@ -53,6 +53,9 @@ import { licenseOperationRecoveryAttemptsMigration } from './migrations/20261031
 import { instanceLicenseStateMigration } from './migrations/202610310003_instance_license_state.js'
 import { instanceLicenseRefusalFirstMigration } from './migrations/202610311001_instance_license_refusal_first.js'
 import { trustedLicenseTimeWatermarkMigration } from './migrations/202611010001_trusted_license_time_watermark.js'
+import { instanceLicenseExpiredRefusalMigration } from './migrations/202611010002_instance_license_expired_refusal.js'
+import { licenseOperationRenewalAttemptsMigration } from './migrations/202611010003_license_operation_renewal_attempts.js'
+import { licenseRenewalRetryMigration } from './migrations/202611010004_license_renewal_retry.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -110,6 +113,9 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610310003_instance_license_state': instanceLicenseStateMigration,
       '202610311001_instance_license_refusal_first': instanceLicenseRefusalFirstMigration,
       '202611010001_trusted_license_time_watermark': trustedLicenseTimeWatermarkMigration,
+      '202611010002_instance_license_expired_refusal': instanceLicenseExpiredRefusalMigration,
+      '202611010003_license_operation_renewal_attempts': licenseOperationRenewalAttemptsMigration,
+      '202611010004_license_renewal_retry': licenseRenewalRetryMigration,
     }
   }
 }

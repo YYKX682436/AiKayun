@@ -81,6 +81,9 @@ beforeAll(async () => {
     '202610310003_instance_license_state',
     '202610311001_instance_license_refusal_first',
     '202611010001_trusted_license_time_watermark',
+    '202611010002_instance_license_expired_refusal',
+    '202611010003_license_operation_renewal_attempts',
+    '202611010004_license_renewal_retry',
   ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])

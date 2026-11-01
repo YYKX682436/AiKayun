@@ -45,7 +45,7 @@ export async function verifyLicensePendingBackupPair(): Promise<{ operations: nu
       // Recomputes the center-compatible immutable intent from each encrypted operation payload.
       if (operation.kind === 'activation') {
         await readActivationOperationPayload(db, config.licensePendingKeyRoot, operation.operation_id)
-      } else if (operation.kind === 'recovery') {
+      } else if (['recovery', 'renewal'].includes(operation.kind)) {
         await readRecoveryOperationPayload(db, config.licensePendingKeyRoot, operation.operation_id)
       } else {
         throw new Error('license_pending_restore_check_unsupported_operation_kind')
@@ -173,7 +173,7 @@ async function verifyProjectionEvidence(input: {
   const receipt = claims as Record<string, unknown>
   const operation = await input.db.selectFrom('local_license_operations').selectAll()
     .where('operation_id', '=', input.operationId).executeTakeFirst()
-  if (protectedHeader.typ !== 'aikayun-license-operation+jwt' || !operation || operation.kind !== 'recovery' ||
+  if (protectedHeader.typ !== 'aikayun-license-operation+jwt' || !operation || !['recovery', 'renewal'].includes(operation.kind) ||
     receipt.sub !== operation.license_id || receipt.actor_jkt !== operation.identity_jkt ||
     receipt.operation_id !== input.operationId || receipt.intent_digest !== operation.intent_digest ||
     receipt.attempt_no !== input.attemptNo || receipt.request_digest !== receiptAttempt.requestBodyDigest ||
@@ -185,7 +185,7 @@ async function verifyProjectionEvidence(input: {
   const committedAttemptNo = Number(receipt.committed_attempt_no)
   const committed = await readLicenseOperationAttemptEnvelope(input.db, input.pendingKeyRoot,
     input.operationId, committedAttemptNo)
-  if (!['recovery', 'continue'].includes(committed.purpose) ||
+  if (!['recovery', 'renewal', 'continue'].includes(committed.purpose) ||
     ['prepared', 'transport_error'].includes(committed.sendState) ||
     committed.requestBodyDigest !== receipt.committed_request_digest ||
     committed.requestNonceHash !== receipt.committed_request_nonce_hash) {

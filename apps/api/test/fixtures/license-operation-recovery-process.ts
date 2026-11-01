@@ -62,7 +62,9 @@ const client = createLicenseOperationRecoveryClient({
 try {
   const mode = process.env.RECOVERY_TEST_MODE
   let result: unknown
-  if (mode === 'current_lease') {
+  if (mode === 'renewal') {
+    result = await client.resumeRenewal(operationId)
+  } else if (mode === 'current_lease') {
     result = await client.recoverCurrentLease(operationId)
   } else if (mode === 'parallel') {
     result = await Promise.all([client.queryPendingActivation(operationId), client.queryPendingActivation(operationId)])

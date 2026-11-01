@@ -7,7 +7,7 @@ import type {
   LocalLicenseOperationState,
   LocalLicenseOperationsTable,
 } from '../db/types.js'
-import { buildActivationIntent, buildRecoveryIntent, ed25519IdentityJkt, sha256Base64url } from './license-intent.js'
+import { buildActivationIntent, buildRecoveryIntent, buildRenewalIntent, ed25519IdentityJkt, sha256Base64url } from './license-intent.js'
 import {
   decryptLicensePendingBytes,
   encryptLicensePendingBytes,
@@ -44,7 +44,7 @@ export interface RecoveryOperationInput {
 }
 
 export interface RecoveryOperationPayload {
-  recoveryOfOperationId: string
+  recoveryOfOperationId: string | null
   expectedGeneration: string
   knownRevision: string
 }
@@ -176,32 +176,34 @@ async function decryptRecoveryPayload(
     'operation_id' | 'kind' | 'license_id' | 'database_id' | 'instance_id' | 'identity_jkt' |
     'intent_digest' | 'expected_generation' | 'payload_key_id' | 'encrypted_intent_payload'>,
 ): Promise<RecoveryOperationPayload> {
-  if (operation.kind !== 'recovery' || operation.expected_generation === null) invalid('operation_unavailable')
+  if (!['recovery', 'renewal'].includes(operation.kind) || operation.expected_generation === null) invalid('operation_unavailable')
   const plaintext = await decryptLicensePendingBytes(pendingKeyRoot, {
     operationId: operation.operation_id,
     record: 'operation',
     field: 'intent_payload',
   }, { keyId: operation.payload_key_id, ciphertext: operation.encrypted_intent_payload })
   const payload = parseJsonObject(plaintext, 'operation_payload_corrupt')
-  if (Object.keys(payload).sort().join(',') !== 'expected_generation,known_revision,recovery_of_operation_id,schema' ||
-    payload.schema !== 1 || typeof payload.recovery_of_operation_id !== 'string' ||
+  if (Object.keys(payload).sort().join(',') !== (operation.kind === 'recovery' ? 'expected_generation,known_revision,recovery_of_operation_id,schema' : 'expected_generation,known_revision,schema') ||
+    payload.schema !== 1 || (operation.kind === 'recovery' && typeof payload.recovery_of_operation_id !== 'string') ||
     typeof payload.expected_generation !== 'string' || typeof payload.known_revision !== 'string') {
     invalid('operation_payload_corrupt')
   }
-  const intent = buildRecoveryIntent({
+  const commonIntent = {
     licenseId: operation.license_id,
     databaseId: operation.database_id,
     instanceId: operation.instance_id,
     identityJkt: operation.identity_jkt,
     expectedGeneration: payload.expected_generation,
     knownRevision: payload.known_revision,
-    recoveryOfOperationId: payload.recovery_of_operation_id,
-  })
+  }
+  const intent = operation.kind === 'recovery'
+    ? buildRecoveryIntent({ ...commonIntent, recoveryOfOperationId: payload.recovery_of_operation_id as string })
+    : buildRenewalIntent(commonIntent)
   if (intent.intentDigest !== operation.intent_digest || operation.expected_generation !== payload.expected_generation) {
     invalid('operation_payload_intent_mismatch')
   }
   return {
-    recoveryOfOperationId: payload.recovery_of_operation_id,
+    recoveryOfOperationId: operation.kind === 'recovery' ? payload.recovery_of_operation_id as string : null,
     expectedGeneration: payload.expected_generation,
     knownRevision: payload.known_revision,
   }
@@ -223,9 +225,9 @@ function validateOperationRequestBody(
     'license_id', 'operation_id', 'public_jwk',
   ]
   const expectedFields = purpose === 'query' ? commonFields
-    : purpose === 'recovery' ? [...commonFields, 'expected_generation', 'known_revision', 'recovery_of_operation_id']
-      : operation.kind === 'recovery'
-        ? [...commonFields, 'expected_generation', 'known_revision', 'recovery_of_operation_id', 'kind']
+    : purpose === 'recovery' || purpose === 'renewal' ? [...commonFields, 'expected_generation', 'known_revision', ...(operation.kind === 'recovery' ? ['recovery_of_operation_id'] : [])]
+      : operation.kind === 'recovery' || operation.kind === 'renewal'
+        ? [...commonFields, 'expected_generation', 'known_revision', ...(operation.kind === 'recovery' ? ['recovery_of_operation_id'] : []), 'kind']
         : [...commonFields, 'activation_code', 'origin', ...(purpose === 'continue' ? ['kind'] : [])]
   if (Object.keys(body).sort().join(',') !== expectedFields.sort().join(',')) invalid('attempt_request_binding_conflict')
   const publicJwk = body.public_jwk
@@ -248,13 +250,13 @@ function validateOperationRequestBody(
     if (operation.kind !== 'activation' || target !== expectedTarget || !payload ||
       body.activation_code !== payload.activationCode || body.origin !== payload.origin ||
       (purpose === 'continue' && body.kind !== 'activation')) invalid('attempt_request_binding_conflict')
-  } else if (purpose === 'recovery' || (purpose === 'continue' && operation.kind === 'recovery')) {
-    const expectedTarget = purpose === 'recovery' ? '/v1/leases/renew' : '/v1/operations/continue'
-    if (operation.kind !== 'recovery' || target !== expectedTarget || !recoveryPayload ||
+  } else if (purpose === 'recovery' || purpose === 'renewal' || (purpose === 'continue' && ['recovery', 'renewal'].includes(operation.kind))) {
+    const expectedTarget = purpose !== 'continue' ? '/v1/leases/renew' : '/v1/operations/continue'
+    if (!['recovery', 'renewal'].includes(operation.kind) || target !== expectedTarget || !recoveryPayload ||
       body.expected_generation !== recoveryPayload.expectedGeneration ||
       body.known_revision !== recoveryPayload.knownRevision ||
-      body.recovery_of_operation_id !== recoveryPayload.recoveryOfOperationId ||
-      (purpose === 'continue' && body.kind !== 'recovery')) invalid('attempt_request_binding_conflict')
+      (operation.kind === 'recovery' && body.recovery_of_operation_id !== recoveryPayload.recoveryOfOperationId) ||
+      (purpose === 'continue' && body.kind !== operation.kind)) invalid('attempt_request_binding_conflict')
   } else if (purpose === 'query') {
     if (target !== '/v1/operations/query') invalid('attempt_request_binding_conflict')
   }
@@ -278,7 +280,7 @@ async function validateStoredOperationRequest(
   const activationPayload = operation.kind === 'activation' && purpose !== 'query'
     ? await decryptActivationPayload(pendingKeyRoot, operation)
     : undefined
-  const recoveryPayload = operation.kind === 'recovery' && purpose !== 'query'
+  const recoveryPayload = ['recovery', 'renewal'].includes(operation.kind) && purpose !== 'query'
     ? await decryptRecoveryPayload(pendingKeyRoot, operation)
     : undefined
   validateOperationRequestBody(
@@ -448,7 +450,7 @@ export async function createOrLoadRecoveryOperation(
           intentDigest: candidate.intent_digest,
           state: candidate.state,
           created: false,
-          recoveryOfOperationId: payload.recoveryOfOperationId,
+          recoveryOfOperationId: payload.recoveryOfOperationId!,
           expectedGeneration: payload.expectedGeneration,
           knownRevision: payload.knownRevision,
           licenseId: candidate.license_id,
@@ -500,7 +502,7 @@ export async function createOrLoadRecoveryOperation(
         intentDigest: created.intent_digest,
         state: created.state,
         created: true,
-        recoveryOfOperationId: payload.recoveryOfOperationId,
+        recoveryOfOperationId: payload.recoveryOfOperationId!,
         expectedGeneration: payload.expectedGeneration,
         knownRevision: payload.knownRevision,
         licenseId: input.licenseId,
@@ -515,6 +517,49 @@ export async function createOrLoadRecoveryOperation(
     if (postgresCode(error) === '23514') invalid('recovery_operation_invalid')
     throw error
   }
+}
+
+
+export type RenewalOperationInput = Omit<RecoveryOperationInput, 'recoveryOfOperationId'>
+
+/** Serialize creation on installation binding; never replace an unfinished operation. */
+export async function createOrLoadRenewalOperation(
+  db: Kysely<Database>, pendingKeyRoot: string, input: RenewalOperationInput,
+): Promise<StoredActivationOperation> {
+  assertUuid(input.licenseId); assertUuid(input.databaseId); assertUuid(input.instanceId); assertJkt(input.identityJkt)
+  const intent = buildRenewalIntent(input)
+  return db.transaction().execute(async trx => {
+    const binding = await trx.selectFrom('installation_binding').selectAll().where('singleton', '=', true).forUpdate().executeTakeFirst()
+    if (!binding || binding.binding_state !== 'ready' || binding.database_id !== input.databaseId ||
+      binding.instance_id !== input.instanceId || binding.identity_jkt !== input.identityJkt) invalid('installation_binding_conflict')
+    const candidates = await trx.selectFrom('local_license_operations').selectAll().where('kind', '=', 'renewal')
+      .where('state', 'in', ['pending', 'response_saved']).orderBy('created_at', 'asc').forUpdate().execute()
+    if (candidates.length > 1) invalid('renewal_operation_conflict')
+    const existing = candidates[0]
+    if (existing) {
+      await decryptRecoveryPayload(pendingKeyRoot, existing)
+      if (existing.license_id !== input.licenseId || existing.database_id !== input.databaseId ||
+        existing.instance_id !== input.instanceId || existing.identity_jkt !== input.identityJkt) invalid('renewal_operation_conflict')
+      return { operationId: existing.operation_id, intentDigest: existing.intent_digest, state: existing.state, created: false }
+    }
+    const state = await trx.selectFrom('instance_license_state').selectAll().where('singleton', '=', true).forUpdate().executeTakeFirst()
+    if (!state || state.license_id !== input.licenseId || state.database_id !== input.databaseId ||
+      String(state.activation_generation) !== input.expectedGeneration || String(state.entitlement_revision) !== input.knownRevision) {
+      invalid('renewal_projection_changed')
+    }
+    const operationId = randomUUID()
+    const encrypted = await encryptLicensePendingBytes(pendingKeyRoot, { operationId, record: 'operation', field: 'intent_payload' },
+      Buffer.from(JSON.stringify({ schema: 1, expected_generation: input.expectedGeneration, known_revision: input.knownRevision }), 'utf8'))
+    const row = await trx.insertInto('local_license_operations').values({
+      operation_id: operationId, kind: 'renewal', intent_digest: intent.intentDigest,
+      license_id: input.licenseId, database_id: input.databaseId, instance_id: input.instanceId, identity_jkt: input.identityJkt,
+      expected_generation: input.expectedGeneration, intent_schema: 1, payload_key_id: encrypted.keyId,
+      encrypted_intent_payload: encrypted.ciphertext, state: 'pending', response_attempt_no: null, response_digest: null,
+      encrypted_center_evidence: null, center_evidence_key_id: null, center_evidence_digest: null,
+      response_saved_at: null, finalized_at: null,
+    }).returning(['operation_id', 'intent_digest', 'state']).executeTakeFirstOrThrow()
+    return { operationId: row.operation_id, intentDigest: row.intent_digest, state: row.state, created: true }
+  })
 }
 
 /** Allocate the next immutable attempt number under both an operation advisory lock and parent row lock. */
@@ -542,8 +587,9 @@ export async function allocateLicenseOperationAttempt(
       }
       if ((input.purpose === 'activation' && operation.kind !== 'activation') ||
         (input.purpose === 'recovery' && operation.kind !== 'recovery') ||
-        (input.purpose === 'continue' && !['activation', 'recovery'].includes(operation.kind)) ||
-        (input.purpose === 'query' && !['activation', 'recovery'].includes(operation.kind))) {
+        (input.purpose === 'renewal' && operation.kind !== 'renewal') ||
+        (input.purpose === 'continue' && !['activation', 'recovery', 'renewal'].includes(operation.kind)) ||
+        (input.purpose === 'query' && !['activation', 'recovery', 'renewal'].includes(operation.kind))) {
         invalid('attempt_purpose_conflict')
       }
       if (input.purpose === 'activation') {
@@ -597,7 +643,7 @@ export async function allocateLicenseOperationAttempt(
       const activationPayload = operation.kind === 'activation' && input.purpose !== 'query'
         ? await decryptActivationPayload(pendingKeyRoot, operation)
         : undefined
-      const recoveryPayload = operation.kind === 'recovery' && input.purpose !== 'query'
+      const recoveryPayload = ['recovery', 'renewal'].includes(operation.kind) && input.purpose !== 'query'
         ? await decryptRecoveryPayload(pendingKeyRoot, operation)
         : undefined
       validateOperationRequestBody(built.requestBody, parsedEnvelope.target, operation, input.purpose, attemptNo,
@@ -827,7 +873,8 @@ export async function saveLicenseOperationResultJws(
       .where('operation_id', '=', operationId).where('attempt_no', '=', attemptNo).forUpdate().executeTakeFirst()
     if (!operation || !attempt ||
       !((operation.kind === 'activation' && ['activation', 'continue'].includes(attempt.purpose)) ||
-        (operation.kind === 'recovery' && ['recovery', 'continue'].includes(attempt.purpose))) ||
+        (operation.kind === 'recovery' && ['recovery', 'continue'].includes(attempt.purpose)) ||
+        (operation.kind === 'renewal' && ['renewal', 'continue'].includes(attempt.purpose))) ||
       attempt.intent_digest !== operation.intent_digest || attempt.identity_jkt !== operation.identity_jkt ||
       !['sent', 'transport_unknown', 'response_saved'].includes(attempt.send_state)) {
       invalid('operation_result_binding_conflict')

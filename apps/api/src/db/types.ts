@@ -66,7 +66,7 @@ export interface LocalLicenseOperationsTable {
   finalized_at: Date | null
 }
 
-export type LocalLicenseAttemptPurpose = 'activation' | 'query' | 'continue' | 'recovery'
+export type LocalLicenseAttemptPurpose = 'activation' | 'query' | 'continue' | 'recovery' | 'renewal'
 export type LocalLicenseAttemptSendState = 'prepared' | 'sent' | 'transport_unknown' | 'transport_error' | 'response_saved'
 export interface LocalLicenseOperationAttemptsTable {
   operation_id: string
@@ -111,7 +111,7 @@ export interface InstanceLicenseStateTable {
   credential_jws_digest: string | null
   credential_encryption_key_id: string | null
   encrypted_credential_jws: Buffer | null
-  refusal_status: 'revoked' | 'superseded' | null
+  refusal_status: 'expired' | 'revoked' | 'superseded' | null
   refusal_generation: string | null
   refusal_revision: string | null
   refusal_current_generation: string | null
@@ -121,6 +121,8 @@ export interface InstanceLicenseStateTable {
   refusal_encryption_key_id: string | null
   encrypted_refusal_jws: Buffer | null
   trusted_time_high_water_ms: string | null
+  renewal_retry_count: Generated<number>
+  renewal_retry_after: Date | null
   updated_at: Generated<Date>
 }
 
