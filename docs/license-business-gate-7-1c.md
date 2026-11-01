@@ -45,5 +45,7 @@ Compose 浏览器验收通过独立 PostgreSQL 18 服务和冻结中心只读 ch
 - API 集成测试 37 个文件、675/675 项通过，其中冻结授权中心 HTTPS Challenge、签名证据与恢复互操作 135 项全部通过。
 - 真实浏览器测试通过：主 Chromium 套件 93/93、brand-alt 1/1、SSR 错误/重试 3/3、dev-preview 1/1、production-brand 1/1。
 - 使用冻结中心签名证据的完整 Compose 浏览器套件通过：93 项中 84 项通过，9 项按现有集成服务条件跳过；支付回调测试使用本机隔离宿主 API 端口执行。
+- 隔离数字履约恢复脚本 `scripts/verify-digital-recovery.mjs` 在真实 PostgreSQL 18 和冻结中心签名证据下通过。新的合成采购订单经隔离 signed API 准入；随后 API 与 DB 分别 SIGKILL/重启，身份、Pending-key、Trust Store、订单履约、采购预算及附件完成备份恢复；历史密钥、全部 6 种交付方式、未知供应商请求只读恢复均核对成功，最终对账差异为 0。签名档案在重启前后用 SHA-256 比对，fixture 不把 JWS 内容写入日志；恢复脚本退出时会移除 `signed-recovery` profile、容器和卷。
 - PostgreSQL 锁竞争回归在真实 PG 18 中通过：测试通过 `pg_stat_activity` / `pg_blocking_pids()` 观察订单准入连接在 `installation_binding` 行锁等待；授权过期边界测试持锁越过签名截止时间后返回 403。另有 SIGKILL、未知 COMMIT、撤销并发、Trust Store 写入中断及重试恢复用例通过。
+- 最终整体验收再次执行 `pnpm verify`，退出码 0：lint、类型检查、money 单测 16/16、API 集成 37 个文件 675/675、API/Web 构建、主 Chromium 93/93 和生产品牌 1/1 全部通过。独立 `scripts/test-license-center-interop.sh` 使用冻结中心 SHA `a5cf99439e3bf92b65f19d60c013bca088cf221a` 与真实 PostgreSQL 18，Challenge、签名和 operation/recovery 互操作 135/135 通过。
 - 全套通过时，仍只有 7 条上述 lint warning；正式发行根仍为 `null`，所以当前构建会拒绝所有新的订单与充值，直至正式签名发行配置和规范 Trust Store 初始化完成。跨宿主机共享 Trust Store、time-reset、身份迁移、生产部署和 ⑦-2 均不在本阶段范围。

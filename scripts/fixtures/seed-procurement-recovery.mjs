@@ -18,6 +18,8 @@ const { initializeSyntheticProcurementRiskPolicy, recordProcurementRiskFact, loc
 const { prepareProcurementWithRisk, runProcurementFixturePass } = await import('/app/dist/commerce/procurement-executor.js')
 const { finalizeProcurementUnit } = await import('/app/dist/commerce/procurement-finalization.js')
 
+const signedAdmissionOrigin = process.env.AIKAYUN_RECOVERY_SIGNED_API_ORIGIN
+if (!signedAdmissionOrigin) throw new Error('A real signed recovery admission API is required for synthetic new orders')
 const config = readConfig()
 if (!String(config.database.database || '').endsWith('_test')) {
   throw new Error('Procurement backup seed refuses a non-test database')
@@ -104,6 +106,11 @@ try {
 
   // The source-selection loader is test-only and only affects this disposable process.
   process.env.AIKAYUN_SYNTHETIC_PROCUREMENT_SELECTION = JSON.stringify([{ skuId, mappingVersionId }])
+  const signedSelection = await fetch(`${signedAdmissionOrigin}/__test/procurement-selection`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sources: JSON.parse(process.env.AIKAYUN_SYNTHETIC_PROCUREMENT_SELECTION) }),
+  })
+  if (!signedSelection.ok) throw new Error('Signed recovery fixture rejected its isolated procurement mapping')
   const { createApp } = await import('/app/dist/app.js')
   const app = await createApp({ db, config: legacyConfig, logger: false })
   await app.ready()
@@ -162,10 +169,12 @@ try {
     const quote = await app.inject({ method: 'POST', url: '/api/v1/checkout/quote', headers, payload: { version: 2, items } })
     if (quote.statusCode !== 200 || !quote.json().data.canContinue) throw new Error('Synthetic recovery quote failed: ' + quote.body)
     const idempotencyKey = randomUUID()
-    const created = await app.inject({ method: 'POST', url: '/api/v1/checkout/orders', headers,
-      payload: { version: 2, items, idempotencyKey, quoteToken: quote.json().data.quoteToken } })
-    if (created.statusCode !== 201) throw new Error('Synthetic recovery checkout failed: ' + created.body)
-    const order = created.json().data.order
+    const createdResponse = await fetch(`${signedAdmissionOrigin}/api/v1/checkout/orders`, { method: 'POST', headers: {
+      ...headers, 'content-type': 'application/json',
+    }, body: JSON.stringify({ version: 2, items, idempotencyKey, quoteToken: quote.json().data.quoteToken }) })
+    const createdBody = await createdResponse.text()
+    if (createdResponse.status !== 201) throw new Error('Synthetic recovery checkout failed: ' + createdBody)
+    const order = JSON.parse(createdBody).data.order
     const amount = (await db.selectFrom('orders').select('total_amount').where('id', '=', order.id).executeTakeFirstOrThrow()).total_amount
     const walletOperationId = randomUUID()
     await db.transaction().execute(async trx => {

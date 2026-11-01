@@ -14,7 +14,11 @@ trap 'exit 143' TERM INT
 git clone --quiet --no-hardlinks /license-center "$root/center"
 (cd "$root/center" && npm ci --no-audit --no-fund)
 export LICENSE_CENTER_CHECKOUT="$root/center"
-pnpm --filter @aikayun/api exec tsx "$@" &
+if [ -n "${AIKAYUN_TEST_NODE_IMPORT:-}" ]; then
+  pnpm --filter @aikayun/api exec node --import tsx --import "$AIKAYUN_TEST_NODE_IMPORT" "$@" &
+else
+  pnpm --filter @aikayun/api exec tsx "$@" &
+fi
 child=$!
 wait "$child"
 child=''

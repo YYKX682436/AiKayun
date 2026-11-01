@@ -8,8 +8,10 @@ export function selectCheckoutProcurementSources() {
 `)
 
 export async function resolve(specifier, context, nextResolve) {
-  if (specifier === './procurement-source-selection.js'
-    && context.parentURL?.endsWith('/dist/commerce/orders.js')) {
+  // This loader is installed only by isolated procurement/recovery fixtures.
+  // The exact relative specifier is the checkout order route's selector in both
+  // the compiled production API and the TSX signed auxiliary API.
+  if (specifier === './procurement-source-selection.js' || specifier === './procurement-source-selection.ts') {
     return { url: replacement, shortCircuit: true }
   }
   return nextResolve(specifier, context)

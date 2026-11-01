@@ -16,8 +16,11 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       TEST_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       LICENSE_CENTER_CHECKOUT: /license-center
+      AIKAYUN_TEST_NODE_IMPORT: /test/register-procurement-selection-loader.mjs
     volumes:
       - ${LICENSE_CENTER_CHECKOUT:?Set LICENSE_CENTER_CHECKOUT to the frozen test checkout}:/license-center:ro
+      - ./scripts/fixtures/register-procurement-selection-loader.mjs:/test/register-procurement-selection-loader.mjs:ro
+      - ./scripts/fixtures/procurement-selection-loader.mjs:/test/procurement-selection-loader.mjs:ro
     ports:
       - "127.0.0.1:${SIGNED_RECOVERY_API_PORT:?Set an isolated API port}:3002"
     healthcheck:

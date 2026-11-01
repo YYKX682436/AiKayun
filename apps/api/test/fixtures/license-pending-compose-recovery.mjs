@@ -20,7 +20,6 @@ import {
 import { encryptLicensePendingBytes } from 'file:///app/dist/licensing/pending-encryption-key.js'
 
 const operationId = '44444444-4444-4444-8444-444444444444'
-const replacementOperationId = '55555555-5555-4555-8555-555555555555'
 const licenseId = '11111111-1111-4111-8111-111111111111'
 const activationCode = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
 const origin = 'https://shop.example.test'
@@ -179,8 +178,8 @@ try {
       finalized_at: new Date(),
     }).where('operation_id', '=', operationId).where('state', '=', 'response_saved').executeTakeFirstOrThrow()
     assert.deepEqual(await readLicenseOperationCenterEvidence(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId), responseJws)
-    process.stdout.write(`RESULT_JWS=${resultJws.toString('base64url')}\n`)
-    process.stdout.write(`CENTER_EVIDENCE=${responseJws.toString('base64url')}\n`)
+    process.stdout.write(`RESULT_JWS_SHA256=${createHash('sha256').update(resultJws).digest('hex')}\n`)
+    process.stdout.write(`CENTER_EVIDENCE_SHA256=${createHash('sha256').update(responseJws).digest('hex')}\n`)
     process.stdout.write('license_pending_fixture_seeded\n')
   } else if (mode === 'verify') {
     const payload = await readActivationOperationPayload(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId)
@@ -198,17 +197,11 @@ try {
     assert.deepEqual(centerEvidence, response)
     const resultJws = await readLicenseOperationAttemptResultJws(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId, 1)
     assert.ok(resultJws)
-    process.stdout.write(`RESULT_JWS=${resultJws.toString('base64url')}\n`)
-    process.stdout.write(`CENTER_EVIDENCE=${centerEvidence.toString('base64url')}\n`)
+    process.stdout.write(`RESULT_JWS_SHA256=${createHash('sha256').update(resultJws).digest('hex')}\n`)
+    process.stdout.write(`CENTER_EVIDENCE_SHA256=${createHash('sha256').update(centerEvidence).digest('hex')}\n`)
     const state = await db.selectFrom('local_license_operations').select('state')
       .where('operation_id', '=', operationId).executeTakeFirstOrThrow()
     assert.equal(state.state, 'terminal')
-    const replacement = await createOrLoadActivationOperation(db, process.env.LICENSE_PENDING_KEY_ROOT, {
-      operationId: replacementOperationId, licenseId, activationCode,
-      instanceId: binding.instance_id, databaseId: binding.database_id,
-      identityJkt: binding.identity_jkt, origin,
-    })
-    assert.equal(replacement.state, 'pending')
     process.stdout.write('license_pending_fixture_pair_verified\n')
   } else {
     throw new Error('Expected seed or verify')

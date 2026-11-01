@@ -118,19 +118,19 @@ try {
   compose('exec', '-T', '-e', 'NODE_ENV=test', '-e', `TEST_DATABASE_URL=${testDatabaseUrl}`, 'api', 'node',
     'dist/licensing/pending-encryption-key-cli.js', 'init', '--temporary', '--environment', 'test',
     '--pending-key-dir', '/var/lib/aikayun/license-pending')
-  const fixtureResult = output => {
-    const line = output.split('\n').find(value => value.startsWith('RESULT_JWS='))
-    assert.ok(line, 'license result archive missing from fixture')
-    return Buffer.from(line.slice('RESULT_JWS='.length), 'base64url')
+  const fixtureResultDigest = output => {
+    const line = output.split('\n').find(value => value.startsWith('RESULT_JWS_SHA256='))
+    assert.ok(line, 'license result archive digest missing from fixture')
+    return line.slice('RESULT_JWS_SHA256='.length)
   }
-  const fixtureCenterEvidence = output => {
-    const line = output.split('\n').find(value => value.startsWith('CENTER_EVIDENCE='))
-    assert.ok(line, 'terminal center evidence missing from fixture')
-    return Buffer.from(line.slice('CENTER_EVIDENCE='.length), 'base64url')
+  const fixtureCenterEvidenceDigest = output => {
+    const line = output.split('\n').find(value => value.startsWith('CENTER_EVIDENCE_SHA256='))
+    assert.ok(line, 'terminal center evidence digest missing from fixture')
+    return line.slice('CENTER_EVIDENCE_SHA256='.length)
   }
   const seededLicensePending = compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'seed')
-  const originalResultJws = fixtureResult(seededLicensePending)
-  const originalCenterEvidence = fixtureCenterEvidence(seededLicensePending)
+  const originalResultJwsDigest = fixtureResultDigest(seededLicensePending)
+  const originalCenterEvidenceDigest = fixtureCenterEvidenceDigest(seededLicensePending)
   assert.ok(!compose('logs', 'api').includes(pendingActivationCode), 'activation code leaked to API logs')
   const trustFixtureOutput = compose('exec', '-T', 'api', 'node', '/app/trust-store-compose-restore.mjs', 'import')
   const trustFixtureLine = trustFixtureOutput.split('\n').find(line => line.startsWith('TRUST_STORE_FIXTURE='))
@@ -229,15 +229,14 @@ try {
     body: { username: `restore-${randomUUID().slice(0, 12)}`, password: 'Isolated-Customer-Password-2026!!' } })
   const quote = await request('/api/v1/checkout/quote', { cookies: customer, token: customerCsrf, method: 'POST', body: { items } })
   assert.equal(quote.canContinue, true)
-  // Admission uses a second, test-only API with real signed center evidence and
-  // the already initialized identity/key. All subsequent recovery remains on
-  // the production API, including its fail-closed behavior and SIGKILL tests.
+  // All new obligations in this acceptance test use a test-only API with real
+  // signed center evidence and the already initialized identity/key. Payment,
+  // fulfillment, reads and all later recovery remain on the production API.
   compose('--profile', 'signed-recovery', 'up', '-d', '--build', '--no-deps', 'signed-api')
   const signedOrigin = `http://127.0.0.1:${env.SIGNED_RECOVERY_API_PORT}`
   await until(async () => (await fetch(`${signedOrigin}/api/v1/health/ready`)).ok, 'signed admission fixture')
   const created = await request('/api/v1/checkout/orders', { cookies: customer, token: customerCsrf, method: 'POST', expected: 201,
     requestOrigin: signedOrigin, body: { items, quoteToken: quote.quoteToken, idempotencyKey: randomUUID() } })
-  compose('stop', 'signed-api')
   const orderId = created.order.id
   await request(`/api/v1/orders/${orderId}/payments`, { cookies: customer, token: customerCsrf, method: 'POST', expected: 201,
     body: { idempotencyKey: randomUUID(), channelId: channel.channel.id, paymentMethod: 'alipay' } })
@@ -271,6 +270,7 @@ try {
   }, 'independent procurement supplier fixture')
   console.log('Seed isolated procurement operations, cross-operation conflict, historical key, and private purchase archive')
   const seedOutput = compose('exec', '-T', '-e', 'AIKAYUN_RECOVERY_SUPPLIER_URL=http://127.0.0.1:3102',
+    '-e', 'AIKAYUN_RECOVERY_SIGNED_API_ORIGIN=http://signed-api:3002',
     'api', 'node', '--import', '/test/register-procurement-selection-loader.mjs', '/test/seed-procurement-recovery.mjs')
   const seedLine = seedOutput.split('\n').find(line => line.startsWith('PROCUREMENT_RECOVERY_SEED='))
   assert.ok(seedLine, `isolated procurement seed did not emit metadata: ${seedOutput}`)
@@ -283,6 +283,7 @@ try {
   assert.equal(seed.counts.procurement_deliveries, '1')
   assert.equal(seed.counts.inventory_consumes, '1')
   assert.equal(seed.counts.retained_purchase_attachments, '1')
+  compose('stop', 'signed-api')
   const facts = snapshot()
   const reconciliationSql = await readFile(join(workspace, 'scripts/reconcile-digital-fulfillment.sql'), 'utf8')
   const reconcile = () => database(`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n${reconciliationSql}\nCOMMIT;`)
@@ -301,8 +302,8 @@ try {
     assert.notEqual(newId, oldId)
     await ready()
     const verifiedLicensePending = compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'verify')
-    assert.deepEqual(fixtureResult(verifiedLicensePending), originalResultJws)
-    assert.deepEqual(fixtureCenterEvidence(verifiedLicensePending), originalCenterEvidence)
+    assert.equal(fixtureResultDigest(verifiedLicensePending), originalResultJwsDigest)
+    assert.equal(fixtureCenterEvidenceDigest(verifiedLicensePending), originalCenterEvidenceDigest)
     await verifyDownload()
     assert.equal(snapshot(), facts)
     proof.sigkill.push({ service, replaced: true, historyIdentical: true, sha256: digest })
@@ -324,8 +325,8 @@ ${await readFile(join(directory, 'backup', backups[0], 'SHA256SUMS'), 'utf8')}`
   command('bash', ['scripts/restore-test-compose-data.sh', join(directory, 'backup', backups[0])], { env: { ...env, ALLOW_TEST_DATABASE_RESTORE: 'YES' } })
   await ready()
   const restoredLicensePending = compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'verify')
-  assert.deepEqual(fixtureResult(restoredLicensePending), originalResultJws)
-  assert.deepEqual(fixtureCenterEvidence(restoredLicensePending), originalCenterEvidence)
+  assert.equal(fixtureResultDigest(restoredLicensePending), originalResultJwsDigest)
+  assert.equal(fixtureCenterEvidenceDigest(restoredLicensePending), originalCenterEvidenceDigest)
   const restoredTrustMarker = compose('exec', '-T', 'api', 'node', '-e', `process.stdout.write(require('node:fs').readFileSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'),'utf8').trim())`).trim()
   assert.equal(restoredTrustMarker, trustStoreMarker)
   const trustRestoreOutput = compose('exec', '-T', '-e', `TRUST_STORE_TEST_FIXTURE=${JSON.stringify(trustFixture)}`,
@@ -379,5 +380,6 @@ ${await readFile(join(directory, 'backup', backups[0], 'SHA256SUMS'), 'utf8')}`
   console.log(JSON.stringify(proof))
 } finally {
   console.log('Removing only the isolated recovery project and its volumes')
-  try { compose('down', '-v', '--remove-orphans', '--rmi', 'local') } finally { await rm(directory, { recursive: true, force: true }) }
+  try { compose('--profile', 'signed-recovery', 'down', '-v', '--remove-orphans', '--rmi', 'local') }
+  finally { await rm(directory, { recursive: true, force: true }) }
 }

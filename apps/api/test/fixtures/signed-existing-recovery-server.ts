@@ -29,6 +29,20 @@ try {
     existingRoots: { identityRoot: config.identityRoot, pendingKeyRoot: config.licensePendingKeyRoot } })
   app = await createApp({ db, config, licenseForTests: { releaseConfig: fixture.options.releaseConfig,
     trustStore: fixture.options.trustStore, pool } })
+  app.put('/__test/procurement-selection', async (request, reply) => {
+    const body = request.body && typeof request.body === 'object' && !Array.isArray(request.body)
+      ? request.body as { sources?: unknown }
+      : undefined
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
+    if (!Array.isArray(body?.sources) || body.sources.length > 20 || body.sources.some(source =>
+      !source || typeof source !== 'object' || Array.isArray(source) ||
+      !('skuId' in source) || typeof source.skuId !== 'string' || !uuid.test(source.skuId) ||
+      !('mappingVersionId' in source) || typeof source.mappingVersionId !== 'string' || !uuid.test(source.mappingVersionId))) {
+      return reply.code(400).send({ error: { code: 'RECOVERY_FIXTURE_SELECTION_INVALID' } })
+    }
+    process.env.AIKAYUN_SYNTHETIC_PROCUREMENT_SELECTION = JSON.stringify(body.sources)
+    return reply.code(204).send()
+  })
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.once(signal, () => { void close().finally(() => process.exit(0)) })
   }
