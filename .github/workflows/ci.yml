@@ -57,6 +57,8 @@ jobs:
       - name: Unit and PostgreSQL integration tests
         run: pnpm test
       - name: Frozen license-center HTTPS Challenge and activation interoperability
+        env:
+          LICENSE_CENTER_READ_TOKEN: ${{ secrets.LICENSE_CENTER_READ_TOKEN }}
         run: scripts/test-license-center-interop.sh
       - name: Install Chromium
         run: pnpm --filter @aikayun/web exec playwright install --with-deps chromium
