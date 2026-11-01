@@ -13,8 +13,9 @@ import {
   readSavedLicenseOperationResponse,
 } from './license-operation-store.js'
 import { decryptLicensePendingBytes, loadLicensePendingKey } from './pending-encryption-key.js'
+import { readTrustedTimeWatermark } from './trusted-time-watermark.js'
 
-export async function verifyLicensePendingBackupPair(): Promise<{ operations: number; attempts: number; projections: number }> {
+export async function verifyLicensePendingBackupPair(): Promise<{ operations: number; attempts: number; projections: number; watermark: boolean }> {
   const config = readConfig(process.env)
   if (config.nodeEnv !== 'test') throw new Error('license_pending_restore_check_test_only')
   await loadLicensePendingKey(config.licensePendingKeyRoot, [
@@ -71,11 +72,28 @@ export async function verifyLicensePendingBackupPair(): Promise<{ operations: nu
       .where('singleton', '=', true).execute()
     if (projectionRows.length !== 1) throw new Error('license_pending_restore_check_projection_row_missing')
     const projection = projectionRows[0]!
-    if (projection.license_id !== null) {
+    let watermark = false
+    if (projection.license_id !== null || projection.trusted_time_high_water_ms !== null) {
       const binding = await db.selectFrom('installation_binding').selectAll()
         .where('singleton', '=', true).executeTakeFirst()
-      if (!binding || binding.database_id !== projection.database_id || binding.instance_id !== projection.instance_id ||
-        binding.identity_jkt !== projection.identity_jkt) throw new Error('license_pending_restore_check_projection_identity_mismatch')
+      if (!binding || projection.license_id !== null &&
+        (binding.database_id !== projection.database_id || binding.instance_id !== projection.instance_id ||
+          binding.identity_jkt !== projection.identity_jkt)) {
+        throw new Error('license_pending_restore_check_projection_identity_mismatch')
+      }
+      if (projection.trusted_time_high_water_ms === null || !/^[1-9][0-9]{0,15}$/u.test(projection.trusted_time_high_water_ms)) {
+        throw new Error('license_pending_restore_check_time_watermark_missing')
+      }
+      const storedWatermark = await readTrustedTimeWatermark(config.licensePendingKeyRoot, {
+        databaseId: binding.database_id,
+        instanceId: binding.instance_id,
+        identityJkt: binding.identity_jkt,
+      })
+      if (storedWatermark.status !== 'valid' ||
+        storedWatermark.record.high_water_ms < Number(projection.trusted_time_high_water_ms)) {
+        throw new Error('license_pending_restore_check_time_watermark_mismatch')
+      }
+      watermark = true
       if (projection.credential_jti !== null) {
         await verifyProjectionEvidence({
           db, pendingKeyRoot: config.licensePendingKeyRoot,
@@ -93,7 +111,7 @@ export async function verifyLicensePendingBackupPair(): Promise<{ operations: nu
         })
       }
     }
-    return { operations: operations.length, attempts: attempts.length, projections: projectionRows.length }
+    return { operations: operations.length, attempts: attempts.length, projections: projectionRows.length, watermark }
   } finally {
     await db.destroy()
   }
@@ -102,7 +120,7 @@ export async function verifyLicensePendingBackupPair(): Promise<{ operations: nu
 async function main(): Promise<void> {
   try {
     const result = await verifyLicensePendingBackupPair()
-    process.stdout.write(`license_pending_restore_pair_verified operations=${result.operations} attempts=${result.attempts} projections=${result.projections}\n`)
+    process.stdout.write(`license_pending_restore_pair_verified operations=${result.operations} attempts=${result.attempts} projections=${result.projections} watermark=${result.watermark}\n`)
   } catch {
     // Never include decrypt, filesystem, database payload, or secret-bearing errors in command output.
     process.stderr.write('license_pending_restore_pair_rejected\n')

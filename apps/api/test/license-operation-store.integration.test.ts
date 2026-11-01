@@ -17,6 +17,8 @@ import { licenseOperationTrustedRejectionMigration } from '../src/db/migrations/
 import { licenseOperationRecoveryAttemptsMigration } from '../src/db/migrations/202610310002_license_operation_recovery_attempts.js'
 import { instanceLicenseStateMigration } from '../src/db/migrations/202610310003_instance_license_state.js'
 import { instanceLicenseRefusalFirstMigration } from '../src/db/migrations/202610311001_instance_license_refusal_first.js'
+import { trustedLicenseTimeWatermarkMigration } from '../src/db/migrations/202611010001_trusted_license_time_watermark.js'
+import { advanceTrustedTimeWatermarkFile, trustedTimeWatermarkFileName } from '../src/licensing/trusted-time-watermark.js'
 import { buildRecoveryIntent, ed25519IdentityJkt } from '../src/licensing/license-intent.js'
 import {
   allocateLicenseOperationAttempt,
@@ -104,6 +106,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
     await licenseOperationRecoveryAttemptsMigration.up(db)
     await instanceLicenseStateMigration.up(db)
     await instanceLicenseRefusalFirstMigration.up(db)
+        await trustedLicenseTimeWatermarkMigration.up(db)
     const pendingRoot = await mkdtemp(join(tmpdir(), 'aikayun-license-pending-pg-'))
     pendingRoots.add(pendingRoot)
     await initializeTemporaryLicensePendingKey(pendingRoot, 'test')
@@ -802,6 +805,16 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         credential_encryption_key_id: encryptedProjection.keyId,
         encrypted_credential_jws: encryptedProjection.ciphertext,
       }).where('singleton', '=', true).execute()
+      const sourceWatermarkMs = Date.now()
+      await source.db.transaction().execute(async tx => {
+        await tx.selectFrom('installation_binding').selectAll().where('singleton', '=', true).forUpdate().executeTakeFirstOrThrow()
+        await tx.selectFrom('instance_license_state').selectAll().where('singleton', '=', true).forUpdate().executeTakeFirstOrThrow()
+        await advanceTrustedTimeWatermarkFile(source.pendingRoot, {
+          databaseId: input.databaseId, instanceId: input.instanceId, identityJkt: input.identityJkt,
+        }, sourceWatermarkMs)
+        await tx.updateTable('instance_license_state').set({ trusted_time_high_water_ms: String(sourceWatermarkMs) })
+          .where('singleton', '=', true).executeTakeFirstOrThrow()
+      })
       const sourceOperation = await source.db.selectFrom('local_license_operations').selectAll()
         .where('operation_id', '=', input.operationId).executeTakeFirstOrThrow()
       const sourceAttempt = await source.db.selectFrom('local_license_operation_attempts').selectAll()
@@ -847,6 +860,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         await licenseOperationRecoveryAttemptsMigration.up(restoredDb)
         await instanceLicenseStateMigration.up(restoredDb)
         await instanceLicenseRefusalFirstMigration.up(restoredDb)
+        await trustedLicenseTimeWatermarkMigration.up(restoredDb)
         await restoredDb.transaction().execute(async trx => {
           await sql.raw('ALTER TABLE local_license_operations DISABLE TRIGGER USER').execute(trx)
           await sql.raw('ALTER TABLE local_license_operation_attempts DISABLE TRIGGER USER').execute(trx)
@@ -876,6 +890,7 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
             refusal_jws_digest: sourceProjection.refusal_jws_digest,
             refusal_encryption_key_id: sourceProjection.refusal_encryption_key_id,
             encrypted_refusal_jws: sourceProjection.encrypted_refusal_jws,
+            trusted_time_high_water_ms: sourceProjection.trusted_time_high_water_ms,
           }).where('singleton', '=', true).execute()
           await sql.raw('SET CONSTRAINTS ALL IMMEDIATE').execute(trx)
           await sql.raw('ALTER TABLE local_license_operation_attempts ENABLE TRIGGER USER').execute(trx)
@@ -885,6 +900,8 @@ describe.skipIf(!testDatabaseUrl)('⑦-1B-3C-1 local license operation PostgreSQ
         const restoredKey = join(restoredRoot, 'license-pending-aes-256-gcm.json')
         await copyFile(sourceKey, restoredKey)
         await chmod(restoredKey, 0o600)
+        await copyFile(join(source.pendingRoot, trustedTimeWatermarkFileName), join(restoredRoot, trustedTimeWatermarkFileName))
+        await chmod(join(restoredRoot, trustedTimeWatermarkFileName), 0o600)
 
         const check = await runChild({ schema: restoredSchema, pendingRoot: restoredRoot } as Sandbox, 'restore-check', input)
         expect(check.code).toBe(0)

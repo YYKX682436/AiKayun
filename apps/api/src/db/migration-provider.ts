@@ -52,6 +52,7 @@ import { licenseOperationTrustedRejectionMigration } from './migrations/20261031
 import { licenseOperationRecoveryAttemptsMigration } from './migrations/202610310002_license_operation_recovery_attempts.js'
 import { instanceLicenseStateMigration } from './migrations/202610310003_instance_license_state.js'
 import { instanceLicenseRefusalFirstMigration } from './migrations/202610311001_instance_license_refusal_first.js'
+import { trustedLicenseTimeWatermarkMigration } from './migrations/202611010001_trusted_license_time_watermark.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -108,6 +109,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202610310002_license_operation_recovery_attempts': licenseOperationRecoveryAttemptsMigration,
       '202610310003_instance_license_state': instanceLicenseStateMigration,
       '202610311001_instance_license_refusal_first': instanceLicenseRefusalFirstMigration,
+      '202611010001_trusted_license_time_watermark': trustedLicenseTimeWatermarkMigration,
     }
   }
 }

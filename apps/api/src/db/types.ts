@@ -120,6 +120,7 @@ export interface InstanceLicenseStateTable {
   refusal_jws_digest: string | null
   refusal_encryption_key_id: string | null
   encrypted_refusal_jws: Buffer | null
+  trusted_time_high_water_ms: string | null
   updated_at: Generated<Date>
 }
 

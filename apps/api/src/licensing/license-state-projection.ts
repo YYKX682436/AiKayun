@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { decodeProtectedHeader } from 'jose'
 import type { Kysely, Selectable } from 'kysely'
 import type { Database, InstanceLicenseStateTable } from '../db/types.js'
-import { withVerifiedInstallationSigningContext } from './installation-identity.js'
+import { InstallationIdentityError, withVerifiedInstallationSigningContext } from './installation-identity.js'
 import { sha256Base64url } from './license-intent.js'
 import { parseStrictJson } from './strict-json.js'
 import {
@@ -15,7 +15,8 @@ import {
   readPersistedLicenseProjectionHistory,
   readVerifiedPersistedRecoveryQueryResult,
 } from './license-operation-recovery-client.js'
-import { fetchTrustedTimeAnchor } from './trust/time-anchor-client.js'
+import { fetchTrustedTimeAnchor, getTrustedCenterContactState } from './trust/time-anchor-client.js'
+import { advanceLicenseTrustedTime, LicenseClockSuspectError } from './license-trusted-time.js'
 import {
   verifyCurrentLicenseLease,
   verifyExpiredHistoricalLease,
@@ -39,6 +40,12 @@ export type LicenseProjectionCheckpoint =
 export interface LicenseStateProjectionOptions extends LicenseOperationRecoveryClientOptions {
   /** Fault injection for isolated transaction and process-crash tests only. */
   readonly onProjectionTestCheckpoint?: (stage: LicenseProjectionCheckpoint) => void | Promise<void>
+  /** Deterministic wall-clock projection for isolated trusted-time boundary tests only. */
+  readonly onTrustedTimeTestOverride?: () => {
+    databaseTimeMs: number
+    signedTimeMs?: number | null
+    ignoreProcessAnchor?: boolean
+  } | undefined
 }
 
 export interface LicenseStateProjectionResult {
@@ -53,6 +60,20 @@ export interface LicenseStateProjectionResult {
   readonly refusalRevision: string | null
   readonly evidenceDigest: string | null
   readonly commitRecovered?: true
+}
+
+export type LicenseSnapshotStatus = 'unactivated' | 'active' | 'offline_valid' | 'expired' | 'offline_expired'
+  | 'revoked' | 'superseded' | 'invalid_credential' | 'identity_mismatch' | 'clock_suspect'
+
+export interface LicenseSnapshotResult {
+  readonly status: LicenseSnapshotStatus
+  readonly reason: string
+  readonly allowedUntil: string | null
+  readonly nextRenewalAt: string | null
+  readonly activationGeneration: string | null
+  readonly entitlementRevision: string | null
+  readonly canCreateOrder: boolean
+  readonly canCreateTopUp: boolean
 }
 
 interface CandidateSource {
@@ -322,7 +343,7 @@ function rowFingerprint(row: InstanceLicenseStateRow): string {
     row.credential_encryption_key_id, row.encrypted_credential_jws?.toString('base64url'),
     row.refusal_status, row.refusal_generation, row.refusal_revision, row.refusal_current_generation,
     row.refusal_operation_id, row.refusal_attempt_no, row.refusal_jws_digest,
-    row.refusal_encryption_key_id, row.encrypted_refusal_jws?.toString('base64url'),
+    row.refusal_encryption_key_id, row.encrypted_refusal_jws?.toString('base64url'), row.trusted_time_high_water_ms,
     row.updated_at.toISOString()].join('|')
 }
 
@@ -552,11 +573,213 @@ async function applyCandidate(input: {
 }
 
 export function createLicenseStateProjectionClient(options: LicenseStateProjectionOptions) {
-  if (options.onProjectionTestCheckpoint && process.env.NODE_ENV !== 'test') {
+  if ((options.onProjectionTestCheckpoint || options.onTrustedTimeTestOverride) && process.env.NODE_ENV !== 'test') {
     throw new Error('License projection fault injection is restricted to isolated tests')
   }
   const checkpoint = async (stage: LicenseProjectionCheckpoint) => options.onProjectionTestCheckpoint?.(stage)
+  const getLicenseSnapshot = async (): Promise<LicenseSnapshotResult> => {
+    const denied = (status: LicenseSnapshotStatus, reason: string, values: {
+      allowedUntil?: string | null
+      nextRenewalAt?: string | null
+      activationGeneration?: string | null
+      entitlementRevision?: string | null
+    } = {}): LicenseSnapshotResult => Object.freeze({
+      status, reason,
+      allowedUntil: values.allowedUntil ?? null,
+      nextRenewalAt: values.nextRenewalAt ?? null,
+      activationGeneration: values.activationGeneration ?? null,
+      entitlementRevision: values.entitlementRevision ?? null,
+      canCreateOrder: false,
+      canCreateTopUp: false,
+    })
+    try {
+      return await withVerifiedInstallationSigningContext(options.pool, options.identityRoot, async identity => {
+        return await options.db.transaction().execute(async tx => {
+          const binding = await tx.selectFrom('installation_binding').selectAll()
+            .where('singleton', '=', true).forUpdate().executeTakeFirst()
+          if (!binding || binding.binding_state !== 'ready' || binding.database_id !== identity.databaseId ||
+            binding.instance_id !== identity.instanceId || binding.identity_jkt !== identity.identityJkt) {
+            return denied('identity_mismatch', 'installation_binding_mismatch')
+          }
+          const row = await tx.selectFrom('instance_license_state').selectAll()
+            .where('singleton', '=', true).forUpdate().executeTakeFirst()
+          if (!row) return denied('invalid_credential', 'license_state_unavailable')
+          let time
+          try {
+            const testTime = options.onTrustedTimeTestOverride?.()
+            time = await advanceLicenseTrustedTime({
+              tx,
+              row,
+              pendingRoot: options.pendingKeyRoot,
+              identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
+              ...(testTime === undefined ? {} : {
+                databaseTimeMs: testTime.databaseTimeMs,
+                signedTimeMs: testTime.signedTimeMs,
+                ...(testTime.ignoreProcessAnchor ? { useProcessAnchor: false } : {}),
+              }),
+            })
+          } catch (error) {
+            if (error instanceof LicenseClockSuspectError) return denied('clock_suspect', error.reason)
+            throw error
+          }
+          const currentRow = await tx.selectFrom('instance_license_state').selectAll()
+            .where('singleton', '=', true).executeTakeFirstOrThrow()
+          if (currentRow.license_id === null && currentRow.credential_jti === null && currentRow.refusal_status === null) {
+            return denied('unactivated', 'no_accepted_license_lease')
+          }
+          if (currentRow.database_id !== null && currentRow.database_id !== identity.databaseId ||
+            currentRow.instance_id !== null && currentRow.instance_id !== identity.instanceId ||
+            currentRow.identity_jkt !== null && currentRow.identity_jkt !== identity.identityJkt) {
+            return denied('identity_mismatch', 'license_projection_identity_mismatch')
+          }
+          const accepted = await options.trustStore.getAccepted(() => time.trustedTimeSeconds)
+          if (accepted.centerIssuer !== options.releaseConfig.expected_center_issuer) {
+            return denied('invalid_credential', 'trust_store_unavailable')
+          }
+          const localIdentity = {
+            databaseId: identity.databaseId,
+            instanceId: identity.instanceId,
+            identityJkt: identity.identityJkt,
+          }
+          const snapshotIdentity = {
+            status: 'ready' as const,
+            code: 'ready',
+            bindingState: 'ready' as const,
+            ...localIdentity,
+          }
+          let leaseValues: {
+            token: Buffer
+            issuedAt: number
+            expiresAt: number
+            subscriptionEnd: number
+            renewAfter: number
+            generation: string
+            revision: string
+          } | null = null
+          if (currentRow.credential_jti !== null) {
+            await readAndVerifyStoredEvidence({
+              options, tx, row: currentRow, identity: localIdentity, kind: 'lease', accepted,
+              trustedTime: time.trustedTimeSeconds,
+            })
+            const token = await decryptLicensePendingBytes(options.pendingKeyRoot, {
+              operationId: currentRow.credential_operation_id!, attemptNo: currentRow.credential_attempt_no!,
+              record: 'attempt', field: 'projection_lease_jws',
+            }, { keyId: currentRow.credential_encryption_key_id!, ciphertext: currentRow.encrypted_credential_jws! })
+            const encoded = exactJws(token)
+            if (!encoded) return denied('invalid_credential', 'saved_lease_invalid')
+            const claimsValue = parseStrictJson(Buffer.from(encoded.split('.')[1]!, 'base64url'))
+            if (!claimsValue || typeof claimsValue !== 'object' || Array.isArray(claimsValue)) {
+              return denied('invalid_credential', 'saved_lease_invalid')
+            }
+            const claims = claimsValue as Record<string, unknown>
+            const issuedAt = claims.iat
+            const expiresAt = claims.exp
+            const subscriptionEnd = claims.subscription_end
+            const renewAfter = claims.renew_after
+            if (![issuedAt, expiresAt, subscriptionEnd, renewAfter].every(Number.isSafeInteger) ||
+              typeof issuedAt !== 'number' || typeof expiresAt !== 'number' || typeof subscriptionEnd !== 'number' ||
+              typeof renewAfter !== 'number' || claims.jti !== currentRow.credential_jti ||
+              claims.activation_generation !== currentRow.activation_generation ||
+              claims.entitlement_revision !== currentRow.entitlement_revision) {
+              return denied('invalid_credential', 'saved_lease_invalid')
+            }
+            if (expiresAt <= time.trustedTimeSeconds) {
+              await verifyExpiredHistoricalLease(encoded, {
+                resolver: accepted.resolver,
+                issuer: accepted.centerIssuer,
+                trustedTime: time.trustedTimeSeconds,
+                identity: snapshotIdentity,
+              })
+            } else {
+              await verifyCurrentLicenseLease(encoded, {
+                resolver: accepted.resolver,
+                issuer: accepted.centerIssuer,
+                trustedTime: time.trustedTimeSeconds,
+                identity: snapshotIdentity,
+              })
+            }
+            leaseValues = {
+              token, issuedAt, expiresAt, subscriptionEnd, renewAfter,
+              generation: currentRow.activation_generation!,
+              revision: currentRow.entitlement_revision!,
+            }
+          }
+          if (currentRow.refusal_status !== null) {
+            await readAndVerifyStoredEvidence({
+              options, tx, row: currentRow, identity: localIdentity, kind: 'refusal', accepted,
+              trustedTime: time.trustedTimeSeconds,
+            })
+            const token = await decryptLicensePendingBytes(options.pendingKeyRoot, {
+              operationId: currentRow.refusal_operation_id!, attemptNo: currentRow.refusal_attempt_no!,
+              record: 'attempt', field: 'projection_rejection_jws',
+            }, { keyId: currentRow.refusal_encryption_key_id!, ciphertext: currentRow.encrypted_refusal_jws! })
+            const encoded = exactJws(token)
+            if (!encoded) return denied('invalid_credential', 'saved_refusal_invalid')
+            const claimsValue = parseStrictJson(Buffer.from(encoded.split('.')[1]!, 'base64url'))
+            if (!claimsValue || typeof claimsValue !== 'object' || Array.isArray(claimsValue)) {
+              return denied('invalid_credential', 'saved_refusal_invalid')
+            }
+            const claims = claimsValue as Record<string, unknown>
+            const expiry = claims.exp
+            if (typeof expiry !== 'number' || !Number.isSafeInteger(expiry)) {
+              return denied('invalid_credential', 'saved_refusal_invalid')
+            }
+            const status = expiry <= time.trustedTimeSeconds
+              ? await verifyExpiredHistoricalStatusReceipt(encoded, {
+                resolver: accepted.resolver, issuer: accepted.centerIssuer, trustedTime: time.trustedTimeSeconds,
+              })
+              : await verifyLicenseStatusReceipt(encoded, {
+                resolver: accepted.resolver, issuer: accepted.centerIssuer, trustedTime: time.trustedTimeSeconds,
+              })
+            if (status.claims.status !== currentRow.refusal_status || status.claims.sub !== currentRow.license_id ||
+              status.claims.activation_generation !== currentRow.refusal_generation ||
+              status.claims.entitlement_revision !== currentRow.refusal_revision ||
+              status.claims.current_generation !== currentRow.refusal_current_generation) {
+              return denied('invalid_credential', 'saved_refusal_mismatch')
+            }
+          }
+          const latest = await options.trustStore.getAccepted(() => time.trustedTimeSeconds)
+          if (latest.artifactSha256 !== accepted.artifactSha256) {
+            return denied('invalid_credential', 'trust_store_changed')
+          }
+          const refusalBlocks = currentRow.refusal_status === 'superseded' ||
+            currentRow.refusal_status === 'revoked' &&
+              (!leaseValues || BigInt(leaseValues.revision) <= BigInt(currentRow.refusal_revision!))
+          const allowedUntil = leaseValues === null ? null : Math.min(leaseValues.expiresAt, leaseValues.subscriptionEnd)
+          const dates = {
+            allowedUntil: allowedUntil === null ? null : new Date(allowedUntil * 1000).toISOString(),
+            nextRenewalAt: leaseValues === null ? null : new Date(leaseValues.renewAfter * 1000).toISOString(),
+            activationGeneration: currentRow.activation_generation,
+            entitlementRevision: currentRow.entitlement_revision,
+          }
+          if (currentRow.refusal_status === 'superseded') return denied('superseded', 'accepted_superseded_evidence', dates)
+          if (refusalBlocks) return denied('revoked', 'accepted_revocation_not_superseded', dates)
+          if (!leaseValues || allowedUntil === null) return denied('invalid_credential', 'no_current_lease', dates)
+          if (time.trustedTimeMs >= allowedUntil * 1000) {
+            if (time.trustedTimeMs >= leaseValues.subscriptionEnd * 1000) {
+              return denied('expired', 'subscription_end_reached', dates)
+            }
+            return denied(getTrustedCenterContactState() === 'unavailable' ? 'offline_expired' : 'expired',
+              getTrustedCenterContactState() === 'unavailable' ? 'center_unavailable_after_lease_expiry' : 'lease_expired', dates)
+          }
+          const offline = getTrustedCenterContactState() === 'unavailable'
+          return Object.freeze({
+            status: offline ? 'offline_valid' : 'active',
+            reason: offline ? 'trusted_center_connection_failed' : 'lease_within_signed_window',
+            ...dates,
+            canCreateOrder: true,
+            canCreateTopUp: true,
+          })
+        })
+      })
+    } catch (error) {
+      if (error instanceof LicenseClockSuspectError) return denied('clock_suspect', error.reason)
+      if (error instanceof InstallationIdentityError) return denied('identity_mismatch', 'installation_identity_unavailable')
+      return denied('invalid_credential', 'license_evidence_unavailable')
+    }
+  }
   return Object.freeze({
+    getLicenseSnapshot,
     /** The only write entrypoint: all candidate bytes are loaded from and rebound to persisted operation history. */
     async projectPersistedOperation(operationId: string): Promise<LicenseStateProjectionResult> {
       if (!UUID.test(operationId)) fail('license_projection_operation_id_invalid')
@@ -575,10 +798,8 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
             ...(options.testTls.ca === undefined ? {} : { testCa: options.testTls.ca }),
             ...(options.testTls.lookup === undefined ? {} : { testLookup: options.testTls.lookup }),
           })
-        const accepted = await options.trustStore.getAccepted(sample.assertFresh)
-        if (accepted.centerIssuer !== options.releaseConfig.expected_center_issuer) fail('license_projection_trust_mismatch')
 
-        const transactionCommit: { fingerprint?: string; result?: LicenseStateProjectionResult } = {}
+        const transactionCommit: { fingerprint?: string; result?: LicenseStateProjectionResult; acceptedArtifactSha256?: string } = {}
         let transactionOutcome: { result: LicenseStateProjectionResult; fingerprint: string }
         try {
           transactionOutcome = await options.db.transaction().execute(async tx => {
@@ -589,11 +810,26 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
             fail('license_projection_identity_changed')
           }
           await checkpoint('after_projection_binding_locked')
-          const row = await tx.selectFrom('instance_license_state').selectAll()
+          let row = await tx.selectFrom('instance_license_state').selectAll()
             .where('singleton', '=', true).forUpdate().executeTakeFirst()
           if (!row) fail('license_projection_singleton_missing')
           await checkpoint('after_projection_row_locked')
-          const trustedTime = sample.assertFresh()
+          const testTime = options.onTrustedTimeTestOverride?.()
+          const time = await advanceLicenseTrustedTime({
+            tx,
+            row,
+            pendingRoot: options.pendingKeyRoot,
+            identity: { databaseId: identity.databaseId, instanceId: identity.instanceId, identityJkt: identity.identityJkt },
+            signedTimeMs: testTime?.signedTimeMs ?? sample.readCurrentTrustedTimeMs(),
+            ...(testTime === undefined ? {} : { databaseTimeMs: testTime.databaseTimeMs }),
+            ...(testTime?.ignoreProcessAnchor ? { useProcessAnchor: false } : {}),
+          })
+          const trustedTime = time.trustedTimeSeconds
+          sample.assertFresh()
+          const accepted = await options.trustStore.getAccepted(() => trustedTime)
+          if (accepted.centerIssuer !== options.releaseConfig.expected_center_issuer) fail('license_projection_trust_mismatch')
+          transactionCommit.acceptedArtifactSha256 = accepted.artifactSha256
+          row = await tx.selectFrom('instance_license_state').selectAll().where('singleton', '=', true).executeTakeFirstOrThrow()
           if (row.license_id !== null && row.credential_jti !== null) {
             await readAndVerifyStoredEvidence({
               options, tx, row,
@@ -678,7 +914,7 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
           const result = resultFromRow(current, outcome, evidenceDigest)
           const fingerprint = rowFingerprint(current)
           await checkpoint('after_projection_row_update')
-          const trustBeforeCommit = await options.trustStore.getAccepted(sample.assertFresh)
+          const trustBeforeCommit = await options.trustStore.getAccepted(() => trustedTime)
           if (trustBeforeCommit.artifactSha256 !== accepted.artifactSha256) fail('license_projection_trust_changed')
           transactionCommit.fingerprint = fingerprint
           transactionCommit.result = result
@@ -688,16 +924,18 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
         } catch (error) {
           const after = await options.db.selectFrom('instance_license_state').selectAll()
             .where('singleton', '=', true).executeTakeFirst()
-          if (!after || !transactionCommit.fingerprint || !transactionCommit.result ||
+          if (!after || !transactionCommit.fingerprint || !transactionCommit.result || !transactionCommit.acceptedArtifactSha256 ||
             rowFingerprint(after) !== transactionCommit.fingerprint) throw error
           const latest = await options.trustStore.getAccepted(sample.assertFresh)
-          if (latest.artifactSha256 !== accepted.artifactSha256) fail('license_projection_trust_changed')
+          if (latest.artifactSha256 !== transactionCommit.acceptedArtifactSha256) fail('license_projection_trust_changed')
           const recovered = transactionCommit.result
           if (!recovered) throw error
           return Object.freeze({ ...recovered, commitRecovered: true })
         }
         const latest = await options.trustStore.getAccepted(sample.assertFresh)
-        if (latest.artifactSha256 !== accepted.artifactSha256) fail('license_projection_trust_changed')
+        if (!transactionCommit.acceptedArtifactSha256 || latest.artifactSha256 !== transactionCommit.acceptedArtifactSha256) {
+          fail('license_projection_trust_changed')
+        }
         return transactionOutcome.result
       })
     },

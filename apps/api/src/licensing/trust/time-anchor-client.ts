@@ -18,7 +18,35 @@ export interface TrustedTimeSample {
   readonly responseReceivedAt: number
   readonly roundTripMs: number
   readCurrentTrustedTime(): number
+  readCurrentTrustedTimeMs(): number
   assertFresh(): number
+}
+
+export type TrustedCenterContactState = 'unknown' | 'available' | 'unavailable'
+
+export class TrustedCenterUnavailableError extends Error {
+  constructor(message = 'Trusted license center is temporarily unavailable') {
+    super(message)
+    this.name = 'TrustedCenterUnavailableError'
+  }
+}
+
+let latestContactState: TrustedCenterContactState = 'unknown'
+let latestProcessSample: TrustedTimeSample | null = null
+
+export function getTrustedCenterContactState(): TrustedCenterContactState {
+  return latestContactState
+}
+
+/** A fresh signed sample scoped to this process; it never performs network I/O. */
+export function readCurrentProcessSignedTimeMs(): number | null {
+  if (!latestProcessSample) return null
+  try {
+    latestProcessSample.assertFresh()
+    return latestProcessSample.readCurrentTrustedTimeMs()
+  } catch {
+    return null
+  }
 }
 
 interface TestTimeAnchorOptions {
@@ -85,7 +113,12 @@ function postNonce(
     const requestStartedAt = performance.now()
     const request = httpsRequest(requestOptions, async (response) => {
       try {
-        if (response.statusCode !== 200) throw new Error('Time-anchor endpoint returned a non-success status')
+        if (response.statusCode !== 200) {
+          if (response.statusCode !== undefined && response.statusCode >= 500) {
+            throw new TrustedCenterUnavailableError('Trusted license center returned a server error')
+          }
+          throw new Error('Time-anchor endpoint returned a non-success status')
+        }
         const contentType = String(response.headers['content-type'] ?? '').split(';', 1)[0]!.trim().toLowerCase()
         if (contentType !== 'application/json') throw new Error('Time-anchor endpoint returned a non-JSON response')
         const contentLength = response.headers['content-length']
@@ -99,7 +132,7 @@ function postNonce(
         const responseReceivedAt = performance.now()
         const roundTripMs = responseReceivedAt - requestStartedAt
         if (!Number.isFinite(roundTripMs) || roundTripMs < 0 || roundTripMs > MAX_TIME_ANCHOR_RTT_MS) {
-          throw new Error('Time-anchor network round trip exceeded 5000ms')
+          throw new TrustedCenterUnavailableError('Time-anchor network round trip exceeded 5000ms')
         }
         resolve({ body, roundTripMs, requestStartedAt, responseReceivedAt })
       } catch (error) {
@@ -109,7 +142,16 @@ function postNonce(
     })
     const timer = setTimeout(() => request.destroy(new Error('Time-anchor request timed out')), MAX_TIME_ANCHOR_RTT_MS)
     request.once('close', () => clearTimeout(timer))
-    request.once('error', reject)
+    request.once('error', (error: NodeJS.ErrnoException) => {
+      const code = String(error.code ?? '')
+      if (['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE'].includes(code) ||
+        error.message.includes('Time-anchor request timed out')) {
+        reject(error.message.includes('Time-anchor request timed out')
+          ? new TrustedCenterUnavailableError('Time-anchor request timed out after 5000ms')
+          : new TrustedCenterUnavailableError('Trusted license center network request failed'))
+      }
+      else reject(error)
+    })
     request.end(requestBody)
   })
 }
@@ -122,33 +164,45 @@ export async function fetchTrustedTimeAnchor(
 ): Promise<TrustedTimeSample> {
   if (candidate.claims.sub !== config.expected_center_issuer) throw new Error('Candidate bundle does not match the configured center issuer')
   const nonce = createTimeAnchorNonce()
-  const response = await postNonce(config, nonce, options)
-  const json = parseStrictJson(response.body)
-  const envelope = exactObject(json, ['time_anchor'], 'Time-anchor response')
-  if (typeof envelope.time_anchor !== 'string' || envelope.time_anchor.length === 0) throw new Error('Time-anchor response token is missing')
-  const anchor = await verifyTimeAnchorWithTrustBundleCandidate(envelope.time_anchor, {
-    candidate,
-    clientNonce: nonce,
-    roundTripMs: response.roundTripMs,
-  })
-  const assertFresh = (): number => {
-    const now = performance.now()
-    const afterResponseMs = now - response.responseReceivedAt
-    if (!Number.isFinite(afterResponseMs) || afterResponseMs < 0 || response.roundTripMs + afterResponseMs >= MAX_ANCHOR_AGE_MS) {
-      throw new Error('Time-anchor sample is stale; fetch a new signed anchor')
+  try {
+    const response = await postNonce(config, nonce, options)
+    const json = parseStrictJson(response.body)
+    const envelope = exactObject(json, ['time_anchor'], 'Time-anchor response')
+    if (typeof envelope.time_anchor !== 'string' || envelope.time_anchor.length === 0) throw new Error('Time-anchor response token is missing')
+    const anchor = await verifyTimeAnchorWithTrustBundleCandidate(envelope.time_anchor, {
+      candidate,
+      clientNonce: nonce,
+      roundTripMs: response.roundTripMs,
+    })
+    const readCurrentTrustedTimeMs = (): number => {
+      const afterResponseMs = performance.now() - response.responseReceivedAt
+      if (!Number.isFinite(afterResponseMs) || afterResponseMs < 0 ||
+        response.roundTripMs + afterResponseMs >= MAX_ANCHOR_AGE_MS) {
+        throw new Error('Time-anchor sample is stale; fetch a new signed anchor')
+      }
+      // Adding the full measured RTT is conservative: it does not undercount transit time.
+      const trustedTimeMs = anchor.serverTime * 1000 + Math.ceil(response.roundTripMs + afterResponseMs)
+      if (!Number.isSafeInteger(trustedTimeMs) || trustedTimeMs >= anchor.expiresAt * 1000) {
+        throw new Error('Time-anchor sample has expired')
+      }
+      return trustedTimeMs
     }
-    const trustedTime = anchor.serverTime + Math.floor(afterResponseMs / 1000)
-    if (!Number.isSafeInteger(trustedTime) || trustedTime >= anchor.expiresAt) throw new Error('Time-anchor sample has expired')
-    return trustedTime
+    const assertFresh = (): number => Math.floor(readCurrentTrustedTimeMs() / 1000)
+    const sample: TrustedTimeSample = Object.freeze({
+      anchor,
+      requestStartedAt: response.requestStartedAt,
+      responseReceivedAt: response.responseReceivedAt,
+      roundTripMs: response.roundTripMs,
+      readCurrentTrustedTime: assertFresh,
+      readCurrentTrustedTimeMs,
+      assertFresh,
+    })
+    sample.assertFresh()
+    latestContactState = 'available'
+    latestProcessSample = sample
+    return sample
+  } catch (error) {
+    if (error instanceof TrustedCenterUnavailableError) latestContactState = 'unavailable'
+    throw error
   }
-  const sample: TrustedTimeSample = Object.freeze({
-    anchor,
-    requestStartedAt: response.requestStartedAt,
-    responseReceivedAt: response.responseReceivedAt,
-    roundTripMs: response.roundTripMs,
-    readCurrentTrustedTime: assertFresh,
-    assertFresh,
-  })
-  sample.assertFresh()
-  return sample
 }

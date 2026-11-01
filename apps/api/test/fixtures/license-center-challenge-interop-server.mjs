@@ -280,6 +280,18 @@ try {
     if (!updated) return reply.code(404).send({ error: 'test license not found' })
     return reply.code(200).send({ state: 'expired' })
   })
+  app.post('/__test/set-subscription-end', async (request, reply) => {
+    const body = request.body
+    if (!body || typeof body !== 'object' || typeof body.license_id !== 'string' ||
+      !Number.isSafeInteger(body.seconds_from_now) || body.seconds_from_now < 60 || body.seconds_from_now > 2_592_000) {
+      return reply.code(400).send({ error: 'invalid test request' })
+    }
+    const updated = await db.updateTable('licenses').set({
+      confirmed_subscription_end: new Date(Date.now() + body.seconds_from_now * 1000),
+    }).where('id', '=', body.license_id).returning('id').executeTakeFirst()
+    if (!updated) return reply.code(404).send({ error: 'test license not found' })
+    return reply.code(200).send({ state: 'updated' })
+  })
   app.post('/__test/revoke-license', async (request, reply) => {
     const body = request.body
     if (!body || typeof body !== 'object' || typeof body.license_id !== 'string') {
