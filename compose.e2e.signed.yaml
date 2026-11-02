@@ -12,3 +12,5 @@ services:
       LICENSE_CENTER_CHECKOUT: /license-center
     volumes:
       - ${LICENSE_CENTER_CHECKOUT:?Set LICENSE_CENTER_CHECKOUT to the frozen test checkout}:/license-center:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
