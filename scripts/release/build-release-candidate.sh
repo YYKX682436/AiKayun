@@ -230,7 +230,7 @@ for platform in linux/amd64 linux/arm64; do
     '202611010005_trusted_bundle_head'
 done
 migration_path="$work/migration-checksums.json"
-container_id="$(docker create --platform linux/amd64 "$api_index_ref")"
+container_id="$(docker create --platform linux/amd64 "$api_staging_index_ref")"
 docker cp "$container_id:/app/dist/db/migration-checksums.json" "$migration_path"
 docker rm "$container_id" >/dev/null
 migration_head="$(jq -er '.migration_head | select(test("^[0-9]{12}_[A-Za-z0-9_-]+$"))' "$migration_path")"
