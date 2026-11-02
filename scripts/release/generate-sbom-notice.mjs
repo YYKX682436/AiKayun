@@ -21,6 +21,9 @@ const postgresqlNoticeSha256 = '3d6af92ff8a4c2cdf69afb1cf44edea727922f5cd0cf8b5f
 const gosuNoticePath = join(scriptDirectory, 'upstream-notices', 'gosu-1.19-LICENSE')
 const gosuNoticeCommit = '6456aaa0f3c854d199d0f037f068eb97515b7513'
 const gosuNoticeSha256 = 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30'
+const utilLinuxFlockVersion = '2.41.5-0+deb13u1'
+const utilLinuxFlockCopyrightPath = join(scriptDirectory, 'upstream-notices', 'util-linux-2.41.5-COPYRIGHT')
+const utilLinuxFlockCopyrightSha256 = '56b67e2eb8bac5a15d91e261d558d73f1f029113cced229753138194997366b6'
 const pinnedGoLicenseAssets = new Map([
   ['caddy@v0.0.0-20261003050618-72dd0fb067f6', {
     path: join(scriptDirectory, 'upstream-notices', 'caddy-v2.11.7-LICENSE'),
@@ -259,6 +262,23 @@ async function collectNoticeFiles(input, found = []) {
 
 const noticeFiles = (await Promise.all(['doc', 'licenses', 'common-licenses', 'nodejs'].map(path =>
   collectNoticeFiles(join(systemRoot, path))))).flat().sort((a, b) => a.localeCompare(b))
+const runtimeFlockNotice = join(systemRoot, 'doc', 'util-linux', 'copyright')
+let runtimeFlockProvenance = []
+try {
+  const embeddedCopyright = await readFile(runtimeFlockNotice)
+  const pinnedCopyright = await readFile(utilLinuxFlockCopyrightPath)
+  if (createHash('sha256').update(embeddedCopyright).digest('hex') !== utilLinuxFlockCopyrightSha256 ||
+    !embeddedCopyright.equals(pinnedCopyright)) {
+    throw new Error('The embedded util-linux copyright file does not match the pinned runtime source')
+  }
+  runtimeFlockProvenance = [
+    `Runtime utility: /usr/bin/flock from Debian util-linux@${utilLinuxFlockVersion}.`,
+    `Debian copyright SHA-256: ${utilLinuxFlockCopyrightSha256}.`,
+    '',
+  ]
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error
+}
 const noticeFileByPackage = new Map()
 for (const path of noticeFiles) {
   const parts = relative(join(systemRoot, 'doc'), path).split(sep)
@@ -374,6 +394,7 @@ const lines = [
     `Package URL: ${component.purl}`,
     '',
   ]),
+  ...runtimeFlockProvenance,
   ...moduleLicenseText,
   ...alpineLicenseText,
   ...(noticeFiles.length ? [

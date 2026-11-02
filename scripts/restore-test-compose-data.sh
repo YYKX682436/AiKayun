@@ -66,11 +66,13 @@ if [[ -z "$api_container" ]]; then
   printf 'Refusing restore because the isolated API container is not running.\n' >&2
   exit 2
 fi
-media_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.MEDIA_ROOT || "")')"
-private_file_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.PRIVATE_FILE_ROOT || "")')"
-identity_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.INSTANCE_IDENTITY_ROOT || "")')"
-license_trust_store_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.LICENSE_TRUST_STORE_ROOT || "")')"
-license_pending_key_root="$(docker compose exec -T api node -e 'process.stdout.write(process.env.LICENSE_PENDING_KEY_ROOT || "")')"
+media_root="$(docker compose exec -T api /nodejs/bin/node -e 'process.stdout.write(process.env.MEDIA_ROOT || "")')"
+private_file_root="$(docker compose exec -T api /nodejs/bin/node -e 'process.stdout.write(process.env.PRIVATE_FILE_ROOT || "")')"
+identity_root="$(docker compose exec -T api /nodejs/bin/node -e 'process.stdout.write(process.env.INSTANCE_IDENTITY_ROOT || "")')"
+license_trust_store_root="$(docker compose exec -T api /nodejs/bin/node -e 'process.stdout.write(process.env.LICENSE_TRUST_STORE_ROOT || "")')"
+license_pending_key_root="$(docker compose exec -T api /nodejs/bin/node -e 'process.stdout.write(process.env.LICENSE_PENDING_KEY_ROOT || "")')"
+compose_config="$(docker compose config --format json)"
+database_image="$(jq -er '.services.db.image | select(test("@sha256:"))' <<< "$compose_config")"
 media_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$media_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
 private_file_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$private_file_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
 identity_volume="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "'"$identity_root"'"}}{{.Name}}{{end}}{{end}}' "$api_container")"
@@ -102,22 +104,20 @@ docker compose stop api web caddy
 docker compose exec -T db sh -lc \
   'pg_restore --clean --if-exists --no-owner --no-privileges --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
   < "$backup_directory/database.dump"
-docker compose run --rm --no-deps -T --entrypoint sh api -c \
-  'node -e '\''const fs=require("node:fs"),path=require("node:path"),root=process.env.MEDIA_ROOT;for(const name of fs.readdirSync(root))fs.rmSync(path.join(root,name),{recursive:true,force:true})'\'' && tar -xzf - -C "$MEDIA_ROOT"' \
-  < "$backup_directory/media.tar.gz"
-docker compose run --rm --no-deps -T --entrypoint sh api -c \
-  'node -e '\''const fs=require("node:fs"),path=require("node:path"),root=process.env.PRIVATE_FILE_ROOT;for(const name of fs.readdirSync(root))fs.rmSync(path.join(root,name),{recursive:true,force:true})'\'' && tar -xzf - -C "$PRIVATE_FILE_ROOT"' \
-  < "$backup_directory/private-files.tar.gz"
-docker compose run --rm --no-deps -T --entrypoint sh api -c \
-  'node -e '\''const fs=require("node:fs"),path=require("node:path"),root=process.env.INSTANCE_IDENTITY_ROOT;for(const name of fs.readdirSync(root))fs.rmSync(path.join(root,name),{recursive:true,force:true})'\'' && tar -xzf - -C "$INSTANCE_IDENTITY_ROOT"' \
-  < "$backup_directory/identity.tar.gz"
-docker compose run --rm --no-deps -T --entrypoint sh api -c \
-  'node -e '\''const fs=require("node:fs"),path=require("node:path"),root=process.env.LICENSE_TRUST_STORE_ROOT;for(const name of fs.readdirSync(root))fs.rmSync(path.join(root,name),{recursive:true,force:true})'\'' && tar -xzf - -C "$LICENSE_TRUST_STORE_ROOT"' \
-  < "$backup_directory/license-trust-store.tar.gz"
-docker compose run --rm --no-deps -T --entrypoint sh api -c \
-  'node -e '\''const fs=require("node:fs"),path=require("node:path"),root=process.env.LICENSE_PENDING_KEY_ROOT;for(const name of fs.readdirSync(root))fs.rmSync(path.join(root,name),{recursive:true,force:true})'\'' && tar -xzf - -C "$LICENSE_PENDING_KEY_ROOT"' \
-  < "$backup_directory/license-pending-key.tar.gz"
-docker compose run --rm --no-deps -T -e NODE_ENV=test --entrypoint node api \
+restore_volume() {
+  local volume_root="$1"
+  local archive_path="$2"
+  docker run --rm -i --network none --volumes-from "$api_container" --user 1000:1000 \
+    -e "VOLUME_ROOT=$volume_root" --entrypoint sh "$database_image" \
+    -c 'find "$VOLUME_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && tar -xzf - -C "$VOLUME_ROOT"' \
+    < "$archive_path"
+}
+restore_volume "$media_root" "$backup_directory/media.tar.gz"
+restore_volume "$private_file_root" "$backup_directory/private-files.tar.gz"
+restore_volume "$identity_root" "$backup_directory/identity.tar.gz"
+restore_volume "$license_trust_store_root" "$backup_directory/license-trust-store.tar.gz"
+restore_volume "$license_pending_key_root" "$backup_directory/license-pending-key.tar.gz"
+docker compose run --rm --no-deps -T -e NODE_ENV=test --entrypoint /nodejs/bin/node api \
   dist/licensing/license-pending-restore-check.js
 docker compose start api web caddy
 printf 'Restored the verified backup into isolated database %s.\n' "$database_name"

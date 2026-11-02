@@ -104,4 +104,15 @@ it('rejects test endpoints and insecure production origins', () => {
     .toThrow('Test-only configuration is forbidden in production')
   expect(() => readConfig({ ...productionEnvironment(), PUBLIC_ORIGIN: 'http://store.customer-domain.com' }))
     .toThrow('Production requires an HTTPS PUBLIC_ORIGIN and COOKIE_SECURE=true')
+  expect(() => readConfig({ ...productionEnvironment(), SUPPLIER_HTTP_TEST_ALLOWLIST: 'https://127.0.0.1' }))
+    .toThrow('Test-only configuration is forbidden in production')
+})
+
+it('allows only exact loopback HTTP and HTTPS supplier origins in test processes', () => {
+  const config = readConfig({ NODE_ENV: 'test', PUBLIC_ORIGIN: 'http://localhost:3000',
+    SUPPLIER_HTTP_TEST_ALLOWLIST: 'http://127.0.0.1:3101,https://127.0.0.1' })
+  expect(config.supplierHttpTestAllowlist).toEqual(['http://127.0.0.1:3101', 'https://127.0.0.1'])
+  expect(() => readConfig({ NODE_ENV: 'test', PUBLIC_ORIGIN: 'http://localhost:3000',
+    SUPPLIER_HTTP_TEST_ALLOWLIST: 'https://supplier.example' }))
+    .toThrow('Supplier test allowlist entries must be exact HTTP(S) loopback origins')
 })

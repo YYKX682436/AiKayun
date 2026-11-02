@@ -9,10 +9,11 @@ const server = createServer({ key: await readFile('/tls/key.pem'), cert: await r
   requests++
   response.end('{}')
 })
-await new Promise(resolve => server.listen(443, '93.184.216.34', resolve))
+await new Promise(resolve => server.listen(443, '127.0.0.1', resolve))
 try {
-  await assert.rejects(createHttpJsonV1Delivery(readConfig({ NODE_ENV: 'test' }), {
-    baseUrl: 'https://93.184.216.34', bearerToken: 'isolated-tls-test-token',
+  await assert.rejects(createHttpJsonV1Delivery(readConfig({ ...process.env,
+    NODE_ENV: 'test', SUPPLIER_HTTP_TEST_ALLOWLIST: 'https://127.0.0.1' }), {
+    baseUrl: 'https://127.0.0.1', bearerToken: 'isolated-tls-test-token',
   }, { operationId: '00000000-0000-4000-8000-000000000001', idempotencyKey: 'aikayun:00000000-0000-4000-8000-000000000001',
     productId: 'tls-probe', unitAmount: '0.00', parameters: {} }), { classification: 'transport_unknown' })
   assert.equal(requests, 0, 'TLS must reject before sending supplier credentials or request content')

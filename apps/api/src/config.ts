@@ -310,11 +310,11 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   for (const value of supplierHttpTestAllowlist) {
     let parsed: URL
-    try { parsed = new URL(value) } catch { throw new Error('Supplier test allowlist entries must be HTTP loopback origins') }
+    try { parsed = new URL(value) } catch { throw new Error('Supplier test allowlist entries must be HTTP(S) loopback origins') }
     const host = parsed.hostname.replace(/^\[|\]$/gu, '').toLowerCase()
-    if (parsed.protocol !== 'http:' || parsed.origin !== value
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.origin !== value
       || !['localhost', '127.0.0.1', '::1'].includes(host)) {
-      throw new Error('Supplier test allowlist entries must be exact HTTP loopback origins')
+      throw new Error('Supplier test allowlist entries must be exact HTTP(S) loopback origins')
     }
   }
 

@@ -64,6 +64,7 @@ const command = (binary, args, options = {}) => execFileSync(binary, args, {
   cwd: workspace, env, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 300_000, ...options,
 })
 const compose = (...args) => command('docker', ['compose', ...args])
+const apiNode = '/nodejs/bin/node'
 const database = query => compose('exec', '-T', 'db', 'psql', '-U', 'aikayun', '-d', env.POSTGRES_DB, '-qAt', '-v', 'ON_ERROR_STOP=1', '-c', query).trim()
 async function until(action, description, timeout = 120_000) {
   const deadline = Date.now() + timeout
@@ -108,14 +109,14 @@ try {
   console.log('Starting isolated recovery Compose project')
   compose('up', '-d', '--build')
   await ready()
-  const initializedIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', 'node',
+  const initializedIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', apiNode,
     'dist/licensing/installation-identity-cli.js', 'init', '--mode', 'fresh'))
   assert.equal(initializedIdentity.status, 'ready')
-  const verifiedIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', 'node',
+  const verifiedIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', apiNode,
     'dist/licensing/installation-identity-cli.js', 'verify'))
   assert.deepEqual(verifiedIdentity, initializedIdentity)
   const testDatabaseUrl = `postgresql://${env.POSTGRES_USER}:${env.POSTGRES_PASSWORD}@db:5432/${env.POSTGRES_DB}`
-  compose('exec', '-T', '-e', 'NODE_ENV=test', '-e', `TEST_DATABASE_URL=${testDatabaseUrl}`, 'api', 'node',
+  compose('exec', '-T', '-e', 'NODE_ENV=test', '-e', `TEST_DATABASE_URL=${testDatabaseUrl}`, 'api', apiNode,
     'dist/licensing/pending-encryption-key-cli.js', 'init', '--temporary', '--environment', 'test',
     '--pending-key-dir', '/var/lib/aikayun/license-pending')
   const fixtureResultDigest = output => {
@@ -128,27 +129,27 @@ try {
     assert.ok(line, 'terminal center evidence digest missing from fixture')
     return line.slice('CENTER_EVIDENCE_SHA256='.length)
   }
-  const seededLicensePending = compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'seed')
+  const seededLicensePending = compose('exec', '-T', 'api', apiNode, '/app/license-pending-compose-recovery.mjs', 'seed')
   const originalResultJwsDigest = fixtureResultDigest(seededLicensePending)
   const originalCenterEvidenceDigest = fixtureCenterEvidenceDigest(seededLicensePending)
   assert.ok(!compose('logs', 'api').includes(pendingActivationCode), 'activation code leaked to API logs')
-  const trustFixtureOutput = compose('exec', '-T', 'api', 'node', '/app/trust-store-compose-restore.mjs', 'import')
+  const trustFixtureOutput = compose('exec', '-T', 'api', apiNode, '/app/trust-store-compose-restore.mjs', 'import')
   const trustFixtureLine = trustFixtureOutput.split('\n').find(line => line.startsWith('TRUST_STORE_FIXTURE='))
   assert.ok(trustFixtureLine, `isolated trust store seed did not emit metadata: ${trustFixtureOutput}`)
   const trustFixture = JSON.parse(trustFixtureLine.slice('TRUST_STORE_FIXTURE='.length))
-  compose('exec', '-T', 'api', 'node', '-e', `require('node:fs').writeFileSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'),${JSON.stringify(trustStoreMarker)}+'\\n',{mode:0o600})`)
+  compose('exec', '-T', 'api', apiNode, '-e', `require('node:fs').writeFileSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'),${JSON.stringify(trustStoreMarker)}+'\\n',{mode:0o600})`)
   proof.installationIdentity = {
     databaseId: initializedIdentity.databaseId,
     instanceId: initializedIdentity.instanceId,
     identityJkt: initializedIdentity.identityJkt,
   }
-  compose('exec', '-d', 'api', 'node', '--experimental-strip-types', '/test/http-json-v1-server.ts', '--serve')
+  compose('exec', '-d', 'api', apiNode, '--experimental-strip-types', '/test/http-json-v1-server.ts', '--serve')
   await until(() => {
-    compose('exec', '-T', 'api', 'node', '-e', "fetch('http://127.0.0.1:3101/__fixture/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))")
+    compose('exec', '-T', 'api', apiNode, '-e', "fetch('http://127.0.0.1:3101/__fixture/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))")
     return true
   }, 'controlled supplier fixture')
   await until(async () => (await fetch(`http://localhost:${supplierPort}/__fixture/health`)).ok, 'controlled payment fixture')
-  compose('exec', '-T', '-e', 'ADMIN_INITIAL_EMAIL=recovery-test@example.com', '-e', 'ADMIN_INITIAL_PASSWORD=Isolated-Recovery-Password-2026!!', 'api', 'node', 'dist/admin-init.js')
+  compose('exec', '-T', '-e', 'ADMIN_INITIAL_EMAIL=recovery-test@example.com', '-e', 'ADMIN_INITIAL_PASSWORD=Isolated-Recovery-Password-2026!!', 'api', apiNode, 'dist/admin-init.js')
   const admin = jar()
   const adminCsrf = (await request('/api/v1/admin/auth/csrf', { cookies: admin })).csrfToken
   await request('/api/v1/admin/auth/login', { cookies: admin, token: adminCsrf, method: 'POST',
@@ -234,7 +235,8 @@ try {
   // fulfillment, reads and all later recovery remain on the production API.
   compose('--profile', 'signed-recovery', 'up', '-d', '--build', '--no-deps', 'signed-api')
   const signedOrigin = `http://127.0.0.1:${env.SIGNED_RECOVERY_API_PORT}`
-  await until(async () => (await fetch(`${signedOrigin}/api/v1/health/ready`)).ok, 'signed admission fixture')
+  await until(async () => (await fetch(`${signedOrigin}/api/v1/health/ready`)).ok,
+    'signed admission fixture (the isolated checkout installs its own locked dependencies)', 300_000)
   const created = await request('/api/v1/checkout/orders', { cookies: customer, token: customerCsrf, method: 'POST', expected: 201,
     requestOrigin: signedOrigin, body: { items, quoteToken: quote.quoteToken, idempotencyKey: randomUUID() } })
   const orderId = created.order.id
@@ -263,15 +265,15 @@ try {
     assert.equal(JSON.stringify(await request(`/api/v1/customer/orders/${orderId}`, { cookies: customer })), authorizedView)
   }
   await verifyDownload()
-  compose('exec', '-d', 'api', 'node', '/test/procurement-supplier-process.mjs', '/test-output/procurement-supplier', '3102')
+  compose('exec', '-d', 'api', apiNode, '/test/procurement-supplier-process.mjs', '/test-output/procurement-supplier', '3102')
   await until(async () => {
-    compose('exec', '-T', 'api', 'node', '-e', "fetch('http://127.0.0.1:3102/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))")
+    compose('exec', '-T', 'api', apiNode, '-e', "fetch('http://127.0.0.1:3102/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))")
     return true
   }, 'independent procurement supplier fixture')
   console.log('Seed isolated procurement operations, cross-operation conflict, historical key, and private purchase archive')
   const seedOutput = compose('exec', '-T', '-e', 'AIKAYUN_RECOVERY_SUPPLIER_URL=http://127.0.0.1:3102',
     '-e', 'AIKAYUN_RECOVERY_SIGNED_API_ORIGIN=http://signed-api:3002',
-    'api', 'node', '--import', '/test/register-procurement-selection-loader.mjs', '/test/seed-procurement-recovery.mjs')
+    'api', apiNode, '--import', '/test/register-procurement-selection-loader.mjs', '/test/seed-procurement-recovery.mjs')
   const seedLine = seedOutput.split('\n').find(line => line.startsWith('PROCUREMENT_RECOVERY_SEED='))
   assert.ok(seedLine, `isolated procurement seed did not emit metadata: ${seedOutput}`)
   const seed = JSON.parse(seedLine.slice('PROCUREMENT_RECOVERY_SEED='.length))
@@ -301,7 +303,7 @@ try {
     const newId = compose('ps', '-q', service).trim()
     assert.notEqual(newId, oldId)
     await ready()
-    const verifiedLicensePending = compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'verify')
+    const verifiedLicensePending = compose('exec', '-T', 'api', apiNode, '/app/license-pending-compose-recovery.mjs', 'verify')
     assert.equal(fixtureResultDigest(verifiedLicensePending), originalResultJwsDigest)
     assert.equal(fixtureCenterEvidenceDigest(verifiedLicensePending), originalCenterEvidenceDigest)
     await verifyDownload()
@@ -317,37 +319,37 @@ try {
   const backupSummary = `${await readFile(join(directory, 'backup', backups[0], 'manifest.txt'), 'utf8')}
 ${await readFile(join(directory, 'backup', backups[0], 'SHA256SUMS'), 'utf8')}`
   assert.ok(!backupSummary.includes(pendingActivationCode), 'activation code leaked to backup summary')
-  compose('exec', '-T', 'api', 'node', '-e', `require('node:fs').unlinkSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'))`)
-  compose('exec', '-T', 'api', 'node', '-e', `const fs=require('node:fs'),path=require('node:path'),root=process.env.LICENSE_TRUST_STORE_ROOT;for(const name of ['trust-bundle-state.json','trust-bundle-store.marker.json'])fs.rmSync(path.join(root,name),{force:true})`)
-  compose('exec', '-T', 'api', 'node', '-e', `const fs=require('node:fs'),path=require('node:path'),id=${JSON.stringify(uploaded.uploadId)};fs.unlinkSync(path.join(process.env.PRIVATE_FILE_ROOT,'objects',id.slice(0,2),id+'.bin'))`)
+  compose('exec', '-T', 'api', apiNode, '-e', `require('node:fs').unlinkSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'))`)
+  compose('exec', '-T', 'api', apiNode, '-e', `const fs=require('node:fs'),path=require('node:path'),root=process.env.LICENSE_TRUST_STORE_ROOT;for(const name of ['trust-bundle-state.json','trust-bundle-store.marker.json'])fs.rmSync(path.join(root,name),{force:true})`)
+  compose('exec', '-T', 'api', apiNode, '-e', `const fs=require('node:fs'),path=require('node:path'),id=${JSON.stringify(uploaded.uploadId)};fs.unlinkSync(path.join(process.env.PRIVATE_FILE_ROOT,'objects',id.slice(0,2),id+'.bin'))`)
   const missing = await fetch(`${origin}${downloadPath}`, { headers: headers(customer) })
   assert.equal(missing.status, 410)
   command('bash', ['scripts/restore-test-compose-data.sh', join(directory, 'backup', backups[0])], { env: { ...env, ALLOW_TEST_DATABASE_RESTORE: 'YES' } })
   await ready()
-  const restoredLicensePending = compose('exec', '-T', 'api', 'node', '/app/license-pending-compose-recovery.mjs', 'verify')
+  const restoredLicensePending = compose('exec', '-T', 'api', apiNode, '/app/license-pending-compose-recovery.mjs', 'verify')
   assert.equal(fixtureResultDigest(restoredLicensePending), originalResultJwsDigest)
   assert.equal(fixtureCenterEvidenceDigest(restoredLicensePending), originalCenterEvidenceDigest)
-  const restoredTrustMarker = compose('exec', '-T', 'api', 'node', '-e', `process.stdout.write(require('node:fs').readFileSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'),'utf8').trim())`).trim()
+  const restoredTrustMarker = compose('exec', '-T', 'api', apiNode, '-e', `process.stdout.write(require('node:fs').readFileSync(require('node:path').join(process.env.LICENSE_TRUST_STORE_ROOT,'acceptance-marker.json'),'utf8').trim())`).trim()
   assert.equal(restoredTrustMarker, trustStoreMarker)
   const trustRestoreOutput = compose('exec', '-T', '-e', `TRUST_STORE_TEST_FIXTURE=${JSON.stringify(trustFixture)}`,
-    'api', 'node', '/app/trust-store-compose-restore.mjs', 'verify')
+    'api', apiNode, '/app/trust-store-compose-restore.mjs', 'verify')
   const trustRestoreLine = trustRestoreOutput.split('\n').find(line => line.startsWith('TRUST_STORE_RESTORED='))
   assert.ok(trustRestoreLine, `restored trust bundle was not verified: ${trustRestoreOutput}`)
   const restoredTrust = JSON.parse(trustRestoreLine.slice('TRUST_STORE_RESTORED='.length))
   assert.equal(restoredTrust.bundleVersion, trustFixture.bundleVersion)
   assert.equal(restoredTrust.artifactSha256, trustFixture.artifactSha256)
-  const restoredIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', 'node',
+  const restoredIdentity = JSON.parse(compose('exec', '-T', '-e', 'NODE_ENV=test', 'api', apiNode,
     'dist/licensing/installation-identity-cli.js', 'verify'))
   assert.deepEqual(restoredIdentity, initializedIdentity)
-  compose('exec', '-d', 'api', 'node', '/test/procurement-supplier-process.mjs', '/test-output/procurement-supplier', '3102')
+  compose('exec', '-d', 'api', apiNode, '/test/procurement-supplier-process.mjs', '/test-output/procurement-supplier', '3102')
   await until(async () => {
-    compose('exec', '-T', 'api', 'node', '-e', "fetch('http://127.0.0.1:3102/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))")
+    compose('exec', '-T', 'api', apiNode, '-e', "fetch('http://127.0.0.1:3102/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))")
     return true
   }, 'restored independent procurement supplier fixture')
   await verifyDownload()
   assert.equal(snapshot(), facts)
   assert.equal(reconcile(), '')
-  const reconciliation = JSON.parse(compose('exec', '-T', 'api', 'node', 'dist/media/private-file-reconcile-cli.js', '--check'))
+  const reconciliation = JSON.parse(compose('exec', '-T', 'api', apiNode, 'dist/media/private-file-reconcile-cli.js', '--check'))
   assert.equal(reconciliation.needsAttention, false)
   assert.equal(reconciliation.verifiedObjects, 1)
   proof.backupRestore = true
@@ -363,18 +365,18 @@ ${await readFile(join(directory, 'backup', backups[0], 'SHA256SUMS'), 'utf8')}`
 
   console.log('Verify restored procurement budget, historical key, purchase archive, and query-only recovery')
   const verifyOutput = compose('exec', '-T', '-e', `AIKAYUN_PROCUREMENT_RECOVERY_METADATA=${JSON.stringify(seed)}`,
-    'api', 'node', '/test/verify-procurement-recovery.mjs')
+    'api', apiNode, '/test/verify-procurement-recovery.mjs')
   const verifyLine = verifyOutput.split('\n').find(line => line.startsWith('PROCUREMENT_RECOVERY_VERIFY='))
   assert.ok(verifyLine, `isolated procurement restore verification did not emit proof: ${verifyOutput}`)
   proof.procurementBackupRestore = JSON.parse(verifyLine.slice('PROCUREMENT_RECOVERY_VERIFY='.length))
 
   console.log('Verify a real untrusted TLS handshake in an isolated network namespace')
   command('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', join(directory, 'key.pem'), '-out', join(directory, 'cert.pem'),
-    '-days', '1', '-subj', '/CN=93.184.216.34'], { stdio: 'ignore' })
+    '-days', '1', '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1'], { stdio: 'ignore' })
   const image = compose('images', '-q', 'api').trim().split('\n')[0]
-  command('docker', ['run', '--rm', '--network=none', '--cap-add=NET_ADMIN', '--user=0',
+  command('docker', ['run', '--rm', '--network=none', '--user=0',
     '-v', `${directory}:/tls:ro`, '-v', `${join(workspace, 'apps/api/test/fixtures/tls-rejection.mjs')}:/test/tls-rejection.mjs:ro`,
-    '--entrypoint', 'sh', image, '-c', 'ip addr add 93.184.216.34/32 dev lo && node /test/tls-rejection.mjs'])
+    '--entrypoint', '/nodejs/bin/node', image, '/test/tls-rejection.mjs'])
   proof.tlsRejected = true
   if (process.env.AIKAYUN_RECOVERY_REPORT) await writeFile(process.env.AIKAYUN_RECOVERY_REPORT, `${JSON.stringify(proof, null, 2)}\n`)
   console.log(JSON.stringify(proof))

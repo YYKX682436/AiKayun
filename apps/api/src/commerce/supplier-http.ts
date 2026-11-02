@@ -118,9 +118,6 @@ export function validateSupplierBaseUrl(value: string, config: AppConfig): URL {
   if (url.protocol === 'http:' && !(config.nodeEnv === 'test' && config.supplierHttpTestAllowlist.includes(url.origin))) {
     throw new SupplierHttpError('response_invalid', 'supplier_https_required')
   }
-  if (url.protocol === 'https:' && config.supplierHttpTestAllowlist.includes(url.origin)) {
-    throw new SupplierHttpError('response_invalid', 'supplier_test_allowlist_is_http_only')
-  }
   return url
 }
 
@@ -154,8 +151,7 @@ export async function resolvePinnedAddress(
     }
   }
   if (!addresses.length) throw new SupplierHttpError('transport_unknown', 'supplier_dns_empty')
-  const testAllowed = config.nodeEnv === 'test' && url.protocol === 'http:'
-    && config.supplierHttpTestAllowlist.includes(url.origin)
+  const testAllowed = config.nodeEnv === 'test' && config.supplierHttpTestAllowlist.includes(url.origin)
   const allAllowed = addresses.every(row => testAllowed ? isLoopbackAddress(row.address) : isPublicAddress(row.address))
   if (!allAllowed) throw new SupplierHttpError('response_invalid', 'supplier_address_not_public')
   return addresses[0]!

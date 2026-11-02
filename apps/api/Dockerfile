@@ -47,6 +47,9 @@ RUN mkdir -p /runtime-root/var/lib/aikayun/media /runtime-root/var/lib/aikayun/p
   && chown -R 1000:1000 /runtime-root/var/lib/aikayun \
   && chmod 700 /runtime-root/var/lib/aikayun/private-files /runtime-root/var/lib/aikayun/identity \
     /runtime-root/var/lib/aikayun/license-trust /runtime-root/var/lib/aikayun/license-pending
+RUN test "$(dpkg-query -W -f='${Version}' util-linux)" = '2.41.5-0+deb13u1' \
+  && install -D -m 0755 /usr/bin/flock /runtime-root/usr/bin/flock \
+  && install -D -m 0644 /usr/share/doc/util-linux/copyright /runtime-root/usr/share/doc/util-linux/copyright
 
 FROM gcr.io/distroless/nodejs24-debian13:nonroot@sha256:b8cec4b2f2126ff7bd034ec9ac207ffb3272667dfdc48376e3b035d3270549ba AS runtime
 
@@ -63,6 +66,7 @@ COPY --from=build --chown=1000:1000 /runtime-root/var/lib/aikayun/ /var/lib/aika
 COPY --from=build --chown=1000:1000 /prod/api/package.json ./package.json
 COPY --from=build --chown=1000:1000 /prod/api/node_modules ./node_modules
 COPY --from=build --chown=1000:1000 /prod/api/dist ./dist
+COPY --from=build /runtime-root/usr/ /usr/
 USER 1000:1000
 EXPOSE 3001
 CMD ["dist/index.js"]

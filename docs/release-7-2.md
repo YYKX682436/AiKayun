@@ -35,7 +35,7 @@ GHCR 容器包名为：
 
 目前只检测到 `LICENSE_CENTER_READ_TOKEN` 仓库 secret；没有配置正式 release signing key、生产授权配置、release 公钥 pin、production issuer/root KID、授权 signer KID 列表、受保护的 GHCR 包管理权限、受控 `aikayun-release` reviewer 环境与 `v*` tag ruleset、HTTPS release origin、静态上传 endpoint 或上传凭据。两个源码仓库在本轮初始核对时均为 Private。GitHub API 当前不允许这个 Private 仓库读取或设置 `main` 分支保护和 tag ruleset，并提示需启用支持 Private 仓库保护的 GitHub 计划；`aikayun-release` environment 也不存在。发行门禁保留这些检查，继续保持 fail closed，不把源码仓库改成公开，也不生成测试密钥冒充正式签名。
 
-2026-11-02 的本机扫描快照也阻止候选发行：API 与 Web 的四个平台镜像各自均为 0 个 High/Critical 漏洞；固定 PostgreSQL 18 Alpine 镜像在 amd64、arm64 均为 28 个 High/Critical，包含 Alpine `brotli-libs`、`libcurl` 与 `gosu` 所带 Go 1.24.6 标准库问题；升级到官方 Caddy 2.11.7 后，两架构仍各有 10 个 High/Critical，涵盖 Alpine 系统包和 Caddy Go 依赖。官方 PostgreSQL 18 Trixie 变体扫描为 89 个 High/Critical，因此没有替换 Alpine 镜像。八个 API/Web/PostgreSQL/Caddy 平台镜像的 Trivy secret findings 均为 0；每个镜像的 CycloneDX SBOM 与 NOTICE 已生成，第三方许可证文本未解析数为 0。发行扫描无忽略文件和漏洞例外；必须使用更新的上游镜像或经独立审核的修复镜像，并在发布前重新完整扫描。该快照只记录当前依赖状态，不代替未来发行时的重新扫描。
+2026-11-02 的本机扫描快照也阻止候选发行：API 与 Web 的四个平台镜像各自均为 0 个 High/Critical 漏洞。API 镜像为 Trust Store 内核锁携带 `/usr/bin/flock`；它来自固定 Debian `util-linux@2.41.5-0+deb13u1`，Syft 将该 ELF 包列入逐架构 SBOM，随镜像的 Debian copyright 校验副本进入 NOTICE，许可证未解析数仍为 0。固定 PostgreSQL 18 Alpine 镜像在 amd64、arm64 均为 28 个 High/Critical，包含 Alpine `brotli-libs`、`libcurl` 与 `gosu` 所带 Go 1.24.6 标准库问题；升级到官方 Caddy 2.11.7 后，两架构仍各有 10 个 High/Critical，涵盖 Alpine 系统包和 Caddy Go 依赖。官方 PostgreSQL 18 Trixie 变体扫描为 89 个 High/Critical，因此没有替换 Alpine 镜像。八个 API/Web/PostgreSQL/Caddy 平台镜像的 Trivy secret findings 均为 0；每个镜像的 CycloneDX SBOM 与 NOTICE 已生成，第三方许可证文本未解析数为 0。发行扫描无忽略文件和漏洞例外；必须使用更新的上游镜像或经独立审核的修复镜像，并在发布前重新完整扫描。该快照只记录当前依赖状态，不代替未来发行时的重新扫描。
 
 ## 独立验证
 
@@ -73,6 +73,8 @@ docker run --rm \
 新数据库发行 Compose 使用独立 `aikayun_app` 与 `aikayun_migrator` 角色；API 只持有应用 DML 凭据，迁移只持有 DDL 凭据，bootstrap superuser 不进入 API 或 Web 容器。role bootstrap 只有在隔离的新库中首次创建角色，不会把旧数据库账号或对象所有者静默改写。已有安装迁移角色必须停写、备份并由数据库所有者单独评审。
 
 API 和迁移进程固定以镜像 UID/GID `1000:1000` 运行。普通 Compose 的文件型 secrets 会保留宿主机文件 owner 和 mode：API 数据库密码、迁移数据库密码、支付密钥环和交付密钥环必须由 UID/GID 1000 读取，建议 owner=`1000:1000`、mode=`0400`；数据库 bootstrap 密码只供 PostgreSQL 初始化和本机角色 bootstrap 使用，可保持 root-owned `0400`。进程内仍会用 `O_NOFOLLOW`、普通单链接文件和严格 mode 校验阻止链接替换、宽权限及 `*_FILE`/明文冲突。
+
+Distroless API 保持无 shell。Trust Store 的进程间内核锁使用镜像中单独复制的固定版 `flock` 运维二进制；备份脚本从已停止 API 容器取得项目卷，通过 digest 固定的 PostgreSQL 镜像、UID/GID 1000 且禁网的临时工具容器归档。恢复验收脚本只允许显式隔离 `_test` 数据库，并用同一受限工具容器解包，不把 shell 或 tar 安装回 API。
 
 首次安装先验证签名发行清单和授权配置，然后通过本机 `license-trust-head:init` 获取并验证固定 issuer/offline-root 签名的 Trust Bundle，只有确认其版本达到发行最低值并与数据库 singleton trust head 一致后才能初始化信任状态。缺少生产配置、bundle 或离线根时新订单/充值继续 fail closed。
 
