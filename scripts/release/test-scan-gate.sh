@@ -51,7 +51,7 @@ set -e
 jq -e '.gate == "blocked" and .high_critical_count == 1 and
   .vulnerabilities[0] == {cve:"CVE-2099-12345",component:"libcurl",version:"8.10.1-r0",severity:"HIGH",fixed_version:"8.10.2-r0"} and
   .secret_findings[0].rule_id == "private-key"' "$temporary_root/reports/api-amd64.json" >/dev/null
-if rg -q 'RAW-SECRET-MUST-NOT-APPEAR' "$temporary_root/reports/api-amd64.json"; then
+if grep -q 'RAW-SECRET-MUST-NOT-APPEAR' "$temporary_root/reports/api-amd64.json"; then
   echo 'Sanitized Trivy JSON leaked the raw secret match.' >&2
   exit 1
 fi
@@ -114,7 +114,7 @@ promotion_output="$(PATH="$temporary_root/mock-promote:$PATH" \
   "$repo_root/scripts/release/promote-scanned-oci-image.sh" "$source_ref" ghcr.io/owner/aikayun-api \
   0.1.0-rc.1 "$reports" "$PROMOTION_WORKDIR" "quay.io/skopeo/stable@sha256:$(printf 'b%.0s' {1..64})")"
 [[ "$promotion_output" == "$PROMOTION_EXPECTED_DIGEST" ]]
-rg -q -- '--all --preserve-digests' "$PROMOTION_DOCKER_LOG" || {
+grep -Fq -- '--all --preserve-digests' "$PROMOTION_DOCKER_LOG" || {
   echo 'OCI promotion did not copy all platforms with digest preservation.' >&2
   exit 1
 }
