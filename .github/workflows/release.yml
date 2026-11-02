@@ -163,3 +163,11 @@ jobs:
           AIKAYUN_RELEASE_VERSION: ${{ inputs.version }}
           AIKAYUN_RELEASE_CONFIRMATION: ${{ inputs.confirmation }}
         run: scripts/release/build-release-candidate.sh "$AIKAYUN_RELEASE_VERSION" "$AIKAYUN_RELEASE_CONFIRMATION"
+      - name: Preserve sanitized Trivy reports for blocked candidates
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: aikayun-release-scan-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/aikayun-release-scan-reports-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: ignore
+          retention-days: 7

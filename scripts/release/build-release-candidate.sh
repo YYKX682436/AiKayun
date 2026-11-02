@@ -12,13 +12,20 @@ postgres_image='docker.io/library/postgres@sha256:77f585114c32fbca283dc835b0596f
 caddy_image='docker.io/library/caddy@sha256:e70b164da81ef698b3ad19af799ea6086ce6d9e48ed4079eb9fe26f6fbf14ee5'
 syft_image='anchore/syft@sha256:825cad3a952c87676a6d07e9a3bb05ac9c401d598360070e970aa46d54c1727e'
 trivy_image='aquasec/trivy@sha256:33f816d414b9d582d25bb737ffa4a632ae34e222f7ec1b50252cef0ce2266006'
+skopeo_image='quay.io/skopeo/stable@sha256:87a0dd8d9a093c87681706a2cb8ae51757af8c12340f04ab024c85badc6dcc07'
 owner="${GITHUB_REPOSITORY_OWNER,,}"
 release_tag="v${version}"
 api_repository="ghcr.io/${owner}/aikayun-api"
 web_repository="ghcr.io/${owner}/aikayun-web"
 bundle_repository="ghcr.io/${owner}/aikayun-release-bundle"
+staging_api_repository="ghcr.io/${owner}/aikayun-staging-api"
+staging_web_repository="ghcr.io/${owner}/aikayun-staging-web"
+staging_bundle_repository="ghcr.io/${owner}/aikayun-staging-release-bundle"
+staging_tag="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
 work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/aikayun-release-${version//[^A-Za-z0-9.-]/_}.XXXXXX")"
+scan_report_dir="${RUNNER_TEMP:-/tmp}/aikayun-release-scan-reports-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+export DOCKER_CONFIG="$work/docker-config"
 export AIKAYUN_GO_LICENSE_CACHE_DIR="$work/go-license-cache"
 release_key_file="$work/release-signing-key.pem"
 registry_logged_in=0
@@ -29,6 +36,7 @@ cleanup() {
   unset GH_TOKEN
   if [[ "$registry_logged_in" == 1 ]]; then docker logout ghcr.io >/dev/null 2>&1 || true; fi
   rm -f "$release_key_file"
+  if [[ "$status" == 0 ]]; then rm -rf "$scan_report_dir"; fi
   rm -rf "$work"
   return "$status"
 }
@@ -45,6 +53,9 @@ node --input-type=module -e 'import { isCanonicalReleaseSemVer } from "./apps/ap
   fail 'Release version must be canonical OCI-compatible SemVer without build metadata.'
 [[ "$confirmation" == "PUBLISH-${version}" ]] || fail 'Release confirmation text does not match the requested version.'
 [[ "${GITHUB_REPOSITORY,,}" == 'yykx682436/aikayun' ]] || fail 'Unexpected GitHub source repository.'
+[[ ! -e "$scan_report_dir" ]] || fail 'A scan-report directory for this workflow attempt already exists.'
+mkdir -m 0700 "$scan_report_dir"
+mkdir -m 0700 "$DOCKER_CONFIG"
 for name in AIKAYUN_RELEASE_SIGNING_KEY_PEM AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD AIKAYUN_RELEASE_PUBLIC_KEY_JWK \
   AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 AIKAYUN_PRODUCTION_LICENSE_ISSUER AIKAYUN_PRODUCTION_LICENSE_ROOT_KID \
   AIKAYUN_LICENSE_CENTER_SIGNER_KIDS AIKAYUN_RELEASE_ORIGIN AIKAYUN_RELEASE_PUBLISH_URL \
@@ -99,6 +110,12 @@ else
 fi
 printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin >/dev/null
 registry_logged_in=1
+owner_type="$(gh api "/users/${GITHUB_REPOSITORY_OWNER}" --jq .type)"
+for package in aikayun-staging-api aikayun-staging-web aikayun-staging-release-bundle; do
+  if [[ "$owner_type" == Organization ]]; then path="/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}/visibility"; else path="/user/packages/container/${package}/visibility"; fi
+  visibility="$(GH_TOKEN="$AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN" gh api "$path" --jq .visibility)"
+  [[ "$visibility" == private ]] || fail "The required staging package must already exist and remain private: $package"
+done
 for repository in "$api_repository" "$web_repository" "$bundle_repository"; do
   set +e
   docker manifest inspect "${repository}:${version}" > "$work/tag-check.stdout" 2> "$work/tag-check.stderr"
@@ -119,8 +136,6 @@ git -C "$source_root" tag -a "$release_tag" -m "AiKayun ${version} immutable rel
 git -C "$source_root" push origin "refs/tags/${release_tag}"
 
 build_time="$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')"
-api_tag="${api_repository}:${version}"
-web_tag="${web_repository}:${version}"
 mkdir -p "$work/support" "$work/sbom" "$work/notices" "$work/inspection" "$work/trivy-cache"
 
 build_args=(--build-arg "AIKAYUN_RELEASE_ID=${release_id}" --build-arg "AIKAYUN_RELEASE_VERSION=${version}" \
@@ -131,16 +146,18 @@ docker buildx build --platform linux/amd64,linux/arm64 --push --sbom=true --prov
   "${build_args[@]}" --build-arg AIKAYUN_REQUIRE_LICENSE_CONFIG=true \
   --build-arg "AIKAYUN_PRODUCTION_LICENSE_ISSUER=${AIKAYUN_PRODUCTION_LICENSE_ISSUER}" \
   --build-arg "AIKAYUN_PRODUCTION_LICENSE_ROOT_KID=${AIKAYUN_PRODUCTION_LICENSE_ROOT_KID}" \
-  --tag "$api_tag" -f "$source_root/apps/api/Dockerfile" "$source_root"
+  --tag "${staging_api_repository}:${staging_tag}" -f "$source_root/apps/api/Dockerfile" "$source_root"
 docker buildx build --platform linux/amd64,linux/arm64 --push --sbom=true --provenance=false \
   --metadata-file "$work/web-build-metadata.json" "${build_args[@]}" \
-  --tag "$web_tag" -f "$source_root/apps/web/Dockerfile" "$source_root"
+  --tag "${staging_web_repository}:${staging_tag}" -f "$source_root/apps/web/Dockerfile" "$source_root"
 api_index_digest="$(jq -er '.["containerimage.digest"] | select(test("^sha256:[a-f0-9]{64}$"))' "$work/api-build-metadata.json")"
 web_index_digest="$(jq -er '.["containerimage.digest"] | select(test("^sha256:[a-f0-9]{64}$"))' "$work/web-build-metadata.json")"
+api_staging_index_ref="${staging_api_repository}@${api_index_digest}"
+web_staging_index_ref="${staging_web_repository}@${web_index_digest}"
 api_index_ref="${api_repository}@${api_index_digest}"
 web_index_ref="${web_repository}@${web_index_digest}"
-docker buildx imagetools inspect --raw "$api_index_ref" > "$work/api-index.json"
-docker buildx imagetools inspect --raw "$web_index_ref" > "$work/web-index.json"
+docker buildx imagetools inspect --raw "$api_staging_index_ref" > "$work/api-index.json"
+docker buildx imagetools inspect --raw "$web_staging_index_ref" > "$work/web-index.json"
 docker buildx imagetools inspect --raw "$postgres_image" > "$work/postgres-index.json"
 docker buildx imagetools inspect --raw "$caddy_image" > "$work/caddy-index.json"
 
@@ -158,10 +175,10 @@ for platform in linux/amd64 linux/arm64; do
   arch="${platform#linux/}"
   for image_name in api web postgres caddy; do
     case "$image_name:$arch" in
-      api:amd64) repository="$api_repository"; child="$api_amd64" ;;
-      api:arm64) repository="$api_repository"; child="$api_arm64" ;;
-      web:amd64) repository="$web_repository"; child="$web_amd64" ;;
-      web:arm64) repository="$web_repository"; child="$web_arm64" ;;
+      api:amd64) repository="$staging_api_repository"; child="$api_amd64" ;;
+      api:arm64) repository="$staging_api_repository"; child="$api_arm64" ;;
+      web:amd64) repository="$staging_web_repository"; child="$web_amd64" ;;
+      web:arm64) repository="$staging_web_repository"; child="$web_arm64" ;;
       postgres:amd64) repository='docker.io/library/postgres'; child="$postgres_amd64" ;;
       postgres:arm64) repository='docker.io/library/postgres'; child="$postgres_arm64" ;;
       caddy:amd64) repository='docker.io/library/caddy'; child="$caddy_amd64" ;;
@@ -174,12 +191,8 @@ for platform in linux/amd64 linux/arm64; do
     docker save --output "$tar_path" "$image_ref"
     docker run --rm -v "$work:/work" "$syft_image" \
       "docker-archive:/work/$(basename "$tar_path")" -o "cyclonedx-json=/work/sbom/$(basename "$sbom_path")"
-    docker run --rm -v "$work:/work" -v "$work/trivy-cache:/root/.cache/trivy" "$trivy_image" \
-      image --input "/work/$(basename "$tar_path")" --scanners vuln --severity HIGH,CRITICAL \
-      --exit-code 1 --format table > "$work/${image_name}-${arch}-trivy.txt"
-    docker run --rm -v "$work:/work" -v "$work/trivy-cache:/root/.cache/trivy" "$trivy_image" \
-      image --input "/work/$(basename "$tar_path")" --scanners secret --exit-code 1 --format table \
-      > "$work/${image_name}-${arch}-secret-scan.txt"
+    "$source_root/scripts/release/scan-oci-image.sh" "$image_name" "$platform" "$image_ref" \
+      "$tar_path" "$trivy_image" "$work" "$scan_report_dir"
     chmod 0644 "$sbom_path"
     "$source_root/scripts/release/inspect-oci-image.sh" "$image_ref" "$platform" \
       "$work/inspection/${image_name}-${arch}"
@@ -213,7 +226,7 @@ for platform in linux/amd64 linux/arm64; do
 done
 
 for platform in linux/amd64 linux/arm64; do
-  "$source_root/scripts/release/test-runtime-platform.sh" "$platform" "$api_index_ref" "$web_index_ref" \
+  "$source_root/scripts/release/test-runtime-platform.sh" "$platform" "$api_staging_index_ref" "$web_staging_index_ref" \
     '202611010005_trusted_bundle_head'
 done
 migration_path="$work/migration-checksums.json"
@@ -287,14 +300,31 @@ fi
 docker buildx build --platform linux/amd64,linux/arm64 --push --provenance=false \
   --metadata-file "$work/bundle-build-metadata.json" \
   --build-arg "AIKAYUN_RELEASE_ID=${release_id}" --build-arg "AIKAYUN_RELEASE_VERSION=${version}" \
-  --build-arg "AIKAYUN_SOURCE_COMMIT=${GITHUB_SHA}" --tag "${bundle_repository}:${version}" \
+  --build-arg "AIKAYUN_SOURCE_COMMIT=${GITHUB_SHA}" --tag "${staging_bundle_repository}:${staging_tag}" \
   -f "$source_root/apps/api/scripts/release/ReleasePackage.Dockerfile" "$release_dir"
 bundle_digest="$(jq -er '.["containerimage.digest"] | select(test("^sha256:[a-f0-9]{64}$"))' "$work/bundle-build-metadata.json")"
+bundle_staging_ref="${staging_bundle_repository}@${bundle_digest}"
+"$source_root/scripts/release/extract-oci-bundle.sh" "$bundle_staging_ref" \
+  "$work/bundle-extracted" "$version" >/dev/null
+diff -qr "$release_dir" "$work/bundle-extracted" >/dev/null || fail 'Extracted OCI bundle differs from the verified release package.'
+node "$work/bundle-extracted/release-verifier.mjs" "$work/bundle-extracted/release-manifest.json" \
+  "$work/bundle-extracted/release-manifest.jws" "$work/bundle-extracted/release-signing-root.jwk.json" \
+  > "$work/extracted-bundle-jws-verification.json"
+node "$work/bundle-extracted/verify-artifacts.mjs" "$work/bundle-extracted/release-manifest.json" \
+  "$work/bundle-extracted" > "$work/extracted-bundle-artifact-verification.json"
+
+api_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.sh" \
+  "$api_staging_index_ref" "$api_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
+web_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.sh" \
+  "$web_staging_index_ref" "$web_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
+bundle_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.sh" \
+  "$bundle_staging_ref" "$bundle_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
+[[ "$api_promoted_digest" == "$api_index_digest" && "$web_promoted_digest" == "$web_index_digest" && \
+  "$bundle_promoted_digest" == "$bundle_digest" ]] || fail 'OCI promotion did not preserve the verified staging digests.'
 cosign sign --yes "$api_index_ref" >/dev/null
 cosign sign --yes "$web_index_ref" >/dev/null
 cosign sign --yes "${bundle_repository}@${bundle_digest}" >/dev/null
 
-owner_type="$(gh api "/users/${GITHUB_REPOSITORY_OWNER}" --jq .type)"
 for package in aikayun-api aikayun-web aikayun-release-bundle; do
   if [[ "$owner_type" == Organization ]]; then path="/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}/visibility"; else path="/user/packages/container/${package}/visibility"; fi
   visibility="$(GH_TOKEN="$AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN" gh api --method PATCH "$path" -f visibility=public --jq .visibility)"

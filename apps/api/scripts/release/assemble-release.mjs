@@ -26,6 +26,7 @@ if (/\blatest\b/.test(compose) || /\bbuild\s*:/u.test(compose)) throw new Error(
 await writeFile(join(output, 'compose.yaml'), compose, { flag: 'wx', mode: 0o644 })
 await cp(new URL('../../../../deploy/Caddyfile', import.meta.url), join(output, 'deploy/Caddyfile'))
 await cp(new URL('../../../../deploy/bootstrap-production-db-roles.sh', import.meta.url), join(output, 'deploy/bootstrap-production-db-roles.sh'))
+await cp(new URL('../../../../scripts/release/extract-oci-bundle.sh', import.meta.url), join(output, 'extract-release-bundle.sh'))
 await cp(migrationChecksumsPath, join(output, 'migration-checksums.json'))
 await writeFile(join(output, 'license-offline-root.jwk.json'), `${JSON.stringify(config.offline_root.publicJwk)}\n`, { flag: 'wx', mode: 0o644 })
 for (const entry of await readdir(supportDirectory, { withFileTypes: true })) {
@@ -53,6 +54,7 @@ for (const image of ['api', 'web', 'postgres', 'caddy']) {
 await readFile(join(output, 'release-verifier.mjs'))
 await readFile(join(output, 'verify-artifacts.mjs'))
 await readFile(join(output, 'release-signing-root.jwk.json'))
+await readFile(join(output, 'extract-release-bundle.sh'))
 
 const releaseIndex = {
   schema: 1,
@@ -76,8 +78,9 @@ await writeFile(join(output, 'README.md'), [
   '1. Verify `release-manifest.cosign.bundle` with Cosign, the Sigstore trust root and the published release workflow identity.',
   '2. Verify `release-manifest.json` and its detached JWS with `release-signing-root.jwk.json` using `release-verifier.mjs`; step 1 authenticates this JWS root.',
   '3. Compare every artifact SHA-256 and every OCI image reference with the signed manifest before using `compose.yaml`.',
-  '4. Set the required HTTPS hostname and create secret files with mode 0400 or 0600. Database, payment and delivery secrets read by API/migration must be owned by UID/GID 1000; file-based Compose secrets preserve host ownership and mode. The PostgreSQL bootstrap password can remain root-owned. Never store the authorization root private key in this bundle.',
-  '5. Use only the image digests rendered into `compose.yaml`; do not replace them with tags.',
+  '4. Bootstrap bundle extraction on Linux with Docker using the digest-pinned pull/create/cp interface. The signed HTTPS artifact `extract-release-bundle.sh` provides that interface without Node, pnpm or source; it is also included in the OCI payload for later installer runs.',
+  '5. Set the required HTTPS hostname and create secret files with mode 0400 or 0600. Database, payment and delivery secrets read by API/migration must be owned by UID/GID 1000; file-based Compose secrets preserve host ownership and mode. The PostgreSQL bootstrap password can remain root-owned. Never store the authorization root private key in this bundle.',
+  '6. Use only the image digests rendered into `compose.yaml`; do not replace them with tags.',
   '',
   'The signed release index and artifacts are served from the HTTPS download location recorded in the signed manifest and index.',
   '',

@@ -10,13 +10,15 @@ GHCR 容器包名为：
 - `ghcr.io/yykx682436/aikayun-web`
 - `ghcr.io/yykx682436/aikayun-release-bundle`
 
-客户从 release bundle OCI 镜像取出 `release-manifest.json`、分离式 JWS、Cosign bundle、digest 固定的 Compose、Caddy 配置、DB role bootstrap、迁移 checksum、逐架构 SBOM、第三方 NOTICE 和 release verifier。取包只需要公开 GHCR 匿名拉取权限；两个 Git 源码仓库保持 Private。bundle 镜像不运行应用代码，可用 `docker create` 和 `docker cp` 获取文件。
+客户从 release bundle OCI 镜像取出 `release-manifest.json`、分离式 JWS、Cosign bundle、digest 固定的 Compose、Caddy 配置、DB role bootstrap、迁移 checksum、逐架构 SBOM、第三方 NOTICE、release verifier 和 `extract-release-bundle.sh`。首次引导可从签名 HTTPS release 目录取得并校验该 shell artifact，再由无源码安装器复用其 digest 固定提取接口；脚本底层使用 Docker pull/create/cp，不运行 bundle 代码，且也放在 OCI payload 内供后续直接调用。取包只需要公开 GHCR 匿名拉取权限；两个 Git 源码仓库保持 Private。
 
 版本清单的 schema、字节规范化、ES256 分离式 JWS 签名/验签及篡改测试位于 `apps/api/scripts/release/manifest.mjs`。JWS release key 必须是固定的 P-256 密钥，公钥由受保护的 release 环境固定；每版 manifest 和 bundle OCI 另外由 Cosign GitHub OIDC 身份签名，API/Web OCI index 也签名。Cosign 身份固定为本仓库的 `release.yml` `main` workflow。release key、Cosign workflow 身份与授权中心的在线/离线签名密钥用途分离；签名清单包含授权中心当前在线 signer KID，签名与离线验证都会拒绝 release root 与任一授权 key 重用。独立 `release-verifier.mjs` 可验 JWS，`verify-artifacts.mjs` 会拒绝符号链接并逐个核对签名清单列出的文件大小和 SHA-256。
 
 清单绑定源码 commit、build UTC 时间、SemVer、release ID、两个实际平台的 OCI 子 digest、SBOM SHA-256、所有下载文件 SHA-256、授权 issuer/root/minimum bundle version、迁移文件清单 SHA-256、数据库可读/可写 head 和兼容路径。镜像内只嵌入 release ID、版本和经过生产 issuer/root pin 验证的授权配置；最终清单再绑定镜像 index digest，因此不再有 API 镜像 digest 与 `release_manifest_sha256` 自指问题。
 
 `release-index.json` 使用 HTTPS origin 下 `/releases/<version>/` 路径。独立发布端必须匿名提供静态文件并返回 `.well-known/aikayun-release.json`，其中声明 schema、产品、release 路径、GHCR registry 和 `http-put-if-none-match-v1` 发布协议。发布端的 HTTPS PUT 接口必须对每个文件执行 `If-None-Match: *` 创建，不允许覆盖，并且发布后必须可匿名下载逐字节回读。`release.yml` 先验证 marker 和空版本路径，再上传清单；`release-index.json` 最后写入，作为版本可用的发布标记。当前没有配置发行域名或该 HTTPS endpoint，因此本机/CI 构建只能作为隔离候选验证，不能报告已向客户发布。
+
+API/Web 镜像只推送到 `aikayun-staging-api`、`aikayun-staging-web` 私有 GHCR 包，release workflow 在构建前核实这两个包以及 `aikayun-staging-release-bundle` 已存在并保持 Private。八个平台镜像的 Trivy vuln/secret 扫描、运行时验收、清单签验和 bundle OCI 提取校验均完成后，固定版本标签才由 Skopeo `--all --preserve-digests` 晋级到最终包；脚本核对 staging manifest、copy 返回值和目标 manifest 的 digest 一致。失败时 release 临时目录清理，脱敏扫描 JSON 保存在 runner 临时区并由 workflow 以 7 天期限上传，漏洞不例外、不降级。
 
 ## 构建与签名门禁
 
@@ -30,10 +32,10 @@ GHCR 容器包名为：
 
 - 依赖审计中任何 High 或 Critical 漏洞阻断；Trivy 的 CRITICAL/HIGH 漏洞阻断，包括尚无修复版本的项目，直到修复或由独立发行审核更新策略。
 - 任一 npm 生产依赖缺 SPDX/license 声明或许可证文本时阻断；OS/runtime SBOM 组件必须有 SPDX license ID，或有随镜像导出的对应版权/许可证文件，否则阻断。
-- 任一平台构建、迁移、API readiness、DB least-privilege、SSR、fail-closed 授权检查、层/最终文件检查、SBOM 或签名验签失败时阻断。
+- 任一平台构建、迁移、API readiness、DB least-privilege、SSR、fail-closed 授权检查、层/最终文件检查、SBOM、签名验签或 OCI bundle 提取文件核对失败时阻断。
 - 没有受保护的授权生产配置、release signing key、公钥固定值、授权 signer KID 列表、匿名 GHCR 或独立 HTTPS release origin 时阻断，不创建正式商业签名或发布记录。
 
-目前只检测到 `LICENSE_CENTER_READ_TOKEN` 仓库 secret；没有配置正式 release signing key、生产授权配置、release 公钥 pin、production issuer/root KID、授权 signer KID 列表、受保护的 GHCR 包管理权限、受控 `aikayun-release` reviewer 环境与 `v*` tag ruleset、HTTPS release origin、静态上传 endpoint 或上传凭据。两个源码仓库在本轮初始核对时均为 Private。GitHub API 当前不允许这个 Private 仓库读取或设置 `main` 分支保护和 tag ruleset，并提示需启用支持 Private 仓库保护的 GitHub 计划；`aikayun-release` environment 也不存在。发行门禁保留这些检查，继续保持 fail closed，不把源码仓库改成公开，也不生成测试密钥冒充正式签名。
+目前只检测到 `LICENSE_CENTER_READ_TOKEN` 仓库 secret；没有配置正式 release signing key、生产授权配置、release 公钥 pin、production issuer/root KID、授权 signer KID 列表、受保护的 GHCR 包管理权限、受控 `aikayun-release` reviewer 环境与 `v*` tag ruleset、HTTPS release origin、静态上传 endpoint 或上传凭据。首次运行前还必须由受控管理员创建三个 staging GHCR 包并设为 Private。两个源码仓库在本轮初始核对时均为 Private。GitHub API 当前不允许这个 Private 仓库读取或设置 `main` 分支保护和 tag ruleset，并提示需启用支持 Private 仓库保护的 GitHub 计划；`aikayun-release` environment 也不存在。发行门禁保留这些检查，继续保持 fail closed，不把源码仓库改成公开，也不生成测试密钥冒充正式签名。
 
 2026-11-02 的本机扫描快照也阻止候选发行：API 与 Web 的四个平台镜像各自均为 0 个 High/Critical 漏洞。API 镜像为 Trust Store 内核锁携带 `/usr/bin/flock`；它来自固定 Debian `util-linux@2.41.5-0+deb13u1`，Syft 将该 ELF 包列入逐架构 SBOM，随镜像的 Debian copyright 校验副本进入 NOTICE，许可证未解析数仍为 0。固定 PostgreSQL 18 Alpine 镜像在 amd64、arm64 均为 28 个 High/Critical，包含 Alpine `brotli-libs`、`libcurl` 与 `gosu` 所带 Go 1.24.6 标准库问题；升级到官方 Caddy 2.11.7 后，两架构仍各有 10 个 High/Critical，涵盖 Alpine 系统包和 Caddy Go 依赖。官方 PostgreSQL 18 Trixie 变体扫描为 89 个 High/Critical，因此没有替换 Alpine 镜像。八个 API/Web/PostgreSQL/Caddy 平台镜像的 Trivy secret findings 均为 0；每个镜像的 CycloneDX SBOM 与 NOTICE 已生成，第三方许可证文本未解析数为 0。发行扫描无忽略文件和漏洞例外；必须使用更新的上游镜像或经独立审核的修复镜像，并在发布前重新完整扫描。该快照只记录当前依赖状态，不代替未来发行时的重新扫描。
 
