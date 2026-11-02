@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { randomBytes, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { request as httpsRequest } from 'node:https'
 import { createConnection, createServer, type LookupFunction } from 'node:net'
@@ -158,7 +158,6 @@ export async function createSignedBusinessLicense(input: {
     }
     const releaseConfig = await validateTrustedReleaseLicenseConfig({
       schema_version: 1, trust_configuration_id: randomUUID(), release_id: 'business-integration-test',
-      release_manifest_sha256: randomBytes(32).toString('base64url'),
       expected_center_issuer: info.issuer, expected_center_origin: info.origin,
       offline_root: { kid: info.root_kid, publicJwk: info.root_public_jwk }, minimum_bundle_version: '1',
     })

@@ -230,7 +230,6 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       schema_version: 1,
       trust_configuration_id: randomUUID(),
       release_id: 'test-3c-2b',
-      release_manifest_sha256: randomBytes(32).toString('base64url'),
       expected_center_issuer: info.issuer,
       expected_center_origin: info.origin,
       offline_root: { kid: info.root_kid, publicJwk: info.root_public_jwk },

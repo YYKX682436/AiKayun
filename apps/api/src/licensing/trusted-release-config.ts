@@ -1,15 +1,14 @@
 import { calculateJwkThumbprint } from 'jose'
 import { generatedTrustedReleaseLicenseConfig } from './trusted-release-license-config.generated.js'
+import { generatedReleaseIdentity } from './release-identity.generated.js'
 import { assertMinimumBundleVersion, type Ed25519PublicJwk, type TrustedOfflineRootPin } from './trust/trust-bundle.js'
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const digestPattern = /^[A-Za-z0-9_-]{43}$/
-
 export interface TrustedReleaseLicenseConfigInput {
   schema_version: 1
   trust_configuration_id: string
   release_id: string
-  release_manifest_sha256: string
   expected_center_issuer: string
   expected_center_origin: string
   offline_root: TrustedOfflineRootPin
@@ -39,12 +38,11 @@ export async function validateTrustedReleaseLicenseConfig(value: unknown): Promi
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Trusted release license config must be an object')
   const input = value as Record<string, unknown>
   exactKeys(input, [
-    'schema_version', 'trust_configuration_id', 'release_id', 'release_manifest_sha256',
+    'schema_version', 'trust_configuration_id', 'release_id',
     'expected_center_issuer', 'expected_center_origin', 'offline_root', 'minimum_bundle_version',
   ], 'trusted release license config')
   if (input.schema_version !== 1 || typeof input.trust_configuration_id !== 'string' || !uuidPattern.test(input.trust_configuration_id) ||
-    typeof input.release_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/.test(input.release_id) ||
-    typeof input.release_manifest_sha256 !== 'string' || !digestPattern.test(input.release_manifest_sha256)) {
+    typeof input.release_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/.test(input.release_id)) {
     throw new Error('Invalid trusted release identity')
   }
   const issuer = exactHttpsOrigin(input.expected_center_issuer, 'expected center issuer')
@@ -68,7 +66,6 @@ export async function validateTrustedReleaseLicenseConfig(value: unknown): Promi
     schema_version: 1,
     trust_configuration_id: input.trust_configuration_id,
     release_id: input.release_id,
-    release_manifest_sha256: input.release_manifest_sha256,
     expected_center_issuer: issuer,
     expected_center_origin: origin,
     offline_root: Object.freeze({ kid: rootKid, publicJwk: Object.freeze(publicJwk) }),
@@ -78,5 +75,9 @@ export async function validateTrustedReleaseLicenseConfig(value: unknown): Promi
 
 export async function loadEmbeddedTrustedReleaseLicenseConfig(): Promise<TrustedReleaseLicenseConfig | null> {
   if (generatedTrustedReleaseLicenseConfig === null) return null
-  return validateTrustedReleaseLicenseConfig(generatedTrustedReleaseLicenseConfig)
+  const config = await validateTrustedReleaseLicenseConfig(generatedTrustedReleaseLicenseConfig)
+  if (config.release_id !== generatedReleaseIdentity.release_id) throw new Error('Embedded release identity does not match trusted license configuration')
+  return config
 }
+
+export { generatedReleaseIdentity }

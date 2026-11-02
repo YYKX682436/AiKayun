@@ -1,15 +1,18 @@
-import { existsSync } from 'node:fs'
+import { constants as fsConstants, existsSync, fstatSync, openSync, readFileSync, closeSync } from 'node:fs'
+import { isIP } from 'node:net'
 import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { PoolConfig } from 'pg'
 
-const rootEnvCandidates = [
-  resolve(process.cwd(), '.env'),
-  resolve(process.cwd(), '../../.env'),
-  resolve(import.meta.dirname, '../../../.env'),
-]
-const rootEnvPath = rootEnvCandidates.find((path) => existsSync(path))
-if (rootEnvPath) process.loadEnvFile(rootEnvPath)
+if (process.env.NODE_ENV !== 'production') {
+  const rootEnvCandidates = [
+    resolve(process.cwd(), '.env'),
+    resolve(process.cwd(), '../../.env'),
+    resolve(import.meta.dirname, '../../../.env'),
+  ]
+  const rootEnvPath = rootEnvCandidates.find((path) => existsSync(path))
+  if (rootEnvPath) process.loadEnvFile(rootEnvPath)
+}
 
 function repositoryRoot(): string | undefined {
   const candidates = [
@@ -33,7 +36,7 @@ export interface AppConfig {
   port: number
   publicOrigin: string
   cookieSecure: boolean
-  trustProxy: boolean
+  trustProxy: boolean | string[]
   sessionTtlSeconds: number
   mediaRoot: string
   privateFileRoot: string
@@ -56,6 +59,58 @@ function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (value === 'true') return true
   if (value === 'false') return false
   throw new Error('Boolean environment values must be true or false')
+}
+
+function configuredSecret(env: NodeJS.ProcessEnv, name: string, maxBytes = 64 * 1024): string | undefined {
+  const direct = env[name]
+  const file = env[`${name}_FILE`]
+  if (direct !== undefined && file !== undefined) throw new Error(`CONFIG_CONFLICT: set only one of ${name} and ${name}_FILE`)
+  if (direct !== undefined) return direct
+  if (file === undefined) return undefined
+  if (!isAbsolute(file)) throw new Error(`${name}_FILE must be an absolute path`)
+  let descriptor: number | undefined
+  try {
+    const noFollow = process.platform === 'win32' ? 0 : fsConstants.O_NOFOLLOW
+    descriptor = openSync(file, fsConstants.O_RDONLY | noFollow)
+    const info = fstatSync(descriptor)
+    const mode = info.mode & 0o777
+    if (!info.isFile() || info.size > maxBytes || (process.platform !== 'win32' &&
+      (info.nlink !== 1 || (mode !== 0o400 && mode !== 0o600)))) {
+      throw new Error(`${name}_FILE must be a bounded, single-link regular file with mode 0400 or 0600`)
+    }
+    return readFileSync(descriptor, 'utf8').trimEnd()
+  } catch (error) {
+    if (error instanceof Error && error.message.includes(`${name}_FILE`)) throw error
+    throw new Error(`Unable to read ${name}_FILE`, { cause: error })
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+  }
+}
+
+function parseTrustedProxyCidrs(value: string): string[] {
+  const entries = value.split(',').map(entry => entry.trim()).filter(Boolean)
+  if (entries.length < 1 || entries.length > 32) throw new Error('TRUST_PROXY_CIDRS must contain 1 to 32 exact IPs or CIDRs')
+  for (const entry of entries) {
+    const [address, prefix, extra] = entry.split('/')
+    const family = address ? isIP(address) : 0
+    const maxPrefix = family === 4 ? 32 : family === 6 ? 128 : -1
+    if (family === 0 || extra !== undefined || (prefix !== undefined &&
+      (!/^(0|[1-9][0-9]{0,2})$/.test(prefix) || Number(prefix) > maxPrefix))) {
+      throw new Error('TRUST_PROXY_CIDRS entries must be valid IP addresses or CIDRs')
+    }
+    if (prefix !== undefined && Number(prefix) === 0) throw new Error('TRUST_PROXY_CIDRS must not trust every address')
+  }
+  return [...new Set(entries)]
+}
+
+function databasePassword(env: NodeJS.ProcessEnv): string | undefined {
+  const choices = ['PGPASSWORD', 'POSTGRES_PASSWORD']
+  const configured = choices.flatMap(name => [env[name] !== undefined ? name : undefined,
+    env[`${name}_FILE`] !== undefined ? `${name}_FILE` : undefined].filter((value): value is string => value !== undefined))
+  if (configured.length > 1) throw new Error('CONFIG_CONFLICT: set only one PostgreSQL password source')
+  if (configured.length === 0) return undefined
+  const selected = configured[0]!
+  return selected.endsWith('_FILE') ? configuredSecret(env, selected.slice(0, -5)) : env[selected]
 }
 
 function parsePaymentCredentialKeyRing(value: string | undefined): PaymentCredentialKeyRing | null {
@@ -134,6 +189,7 @@ function parseCodePoolEncryptionKeyRing(value: string | undefined): PaymentCrede
 
 export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const nodeEnv = env.NODE_ENV ?? 'development'
+  if (!['development', 'test', 'production'].includes(nodeEnv)) throw new Error('NODE_ENV must be development, test, or production')
   const origin = env.PUBLIC_ORIGIN ?? 'http://localhost:3000'
   const parsedOrigin = new URL(origin)
   if (parsedOrigin.origin !== origin) {
@@ -141,10 +197,17 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
 
   const cookieSecure = parseBoolean(env.COOKIE_SECURE, nodeEnv === 'production')
-  const localHttpOrigin = parsedOrigin.protocol === 'http:'
-    && ['localhost', '127.0.0.1'].includes(parsedOrigin.hostname)
-  if (nodeEnv === 'production' && !cookieSecure && !localHttpOrigin) {
-    throw new Error('COOKIE_SECURE must be true in production')
+  if (nodeEnv === 'production' && (parsedOrigin.protocol !== 'https:' || !cookieSecure)) {
+    throw new Error('Production requires an HTTPS PUBLIC_ORIGIN and COOKIE_SECURE=true')
+  }
+  if (nodeEnv === 'production' && (isIP(parsedOrigin.hostname) || parsedOrigin.hostname.endsWith('.localhost') ||
+    /(^|\.)(test|example|invalid|local)$/i.test(parsedOrigin.hostname) ||
+    /(^|\.)example\.(com|net|org)$/i.test(parsedOrigin.hostname))) {
+    throw new Error('Production PUBLIC_ORIGIN must use a non-test public DNS hostname')
+  }
+  if (nodeEnv === 'production') {
+    const testOnlyValues = ['TEST_DATABASE_URL', 'PAYMENT_PROVIDER_BASE_URL_FOR_TESTS', 'SUPPLIER_HTTP_TEST_ALLOWLIST']
+    if (testOnlyValues.some(name => env[name] !== undefined)) throw new Error('Test-only configuration is forbidden in production')
   }
 
   const configuredMediaRoot = env.MEDIA_ROOT
@@ -204,14 +267,39 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error('LICENSE_PENDING_KEY_ROOT must use its own API-only storage namespace outside the repository')
   }
 
-  const database: PoolConfig = env.DATABASE_URL
-    ? { connectionString: env.DATABASE_URL }
+  if (nodeEnv === 'production') {
+    const requiredRoots: Array<[string, string | undefined, string]> = [
+      ['MEDIA_ROOT', configuredMediaRoot, mediaRoot],
+      ['PRIVATE_FILE_ROOT', configuredPrivateFileRoot, privateFileRoot],
+      ['INSTANCE_IDENTITY_ROOT', configuredIdentityRoot, identityRoot],
+      ['LICENSE_TRUST_STORE_ROOT', configuredLicenseTrustStoreRoot, licenseTrustStoreRoot],
+      ['LICENSE_PENDING_KEY_ROOT', configuredLicensePendingKeyRoot, licensePendingKeyRoot],
+    ]
+    for (const [name, configured, path] of requiredRoots) {
+      if (!configured || !isWithin('/var/lib/aikayun', path) || path === '/var/lib/aikayun') {
+        throw new Error(`${name} must be explicitly set to an isolated path under /var/lib/aikayun in production`)
+      }
+    }
+  }
+
+  const databaseUrl = configuredSecret(env, 'DATABASE_URL', 16 * 1024)
+  const hasSplitDatabaseSettings = ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD', 'PGPASSWORD_FILE',
+    'POSTGRES_DB', 'POSTGRES_USER', 'POSTGRES_PASSWORD', 'POSTGRES_PASSWORD_FILE']
+    .some(name => env[name] !== undefined)
+  if (nodeEnv === 'production' && databaseUrl !== undefined && hasSplitDatabaseSettings) {
+    throw new Error('CONFIG_CONFLICT: set DATABASE_URL or PostgreSQL host fields, not both')
+  }
+  if (nodeEnv === 'production' && env.DATABASE_URL !== undefined && env.DATABASE_URL_FILE !== undefined) {
+    throw new Error('CONFIG_CONFLICT: set only one of DATABASE_URL and DATABASE_URL_FILE')
+  }
+  const database: PoolConfig = databaseUrl !== undefined
+    ? { connectionString: databaseUrl }
     : {
         host: env.PGHOST ?? '127.0.0.1',
         port: env.PGPORT ? Number(env.PGPORT) : 5432,
         database: env.PGDATABASE ?? env.POSTGRES_DB ?? 'aikayun',
         user: env.PGUSER ?? env.POSTGRES_USER ?? 'aikayun',
-        password: env.PGPASSWORD ?? env.POSTGRES_PASSWORD,
+        password: databasePassword(env),
       }
 
   const supplierHttpTestAllowlist = env.SUPPLIER_HTTP_TEST_ALLOWLIST
@@ -230,13 +318,30 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     }
   }
 
+  const rawTrustProxy = env.TRUST_PROXY
+  const rawTrustProxyCidrs = env.TRUST_PROXY_CIDRS
+  if (rawTrustProxy !== undefined && rawTrustProxyCidrs !== undefined) {
+    throw new Error('CONFIG_CONFLICT: set TRUST_PROXY or TRUST_PROXY_CIDRS, not both')
+  }
+  let trustProxy: boolean | string[]
+  if (nodeEnv === 'production') {
+    if (rawTrustProxy !== undefined || rawTrustProxyCidrs === undefined) {
+      throw new Error('Production requires explicit TRUST_PROXY_CIDRS and does not accept boolean TRUST_PROXY')
+    }
+    trustProxy = parseTrustedProxyCidrs(rawTrustProxyCidrs)
+  } else if (rawTrustProxyCidrs !== undefined) {
+    trustProxy = parseTrustedProxyCidrs(rawTrustProxyCidrs)
+  } else {
+    trustProxy = parseBoolean(rawTrustProxy, false)
+  }
+
   return {
     nodeEnv,
     host: env.API_HOST ?? '127.0.0.1',
     port: env.API_PORT ? Number(env.API_PORT) : 3001,
     publicOrigin: origin,
     cookieSecure,
-    trustProxy: parseBoolean(env.TRUST_PROXY, false),
+    trustProxy,
     sessionTtlSeconds: 60 * 60 * 12,
     mediaRoot,
     privateFileRoot,
@@ -245,7 +350,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     licensePendingKeyRoot,
     supplierHttpTestAllowlist,
     database,
-    paymentCredentialKeyRing: parsePaymentCredentialKeyRing(env.PAYMENT_CREDENTIAL_KEY_RING),
-    codePoolEncryptionKeyRing: parseCodePoolEncryptionKeyRing(env.CODE_POOL_ENCRYPTION_KEY_RING),
+    paymentCredentialKeyRing: parsePaymentCredentialKeyRing(configuredSecret(env, 'PAYMENT_CREDENTIAL_KEY_RING')),
+    codePoolEncryptionKeyRing: parseCodePoolEncryptionKeyRing(configuredSecret(env, 'CODE_POOL_ENCRYPTION_KEY_RING')),
   }
 }

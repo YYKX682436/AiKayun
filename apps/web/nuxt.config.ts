@@ -1,5 +1,6 @@
 export default defineNuxtConfig({
   compatibilityDate: '2026-10-15',
+  sourcemap: { server: false, client: false },
   // Allows isolated Playwright servers to exercise separate deployment themes.
   buildDir: process.env.AIKAYUN_E2E_BUILD_DIR ?? '.nuxt',
   nitro: {

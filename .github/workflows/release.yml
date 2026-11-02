@@ -1,0 +1,165 @@
+name: Commercial release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Immutable OCI-compatible SemVer release version
+        required: true
+        default: 0.1.0-rc.1
+        type: string
+      confirmation:
+        description: Type PUBLISH-<version> after reviewing the source and protected release settings
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aikayun-commercial-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate source and frozen authorization center
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
+    services:
+      postgres:
+        image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+        env:
+          POSTGRES_USER: aikayun
+          POSTGRES_PASSWORD: ci-test-password
+          POSTGRES_DB: aikayun_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aikayun -d aikayun_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql://aikayun:ci-test-password@127.0.0.1:5432/aikayun_test
+      LICENSE_TEST_DATABASE_URL: postgres://license:license-test-only@127.0.0.1:5432/license_center_test
+      POSTGRES_USER: aikayun
+      POSTGRES_PASSWORD: ci-test-password
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996
+        with:
+          version: 10.29.3
+          run_install: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Install marketplace dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Wait for the regular main CI result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in $(seq 1 120); do
+            runs="$(gh api "/repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&per_page=20")"
+            run="$(jq -r '[.workflow_runs[] | select(.event == "push")] | sort_by(.run_number) | last // empty' <<<"$runs")"
+            if [[ -n "$run" ]]; then
+              status="$(jq -r '.status' <<<"$run")"
+              conclusion="$(jq -r '.conclusion // empty' <<<"$run")"
+              if [[ "$status" == completed && "$conclusion" == success ]]; then exit 0; fi
+              if [[ "$status" == completed ]]; then echo "Main CI concluded: $conclusion" >&2; exit 1; fi
+            fi
+            sleep 30
+          done
+          echo 'Timed out waiting for this commit’s regular main CI run.' >&2
+          exit 1
+      - name: Create isolated license-center validation database
+        run: |
+          docker run --rm --network host -e PGPASSWORD=ci-test-password \
+            postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873 \
+            psql -h 127.0.0.1 -U aikayun -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE license LOGIN CREATEDB PASSWORD 'license-test-only'" \
+            -c 'CREATE DATABASE license_center_test OWNER license'
+      - name: Check out the exact authorization-center source pinned for this release
+        env:
+          LICENSE_CENTER_READ_TOKEN: ${{ secrets.LICENSE_CENTER_READ_TOKEN }}
+        run: |
+          test -n "$LICENSE_CENTER_READ_TOKEN"
+          center_commit="$(tr -d '\n' < scripts/release/license-center-release-commit.txt)"
+          [[ "$center_commit" =~ ^[a-f0-9]{40}$ ]]
+          center_dir="$RUNNER_TEMP/aikayun-license-center-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export GIT_ASKPASS="$GITHUB_WORKSPACE/scripts/github-readonly-askpass.sh"
+          export GIT_TERMINAL_PROMPT=0
+          git clone --quiet --no-checkout https://github.com/YYKX682436/AiKayun-License.git "$center_dir"
+          git -C "$center_dir" checkout --quiet --detach "$center_commit"
+          test "$(git -C "$center_dir" rev-parse HEAD)" = "$center_commit"
+          printf 'LICENSE_CENTER_CHECKOUT=%s\n' "$center_dir" >> "$GITHUB_ENV"
+          (cd "$center_dir" && npm ci)
+          (cd "$center_dir" && npm run typecheck && npm run build && npm run build:release && npm test && npm run test:integration && npm audit --omit=dev --audit-level=high)
+      - name: Block high and critical marketplace dependency advisories
+        run: pnpm audit --audit-level high
+      - name: Verify the complete AiKayun application and PostgreSQL integration suite
+        run: pnpm verify
+      - name: Verify frozen ⑦-1C authorization protocol interoperability
+        env:
+          LICENSE_CENTER_READ_TOKEN: ${{ secrets.LICENSE_CENTER_READ_TOKEN }}
+        run: scripts/test-license-center-interop.sh
+      - name: Remove temporary license-center checkout
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/aikayun-license-center-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+
+  publish:
+    name: Build, sign and publish immutable candidate
+    needs: validate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    environment:
+      name: aikayun-release
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996
+        with:
+          version: 10.29.3
+          run_install: false
+      - name: Install locked release tooling
+        run: pnpm install --frozen-lockfile
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62
+        with:
+          cosign-release: v2.5.3
+      - name: Build, verify, sign and publish release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN: ${{ secrets.AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN }}
+          AIKAYUN_RELEASE_SIGNING_KEY_PEM: ${{ secrets.AIKAYUN_RELEASE_SIGNING_KEY_PEM }}
+          AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD: ${{ secrets.AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD }}
+          AIKAYUN_RELEASE_PUBLIC_KEY_JWK: ${{ vars.AIKAYUN_RELEASE_PUBLIC_KEY_JWK }}
+          AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64: ${{ secrets.AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 }}
+          AIKAYUN_PRODUCTION_LICENSE_ISSUER: ${{ vars.AIKAYUN_PRODUCTION_LICENSE_ISSUER }}
+          AIKAYUN_PRODUCTION_LICENSE_ROOT_KID: ${{ vars.AIKAYUN_PRODUCTION_LICENSE_ROOT_KID }}
+          AIKAYUN_LICENSE_CENTER_SIGNER_KIDS: ${{ vars.AIKAYUN_LICENSE_CENTER_SIGNER_KIDS }}
+          AIKAYUN_RELEASE_ORIGIN: ${{ vars.AIKAYUN_RELEASE_ORIGIN }}
+          AIKAYUN_RELEASE_PUBLISH_URL: ${{ vars.AIKAYUN_RELEASE_PUBLISH_URL }}
+          AIKAYUN_RELEASE_PUBLISH_TOKEN: ${{ secrets.AIKAYUN_RELEASE_PUBLISH_TOKEN }}
+          AIKAYUN_RELEASE_POLICY_READ_TOKEN: ${{ secrets.AIKAYUN_RELEASE_POLICY_READ_TOKEN }}
+          AIKAYUN_RELEASE_VERSION: ${{ inputs.version }}
+          AIKAYUN_RELEASE_CONFIRMATION: ${{ inputs.confirmation }}
+        run: scripts/release/build-release-candidate.sh "$AIKAYUN_RELEASE_VERSION" "$AIKAYUN_RELEASE_CONFIRMATION"

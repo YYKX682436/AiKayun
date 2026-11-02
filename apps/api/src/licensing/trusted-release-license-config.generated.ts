@@ -1,5 +1,2 @@
-/**
- * Release-pipeline insertion point for values taken from a verified, signed
- * release manifest. No production trust root has been issued yet.
- */
+/** Replaced with a validated production trust configuration by the protected release build. */
 export const generatedTrustedReleaseLicenseConfig: unknown = null

@@ -250,11 +250,16 @@ describe('customer authentication and storefront policy with PostgreSQL', () => 
 
   it('sets secure session and CSRF cookies when the API runs in production mode', async () => {
     const productionConfig = readConfig({
-      ...process.env,
       DATABASE_URL: testDatabaseUrl,
       NODE_ENV: 'production',
-      PUBLIC_ORIGIN: 'https://store.example.test',
+      PUBLIC_ORIGIN: 'https://www.iana.org',
       COOKIE_SECURE: 'true',
+      TRUST_PROXY_CIDRS: '127.0.0.1/32',
+      MEDIA_ROOT: '/var/lib/aikayun/media',
+      PRIVATE_FILE_ROOT: '/var/lib/aikayun/private-files',
+      INSTANCE_IDENTITY_ROOT: '/var/lib/aikayun/identity',
+      LICENSE_TRUST_STORE_ROOT: '/var/lib/aikayun/license-trust',
+      LICENSE_PENDING_KEY_ROOT: '/var/lib/aikayun/license-pending',
     })
     const productionApp = await createApp({ db, config: productionConfig, logger: false })
     try {
@@ -271,7 +276,7 @@ describe('customer authentication and storefront policy with PostgreSQL', () => 
         method: 'POST',
         url: '/api/v1/customer/auth/register',
         remoteAddress: nextRemoteAddress(),
-        headers: { ...customerHeaders(csrf), origin: 'https://store.example.test' },
+        headers: { ...customerHeaders(csrf), origin: 'https://www.iana.org' },
         payload: { username: 'secure-cookie-user', password: oldPassword },
       })
       expect(response.statusCode).toBe(201)

@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
@@ -39,17 +39,19 @@ jobs:
       SITE_ADDRESS: :80
       COMPOSE_FILE: compose.yaml:compose.e2e.yaml
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996
         with:
           version: 10.29.3
           run_install: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version-file: .node-version
           cache: pnpm
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
+      - name: Block high and critical dependency advisories
+        run: pnpm audit --audit-level high
       - name: Prepare frozen license center for isolated signed tests
         env:
           LICENSE_CENTER_READ_TOKEN: ${{ secrets.LICENSE_CENTER_READ_TOKEN }}

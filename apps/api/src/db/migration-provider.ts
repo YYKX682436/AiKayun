@@ -1,4 +1,7 @@
 import type { Migration, MigrationProvider } from 'kysely/migration'
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { adminAuthMigration } from './migrations/202610150001_admin_auth.js'
 import { productCatalogCoreMigration } from './migrations/202610160001_product_catalog_core.js'
 import { productSkuInvariantMigration } from './migrations/202610160002_product_sku_invariant.js'
@@ -60,7 +63,7 @@ import { trustedBundleHeadMigration } from './migrations/202611010005_trusted_bu
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
-    return {
+    const migrations: Record<string, Migration> = {
       '202610150001_admin_auth': adminAuthMigration,
       '202610160001_product_catalog_core': productCatalogCoreMigration,
       '202610160002_product_sku_invariant': productSkuInvariantMigration,
@@ -119,5 +122,35 @@ export class AppMigrationProvider implements MigrationProvider {
       '202611010004_license_renewal_retry': licenseRenewalRetryMigration,
       '202611010005_trusted_bundle_head': trustedBundleHeadMigration,
     }
+    verifyMigrationChecksums(migrations)
+    return migrations
+  }
+}
+
+function verifyMigrationChecksums(migrations: Record<string, Migration>): void {
+  const checksumPath = join(import.meta.dirname, 'migration-checksums.json')
+  if (!existsSync(checksumPath)) {
+    if (process.env.NODE_ENV === 'production') throw new Error('Production migration checksum manifest is missing')
+    return
+  }
+  const manifest = JSON.parse(readFileSync(checksumPath, 'utf8')) as {
+    schema?: unknown; migration_head?: unknown; migrations?: unknown
+  }
+  if (manifest.schema !== 1 || !Array.isArray(manifest.migrations) || typeof manifest.migration_head !== 'string') {
+    throw new Error('Migration checksum manifest schema is invalid')
+  }
+  const expectedNames = Object.keys(migrations).sort()
+  const entries = manifest.migrations as Array<{ name?: unknown; sha256?: unknown }>
+  if (entries.length !== expectedNames.length || manifest.migration_head !== expectedNames.at(-1)) {
+    throw new Error('Migration checksum manifest does not match the compiled migration registry')
+  }
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]
+    const name = expectedNames[index]
+    if (!entry || entry.name !== name || typeof entry.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(entry.sha256)) {
+      throw new Error('Migration checksum manifest entries are invalid or out of order')
+    }
+    const actual = createHash('sha256').update(readFileSync(join(import.meta.dirname, 'migrations', `${name}.js`))).digest('hex')
+    if (actual !== entry.sha256) throw new Error(`Compiled migration checksum mismatch: ${name}`)
   }
 }
