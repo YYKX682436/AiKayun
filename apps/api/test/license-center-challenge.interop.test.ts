@@ -181,12 +181,20 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     })
     centerProcess.stderr.setEncoding('utf8').on('data', (chunk) => { centerStderr += chunk })
     const ready = Date.now() + 30_000
+    let centerInfo: typeof info | undefined
     while (Date.now() < ready) {
       if (centerProcess.exitCode !== null || centerProcess.signalCode !== null) throw new Error(`Frozen authorization center failed to start: ${centerStderr}`)
-      try { await stat(infoPath); break } catch { await new Promise((resolveResult) => setTimeout(resolveResult, 100)) }
+      try {
+        centerInfo = JSON.parse(await readFile(infoPath, 'utf8')) as typeof info
+        break
+      } catch (error) {
+        const fileNotReady = error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT'
+        if (!(error instanceof SyntaxError) && !fileNotReady) throw error
+        await new Promise((resolveResult) => setTimeout(resolveResult, 100))
+      }
     }
-    await stat(infoPath)
-    info = JSON.parse(await readFile(infoPath, 'utf8')) as typeof info
+    if (!centerInfo) throw new Error(`Frozen authorization-center metadata was not ready before timeout: ${centerStderr}`)
+    info = centerInfo
     if (info.source_commit !== expectedCenterCommit || info.issuer !== info.origin) throw new Error('Isolated authorization-center metadata is invalid')
 
     apiAdminPool = new Pool({ connectionString: testDatabaseUrl, max: 4 })
