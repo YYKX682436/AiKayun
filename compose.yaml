@@ -21,9 +21,9 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
-    command: ["node", "dist/db/migrate.js"]
+    command: ["dist/db/migrate.js"]
     environment:
-      NODE_ENV: production
+      NODE_ENV: development
       PGHOST: db
       PGPORT: 5432
       PGDATABASE: ${POSTGRES_DB:-aikayun}
@@ -39,7 +39,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile
     user: "0:0"
-    command: ["sh", "-c", "mkdir -p \"$$MEDIA_ROOT\" && chown node:node \"$$MEDIA_ROOT\""]
+    command: ["dist/ops/init-volume-cli.js", "${MEDIA_ROOT:-/var/lib/aikayun/media}", "0755"]
     environment:
       MEDIA_ROOT: ${MEDIA_ROOT:-/var/lib/aikayun/media}
     volumes:
@@ -51,7 +51,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile
     user: "0:0"
-    command: ["sh", "-c", "mkdir -p \"$$PRIVATE_FILE_ROOT\" && chown node:node \"$$PRIVATE_FILE_ROOT\" && chmod 700 \"$$PRIVATE_FILE_ROOT\""]
+    command: ["dist/ops/init-volume-cli.js", "${PRIVATE_FILE_ROOT:-/var/lib/aikayun/private-files}", "0700"]
     environment:
       PRIVATE_FILE_ROOT: ${PRIVATE_FILE_ROOT:-/var/lib/aikayun/private-files}
     volumes:
@@ -63,7 +63,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile
     user: "0:0"
-    command: ["sh", "-c", "mkdir -p \"$$LICENSE_TRUST_STORE_ROOT\" && chown node:node \"$$LICENSE_TRUST_STORE_ROOT\" && chmod 700 \"$$LICENSE_TRUST_STORE_ROOT\""]
+    command: ["dist/ops/init-volume-cli.js", "${LICENSE_TRUST_STORE_ROOT:-/var/lib/aikayun/license-trust}", "0700"]
     environment:
       LICENSE_TRUST_STORE_ROOT: ${LICENSE_TRUST_STORE_ROOT:-/var/lib/aikayun/license-trust}
     volumes:
@@ -75,7 +75,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile
     user: "0:0"
-    command: ["sh", "-c", "mkdir -p \"$$LICENSE_PENDING_KEY_ROOT\" && chown node:node \"$$LICENSE_PENDING_KEY_ROOT\" && chmod 700 \"$$LICENSE_PENDING_KEY_ROOT\""]
+    command: ["dist/ops/init-volume-cli.js", "${LICENSE_PENDING_KEY_ROOT:-/var/lib/aikayun/license-pending}", "0700"]
     environment:
       LICENSE_PENDING_KEY_ROOT: ${LICENSE_PENDING_KEY_ROOT:-/var/lib/aikayun/license-pending}
     volumes:
@@ -87,7 +87,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile
     environment:
-      NODE_ENV: production
+      NODE_ENV: development
       API_HOST: 0.0.0.0
       API_PORT: 3001
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:8080}
@@ -114,7 +114,7 @@ services:
       - license_trust_store:${LICENSE_TRUST_STORE_ROOT:-/var/lib/aikayun/license-trust}
       - license_pending_key:${LICENSE_PENDING_KEY_ROOT:-/var/lib/aikayun/license-pending}
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:3001/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -150,7 +150,7 @@ services:
     expose:
       - "3000"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
       retries: 10

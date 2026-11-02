@@ -106,7 +106,7 @@ jobs:
             sleep 2
           done
           curl --fail --silent http://localhost:8080/ | grep -q '暂无可展示的商品'
-          docker compose exec -T -e ADMIN_INITIAL_EMAIL=browser-test@example.com -e 'ADMIN_INITIAL_PASSWORD=Only-For-E2E-Tests-2026!!' api node dist/admin-init.js
+          docker compose exec -T -e ADMIN_INITIAL_EMAIL=browser-test@example.com -e 'ADMIN_INITIAL_PASSWORD=Only-For-E2E-Tests-2026!!' api /nodejs/bin/node dist/admin-init.js
       - name: Run full Compose browser suite with signed test license
         env:
           COMPOSE_FILE: compose.yaml:compose.e2e.yaml:compose.e2e.signed.yaml

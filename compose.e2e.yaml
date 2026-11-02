@@ -17,7 +17,7 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
-    command: ["node", "--experimental-strip-types", "/app/test/fixtures/zpay-http-server.ts", "--serve"]
+    command: ["--experimental-strip-types", "/app/test/fixtures/zpay-http-server.ts", "--serve"]
     network_mode: service:api
     depends_on:
       api:
