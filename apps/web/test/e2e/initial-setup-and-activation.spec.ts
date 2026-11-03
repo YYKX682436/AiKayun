@@ -57,8 +57,8 @@ test('admin activation accepts one combined credential and keeps it out of the U
   let requestCredential = ''
   let activated = false
 
-  const authOrigin = `http://127.0.0.1:${process.env.AIKAYUN_TEST_API_PORT ?? '3001'}`
   const webOrigin = new URL(process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3100').origin
+  const authOrigin = webOrigin
   const loginCsrf = await page.request.get(`${authOrigin}/api/v1/admin/auth/csrf`)
   const loginCsrfBody = await loginCsrf.json() as { data: { csrfToken: string } }
   const login = await page.request.post(`${authOrigin}/api/v1/admin/auth/login`, {
