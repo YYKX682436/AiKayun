@@ -46,8 +46,10 @@ printf '{"activeKeyId":"validation","keys":{"validation":"%s"}}\n' "$delivery_ke
 printf '%s\n' 'test-only-placeholder-bundle' > "$work/license-trust-bundle.jws"
 chmod 0400 "$work"/*
 
-export AIKAYUN_API_DIGEST="$(printf '%064d' 0 | tr '0' 'a')"
-export AIKAYUN_WEB_DIGEST="$(printf '%064d' 0 | tr '0' 'b')"
+export AIKAYUN_API_IMAGE="$api_image"
+export AIKAYUN_WEB_IMAGE="$web_image"
+export AIKAYUN_POSTGRES_IMAGE='docker.io/library/postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873'
+export AIKAYUN_CADDY_IMAGE='docker.io/library/caddy@sha256:e70b164da81ef698b3ad19af799ea6086ce6d9e48ed4079eb9fe26f6fbf14ee5'
 export AIKAYUN_PUBLIC_HOST=localhost
 export AIKAYUN_PRIVATE_SUBNET="$network"
 export AIKAYUN_POSTGRES_ADMIN_PASSWORD_FILE="$work/postgres-admin-password"

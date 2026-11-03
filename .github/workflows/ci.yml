@@ -83,6 +83,9 @@ jobs:
         run: |
           scripts/release/test-scan-gate.sh
           scripts/release/test-bundle-extraction.sh
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+      - name: Run controlled Linux installer command-flow regression
+        run: scripts/install/test-ai-kayun-installer.sh
       - name: Browser E2E against real PostgreSQL
         run: PLAYWRIGHT_USE_PRODUCTION_SERVER=true pnpm e2e
       - name: Verify production runtime branding

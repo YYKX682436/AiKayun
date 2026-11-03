@@ -2,6 +2,20 @@
 
 商城起点：`f21d0de63931daae1c7f29503246c00945c8bb4c`。授权中心只读基线：`185dac80204f60abbaa63ffeb5af7d7054b685d7`。本阶段不修改授权中心代码或 `/v1/activations` 请求协议。
 
+## ⑦-3-R1 本轮修订与统一复验
+
+R1 从商城工作树 `aa3e3fb290a549789189ad771606b949749e9e49` 开始。本轮没有修改授权中心 checkout。修正了生产 Compose 与发行组装之间的镜像引用接口：API、Web、PostgreSQL、Caddy 均由签名 manifest 提供完整 `repository@sha256:digest`；发行组装会核对四个规范仓库，安装器再核对 Compose 的四个唯一镜像引用与签名清单完全相同。安装器将这四个完整引用写入固定 `.env`，重复恢复仍核验同一组 digest。
+
+隔离安装器首次运行暴露了 manifest Cosign/JWS 校验容器的挂载根目录多套一层问题，现已修复。`scripts/install/test-ai-kayun-installer.sh` 以 `linux/amd64` 和 `linux/arm64` 各运行 10 个安装器场景，共 20 次通过：TLS 未就绪后 `resume`、HTTPS 就绪后签发 token、发行 index 下载失败、manifest 修改、release root 替换、Compose 镜像引用修改、DNS 失败、磁盘不足、80 端口占用、已有非空部署目录（含身份与秘密文件）。工件由当前 release assembler 临时构造，使用一次性 P-256 JWS 测试签名，实际运行 release JWS verifier 与 artifact SHA-256 verifier。测试容器没有宿主 Docker socket；Docker、Cosign、DNS、HTTPS/ACME 响应是隔离 shim，因此这些结果不证明真实 Sigstore、客户 DNS 或公网 ACME 可用。既有 Docker 数据卷拒绝、重复安装不更改身份/秘密、远程 Docker 拒绝、阶段记录、恢复、token 只在 HTTPS ready 后输出及临时工作目录清理均由命令流断言。
+
+另以当前 API/Web 源码构建了两张唯一命名的 arm64 临时镜像，不提供授权配置、测试根或签名密钥，运行真实 release Compose 与 PostgreSQL 18、Caddy、API、Web。`scripts/release/test-runtime-platform.sh linux/arm64 ... 202611030002_license_pending_key_binding` 完成数据库角色/迁移、生产身份与 Pending Key 初始化、SSR、无信任根时新经营义务 fail closed、重复初始化和 API 容器重建后身份/key 指纹保持一致。临时镜像、Compose 网络、卷和容器在脚本退出时清理。`docker compose ... config --quiet` 也以四个 digest 引用独立渲染通过。此为本机隔离 runtime 证据，不代表受签名的正式发行镜像或商业授权通过。
+
+最终完整 `pnpm verify` 在一次性 PostgreSQL 18 `aikayun_7_3_r1_test` 与只读中心 SHA `185dac80204f60abbaa63ffeb5af7d7054b685d7` 克隆上退出码 0：lint 0 error（保留原商品详情页 7 条 Vue 格式 warning）；API/Web 类型检查和构建通过；money 16/16；API 41 个文件、695/695；发行 manifest/assembly 6/6；主浏览器 95/95、替代品牌 1/1、SSR 错误 3/3、开发预览 1/1、生产品牌 1/1。API 全量包含 setup 并发/未知 COMMIT、身份与 Pending Key SIGKILL 恢复、冻结中心 Challenge/operation 恢复及经营门禁；浏览器包含 `/setup` 首次管理员和 `/admin/license` 组合凭证流程。
+
+有一轮完整 API 运行中，冻结中心 fixture 对“查询恢复后撤销 signer，再由新 signer 续期”测试返回一次 HTTP 503（694/695）。同一测试以 `scripts/test-license-center-interop.sh` 和相同冻结 SHA、独立 PostgreSQL 18 单独重跑为 1/1；随后从头重跑的最终全量为 695/695。该单次失败保留为已复验的瞬时测试服务错误，不从最终通过数中扣除。
+
+完整验收仍不开放正式商业发行：本机没有正式 HTTPS release origin、受保护发布端/GHCR 权限、生产 Cosign/JWS 私钥及固定公钥、生产授权 issuer/root 配置或当前 root 签名 Trust Bundle。上述隔离运行未使用测试根冒充生产根，真实公网安装、ACME、客户卡密及商业激活仍为外部阻断。
+
 ## 客户流程
 
 正式发行域名尚未配置，因此以下命令中的 `<release-origin>` 和 `<version>` 是占位符，不是可访问地址。配置并发布真实发行站后，客户执行同一条命令并提供自己的店铺域名：

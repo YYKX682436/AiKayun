@@ -155,7 +155,7 @@ test('release artifact verifier checks exact file size and SHA-256 and rejects s
   await assert.rejects(verifyReleaseArtifacts(manifestPath, artifactDirectory), /size or SHA-256 mismatch/u)
 })
 
-test('release bundle assembly pins full API/Web references into Compose and includes installer and Trust Bundle', async t => {
+test('release bundle assembly pins all four signed image references into Compose and includes installer and Trust Bundle', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'aikayun-release-assembly-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const support = join(directory, 'support')
@@ -163,6 +163,8 @@ test('release bundle assembly pins full API/Web references into Compose and incl
   await mkdir(support)
   const api = `ghcr.io/yykx682436/aikayun-api@sha256:${hex('a')}`
   const web = `ghcr.io/yykx682436/aikayun-web@sha256:${hex('b')}`
+  const postgres = `docker.io/library/postgres@sha256:${hex('c')}`
+  const caddy = `docker.io/library/caddy@sha256:${hex('d')}`
   const version = '1.2.3-rc.1'
   const metadataPath = join(directory, 'metadata.json')
   const configPath = join(directory, 'config.json')
@@ -170,7 +172,8 @@ test('release bundle assembly pins full API/Web references into Compose and incl
   const trustBundle = 'fixture.payload.signature\n'
   await writeFile(metadataPath, JSON.stringify({
     version, distribution_origin: 'https://download.example.test',
-    images: { api: { reference: api }, web: { reference: web } },
+    images: { api: { reference: api }, web: { reference: web },
+      postgres: { reference: postgres }, caddy: { reference: caddy } },
   }))
   await writeFile(configPath, JSON.stringify({ offline_root: { publicJwk: {
     kty: 'OKP', crv: 'Ed25519', x: Buffer.alloc(32, 7).toString('base64url'),
@@ -192,9 +195,12 @@ test('release bundle assembly pins full API/Web references into Compose and incl
   execFileSync(process.execPath, [join(import.meta.dirname, 'assemble-release.mjs'),
     metadataPath, configPath, checksumsPath, support, output], { encoding: 'utf8' })
   const compose = await readFile(join(output, 'compose.yaml'), 'utf8')
-  assert.ok(compose.includes(`image: ${api}`))
-  assert.ok(compose.includes(`image: ${web}`))
-  assert.ok(!compose.includes(`@sha256:${api}`))
+  for (const image of [api, web, postgres, caddy]) {
+    assert.ok(compose.includes(`image: ${image}`), `Compose must use ${image}`)
+    assert.doesNotMatch(compose, new RegExp(`image: ${image.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}:[^\\s]+`))
+  }
+  const imageReferences = compose.split('\n').filter(line => /^\s+image:/u.test(line)).map(line => line.trim().slice('image:'.length).trim())
+  assert.deepEqual([...new Set(imageReferences)].sort(), [api, web, postgres, caddy].sort())
   assert.equal(await readFile(join(output, 'install.sh'), 'utf8'),
     await readFile(new URL('../../../../scripts/install/install-ai-kayun.sh', import.meta.url), 'utf8'))
   assert.equal(await readFile(join(output, 'license-trust-bundle.jws'), 'utf8'), trustBundle)

@@ -2,7 +2,7 @@ name: aikayun
 
 services:
   db:
-    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    image: ${AIKAYUN_POSTGRES_IMAGE:?Set PostgreSQL image reference from the signed release manifest}
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${AIKAYUN_DB_NAME:-aikayun}
@@ -21,7 +21,7 @@ services:
     networks: [private]
 
   db-role-init:
-    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    image: ${AIKAYUN_POSTGRES_IMAGE:?Set PostgreSQL image reference from the signed release manifest}
     entrypoint: ["sh", "/deploy/bootstrap-production-db-roles.sh"]
     environment:
       POSTGRES_DB: ${AIKAYUN_DB_NAME:-aikayun}
@@ -42,7 +42,7 @@ services:
     networks: [private]
 
   state-volume-init:
-    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    image: ${AIKAYUN_POSTGRES_IMAGE:?Set PostgreSQL image reference from the signed release manifest}
     user: "0:0"
     entrypoint: ["sh", "/deploy/prepare-state-volume.sh"]
     volumes:
@@ -52,7 +52,7 @@ services:
     networks: [private]
 
   migrate:
-    image: ghcr.io/yykx682436/aikayun-api@sha256:${AIKAYUN_API_DIGEST:?Set API digest from the signed release manifest}
+    image: ${AIKAYUN_API_IMAGE:?Set API image reference from the signed release manifest}
     user: "1000:1000"
     command: ["dist/db/migrate.js"]
     environment:
@@ -89,7 +89,7 @@ services:
     networks: [private]
 
   production-install-init:
-    image: ghcr.io/yykx682436/aikayun-api@sha256:${AIKAYUN_API_DIGEST:?Set API digest from the signed release manifest}
+    image: ${AIKAYUN_API_IMAGE:?Set API image reference from the signed release manifest}
     user: "1000:1000"
     command: ["dist/production-install-init.js"]
     environment:
@@ -124,7 +124,7 @@ services:
     networks: [private]
 
   api:
-    image: ghcr.io/yykx682436/aikayun-api@sha256:${AIKAYUN_API_DIGEST:?Set API digest from the signed release manifest}
+    image: ${AIKAYUN_API_IMAGE:?Set API image reference from the signed release manifest}
     user: "1000:1000"
     restart: unless-stopped
     environment:
@@ -174,7 +174,7 @@ services:
     networks: [private]
 
   web:
-    image: ghcr.io/yykx682436/aikayun-web@sha256:${AIKAYUN_WEB_DIGEST:?Set Web digest from the signed release manifest}
+    image: ${AIKAYUN_WEB_IMAGE:?Set Web image reference from the signed release manifest}
     restart: unless-stopped
     environment:
       NODE_ENV: production
@@ -201,7 +201,7 @@ services:
     networks: [private]
 
   caddy:
-    image: caddy:2.11.7-alpine@sha256:e70b164da81ef698b3ad19af799ea6086ce6d9e48ed4079eb9fe26f6fbf14ee5
+    image: ${AIKAYUN_CADDY_IMAGE:?Set Caddy image reference from the signed release manifest}
     restart: unless-stopped
     environment:
       SITE_ADDRESS: ${AIKAYUN_PUBLIC_HOST:?Set the HTTPS storefront host}

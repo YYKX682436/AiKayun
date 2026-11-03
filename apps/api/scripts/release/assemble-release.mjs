@@ -14,17 +14,22 @@ await mkdir(join(output, 'sbom'))
 await mkdir(join(output, 'notices'))
 
 let compose = await readFile(new URL('../../../../compose.release.yaml', import.meta.url), 'utf8')
-for (const name of ['api', 'web']) {
-  const marker = name === 'api'
-    ? '${AIKAYUN_API_DIGEST:?Set API digest from the signed release manifest}'
-    : '${AIKAYUN_WEB_DIGEST:?Set Web digest from the signed release manifest}'
+const imageMarkers = {
+  api: '${AIKAYUN_API_IMAGE:?Set API image reference from the signed release manifest}',
+  web: '${AIKAYUN_WEB_IMAGE:?Set Web image reference from the signed release manifest}',
+  postgres: '${AIKAYUN_POSTGRES_IMAGE:?Set PostgreSQL image reference from the signed release manifest}',
+  caddy: '${AIKAYUN_CADDY_IMAGE:?Set Caddy image reference from the signed release manifest}',
+}
+for (const [name, marker] of Object.entries(imageMarkers)) {
   const reference = metadata.images[name].reference
-  const repository = `ghcr.io/yykx682436/aikayun-${name}`
+  const repository = name === 'api' || name === 'web'
+    ? `ghcr.io/yykx682436/aikayun-${name}`
+    : `docker.io/library/${name}`
   const prefix = `${repository}@sha256:`
   if (!reference.startsWith(prefix) || !/^[a-f0-9]{64}$/.test(reference.slice(prefix.length))) {
-    throw new Error(`${name} image must use its fixed repository and a SHA-256 digest`)
+    throw new Error(`${name} image must use its canonical repository and a SHA-256 digest`)
   }
-  compose = compose.replaceAll(marker, reference.slice(prefix.length))
+  compose = compose.replaceAll(marker, reference)
 }
 if (/\blatest\b/.test(compose) || /\bbuild\s*:/u.test(compose)) throw new Error('Release Compose must use immutable image digests and contain no build steps')
 await writeFile(join(output, 'compose.yaml'), compose, { flag: 'wx', mode: 0o644 })

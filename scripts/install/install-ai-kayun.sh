@@ -20,8 +20,10 @@ SELECTED_RELEASE_ORIGIN="${AIKAYUN_RELEASE_ORIGIN:-}"
 SELECTED_VERSION="${AIKAYUN_RELEASE_VERSION:-}"
 SELECTED_DOMAIN=''
 MANIFEST_SHA256=''
-SELECTED_API_DIGEST=''
-SELECTED_WEB_DIGEST=''
+SELECTED_API_IMAGE=''
+SELECTED_WEB_IMAGE=''
+SELECTED_POSTGRES_IMAGE=''
+SELECTED_CADDY_IMAGE=''
 RELEASE_BASE=''
 
 cleanup() {
@@ -63,7 +65,7 @@ begin_lock() {
 
 require_host_commands() {
   local name
-  for name in awk base64 basename chmod chown cp curl date df diff dirname docker env find flock getent grep head id install mkdir mktemp mv rmdir rm sha256sum sleep stat tr uname; do
+  for name in awk base64 basename chmod chown cp curl date df diff dirname docker env find flock getent grep head id install mkdir mktemp mv rmdir rm sed sha256sum sleep sort stat tr uname; do
     command -v "$name" >/dev/null 2>&1 || fail "Required host command is missing: $name. Install the standard Linux utility package that provides it."
   done
   command -v bash >/dev/null 2>&1 || fail 'Bash is required to run the controlled installer.'
@@ -71,8 +73,28 @@ require_host_commands() {
 
 docker_ready() {
   command -v docker >/dev/null 2>&1 || fail 'Docker Engine is required and is not installed.'
+  check_docker_local_engine
   docker info --format '{{.OSType}}' 2>/dev/null | grep -qx linux || fail 'The Docker Engine must be running in Linux mode.'
   docker compose version --short >/dev/null 2>&1 || fail 'Docker Compose v2 is required.'
+}
+
+check_docker_local_engine() {
+  local context endpoint socket
+  if [[ -n "${DOCKER_CONTEXT:-}" ]]; then
+    context="$DOCKER_CONTEXT"
+    endpoint="$(docker context inspect "$context" --format '{{ (index .Endpoints "docker").Host }}' 2>/dev/null)" || \
+      fail 'The selected Docker context could not be inspected locally.'
+  elif [[ -n "${DOCKER_HOST:-}" ]]; then
+    endpoint="$DOCKER_HOST"
+  else
+    context="$(docker context show 2>/dev/null)" || fail 'The active Docker context could not be read.'
+    endpoint="$(docker context inspect "$context" --format '{{ (index .Endpoints "docker").Host }}' 2>/dev/null)" || \
+      fail 'The active Docker context could not be inspected locally.'
+  fi
+  [[ "$endpoint" == unix:///* ]] || \
+    fail 'Remote Docker Engines are not supported. Select a Docker Engine on this machine using a Unix socket.'
+  socket="${endpoint#unix://}"
+  [[ -S "$socket" ]] || fail 'The selected local Docker Unix socket is missing or is not a socket.'
 }
 
 expected_host_arch() {
@@ -219,7 +241,7 @@ download_and_verify_release() {
   for file in release-manifest.json release-manifest.jws release-manifest.cosign.bundle; do
     fetch_https_file "${RELEASE_BASE}${file}" "$WORK_DIR/release/$file" || fail "Could not download $file."
   done
-  docker run --rm --mount "type=bind,source=$WORK_DIR,target=/release,readonly" --entrypoint cosign "$COSIGN_IMAGE" \
+  docker run --rm --mount "type=bind,source=$WORK_DIR/release,target=/release,readonly" --entrypoint cosign "$COSIGN_IMAGE" \
     verify-blob --bundle /release/release-manifest.cosign.bundle \
     --certificate-identity "$RELEASE_CERT_IDENTITY" --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
     /release/release-manifest.json >/dev/null || fail 'Cosign rejected the release manifest or its fixed workflow identity.'
@@ -244,7 +266,7 @@ download_and_verify_release() {
      -f "$WORK_DIR/release/extract-release-bundle.sh" && -f "$WORK_DIR/release/license-trust-bundle.jws" && \
      -f "$WORK_DIR/release/deploy/prepare-state-volume.sh" ]] || \
     fail 'The signed release is missing a required installation artifact.'
-  docker run --rm --mount "type=bind,source=$WORK_DIR,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
+  docker run --rm --mount "type=bind,source=$WORK_DIR/release,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
     /release/release-verifier.mjs /release/release-manifest.json /release/release-manifest.jws \
     /release/release-signing-root.jwk.json >/dev/null || fail 'The release JWS signature or embedded JWS root failed verification.'
   docker run --rm --mount "type=bind,source=$WORK_DIR/release,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
@@ -257,7 +279,19 @@ download_and_verify_release() {
 }
 
 verify_release_image_references() {
-  local directory="$1" image name
+  local directory="$1" image name manifest_references compose_references
+  manifest_references="$(docker run --rm --mount "type=bind,source=$directory,target=/release,readonly" \
+    --entrypoint node "$NODE_IMAGE" -e '
+    const fs=require("node:fs"); const m=JSON.parse(fs.readFileSync("/release/release-manifest.json","utf8"));
+    for(const name of ["api","web","postgres","caddy"]) {
+      const ref=m.images?.[name]?.reference;
+      if(typeof ref!=="string" || !/@sha256:[a-f0-9]{64}$/.test(ref)) process.exit(1);
+      console.log(ref);
+    }
+  ' 2>/dev/null)" || fail 'The signed manifest does not contain four valid image references.'
+  compose_references="$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$directory/compose.yaml" | sort -u)"
+  [[ "$compose_references" == "$(printf '%s\n' "$manifest_references" | sort -u)" ]] || \
+    fail 'The release Compose image references do not exactly match the four signed manifest digests.'
   for name in api web postgres caddy; do
     image="$(docker run --rm --mount "type=bind,source=$directory,target=/release,readonly" \
       --entrypoint node "$NODE_IMAGE" -e '
@@ -340,19 +374,24 @@ state_value() {
 }
 
 load_release_image_digests() {
-  local image_digests
-  image_digests="$(node_target '
+  local image_references image_reference
+  local -a image_references_array
+  image_references="$(node_target '
     const fs=require("node:fs"); const m=JSON.parse(fs.readFileSync("/target/release/release-manifest.json","utf8"));
-    const values=[m.images?.api?.reference,m.images?.web?.reference];
+    const values=[m.images?.api?.reference,m.images?.web?.reference,m.images?.postgres?.reference,m.images?.caddy?.reference];
     if(values.some(v=>typeof v!=="string" || !/@sha256:[a-f0-9]{64}$/.test(v))) process.exit(1);
-    process.stdout.write(values.map(v=>v.slice(v.lastIndexOf("@sha256:")+8)).join("\n"));
-  ')" || fail 'Could not load the verified API and Web image digests.'
-  set -- $image_digests
-  [[ "$#" == 2 ]] || fail 'The signed release manifest must contain exactly two application digests.'
-  SELECTED_API_DIGEST="$1"
-  SELECTED_WEB_DIGEST="$2"
-  [[ "$SELECTED_API_DIGEST" =~ ^[a-f0-9]{64}$ && "$SELECTED_WEB_DIGEST" =~ ^[a-f0-9]{64}$ ]] || \
-    fail 'The persisted API or Web digest is invalid.'
+    process.stdout.write(values.join("\n"));
+  ')" || fail 'Could not load the four verified image references.'
+  mapfile -t image_references_array <<< "$image_references"
+  [[ "${#image_references_array[@]}" == 4 ]] || fail 'The signed release manifest must contain exactly four images.'
+  SELECTED_API_IMAGE="${image_references_array[0]}"
+  SELECTED_WEB_IMAGE="${image_references_array[1]}"
+  SELECTED_POSTGRES_IMAGE="${image_references_array[2]}"
+  SELECTED_CADDY_IMAGE="${image_references_array[3]}"
+  for image_reference in "${image_references_array[@]}"; do
+    [[ "$image_reference" =~ ^(ghcr\.io/yykx682436/aikayun-(api|web)|docker\.io/library/(postgres|caddy))@sha256:[a-f0-9]{64}$ ]] || \
+      fail 'A signed image reference does not use its canonical repository and immutable digest.'
+  done
 }
 
 phase_rank() {
@@ -377,12 +416,14 @@ write_state() {
 
 compose() {
   env \
-    -u AIKAYUN_API_DIGEST -u AIKAYUN_WEB_DIGEST -u AIKAYUN_PUBLIC_HOST -u AIKAYUN_LICENSE_TRUST_BUNDLE_FILE \
+    -u AIKAYUN_API_IMAGE -u AIKAYUN_WEB_IMAGE -u AIKAYUN_POSTGRES_IMAGE -u AIKAYUN_CADDY_IMAGE \
+    -u AIKAYUN_PUBLIC_HOST -u AIKAYUN_LICENSE_TRUST_BUNDLE_FILE \
     -u AIKAYUN_POSTGRES_ADMIN_PASSWORD_FILE -u AIKAYUN_API_DATABASE_PASSWORD_FILE -u AIKAYUN_MIGRATOR_DATABASE_PASSWORD_FILE \
     -u AIKAYUN_PAYMENT_CREDENTIAL_KEY_RING_FILE -u AIKAYUN_CODE_POOL_ENCRYPTION_KEY_RING_FILE -u AIKAYUN_DB_NAME \
     -u AIKAYUN_PRIVATE_SUBNET -u AIKAYUN_HTTP_BIND_ADDRESS -u AIKAYUN_HTTP_PORT -u AIKAYUN_HTTPS_BIND_ADDRESS \
     -u AIKAYUN_HTTPS_PORT -u NUXT_PUBLIC_STORE_NAME -u NUXT_PUBLIC_STORE_LOGO_URL -u NUXT_PUBLIC_STORE_BRAND_COLOR \
-    AIKAYUN_API_DIGEST="$SELECTED_API_DIGEST" AIKAYUN_WEB_DIGEST="$SELECTED_WEB_DIGEST" \
+    AIKAYUN_API_IMAGE="$SELECTED_API_IMAGE" AIKAYUN_WEB_IMAGE="$SELECTED_WEB_IMAGE" \
+    AIKAYUN_POSTGRES_IMAGE="$SELECTED_POSTGRES_IMAGE" AIKAYUN_CADDY_IMAGE="$SELECTED_CADDY_IMAGE" \
     docker compose --project-name aikayun --file "$RELEASE_DIR/compose.yaml" --env-file "$TARGET_DIR/.env" "$@"
 }
 
@@ -476,8 +517,10 @@ prepare_secret_files() {
     local env_tmp="$TARGET_DIR/.env.$$.tmp"
     cat > "$env_tmp" <<EOF
 AIKAYUN_PUBLIC_HOST=$SELECTED_DOMAIN
-AIKAYUN_API_DIGEST=$SELECTED_API_DIGEST
-AIKAYUN_WEB_DIGEST=$SELECTED_WEB_DIGEST
+AIKAYUN_API_IMAGE=$SELECTED_API_IMAGE
+AIKAYUN_WEB_IMAGE=$SELECTED_WEB_IMAGE
+AIKAYUN_POSTGRES_IMAGE=$SELECTED_POSTGRES_IMAGE
+AIKAYUN_CADDY_IMAGE=$SELECTED_CADDY_IMAGE
 AIKAYUN_LICENSE_TRUST_BUNDLE_FILE=$RELEASE_DIR/license-trust-bundle.jws
 AIKAYUN_POSTGRES_ADMIN_PASSWORD_FILE=$TARGET_DIR/secrets/postgres_admin_password
 AIKAYUN_API_DATABASE_PASSWORD_FILE=$TARGET_DIR/secrets/api_database_password
@@ -493,8 +536,10 @@ EOF
       fail 'The persistent Compose configuration file is unsafe.'
     cmp -s "$TARGET_DIR/.env" <(cat <<EOF
 AIKAYUN_PUBLIC_HOST=$SELECTED_DOMAIN
-AIKAYUN_API_DIGEST=$SELECTED_API_DIGEST
-AIKAYUN_WEB_DIGEST=$SELECTED_WEB_DIGEST
+AIKAYUN_API_IMAGE=$SELECTED_API_IMAGE
+AIKAYUN_WEB_IMAGE=$SELECTED_WEB_IMAGE
+AIKAYUN_POSTGRES_IMAGE=$SELECTED_POSTGRES_IMAGE
+AIKAYUN_CADDY_IMAGE=$SELECTED_CADDY_IMAGE
 AIKAYUN_LICENSE_TRUST_BUNDLE_FILE=$RELEASE_DIR/license-trust-bundle.jws
 AIKAYUN_POSTGRES_ADMIN_PASSWORD_FILE=$TARGET_DIR/secrets/postgres_admin_password
 AIKAYUN_API_DATABASE_PASSWORD_FILE=$TARGET_DIR/secrets/api_database_password
@@ -663,10 +708,8 @@ install_new() {
   mv -- "$STAGING_DIR" "$TARGET_DIR"
   STAGING_DIR=''
   load_release_image_digests
-  rm -rf -- "$WORK_DIR"
-  WORK_DIR=''
-  RELEASE_BASE=''
   initialize_services
+  RELEASE_BASE=''
 }
 
 resume_install() {
