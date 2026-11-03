@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly center_commit='a5cf99439e3bf92b65f19d60c013bca088cf221a'
+readonly center_commit='185dac80204f60abbaa63ffeb5af7d7054b685d7'
 readonly center_repository='https://github.com/YYKX682436/AiKayun-License.git'
 readonly local_center_source='/Users/muchen/Documents/ChatGPT/AiKayun-License'
 readonly repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,9 +71,11 @@ if [[ -n "$test_filter" ]]; then
   pnpm --filter @aikayun/api exec vitest run \
     test/license-center-challenge.interop.test.ts \
     test/license-operation-store.integration.test.ts \
+    test/admin-activation.interop.integration.test.ts \
     --testNamePattern "$test_filter"
 else
   pnpm --filter @aikayun/api exec vitest run \
     test/license-center-challenge.interop.test.ts \
-    test/license-operation-store.integration.test.ts
+    test/license-operation-store.integration.test.ts \
+    test/admin-activation.interop.integration.test.ts
 fi

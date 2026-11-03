@@ -43,6 +43,7 @@ export interface AppConfig {
   identityRoot: string
   licenseTrustStoreRoot: string
   licensePendingKeyRoot: string
+  licenseTrustBundleFile?: string
   supplierHttpTestAllowlist: string[]
   database: PoolConfig
   paymentCredentialKeyRing: PaymentCredentialKeyRing | null
@@ -237,6 +238,10 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error('LICENSE_PENDING_KEY_ROOT must be an absolute path')
   }
   const licensePendingKeyRoot = resolve(configuredLicensePendingKeyRoot ?? join(xdgDataHome, 'aikayun', 'license-pending'))
+  const configuredTrustBundleFile = env.LICENSE_TRUST_BUNDLE_FILE
+  if (configuredTrustBundleFile && !isAbsolute(configuredTrustBundleFile)) {
+    throw new Error('LICENSE_TRUST_BUNDLE_FILE must be an absolute path')
+  }
   const repo = repositoryRoot()
   if (repo && isWithin(repo, mediaRoot)) {
     throw new Error('MEDIA_ROOT must be outside the repository')
@@ -348,6 +353,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     identityRoot,
     licenseTrustStoreRoot,
     licensePendingKeyRoot,
+    ...(configuredTrustBundleFile ? { licenseTrustBundleFile: resolve(configuredTrustBundleFile) } : {}),
     supplierHttpTestAllowlist,
     database,
     paymentCredentialKeyRing: parsePaymentCredentialKeyRing(configuredSecret(env, 'PAYMENT_CREDENTIAL_KEY_RING')),

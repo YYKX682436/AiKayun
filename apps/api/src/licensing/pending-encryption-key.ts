@@ -1,6 +1,6 @@
-import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto'
 import { constants as fsConstants, existsSync } from 'node:fs'
-import { link, lstat, mkdir, open, realpath, unlink } from 'node:fs/promises'
+import { link, lstat, mkdir, open, realpath, readdir, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 const keyFileName = 'license-pending-aes-256-gcm.json'
@@ -105,22 +105,7 @@ async function fsyncDirectory(path: string): Promise<void> {
   try { await handle.sync() } finally { await handle.close() }
 }
 
-/** Explicit one-shot initializer. The CLI gates this to development/test and never overwrites a key. */
-export async function initializeTemporaryLicensePendingKey(root: string, environment: string, forbiddenRoots: string[] = []): Promise<{ keyId: string }> {
-  if ((environment !== 'development' && environment !== 'test') || process.env.NODE_ENV !== environment) {
-    fail('temporary_pending_key_environment_forbidden')
-  }
-  assertPathIsolated(root, forbiddenRoots)
-  const absoluteRoot = resolve(root)
-  try {
-    await mkdir(absoluteRoot, { recursive: true, mode: 0o700 })
-  } catch {
-    fail('pending_key_root_unavailable')
-  }
-  await validateRoot(absoluteRoot)
-  const canonicalRoot = await realpath(absoluteRoot)
-  assertPathIsolated(canonicalRoot, forbiddenRoots)
-
+async function createPendingKeyFile(canonicalRoot: string): Promise<string> {
   const keyId = `lp-${randomUUID().replaceAll('-', '')}`
   const document: StoredKeyFile = {
     schema: 1,
@@ -142,20 +127,139 @@ export async function initializeTemporaryLicensePendingKey(root: string, environ
     await link(temporaryPath, finalPath)
     await unlink(temporaryPath)
     await fsyncDirectory(canonicalRoot)
-    return { keyId }
-  } catch {
+    return keyId
+  } catch (error) {
     if (handle) await handle.close().catch(() => undefined)
     await unlink(temporaryPath).catch(() => undefined)
+    if (errorCode(error) === 'EEXIST') fail('pending_key_already_exists')
     fail('pending_key_already_exists_or_unavailable')
   }
 }
 
+function errorCode(error: unknown): string | undefined {
+  return error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+    ? error.code
+    : undefined
+}
+
+/** Explicit one-shot initializer. The CLI gates this to development/test and never overwrites a key. */
+export async function initializeTemporaryLicensePendingKey(root: string, environment: string, forbiddenRoots: string[] = []): Promise<{ keyId: string }> {
+  if ((environment !== 'development' && environment !== 'test') || process.env.NODE_ENV !== environment) {
+    fail('temporary_pending_key_environment_forbidden')
+  }
+  assertPathIsolated(root, forbiddenRoots)
+  const absoluteRoot = resolve(root)
+  try {
+    await mkdir(absoluteRoot, { recursive: true, mode: 0o700 })
+  } catch {
+    fail('pending_key_root_unavailable')
+  }
+  await validateRoot(absoluteRoot)
+  const canonicalRoot = await realpath(absoluteRoot)
+  assertPathIsolated(canonicalRoot, forbiddenRoots)
+  try {
+    return { keyId: await createPendingKeyFile(canonicalRoot) }
+  } catch {
+    fail('pending_key_already_exists_or_unavailable')
+  }
+}
+
+/**
+ * Production-only, create-once initializer used by the release install entry point.
+ * Existing keys are validated and reused; no container restart can rotate one.
+ */
+export async function ensureProductionLicensePendingKey(
+  root: string,
+  forbiddenRoots: string[] = [],
+): Promise<{ keyId: string; created: boolean }> {
+  if (process.env.NODE_ENV !== 'production') fail('production_pending_key_environment_required')
+  assertPathIsolated(root, forbiddenRoots)
+  const absoluteRoot = resolve(root)
+  try {
+    await mkdir(absoluteRoot, { recursive: true, mode: 0o700 })
+    await validateRoot(absoluteRoot)
+  } catch (error) {
+    if (error instanceof LicensePendingKeyError) throw error
+    fail('pending_key_root_unavailable')
+  }
+  const canonicalRoot = await realpath(absoluteRoot)
+  assertPathIsolated(canonicalRoot, forbiddenRoots)
+
+  let names: string[]
+  try { names = await readdir(canonicalRoot) } catch { fail('pending_key_root_unavailable') }
+  const temporaryNames = names!.filter(name => name !== keyFileName)
+  if (temporaryNames.some(name => !/^\.pending-key-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u.test(name))) {
+    fail('pending_key_root_contents_invalid')
+  }
+  const keyFileExists = names!.includes(keyFileName)
+  if (temporaryNames.length > 0) {
+    const recovered = await recoverStagedKeyFiles(canonicalRoot, temporaryNames, keyFileExists)
+    if (recovered) {
+      const existing = await loadLicensePendingKey(canonicalRoot, forbiddenRoots)
+      return { keyId: existing.keyId, created: true }
+    }
+  }
+  if (keyFileExists) {
+    const existing = await loadLicensePendingKey(canonicalRoot, forbiddenRoots)
+    return { keyId: existing.keyId, created: false }
+  }
+
+  try {
+    const keyId = await createPendingKeyFile(canonicalRoot)
+    return { keyId, created: true }
+  } catch (error) {
+    if (error instanceof LicensePendingKeyError && error.code === 'pending_key_already_exists') {
+      const existing = await loadLicensePendingKey(canonicalRoot, forbiddenRoots)
+      return { keyId: existing.keyId, created: false }
+    }
+    throw error
+  }
+}
+
+/** Verify the file against its immutable installation_binding record without ever recreating it. */
+export async function verifyBoundProductionLicensePendingKey(
+  root: string,
+  expected: { keyId: string; sha256: string },
+  forbiddenRoots: string[] = [],
+): Promise<LicensePendingKey> {
+  if (process.env.NODE_ENV !== 'production') fail('production_pending_key_environment_required')
+  assertPathIsolated(root, forbiddenRoots)
+  try { await validateRoot(resolve(root)) } catch (error) {
+    if (error instanceof LicensePendingKeyError) throw error
+    fail('pending_key_unavailable')
+  }
+  const canonicalRoot = await realpath(root)
+  assertPathIsolated(canonicalRoot, forbiddenRoots)
+  const finalPath = join(canonicalRoot, keyFileName)
+  try {
+    const finalInfo = await lstat(finalPath)
+    if (finalInfo.isSymbolicLink() || !finalInfo.isFile()) fail('pending_key_file_type_invalid')
+  } catch (error) {
+    if (error instanceof LicensePendingKeyError) throw error
+    fail('pending_key_missing_for_bound_installation')
+  }
+  let names: string[]
+  try { names = await readdir(canonicalRoot) } catch { fail('pending_key_root_unavailable') }
+  const temporaryNames = names!.filter(name => name !== keyFileName)
+  if (temporaryNames.some(name => !/^\.pending-key-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u.test(name))) {
+    fail('pending_key_root_contents_invalid')
+  }
+  if (temporaryNames.length > 0) await recoverStagedKeyFiles(canonicalRoot, temporaryNames, true)
+  const key = await loadLicensePendingKey(canonicalRoot, forbiddenRoots)
+  const digest = createHash('sha256').update(key.key).digest('hex')
+  if (key.keyId !== expected.keyId || digest !== expected.sha256) fail('pending_key_binding_mismatch')
+  return key
+}
+
 async function readProtectedKey(root: string): Promise<LicensePendingKey> {
+  return readProtectedKeyFile(root, join(root, keyFileName), 1)
+}
+
+async function readProtectedKeyFile(root: string, path: string, expectedLinks: number): Promise<LicensePendingKey> {
   await validateRoot(root)
-  const path = join(root, keyFileName)
   let before
   try { before = await lstat(path) } catch { fail('pending_key_missing') }
-  if (before!.isSymbolicLink() || !before!.isFile() || before!.nlink !== 1) fail('pending_key_file_type_invalid')
+  if (before!.isSymbolicLink() || !before!.isFile() || before!.nlink !== expectedLinks) fail('pending_key_file_type_invalid')
   if ((before!.mode & 0o777) !== 0o600 || (currentUid() !== undefined && before!.uid !== currentUid())) {
     fail('pending_key_file_permissions_invalid')
   }
@@ -163,7 +267,7 @@ async function readProtectedKey(root: string): Promise<LicensePendingKey> {
   let bytes: Buffer
   try {
     const after = await handle.stat()
-    if (!after.isFile() || after.nlink !== 1 || (after.mode & 0o777) !== 0o600 ||
+    if (!after.isFile() || after.nlink !== expectedLinks || (after.mode & 0o777) !== 0o600 ||
       (currentUid() !== undefined && after.uid !== currentUid()) ||
       before!.dev !== after.dev || before!.ino !== after.ino || after.size > 4096) {
       fail('pending_key_file_changed_or_invalid')
@@ -171,8 +275,12 @@ async function readProtectedKey(root: string): Promise<LicensePendingKey> {
     bytes = await handle.readFile()
   } finally { await handle.close() }
 
+  return parsePendingKeyDocument(bytes!)
+}
+
+function parsePendingKeyDocument(bytes: Buffer): LicensePendingKey {
   let value: unknown
-  try { value = JSON.parse(bytes!.toString('utf8')) as unknown } catch { fail('pending_key_file_corrupt') }
+  try { value = JSON.parse(bytes.toString('utf8')) as unknown } catch { fail('pending_key_file_corrupt') }
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('pending_key_file_corrupt')
   const record = value as Record<string, unknown>
   if (Object.keys(record).sort().join(',') !== 'key,key_id,purpose,schema' || record.schema !== 1 ||
@@ -181,6 +289,53 @@ async function readProtectedKey(root: string): Promise<LicensePendingKey> {
   const key = Buffer.from(record.key, 'base64url')
   if (key.length !== 32 || key.toString('base64url') !== record.key) fail('pending_key_file_corrupt')
   return { keyId: record.key_id, key }
+}
+
+/** Recover only the private, random-named atomic-write files left by a killed initializer. */
+async function recoverStagedKeyFiles(root: string, names: string[], finalExists: boolean): Promise<boolean> {
+  let finalInfo
+  if (finalExists) {
+    try { finalInfo = await lstat(join(root, keyFileName)) } catch { fail('pending_key_file_changed_or_invalid') }
+    if (finalInfo!.isSymbolicLink() || !finalInfo!.isFile() ||
+      (finalInfo!.mode & 0o777) !== 0o600 || (currentUid() !== undefined && finalInfo!.uid !== currentUid())) {
+      fail('pending_key_file_type_invalid')
+    }
+  }
+
+  let recoverable: { name: string; keyId: string } | undefined
+  for (const name of names) {
+    const path = join(root, name)
+    let info
+    try { info = await lstat(path) } catch { fail('pending_key_file_changed_or_invalid') }
+    if (info!.isSymbolicLink() || !info!.isFile() || (info!.mode & 0o777) !== 0o600 ||
+      (currentUid() !== undefined && info!.uid !== currentUid())) {
+      fail('pending_key_file_type_invalid')
+    }
+    if (finalExists) {
+      const sharesFinalInode = info!.dev === finalInfo!.dev && info!.ino === finalInfo!.ino
+      if ((info!.nlink === 2 && !sharesFinalInode) || (info!.nlink === 1 && sharesFinalInode) || info!.nlink > 2) {
+        fail('pending_key_file_type_invalid')
+      }
+      continue
+    }
+    if (info!.nlink !== 1) fail('pending_key_file_type_invalid')
+    try {
+      const key = await readProtectedKeyFile(root, path, 1)
+      recoverable ??= { name, keyId: key.keyId }
+    } catch (error) {
+      if (!(error instanceof LicensePendingKeyError) || error.code !== 'pending_key_file_corrupt') throw error
+      // A SIGKILL may leave a private but incomplete temporary write. It was never committed as a key.
+    }
+  }
+
+  if (!finalExists && recoverable) {
+    try { await link(join(root, recoverable.name), join(root, keyFileName)) } catch (error) {
+      if (errorCode(error) !== 'EEXIST') fail('pending_key_already_exists_or_unavailable')
+    }
+  }
+  for (const name of names) await unlink(join(root, name))
+  await fsyncDirectory(root)
+  return !finalExists && recoverable !== undefined
 }
 
 export async function loadLicensePendingKey(root: string, forbiddenRoots: string[] = []): Promise<LicensePendingKey> {

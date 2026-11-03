@@ -13,7 +13,7 @@ import { Pool } from 'pg'
 import { calculateJwkThumbprint, decodeJwt, decodeProtectedHeader } from 'jose'
 import { assertChallengeClaimsBound, createLicenseChallengeClient, createSignedChallengeRequest, postChallenge } from '../src/licensing/license-challenge-client.js'
 import type { PendingActivationOperation } from '../src/licensing/license-challenge-client.js'
-import { createLicenseActivationClient } from '../src/licensing/license-activation-client.js'
+import { createLicenseActivationClient, LicenseActivationClientError } from '../src/licensing/license-activation-client.js'
 import type { LicenseActivationCheckpoint } from '../src/licensing/license-activation-client.js'
 import { createLicenseOperationRecoveryClient, LicenseOperationRecoveryError } from '../src/licensing/license-operation-recovery-client.js'
 import { finalizeTrustedActivationRejection } from '../src/licensing/license-operation-recovery-client.js'
@@ -63,7 +63,7 @@ import { TrustedCenterUnavailableError } from '../src/licensing/trust/time-ancho
 import { createTrustDatabaseCoordinator } from '../src/licensing/trust/trust-database-coordinator.js'
 import type { LookupFunction } from 'node:net'
 
-const expectedCenterCommit = 'a5cf99439e3bf92b65f19d60c013bca088cf221a'
+const expectedCenterCommit = '185dac80204f60abbaa63ffeb5af7d7054b685d7'
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const centerCheckout = process.env.LICENSE_CENTER_CHECKOUT
 describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization-center HTTPS interop', () => {
@@ -328,12 +328,14 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
   }
 
   async function retryTransientChallenge<T>(request: () => Promise<T>): Promise<T> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
       try { return await request() } catch (error) {
-        if (!(error instanceof LicenseOperationRecoveryError) || error.code !== 'operation_challenge_http_503' || attempt === 2) {
+        const transientRecoveryChallenge = error instanceof LicenseOperationRecoveryError && error.code === 'operation_challenge_http_503'
+        const transientActivationChallenge = error instanceof LicenseActivationClientError && error.code === 'challenge_http_rejected'
+        if ((!transientRecoveryChallenge && !transientActivationChallenge) || attempt === 5) {
           throw error
         }
-        await new Promise<void>(resolveResult => setTimeout(resolveResult, 150))
+        await new Promise<void>(resolveResult => setTimeout(resolveResult, 200))
       }
     }
     throw new Error('recovery challenge retry exhausted')
@@ -1519,14 +1521,15 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     try {
       await setCenterMode('drop_after_commit')
       const activation = fixture.activationClientForCase()
-      await expect(activation.submitPendingActivation(fixture.operation.operationId))
+      await expect(retryTransientChallenge(() => activation.submitPendingActivation(fixture.operation.operationId)))
         .rejects.toMatchObject({ code: 'activation_result_unknown' })
       await clearCenterMode()
 
       const before = await fixture.db.selectFrom('local_license_operation_attempts').selectAll()
         .where('operation_id', '=', fixture.operation.operationId).executeTakeFirstOrThrow()
       expect(before).toMatchObject({ purpose: 'activation', attempt_no: 1, send_state: 'transport_unknown' })
-      const evidence = await fixture.recoveryClientForCase().queryPendingActivation(fixture.operation.operationId)
+      const evidence = await retryTransientChallenge(() => fixture.recoveryClientForCase()
+        .queryPendingActivation(fixture.operation.operationId))
       expect(evidence).toMatchObject({
         requestAttemptNo: 2, state: 'committed', committedAttemptNo: 1, resultDisposition: 'current_lease', projected: false,
       })
@@ -2770,9 +2773,9 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
           releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions() })
         await projection.projectPersistedOperation(fixture.operation.operationId)
         await setCenterMode(mode)
-        await expect(fixture.recoveryClientForCase().renewLicense({ licenseId: scenario.license_id,
+        await expect(retryTransientChallenge(() => fixture.recoveryClientForCase().renewLicense({ licenseId: scenario.license_id,
           databaseId: fixture.identity.databaseId!, instanceId: fixture.identity.instanceId!, identityJkt: fixture.identity.identityJkt!,
-          expectedGeneration: '1', knownRevision: '1' })).rejects.toMatchObject({ code: 'operation_recovery_result_unknown' })
+          expectedGeneration: '1', knownRevision: '1' }))).rejects.toMatchObject({ code: 'operation_recovery_result_unknown' })
         expect(await projection.getLicenseSnapshot()).toMatchObject({ status: 'active' })
         await clearCenterMode()
         const operation = await fixture.db.selectFrom('local_license_operations').selectAll().where('kind', '=', 'renewal').executeTakeFirstOrThrow()
@@ -3041,7 +3044,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     const scenario = await issueCenterActivationScenario()
     const fixture = await createRecoveryCase({ name: 'projection-query-recovers-lost-recovery', license: scenario })
     try {
-      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      await retryTransientChallenge(() => fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId))
       const projection = createLicenseStateProjectionClient({
         db: fixture.db, pool: fixture.pool, identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
         releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions(),
@@ -3049,7 +3052,7 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
       await projection.projectPersistedOperation(fixture.operation.operationId)
       await renewCenterLicense(scenario.license_id)
       await setCenterMode('drop_recovery_after_commit')
-      await expect(fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId))
+      await expect(retryTransientChallenge(() => fixture.recoveryClientForCase().recoverCurrentLease(fixture.operation.operationId)))
         .rejects.toMatchObject({ code: 'operation_recovery_result_unknown' })
       await clearCenterMode()
 
@@ -5066,7 +5069,8 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
         instanceId: fixture.identity.instanceId!, identityJkt: fixture.identity.identityJkt!,
         expectedGeneration: '1', knownRevision: '1' }
       await setCenterMode('drop_recovery_after_commit')
-      await expect(fixture.recoveryClientForCase().renewLicense(input)).rejects.toMatchObject({ code: 'operation_recovery_result_unknown' })
+      await expect(retryTransientChallenge(() => fixture.recoveryClientForCase().renewLicense(input)))
+        .rejects.toMatchObject({ code: 'operation_recovery_result_unknown' })
       await clearCenterMode()
       const pending = await fixture.db.selectFrom('local_license_operations').selectAll()
         .where('kind', '=', 'renewal').executeTakeFirstOrThrow()

@@ -60,6 +60,8 @@ import { instanceLicenseExpiredRefusalMigration } from './migrations/20261101000
 import { licenseOperationRenewalAttemptsMigration } from './migrations/202611010003_license_operation_renewal_attempts.js'
 import { licenseRenewalRetryMigration } from './migrations/202611010004_license_renewal_retry.js'
 import { trustedBundleHeadMigration } from './migrations/202611010005_trusted_bundle_head.js'
+import { adminSetupStateMigration } from './migrations/202611030001_admin_setup_state.js'
+import { licensePendingKeyBindingMigration } from './migrations/202611030002_license_pending_key_binding.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -121,6 +123,8 @@ export class AppMigrationProvider implements MigrationProvider {
       '202611010003_license_operation_renewal_attempts': licenseOperationRenewalAttemptsMigration,
       '202611010004_license_renewal_retry': licenseRenewalRetryMigration,
       '202611010005_trusted_bundle_head': trustedBundleHeadMigration,
+      '202611030001_admin_setup_state': adminSetupStateMigration,
+      '202611030002_license_pending_key_binding': licensePendingKeyBindingMigration,
     }
     verifyMigrationChecksums(migrations)
     return migrations

@@ -32,7 +32,8 @@ registry_logged_in=0
 cleanup() {
   status=$?
   unset AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD AIKAYUN_RELEASE_SIGNING_KEY_PEM \
-    AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 AIKAYUN_RELEASE_PUBLISH_TOKEN AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN
+    AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 AIKAYUN_TRUSTED_LICENSE_BUNDLE_BASE64 \
+    AIKAYUN_RELEASE_PUBLISH_TOKEN AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN
   unset GH_TOKEN
   if [[ "$registry_logged_in" == 1 ]]; then docker logout ghcr.io >/dev/null 2>&1 || true; fi
   rm -f "$release_key_file"
@@ -57,7 +58,8 @@ node --input-type=module -e 'import { isCanonicalReleaseSemVer } from "./apps/ap
 mkdir -m 0700 "$scan_report_dir"
 mkdir -m 0700 "$DOCKER_CONFIG"
 for name in AIKAYUN_RELEASE_SIGNING_KEY_PEM AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD AIKAYUN_RELEASE_PUBLIC_KEY_JWK \
-  AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 AIKAYUN_PRODUCTION_LICENSE_ISSUER AIKAYUN_PRODUCTION_LICENSE_ROOT_KID \
+  AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 AIKAYUN_TRUSTED_LICENSE_BUNDLE_BASE64 \
+  AIKAYUN_PRODUCTION_LICENSE_ISSUER AIKAYUN_PRODUCTION_LICENSE_ROOT_KID \
   AIKAYUN_LICENSE_CENTER_SIGNER_KIDS AIKAYUN_RELEASE_ORIGIN AIKAYUN_RELEASE_PUBLISH_URL \
   AIKAYUN_RELEASE_PUBLISH_TOKEN AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN GH_TOKEN; do need "$name"; done
 need AIKAYUN_RELEASE_POLICY_READ_TOKEN
@@ -70,6 +72,12 @@ AIKAYUN_RELEASE_POLICY_READ_TOKEN="$AIKAYUN_RELEASE_POLICY_READ_TOKEN" \
 printf '%s' "$AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64" | base64 --decode > "$work/trusted-license-config.json" || \
   fail 'The production authorization config is not valid base64.'
 chmod 0600 "$work/trusted-license-config.json"
+printf '%s' "$AIKAYUN_TRUSTED_LICENSE_BUNDLE_BASE64" | base64 --decode > "$work/license-trust-bundle.jws" || \
+  fail 'The root-signed Trust Bundle is not valid base64.'
+chmod 0600 "$work/license-trust-bundle.jws"
+pnpm --filter @aikayun/api exec tsx scripts/release/verify-trust-bundle.ts \
+  "$work/trusted-license-config.json" "$work/license-trust-bundle.jws" >/dev/null || \
+  fail 'The Trust Bundle does not match the release-pinned root, issuer, minimum version and validity window.'
 printf '%s' "$AIKAYUN_RELEASE_SIGNING_KEY_PEM" > "$release_key_file"
 chmod 0600 "$release_key_file"
 
@@ -227,14 +235,14 @@ done
 
 for platform in linux/amd64 linux/arm64; do
   "$source_root/scripts/release/test-runtime-platform.sh" "$platform" "$api_staging_index_ref" "$web_staging_index_ref" \
-    '202611010005_trusted_bundle_head'
+    '202611030002_license_pending_key_binding'
 done
 migration_path="$work/migration-checksums.json"
 container_id="$(docker create --platform linux/amd64 "$api_staging_index_ref")"
 docker cp "$container_id:/app/dist/db/migration-checksums.json" "$migration_path"
 docker rm "$container_id" >/dev/null
 migration_head="$(jq -er '.migration_head | select(test("^[0-9]{12}_[A-Za-z0-9_-]+$"))' "$migration_path")"
-[[ "$migration_head" == '202611010005_trusted_bundle_head' ]] || fail 'Release migration head differs from the reviewed matrix.'
+[[ "$migration_head" == '202611030002_license_pending_key_binding' ]] || fail 'Release migration head differs from the reviewed matrix.'
 
 sha_of() { sha256sum "$1" | cut -d ' ' -f1; }
 jq -n \
@@ -264,6 +272,7 @@ jq -n \
 
 cp "$work/sbom/"*.cdx.json "$work/support/"
 cp "$work/notices/"NOTICE-*.txt "$work/support/"
+cp "$work/license-trust-bundle.jws" "$work/support/license-trust-bundle.jws"
 node "$source_root/apps/api/scripts/release/cli.mjs" public-key "$release_key_file" \
   "$work/support/release-signing-root.jwk.json" >/dev/null
 pnpm exec esbuild "$source_root/apps/api/scripts/release/verify-only.mjs" --bundle --platform=node --format=esm --target=node24 \
@@ -338,10 +347,10 @@ for image in "$api_index_ref" "$web_index_ref" "${bundle_repository}@${bundle_di
   cosign verify --certificate-identity "$release_identity" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com "$image" >/dev/null
 done
-docker run --rm -v "$release_dir:/release:ro" --entrypoint /nodejs/bin/node "$node_base" \
+docker run --rm -v "$release_dir:/release:ro" --entrypoint node "$node_base" \
   /release/release-verifier.mjs /release/release-manifest.json /release/release-manifest.jws \
   /release/release-signing-root.jwk.json > "$work/independent-jws-verification.json"
-docker run --rm -v "$release_dir:/release:ro" --entrypoint /nodejs/bin/node "$node_base" \
+docker run --rm -v "$release_dir:/release:ro" --entrypoint node "$node_base" \
   /release/verify-artifacts.mjs /release/release-manifest.json /release > "$work/independent-artifact-verification.json"
 
 AIKAYUN_RELEASE_ORIGIN="$AIKAYUN_RELEASE_ORIGIN" AIKAYUN_RELEASE_PUBLISH_URL="$AIKAYUN_RELEASE_PUBLISH_URL" \
@@ -365,10 +374,10 @@ env -u GH_TOKEN -u GITHUB_TOKEN -u AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN cosign verif
   --certificate-identity "$release_identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   "$customer_download/release-manifest.json" >/dev/null
-docker run --rm -v "$customer_download:/release:ro" --entrypoint /nodejs/bin/node "$node_base" \
+docker run --rm -v "$customer_download:/release:ro" --entrypoint node "$node_base" \
   /release/release-verifier.mjs /release/release-manifest.json /release/release-manifest.jws \
   /release/release-signing-root.jwk.json > "$work/customer-linux-jws-verification.json"
-docker run --rm -v "$customer_download:/release:ro" --entrypoint /nodejs/bin/node "$node_base" \
+docker run --rm -v "$customer_download:/release:ro" --entrypoint node "$node_base" \
   /release/verify-artifacts.mjs /release/release-manifest.json /release \
   > "$work/customer-linux-artifact-verification.json"
 manifest_sha256="$(jq -er '.manifest_sha256' "$work/jws-verified.json")"

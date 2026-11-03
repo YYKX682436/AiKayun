@@ -10,7 +10,7 @@ GHCR 容器包名为：
 - `ghcr.io/yykx682436/aikayun-web`
 - `ghcr.io/yykx682436/aikayun-release-bundle`
 
-客户从 release bundle OCI 镜像取出 `release-manifest.json`、分离式 JWS、Cosign bundle、digest 固定的 Compose、Caddy 配置、DB role bootstrap、迁移 checksum、逐架构 SBOM、第三方 NOTICE、release verifier 和 `extract-release-bundle.sh`。首次引导可从签名 HTTPS release 目录取得并校验该 shell artifact，再由无源码安装器复用其 digest 固定提取接口；脚本底层使用 Docker pull/create/cp，不运行 bundle 代码，且也放在 OCI payload 内供后续直接调用。取包只需要公开 GHCR 匿名拉取权限；两个 Git 源码仓库保持 Private。
+客户从 release bundle OCI 镜像取出 `release-manifest.json`、分离式 JWS、Cosign bundle、digest 固定的 Compose、Caddy 配置、DB role bootstrap、迁移 checksum、逐架构 SBOM、第三方 NOTICE、release verifier、`extract-release-bundle.sh` 和无源码 `install.sh`。Bundle 还包含 `license-trust-bundle.jws`：发行配置固定的授权中心离线根对其签名，manifest 将原始文件大小和 SHA-256 纳入发行签名。首次引导可从签名 HTTPS release 目录下载文件；安装器固定 Cosign workflow identity 与工具镜像 digest，不接受用户传入的生产公钥，再验证 manifest Cosign、release JWS、所有 artifact 摘要、API/Web 镜像 Cosign 和 OCI bundle digest，调用已验证的 `extract-release-bundle.sh` 提取并比对 OCI 内容。提取脚本底层使用 Docker pull/create/cp，不运行 bundle 代码，且也放在 OCI payload 内供后续直接调用。取包只需要公开 GHCR 匿名拉取权限；两个 Git 源码仓库保持 Private。
 
 版本清单的 schema、字节规范化、ES256 分离式 JWS 签名/验签及篡改测试位于 `apps/api/scripts/release/manifest.mjs`。JWS release key 必须是固定的 P-256 密钥，公钥由受保护的 release 环境固定；每版 manifest 和 bundle OCI 另外由 Cosign GitHub OIDC 身份签名，API/Web OCI index 也签名。Cosign 身份固定为本仓库的 `release.yml` `main` workflow。release key、Cosign workflow 身份与授权中心的在线/离线签名密钥用途分离；签名清单包含授权中心当前在线 signer KID，签名与离线验证都会拒绝 release root 与任一授权 key 重用。独立 `release-verifier.mjs` 可验 JWS，`verify-artifacts.mjs` 会拒绝符号链接并逐个核对签名清单列出的文件大小和 SHA-256。
 
@@ -24,7 +24,7 @@ API/Web 镜像只推送到 `aikayun-staging-api`、`aikayun-staging-web` 私有 
 
 发行 workflow 是手动触发，要求从 `main` 运行、当前提交的常规 CI 成功、全量验证通过、输入 `PUBLISH-<version>` 确认文本、`main` 分支至少一名 PR reviewer、strict CI status check 和管理员强制执行、GitHub `aikayun-release` environment 至少一名 reviewer 审批且只允许受保护分支、GitHub `v*` tag ruleset 阻止更新与删除、生产授权配置/root pin、独立 release signing key、公钥 pin、授权中心 signer KID 列表、issuer 和已就绪的 HTTPS release origin。脚本会从 GitHub API 读取并核对分支、environment 和 ruleset 设置，读取失败即拒绝登录 GHCR、签名和发布。发布权限仅在该 workflow job 使用 `packages:write` 和 OIDC；普通 CI 保持 `contents:read`。
 
-`aikayun-release` environment 需要受控的 `AIKAYUN_RELEASE_POLICY_READ_TOKEN` 用于读取 reviewer 与 tag ruleset 设置；GHCR 包权限由隔离的 `AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN` 管理；自有发行端需要独立的 `AIKAYUN_RELEASE_PUBLISH_TOKEN`。签名密钥通过 `AIKAYUN_RELEASE_SIGNING_KEY_PEM` 与独立 passphrase 注入。发行配置使用 `AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64`，生产 issuer/root KID、release 公钥 JWK、授权中心 signer KID 清单、发行 origin 与 upload endpoint 分别由同名受保护 Actions variables 固定。所有这些材料必须存入 `aikayun-release` environment，且只授予受控发行 workflow。
+`aikayun-release` environment 需要受控的 `AIKAYUN_RELEASE_POLICY_READ_TOKEN` 用于读取 reviewer 与 tag ruleset 设置；GHCR 包权限由隔离的 `AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN` 管理；自有发行端需要独立的 `AIKAYUN_RELEASE_PUBLISH_TOKEN`。签名密钥通过 `AIKAYUN_RELEASE_SIGNING_KEY_PEM` 与独立 passphrase 注入。发行配置使用 `AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64`；当前 root 签名 Trust Bundle JWS 使用 `AIKAYUN_TRUSTED_LICENSE_BUNDLE_BASE64` Actions variable。构建检查其固定离线根、issuer、最低版本与当时有效期，然后把 JWS 原字节绑定进发行 manifest。生产 issuer/root KID、release 公钥 JWK、授权中心 signer KID 清单、发行 origin 与 upload endpoint 分别由同名受保护 Actions variables 固定。所有私有材料必须存入 `aikayun-release` environment，且只授予受控发行 workflow；签名 Trust Bundle 是公开工件，不是离线根私钥。
 
 相同 SemVer/tag 在 GHCR、manifest ID 和 bundle 中都只接受首次生成。任何阶段失败即消耗该版本，修复必须提高 SemVer 并生成新 release ID。workflow 不覆盖已有容器 tag 或 Git tag，不推送 `latest`。公开可拉取验证在退出 GHCR 登录状态后执行。
 
@@ -35,7 +35,7 @@ API/Web 镜像只推送到 `aikayun-staging-api`、`aikayun-staging-web` 私有 
 - 任一平台构建、迁移、API readiness、DB least-privilege、SSR、fail-closed 授权检查、层/最终文件检查、SBOM、签名验签或 OCI bundle 提取文件核对失败时阻断。
 - 没有受保护的授权生产配置、release signing key、公钥固定值、授权 signer KID 列表、匿名 GHCR 或独立 HTTPS release origin 时阻断，不创建正式商业签名或发布记录。
 
-目前只检测到 `LICENSE_CENTER_READ_TOKEN` 仓库 secret；没有配置正式 release signing key、生产授权配置、release 公钥 pin、production issuer/root KID、授权 signer KID 列表、受保护的 GHCR 包管理权限、受控 `aikayun-release` reviewer 环境与 `v*` tag ruleset、HTTPS release origin、静态上传 endpoint 或上传凭据。首次运行前还必须由受控管理员创建三个 staging GHCR 包并设为 Private。两个源码仓库在本轮初始核对时均为 Private。GitHub API 当前不允许这个 Private 仓库读取或设置 `main` 分支保护和 tag ruleset，并提示需启用支持 Private 仓库保护的 GitHub 计划；`aikayun-release` environment 也不存在。发行门禁保留这些检查，继续保持 fail closed，不把源码仓库改成公开，也不生成测试密钥冒充正式签名。
+目前只检测到 `LICENSE_CENTER_READ_TOKEN` 仓库 secret；没有配置正式 release signing key、生产授权配置、release 公钥 pin、production issuer/root KID、授权 signer KID 列表、root 签名 Trust Bundle JWS、受保护的 GHCR 包管理权限、受控 `aikayun-release` reviewer 环境与 `v*` tag ruleset、HTTPS release origin、静态上传 endpoint 或上传凭据。首次运行前还必须由受控管理员创建三个 staging GHCR 包并设为 Private。两个源码仓库在本轮初始核对时均为 Private。GitHub API 当前不允许这个 Private 仓库读取或设置 `main` 分支保护和 tag ruleset，并提示需启用支持 Private 仓库保护的 GitHub 计划；`aikayun-release` environment 也不存在。发行门禁保留这些检查，继续保持 fail closed，不把源码仓库改成公开，也不生成测试密钥冒充正式签名。
 
 2026-11-02 的本机扫描快照也阻止候选发行：API 与 Web 的四个平台镜像各自均为 0 个 High/Critical 漏洞。API 镜像为 Trust Store 内核锁携带 `/usr/bin/flock`；它来自固定 Debian `util-linux@2.41.5-0+deb13u1`，Syft 将该 ELF 包列入逐架构 SBOM，随镜像的 Debian copyright 校验副本进入 NOTICE，许可证未解析数仍为 0。固定 PostgreSQL 18 Alpine 镜像在 amd64、arm64 均为 28 个 High/Critical，包含 Alpine `brotli-libs`、`libcurl` 与 `gosu` 所带 Go 1.24.6 标准库问题；升级到官方 Caddy 2.11.7 后，两架构仍各有 10 个 High/Critical，涵盖 Alpine 系统包和 Caddy Go 依赖。官方 PostgreSQL 18 Trixie 变体扫描为 89 个 High/Critical，因此没有替换 Alpine 镜像。八个 API/Web/PostgreSQL/Caddy 平台镜像的 Trivy secret findings 均为 0；每个镜像的 CycloneDX SBOM 与 NOTICE 已生成，第三方许可证文本未解析数为 0。发行扫描无忽略文件和漏洞例外；必须使用更新的上游镜像或经独立审核的修复镜像，并在发布前重新完整扫描。该快照只记录当前依赖状态，不代替未来发行时的重新扫描。
 
@@ -54,7 +54,7 @@ docker run --rm \
 
 docker run --rm \
   -v "$PWD:/release:ro" \
-  --entrypoint /nodejs/bin/node \
+  --entrypoint node \
   node:24.22.0-trixie-slim@sha256:a6155384446670e9719bdc4fd0ebe4d4b29fb32a8d6aa523da3547a6cfbcf22c \
   /release/release-verifier.mjs \
   /release/release-manifest.json \
@@ -63,7 +63,7 @@ docker run --rm \
 
 docker run --rm \
   -v "$PWD:/release:ro" \
-  --entrypoint /nodejs/bin/node \
+  --entrypoint node \
   node:24.22.0-trixie-slim@sha256:a6155384446670e9719bdc4fd0ebe4d4b29fb32a8d6aa523da3547a6cfbcf22c \
   /release/verify-artifacts.mjs /release/release-manifest.json /release
 ```
@@ -78,7 +78,7 @@ API 和迁移进程固定以镜像 UID/GID `1000:1000` 运行。普通 Compose �
 
 Distroless API 保持无 shell。Trust Store 的进程间内核锁使用镜像中单独复制的固定版 `flock` 运维二进制；备份脚本从已停止 API 容器取得项目卷，通过 digest 固定的 PostgreSQL 镜像、UID/GID 1000 且禁网的临时工具容器归档。恢复验收脚本只允许显式隔离 `_test` 数据库，并用同一受限工具容器解包，不把 shell 或 tar 安装回 API。
 
-首次安装先验证签名发行清单和授权配置，然后通过本机 `license-trust-head:init` 获取并验证固定 issuer/offline-root 签名的 Trust Bundle，只有确认其版本达到发行最低值并与数据库 singleton trust head 一致后才能初始化信任状态。缺少生产配置、bundle 或离线根时新订单/充值继续 fail closed。
+⑦-3 安装器先验证发行 manifest、root 签名 Trust Bundle 工件及其 digest，然后按数据库 → role bootstrap → migration → 正式 identity/Pending Key initialization → API → Web → Caddy 启动。首次管理员提交的首次激活会通过受信任时间锚验证 JWS，再由现有 Trust Store 接受事务同时建立新 Store 与数据库 head；已有 Store 绑定继续使用 `license-trust-head:init`，不能将它用作全新 trust bootstrap。没有生产配置、当前有效 Bundle 或离线根时，激活与新订单/充值仍 fail closed。授权中心冻结版本尚无公开 Bundle 下载接口，正式 release 必须随签名 bundle 提供当前 root 签名文件，或由管理员通过 HTTPS 页面受控导入同等签名文件。
 
 普通升级应保留同一 `trust_configuration_id`、issuer、offline root 和已有 Trust Store/DB trust head/时间水位；release ID 随 SemVer 变化，不因此重置 installation identity。若 issuer/root/configuration ID/minimum trust policy 变化，先完整备份 DB、identity、Trust Store、pending key 和 release artifacts，保持旧 bundle 状态可验证，由受控人工审核迁移信任；发行 Compose 不会接受 bundle、替换身份、重置水位或执行 down migration。
 

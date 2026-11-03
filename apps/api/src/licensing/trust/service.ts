@@ -10,6 +10,7 @@ import type { TrustedReleaseLicenseConfig } from '../trusted-release-config.js'
 import { verifyCurrentLicenseLease } from './evidence.js'
 import type { VerifiedCurrentLeaseEvidence } from './evidence.js'
 import type { InstallationIdentitySnapshot } from '../installation-identity.js'
+import type { LookupFunction } from 'node:net'
 
 export type LicenseTrustCapabilityStatus =
   | { readonly status: 'trust_uninitialized' }
@@ -20,10 +21,17 @@ export interface LicenseTrustServiceOptions {
   config: TrustedReleaseLicenseConfig
   store: TrustBundleStore
   testCa?: string | Buffer
+  testLookup?: LookupFunction
 }
 
-function sampleOptions(options: LicenseTrustServiceOptions): { testCa?: string | Buffer } {
-  return options.testCa === undefined ? {} : { testCa: options.testCa }
+function sampleOptions(options: LicenseTrustServiceOptions): { testCa?: string | Buffer; testLookup?: LookupFunction } {
+  if ((options.testCa !== undefined || options.testLookup !== undefined) && process.env.NODE_ENV !== 'test') {
+    throw new Error('license_trust_test_transport_forbidden')
+  }
+  return {
+    ...(options.testCa === undefined ? {} : { testCa: options.testCa }),
+    ...(options.testLookup === undefined ? {} : { testLookup: options.testLookup }),
+  }
 }
 
 async function bootstrapTime(

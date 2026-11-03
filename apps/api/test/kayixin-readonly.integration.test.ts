@@ -85,6 +85,8 @@ beforeAll(async () => {
     '202611010003_license_operation_renewal_attempts',
     '202611010004_license_renewal_retry',
     '202611010005_trusted_bundle_head',
+    '202611030001_admin_setup_state',
+    '202611030002_license_pending_key_binding',
   ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])

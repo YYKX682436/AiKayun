@@ -22,6 +22,7 @@ import type { AppConfig } from './config.js'
 import type { Database } from './db/types.js'
 import { registerAdminAuthRoutes } from './auth/admin.js'
 import { requireAdmin } from './auth/admin.js'
+import { registerInitialAdminSetupRoutes } from './auth/initial-admin.js'
 import { registerCustomerAuthRoutes } from './auth/customer.js'
 import { registerCustomerPolicyRoutes } from './auth/customer-policy.js'
 import { registerAdminCustomerRoutes } from './customers/admin.js'
@@ -56,7 +57,12 @@ import { registerWithdrawalRoutes } from './commerce/withdrawals.js'
 import { ZpayEpayProvider } from './payments/zpay-epay.js'
 import { createNewObligationGate, LicenseNewObligationError } from './licensing/new-obligation-gate.js'
 import type { TrustedReleaseLicenseConfig } from './licensing/trusted-release-config.js'
+import { loadEmbeddedTrustedReleaseLicenseConfig } from './licensing/trusted-release-config.js'
+import { createReleaseBoundTrustStore } from './licensing/trust/service.js'
+import { createTrustDatabaseCoordinator } from './licensing/trust/trust-database-coordinator.js'
 import type { TrustBundleStore } from './licensing/trust/trust-bundle-store.js'
+import { registerAdminLicenseActivationRoutes } from './licensing/admin-activation.js'
+import type { TestLicenseTlsOptions } from './licensing/license-request-http.js'
 
 export async function createAppInternal(options: {
   db: Kysely<Database>
@@ -66,11 +72,20 @@ export async function createAppInternal(options: {
   /** Loopback-only service endpoint for integration tests; rejected outside NODE_ENV=test. */
   paymentProviderBaseUrlForTests?: string
   /** Real signed evidence and trust configuration, for isolated integration tests only. */
-  licenseForTests?: { releaseConfig: TrustedReleaseLicenseConfig; trustStore: TrustBundleStore; pool?: Pool }
+  licenseForTests?: { releaseConfig: TrustedReleaseLicenseConfig; trustStore: TrustBundleStore; pool?: Pool; testTls?: TestLicenseTlsOptions }
+  /** Simulates an unknown setup COMMIT acknowledgement; accepted only in a dedicated _test database. */
+  adminSetupForTests?: { afterAdminSetupCommit?: () => void | Promise<void> }
 }) {
   const { db, config } = options
   if (options.licenseForTests && (config.nodeEnv !== 'test' || process.env.NODE_ENV !== 'test')) {
     throw new Error('license_gate_test_options_forbidden')
+  }
+  if (options.adminSetupForTests && (config.nodeEnv !== 'test' || process.env.NODE_ENV !== 'test')) {
+    throw new Error('admin_setup_test_options_forbidden')
+  }
+  if (options.adminSetupForTests) {
+    const database = await sql<{ name: string }>`SELECT current_database() AS name`.execute(db)
+    if (!database.rows[0]?.name.endsWith('_test')) throw new Error('admin_setup_test_database_required')
   }
   if (options.licenseForTests) {
     const businessDatabase = await sql<{ name: string }>`SELECT current_database() AS name`.execute(db)
@@ -99,6 +114,15 @@ export async function createAppInternal(options: {
     pendingKeyRoot: config.licensePendingKeyRoot, trustStoreRoot: config.licenseTrustStoreRoot,
     ...(options.licenseForTests ? { test: options.licenseForTests } : {}),
   })
+  let releaseConfig: TrustedReleaseLicenseConfig | null = options.licenseForTests?.releaseConfig ?? null
+  if (!releaseConfig) {
+    try { releaseConfig = await loadEmbeddedTrustedReleaseLicenseConfig() } catch { releaseConfig = null }
+  }
+  const trustCoordinator = createTrustDatabaseCoordinator({ db, identityRoot: config.identityRoot })
+  const activationTrustStore = releaseConfig
+    ? options.licenseForTests?.trustStore.withCoordinator(trustCoordinator)
+      ?? createReleaseBoundTrustStore(releaseConfig, config.licenseTrustStoreRoot, trustCoordinator)
+    : null
   let paymentProviderBaseUrl = 'https://zpayz.cn'
   if (options.paymentProviderBaseUrlForTests) {
     const testProviderUrl = new URL(options.paymentProviderBaseUrlForTests)
@@ -154,6 +178,7 @@ export async function createAppInternal(options: {
       || request.url.startsWith('/api/v1/customer/')
       || request.url.startsWith('/api/v1/checkout/')
       || request.url.startsWith('/api/v1/guest/')
+      || request.url.startsWith('/api/v1/setup/')
       || request.url.startsWith('/api/v1/admin/')) {
       const cacheControl = String(reply.getHeader('cache-control') ?? '').toLowerCase()
       if (!cacheControl.split(',').some((directive) => directive.trim() === 'private')) {
@@ -233,6 +258,7 @@ export async function createAppInternal(options: {
   })
 
   const dummyPasswordHash = await hashPassword(randomBytes(32).toString('base64url'))
+  registerInitialAdminSetupRoutes(app, db, config, options.adminSetupForTests)
   registerAdminAuthRoutes(app, db, config, dummyPasswordHash)
   app.get('/api/v1/admin/license-status', {
     preHandler: requireAdmin(db, config),
@@ -241,6 +267,10 @@ export async function createAppInternal(options: {
       401: ApiErrorSchema,
     } },
   }, async (request) => success(await gate.getDiagnostic(), request.id))
+  registerAdminLicenseActivationRoutes({
+    app, db, pool: licensePool, config, gate, releaseConfig, trustStore: activationTrustStore,
+    ...(options.licenseForTests?.testTls === undefined ? {} : { testTls: options.licenseForTests.testTls }),
+  })
   registerCustomerAuthRoutes(app, db, config, dummyPasswordHash)
   registerCustomerCartRoutes(app, db, config)
   await registerCustomerPurchaseFormRoutes(app, db, config)

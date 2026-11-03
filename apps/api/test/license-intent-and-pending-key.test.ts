@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { chmod, link, lstat, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -10,6 +10,7 @@ import { parsePendingKeyCliArguments, runPendingKeyCli } from '../src/licensing/
 import {
   decryptLicensePendingBytes,
   encryptLicensePendingBytes,
+  ensureProductionLicensePendingKey,
   initializeTemporaryLicensePendingKey,
   LicensePendingKeyError,
   loadLicensePendingKey,
@@ -65,6 +66,60 @@ describe('⑦-1B-3C-1 activation intent digest', () => {
 })
 
 describe('independent AES-256-GCM pending key store', () => {
+  it('creates a production key once and verifies/reuses the same persisted key on repeated initialization', async () => {
+    const directory = await root()
+    const previous = process.env.NODE_ENV
+    process.env.NODE_ENV = 'production'
+    try {
+      const first = await ensureProductionLicensePendingKey(directory)
+      const firstKey = await loadLicensePendingKey(directory)
+      const second = await ensureProductionLicensePendingKey(directory)
+      const secondKey = await loadLicensePendingKey(directory)
+      expect(first.created).toBe(true)
+      expect(second.created).toBe(false)
+      expect(second.keyId).toBe(first.keyId)
+      expect(secondKey.key).toEqual(firstKey.key)
+      expect((await lstat(join(directory, 'license-pending-aes-256-gcm.json'))).mode & 0o777).toBe(0o600)
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV
+      else process.env.NODE_ENV = previous
+    }
+  })
+
+  it('resumes Pending Key atomic writes after SIGKILL at either side of the final hard link', async () => {
+    const directory = await root()
+    const previous = process.env.NODE_ENV
+    process.env.NODE_ENV = 'production'
+    const finalPath = join(directory, 'license-pending-aes-256-gcm.json')
+    try {
+      const created = await ensureProductionLicensePendingKey(directory)
+      const original = await loadLicensePendingKey(directory)
+      const linkedTemporary = join(directory, `.pending-key-${randomUUID()}.tmp`)
+      await link(finalPath, linkedTemporary)
+      const afterLink = await ensureProductionLicensePendingKey(directory)
+      expect(afterLink).toEqual({ keyId: created.keyId, created: false })
+      expect(await readdir(directory)).toEqual(['license-pending-aes-256-gcm.json'])
+
+      const preLinkTemporary = join(directory, `.pending-key-${randomUUID()}.tmp`)
+      await rename(finalPath, preLinkTemporary)
+      const beforeLink = await ensureProductionLicensePendingKey(directory)
+      expect(beforeLink).toEqual({ keyId: created.keyId, created: true })
+      expect(await loadLicensePendingKey(directory)).toEqual(original)
+      expect(await readdir(directory)).toEqual(['license-pending-aes-256-gcm.json'])
+
+      const incompleteTemporary = join(directory, `.pending-key-${randomUUID()}.tmp`)
+      await unlink(finalPath)
+      await writeFile(incompleteTemporary, '{', { mode: 0o600 })
+      const afterPartialWrite = await ensureProductionLicensePendingKey(directory)
+      expect(afterPartialWrite.created).toBe(true)
+      expect(afterPartialWrite.keyId).not.toBe(created.keyId)
+      expect(await readdir(directory)).toEqual(['license-pending-aes-256-gcm.json'])
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV
+      else process.env.NODE_ENV = previous
+    }
+  })
+
   it('round-trips sensitive bytes with row-bound AAD and survives a second load', async () => {
     const directory = await root()
     const { keyId } = await initializeTemporaryLicensePendingKey(directory, 'test')

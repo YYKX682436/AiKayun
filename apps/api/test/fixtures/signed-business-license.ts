@@ -20,7 +20,7 @@ import { verifyTrustBundleSignature } from '../../src/licensing/trust/trust-bund
 import { fetchTrustedTimeAnchor } from '../../src/licensing/trust/time-anchor-client.js'
 import { createTrustDatabaseCoordinator } from '../../src/licensing/trust/trust-database-coordinator.js'
 
-const centerCommit = 'a5cf99439e3bf92b65f19d60c013bca088cf221a'
+const centerCommit = '185dac80204f60abbaa63ffeb5af7d7054b685d7'
 
 async function exposeTestDatabaseOnLoopback(databaseUrl: string) {
   const target = new URL(databaseUrl)
@@ -71,6 +71,8 @@ export async function createSignedBusinessLicense(input: {
   databaseUrl: string
   centerCheckout: string
   subscriptionSeconds?: number
+  /** Leave the signed activation operation pending for the admin HTTP activation route test. */
+  skipInitialActivation?: boolean
   /** Reuse an already verified test identity and paired pending key without modifying either root. */
   existingRoots?: { identityRoot: string; pendingKeyRoot: string }
 }) {
@@ -188,18 +190,31 @@ export async function createSignedBusinessLicense(input: {
       if (result.state !== 'updated') throw new Error('Unable to set test subscription end')
     }
     const options = { db: input.db, pool: input.pool, identityRoot, pendingKeyRoot, releaseConfig, trustStore, testTls }
-    await createLicenseActivationClient(options).submitPendingActivation(operation.operationId)
     const projection = createLicenseStateProjectionClient(options)
-    await projection.projectPersistedOperation(operation.operationId)
-    const snapshot = await projection.getLicenseSnapshot()
-    if (snapshot.status !== 'active') throw new Error(`Test license was not active: ${snapshot.status}`)
+    if (!input.skipInitialActivation) {
+      await createLicenseActivationClient(options).submitPendingActivation(operation.operationId)
+      await projection.projectPersistedOperation(operation.operationId)
+      const snapshot = await projection.getLicenseSnapshot()
+      if (snapshot.status !== 'active') throw new Error(`Test license was not active: ${snapshot.status}`)
+    }
     async function revokeAndProject() {
       const result = await postCenter('/__test/revoke-license', { license_id: info.activation_success.license_id })
       if (result.state !== 'succeeded') throw new Error('Unable to revoke test license')
       const evidence = await createLicenseOperationRecoveryClient(options).recoverCurrentLease(operation.operationId)
       await projection.projectPersistedOperation(evidence.recoveryOperationId)
     }
-    return { options, trustRoot, projection, operation, revokeAndProject, close }
+    return {
+      options,
+      trustRoot,
+      projection,
+      operation,
+      activationCredential: {
+        licenseId: info.activation_success.license_id,
+        activationCode: info.activation_success.activation_code,
+      },
+      revokeAndProject,
+      close,
+    }
   } catch (error) {
     await close()
     throw error

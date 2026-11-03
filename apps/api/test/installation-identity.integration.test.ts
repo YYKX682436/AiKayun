@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { chmod, lstat, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -9,6 +9,7 @@ import { Pool } from 'pg'
 import type { Pool as PgPool } from 'pg'
 import type { Database } from '../src/db/types.js'
 import { installationIdentityMigration } from '../src/db/migrations/202610290001_installation_identity.js'
+import { licensePendingKeyBindingMigration } from '../src/db/migrations/202611030002_license_pending_key_binding.js'
 import {
   initializeInstallationIdentity,
   verifyInstallationIdentity,
@@ -16,6 +17,7 @@ import {
   type InstallationIdentitySnapshot,
 } from '../src/licensing/installation-identity.js'
 import { parseIdentityCliArguments } from '../src/licensing/installation-identity-cli.js'
+import { ensureBoundProductionPendingKey } from '../src/production-install-init.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const integration = describe.skipIf(!testDatabaseUrl)('installation identity PostgreSQL integration', () => {
@@ -61,6 +63,7 @@ const integration = describe.skipIf(!testDatabaseUrl)('installation identity Pos
     })
     const db = new Kysely<Database>({ dialect: new PostgresDialect({ pool }) })
     await installationIdentityMigration.up(db)
+    await licensePendingKeyBindingMigration.up(db)
     const identityRoot = await mkdtemp(join(tmpdir(), 'aikayun-identity-test-'))
     identityRoots.add(identityRoot)
     return { schema, pool, db, identityRoot }
@@ -154,6 +157,21 @@ const integration = describe.skipIf(!testDatabaseUrl)('installation identity Pos
   }
 
   async function seedEmptyBootstrapRows(pool: PgPool): Promise<void> {
+    await pool.query(`
+      CREATE TABLE admin_setup_state (
+        singleton boolean NOT NULL DEFAULT true,
+        state text NOT NULL DEFAULT 'locked',
+        token_hash char(64),
+        token_expires_at timestamptz,
+        token_generation bigint NOT NULL DEFAULT 0,
+        admin_user_id uuid,
+        completed_by_session_hash char(64),
+        created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+        updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+        completed_at timestamptz
+      )
+    `)
+    await pool.query('INSERT INTO admin_setup_state DEFAULT VALUES')
     await pool.query(`
       CREATE TABLE storefront_customer_policy (
         singleton boolean NOT NULL DEFAULT true,
@@ -425,6 +443,21 @@ const integration = describe.skipIf(!testDatabaseUrl)('installation identity Pos
     })
   })
 
+  it.each(['open', 'completed'] as const)('treats a %s administrator setup state as existing data', async (state) => {
+    await withSandbox(async (sandbox) => {
+      await seedEmptyBootstrapRows(sandbox.pool)
+      if (state === 'open') {
+        await sandbox.pool.query(
+          `UPDATE admin_setup_state SET state = $1, token_hash = $2, token_expires_at = clock_timestamp() WHERE singleton = true`,
+          [state, 'd'.repeat(64)],
+        )
+      } else {
+        await sandbox.pool.query(`UPDATE admin_setup_state SET state = $1, completed_at = clock_timestamp() WHERE singleton = true`, [state])
+      }
+      await expectIdentityError(initialize(sandbox), 'not_verified', 'existing_business_data_requires_adoption')
+    })
+  })
+
   it('does not alter existing orders, wallet, funds, stock, or fulfillment rows during controlled adoption', async () => {
     await withSandbox(async (sandbox) => {
       const tables = [
@@ -453,6 +486,45 @@ const integration = describe.skipIf(!testDatabaseUrl)('installation identity Pos
       await expectIdentityError(initialize(sandbox), 'identity_mismatch', 'identity_private_key_missing')
       await expect(rm(keyPath, { force: false })).rejects.toMatchObject({ code: 'ENOENT' })
       expect((await sandbox.pool.query('SELECT database_id::text FROM installation_binding')).rows[0]?.database_id).toBe(created.databaseId)
+    })
+  })
+
+  it('binds the Pending Key once to installation_binding and refuses to rotate it when the file is lost', async () => {
+    await withSandbox(async (sandbox) => {
+      await initialize(sandbox)
+      const pendingRoot = await mkdtemp(join(tmpdir(), 'aikayun-pending-bound-test-'))
+      identityRoots.add(pendingRoot)
+      const previous = process.env.NODE_ENV
+      process.env.NODE_ENV = 'production'
+      try {
+        const first = await ensureBoundProductionPendingKey(sandbox.pool, pendingRoot, [sandbox.identityRoot])
+        const binding = await sandbox.pool.query<{ pending_key_id: string; pending_key_sha256: string }>(
+          'SELECT pending_key_id, pending_key_sha256 FROM installation_binding WHERE singleton = true',
+        )
+        expect(first.created).toBe(true)
+        expect(binding.rows[0]).toMatchObject({
+          pending_key_id: first.keyId,
+          pending_key_sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        })
+        const repeated = await ensureBoundProductionPendingKey(sandbox.pool, pendingRoot, [sandbox.identityRoot])
+        expect(repeated).toEqual({ keyId: first.keyId, created: false })
+
+        await unlink(join(pendingRoot, 'license-pending-aes-256-gcm.json'))
+        await expect(ensureBoundProductionPendingKey(sandbox.pool, pendingRoot, [sandbox.identityRoot]))
+          .rejects.toMatchObject({ code: 'pending_key_missing_for_bound_installation' })
+        expect(await readdir(pendingRoot)).toEqual([])
+        expect((await sandbox.pool.query(
+          'SELECT pending_key_id, pending_key_sha256 FROM installation_binding WHERE singleton = true',
+        )).rows).toEqual(binding.rows)
+        await expect(sandbox.pool.query(
+          'UPDATE installation_binding SET pending_key_id = NULL, pending_key_sha256 = NULL WHERE singleton = true',
+        )).rejects.toMatchObject({ code: '55000' })
+        await expect(sandbox.pool.query('DELETE FROM installation_binding')).rejects.toMatchObject({ code: '55000' })
+        await expect(sandbox.pool.query('TRUNCATE installation_binding')).rejects.toMatchObject({ code: '55000' })
+      } finally {
+        if (previous === undefined) delete process.env.NODE_ENV
+        else process.env.NODE_ENV = previous
+      }
     })
   })
 

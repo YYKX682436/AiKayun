@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createHash, generateKeyPairSync, createPublicKey } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -37,10 +38,10 @@ const makeManifest = () => ({
   distribution: { https_origin: 'https://www.iana.org', release_path: '/releases/0.1.0-rc.1/' },
   database: {
     engine_major: 18,
-    migration_head: '202611010005_trusted_bundle_head',
+    migration_head: '202611030002_license_pending_key_binding',
     migration_checksums_sha256: hex('c'),
-    readable_heads: ['202611010005_trusted_bundle_head'],
-    writable_heads: ['202611010005_trusted_bundle_head'],
+    readable_heads: ['202611030002_license_pending_key_binding'],
+    writable_heads: ['202611030002_license_pending_key_binding'],
     upgrade_from_releases: [],
     rollback_to_releases: [],
     requires_write_quiescence: true,
@@ -152,4 +153,50 @@ test('release artifact verifier checks exact file size and SHA-256 and rejects s
   })
   await writeFile(join(artifactDirectory, 'compose.yaml'), 'tampered')
   await assert.rejects(verifyReleaseArtifacts(manifestPath, artifactDirectory), /size or SHA-256 mismatch/u)
+})
+
+test('release bundle assembly pins full API/Web references into Compose and includes installer and Trust Bundle', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'aikayun-release-assembly-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const support = join(directory, 'support')
+  const output = join(directory, 'bundle')
+  await mkdir(support)
+  const api = `ghcr.io/yykx682436/aikayun-api@sha256:${hex('a')}`
+  const web = `ghcr.io/yykx682436/aikayun-web@sha256:${hex('b')}`
+  const version = '1.2.3-rc.1'
+  const metadataPath = join(directory, 'metadata.json')
+  const configPath = join(directory, 'config.json')
+  const checksumsPath = join(directory, 'migration-checksums.json')
+  const trustBundle = 'fixture.payload.signature\n'
+  await writeFile(metadataPath, JSON.stringify({
+    version, distribution_origin: 'https://download.example.test',
+    images: { api: { reference: api }, web: { reference: web } },
+  }))
+  await writeFile(configPath, JSON.stringify({ offline_root: { publicJwk: {
+    kty: 'OKP', crv: 'Ed25519', x: Buffer.alloc(32, 7).toString('base64url'),
+  } } }))
+  await writeFile(checksumsPath, JSON.stringify({ schema: 1, migration_head: '202611030002_license_pending_key_binding', migrations: [] }))
+
+  const supportFiles = [
+    'release-verifier.mjs', 'verify-artifacts.mjs', 'release-signing-root.jwk.json', 'license-trust-bundle.jws',
+    ...['api', 'web'].flatMap(image => [`NOTICE-${image}-linux-amd64.txt`, `NOTICE-${image}-linux-arm64.txt`]),
+    ...['api', 'web', 'postgres', 'caddy'].flatMap(image => [
+      `NOTICE-image-${image}-linux-amd64.txt`, `NOTICE-image-${image}-linux-arm64.txt`,
+      `${image}-linux-amd64.cdx.json`, `${image}-linux-arm64.cdx.json`,
+    ]),
+  ]
+  for (const filename of supportFiles) {
+    await writeFile(join(support, filename), filename === 'license-trust-bundle.jws' ? trustBundle : `fixture ${filename}\n`)
+  }
+
+  execFileSync(process.execPath, [join(import.meta.dirname, 'assemble-release.mjs'),
+    metadataPath, configPath, checksumsPath, support, output], { encoding: 'utf8' })
+  const compose = await readFile(join(output, 'compose.yaml'), 'utf8')
+  assert.ok(compose.includes(`image: ${api}`))
+  assert.ok(compose.includes(`image: ${web}`))
+  assert.ok(!compose.includes(`@sha256:${api}`))
+  assert.equal(await readFile(join(output, 'install.sh'), 'utf8'),
+    await readFile(new URL('../../../../scripts/install/install-ai-kayun.sh', import.meta.url), 'utf8'))
+  assert.equal(await readFile(join(output, 'license-trust-bundle.jws'), 'utf8'), trustBundle)
+  assert.equal(JSON.parse(await readFile(join(output, 'release-index.json'), 'utf8')).version, version)
 })

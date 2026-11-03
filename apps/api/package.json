@@ -13,6 +13,7 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "db:reset:test": "tsx src/db/reset-test-database.ts",
     "admin:init": "tsx src/admin-init.ts",
+    "setup-token:issue": "tsx src/setup-token-cli.ts issue",
     "identity:init": "tsx src/licensing/installation-identity-cli.ts init",
     "identity:verify": "tsx src/licensing/installation-identity-cli.ts verify",
     "license-pending-key:init": "tsx src/licensing/pending-encryption-key-cli.ts init",

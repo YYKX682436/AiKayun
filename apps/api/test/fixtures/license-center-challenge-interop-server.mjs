@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url'
 
 const checkout = process.env.LICENSE_CENTER_CHECKOUT
 const infoPath = process.env.LICENSE_CENTER_INTEROP_INFO
-const expectedCommit = 'a5cf99439e3bf92b65f19d60c013bca088cf221a'
+const expectedCommit = '185dac80204f60abbaa63ffeb5af7d7054b685d7'
 if (!checkout || !infoPath) throw new Error('interop fixture requires an isolated center checkout and output path')
 
 const centerImport = async (relativePath) => import(pathToFileURL(join(checkout, relativePath)).href)

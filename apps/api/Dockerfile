@@ -32,7 +32,7 @@ RUN --mount=type=secret,id=aikayun-trusted-license-config,required=false \
   && node apps/api/scripts/create-migration-checksums.mjs apps/api/dist/db/migrations \
   && pnpm --filter @aikayun/api deploy --prod /prod/api
 RUN node scripts/release/prune-node-modules.mjs /prod/api/node_modules
-RUN rm -rf /prod/api/src /prod/api/test \
+RUN rm -rf /prod/api/src /prod/api/test /prod/api/scripts \
   && find /prod/api -maxdepth 1 -type f \( -name 'vitest*.config.*' -o -name 'tsconfig*.json' -o -name 'eslint.config.*' \) -delete \
   && find /prod/api/node_modules -type f -name '*.ts' -delete \
   && find /prod/api -type f \( -name '*.map' -o -name '*.d.ts' -o -iname 'README*' -o -iname 'CHANGELOG*' -o -iname 'CONTRIBUTING*' \) -delete

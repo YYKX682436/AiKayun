@@ -14,7 +14,7 @@ esac
 
 repo_root="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
 work="$(mktemp -d "${TMPDIR:-/tmp}/aikayun-runtime-${platform##*/}.XXXXXX")"
-project="aikayun-7-2-${platform##*/}-$$"
+project="aikayun-7-3-${platform##*/}-$$"
 runtime_uid="$(id -u)"
 runtime_gid="$(id -g)"
 https_port="$(node --input-type=module -e 'import net from "node:net"; import { randomInt } from "node:crypto"; const tryPort=()=>new Promise(resolve=>{const s=net.createServer();const p=randomInt(20000,45000);s.once("error",()=>resolve(tryPort()));s.listen(p,"127.0.0.1",()=>s.close(()=>resolve(p))) }); console.log(await tryPort())')"
@@ -24,7 +24,8 @@ cleanup() {
   status=$?
   if [ "$status" -ne 0 ]; then
     docker compose -p "$project" -f "$repo_root/compose.release.yaml" -f "$work/compose.test.yaml" ps -a || true
-    docker compose -p "$project" -f "$repo_root/compose.release.yaml" -f "$work/compose.test.yaml" logs --tail=100 db-role-init migrate api web || true
+    docker compose -p "$project" -f "$repo_root/compose.release.yaml" -f "$work/compose.test.yaml" \
+      logs --tail=100 db-role-init state-volume-init migrate production-install-init api web || true
   fi
   docker compose -p "$project" -f "$repo_root/compose.release.yaml" -f "$work/compose.test.yaml" down --volumes --remove-orphans >/dev/null 2>&1 || true
   docker volume rm "${project}_state" >/dev/null 2>&1 || true
@@ -42,6 +43,7 @@ payment_key="$(openssl rand -base64 32)"
 delivery_key="$(openssl rand -base64 32)"
 printf '{"activeKeyId":"validation","keys":{"validation":"%s"}}\n' "$payment_key" > "$work/payment-key-ring.json"
 printf '{"activeKeyId":"validation","keys":{"validation":"%s"}}\n' "$delivery_key" > "$work/delivery-key-ring.json"
+printf '%s\n' 'test-only-placeholder-bundle' > "$work/license-trust-bundle.jws"
 chmod 0400 "$work"/*
 
 export AIKAYUN_API_DIGEST="$(printf '%064d' 0 | tr '0' 'a')"
@@ -53,6 +55,7 @@ export AIKAYUN_API_DATABASE_PASSWORD_FILE="$work/api-database-password"
 export AIKAYUN_MIGRATOR_DATABASE_PASSWORD_FILE="$work/migrator-database-password"
 export AIKAYUN_PAYMENT_CREDENTIAL_KEY_RING_FILE="$work/payment-key-ring.json"
 export AIKAYUN_CODE_POOL_ENCRYPTION_KEY_RING_FILE="$work/delivery-key-ring.json"
+export AIKAYUN_LICENSE_TRUST_BUNDLE_FILE="$work/license-trust-bundle.jws"
 export AIKAYUN_HTTP_BIND_ADDRESS=127.0.0.1
 export AIKAYUN_HTTP_PORT="$http_port"
 export AIKAYUN_HTTPS_BIND_ADDRESS=127.0.0.1
@@ -65,17 +68,32 @@ export VALIDATION_UID="$runtime_uid"
 export VALIDATION_GID="$runtime_gid"
 
 docker volume create "${project}_state" >/dev/null
-docker run --rm --user 0:0 -v "${project}_state:/state" \
-  --entrypoint sh node:24.22.0-trixie-slim@sha256:a6155384446670e9719bdc4fd0ebe4d4b29fb32a8d6aa523da3547a6cfbcf22c \
-  -c "mkdir -p /state/media /state/private-files /state/identity /state/license-trust /state/license-pending && chown -R ${runtime_uid}:${runtime_gid} /state"
-
+for volume in "postgres_data:${project}_postgres" "caddy_data:${project}_caddy_data" "caddy_config:${project}_caddy_config"; do
+  compose_key="${volume%%:*}"
+  volume_name="${volume#*:}"
+  docker volume create \
+    --label "com.docker.compose.project=$project" \
+    --label "com.docker.compose.volume=$compose_key" \
+    "$volume_name" >/dev/null
+done
 cat > "$work/compose.test.yaml" <<'YAML'
 services:
   db:
     platform: ${TARGET_PLATFORM}
   db-role-init:
     platform: ${TARGET_PLATFORM}
+  state-volume-init:
+    environment:
+      AIKAYUN_STATE_UID: ${VALIDATION_UID}
+      AIKAYUN_STATE_GID: ${VALIDATION_GID}
+      AIKAYUN_STATE_ALLOW_EMPTY_REPAIR: "true"
   migrate:
+    image: ${API_IMAGE}
+    platform: ${TARGET_PLATFORM}
+    user: ${VALIDATION_UID}:${VALIDATION_GID}
+    environment:
+      PUBLIC_ORIGIN: https://www.iana.org
+  production-install-init:
     image: ${API_IMAGE}
     platform: ${TARGET_PLATFORM}
     user: ${VALIDATION_UID}:${VALIDATION_GID}
@@ -162,5 +180,39 @@ for (let attempt = 0; attempt < 30; attempt++) {
 }
 throw lastError;
 '
+
+fingerprint_install_secrets() {
+  docker compose -p "$project" -f "$repo_root/compose.release.yaml" -f "$work/compose.test.yaml" \
+    exec -T api /nodejs/bin/node -e '
+      const fs=require("node:fs"), crypto=require("node:crypto");
+      const identity=JSON.parse(fs.readFileSync("/var/lib/aikayun/identity/current/identity.json","utf8"));
+      const pending=fs.readFileSync("/var/lib/aikayun/license-pending/license-pending-aes-256-gcm.json");
+      process.stdout.write(JSON.stringify({databaseId:identity.database_id,instanceId:identity.instance_id,
+        identityJkt:identity.identity_jkt,pendingKeyDigest:crypto.createHash("sha256").update(pending).digest("hex")}));
+    '
+}
+
+before_fingerprint="$(fingerprint_install_secrets)"
+docker compose -p "$project" -f "$repo_root/compose.release.yaml" -f "$work/compose.test.yaml" \
+  run --rm --no-deps production-install-init >/dev/null
+after_init_fingerprint="$(fingerprint_install_secrets)"
+[ "$after_init_fingerprint" = "$before_fingerprint" ] || {
+  echo 'Repeated production initialization changed instance identity or Pending Key' >&2
+  exit 1
+}
+docker compose -p "$project" -f "$repo_root/compose.release.yaml" -f "$work/compose.test.yaml" \
+  up -d --no-deps --force-recreate api >/dev/null
+docker compose -p "$project" -f "$repo_root/compose.release.yaml" -f "$work/compose.test.yaml" \
+  ps -q api >/dev/null
+for attempt in $(seq 1 120); do
+  api_id="$(docker compose -p "$project" -f "$repo_root/compose.release.yaml" -f "$work/compose.test.yaml" ps -q api)"
+  if [ -n "$api_id" ] && [ "$(docker inspect --format '{{.State.Health.Status}}' "$api_id" 2>/dev/null || true)" = healthy ]; then break; fi
+  sleep 1
+done
+after_recreate_fingerprint="$(fingerprint_install_secrets)"
+[ "$after_recreate_fingerprint" = "$before_fingerprint" ] || {
+  echo 'Recreating the API container changed instance identity or Pending Key' >&2
+  exit 1
+}
 
 printf 'Runtime validation passed for %s (database, migration, SSR and fail-closed license gate).\n' "$platform"

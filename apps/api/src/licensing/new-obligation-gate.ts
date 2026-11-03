@@ -9,6 +9,7 @@ import type { TrustedReleaseLicenseConfig } from './trusted-release-config.js'
 import { createLicenseTrustService, createReleaseBoundTrustStore } from './trust/service.js'
 import { createTrustDatabaseCoordinator } from './trust/trust-database-coordinator.js'
 import { withTrustTransactionScope, type TrustBundleStore } from './trust/trust-bundle-store.js'
+import type { TestLicenseTlsOptions } from './license-request-http.js'
 
 export type NewObligation = 'create_order' | 'create_top_up'
 export type NewObligationStatus = LicenseSnapshotStatus | 'unavailable'
@@ -43,7 +44,7 @@ export interface NewObligationGateOptions {
   pendingKeyRoot: string
   trustStoreRoot: string
   /** Only real cryptographic fixtures, restricted to isolated test processes. */
-  test?: { releaseConfig: TrustedReleaseLicenseConfig; trustStore: TrustBundleStore }
+  test?: { releaseConfig: TrustedReleaseLicenseConfig; trustStore: TrustBundleStore; testTls?: TestLicenseTlsOptions }
 }
 
 const unavailable = (): NewObligationDetails => Object.freeze({ status: 'unavailable', allowedUntil: null, retryable: true })
@@ -76,6 +77,7 @@ export function createNewObligationGate(options: NewObligationGateOptions): NewO
     return createLicenseStateProjectionClient({
       db: options.db, pool: options.pool, identityRoot: options.identityRoot,
       pendingKeyRoot: options.pendingKeyRoot, releaseConfig: config, trustStore: store,
+      ...(options.test?.testTls === undefined ? {} : { testTls: options.test.testTls }),
     })
   })().catch(() => null)
   return Object.freeze({

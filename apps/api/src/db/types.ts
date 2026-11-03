@@ -21,6 +21,26 @@ export interface AdminSessionsTable {
   revoked_at: Date | null
 }
 
+export interface AdminSetupStateTable {
+  singleton: Generated<boolean>
+  state: 'locked' | 'open' | 'completed'
+  token_hash: string | null
+  token_expires_at: Date | null
+  token_generation: Generated<string>
+  admin_user_id: string | null
+  completed_by_session_hash: string | null
+  created_at: Generated<Date>
+  updated_at: Generated<Date>
+  completed_at: Date | null
+}
+
+export interface AdminSetupSessionsTable {
+  session_hash: string
+  token_generation: string
+  expires_at: ColumnType<Date, Date | string, Date | string>
+  created_at: Generated<Date>
+}
+
 export interface InstallationIdentityInitializationsTable {
   singleton: Generated<boolean>
   operation_id: string
@@ -1486,6 +1506,8 @@ export interface Database {
   instance_license_state: InstanceLicenseStateTable
   admin_users: AdminUsersTable
   admin_sessions: AdminSessionsTable
+  admin_setup_state: AdminSetupStateTable
+  admin_setup_sessions: AdminSetupSessionsTable
   admin_product_creation_requests: AdminProductCreationRequestsTable
   products: ProductsTable
   product_variants: ProductVariantsTable

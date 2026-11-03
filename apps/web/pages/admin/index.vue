@@ -173,6 +173,13 @@ async function logout() {
             >
               刷新状态
             </UButton>
+            <UButton
+              to="/admin/license"
+              class="mt-4 ml-2"
+              icon="i-lucide-key-round"
+            >
+              管理授权
+            </UButton>
           </UCard>
         </section>
 

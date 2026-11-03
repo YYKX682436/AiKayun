@@ -112,6 +112,16 @@ const identityMetadataTables = new Set([
   'instance_license_state',
 ])
 const defaultBootstrapRows: Record<string, Record<string, unknown>> = {
+  admin_setup_state: {
+    singleton: true,
+    state: 'locked',
+    token_hash: null,
+    token_expires_at: null,
+    token_generation: 0,
+    admin_user_id: null,
+    completed_by_session_hash: null,
+    completed_at: null,
+  },
   storefront_customer_policy: {
     singleton: true,
     require_email: false,
@@ -585,7 +595,7 @@ async function findExistingBusinessData(client: PoolClient): Promise<string[]> {
     const defaultRow = defaultBootstrapRows[tablename]
     if (defaultRow) {
       const rows = await client.query<{ row: Record<string, unknown> }>(
-        `SELECT to_jsonb(bootstrap_row) - 'updated_at' AS row FROM ${escaped} AS bootstrap_row`,
+        `SELECT to_jsonb(bootstrap_row) - 'created_at' - 'updated_at' AS row FROM ${escaped} AS bootstrap_row`,
       )
       if (rows.rows.length === 1 && isDeepStrictEqual(rows.rows[0]?.row, defaultRow)) continue
       if (rows.rows.length === 0) continue

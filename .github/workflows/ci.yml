@@ -61,8 +61,8 @@ jobs:
           export GIT_ASKPASS="$GITHUB_WORKSPACE/scripts/github-readonly-askpass.sh"
           export GIT_TERMINAL_PROMPT=0
           git clone --quiet --no-checkout https://github.com/YYKX682436/AiKayun-License.git "$center_dir"
-          git -C "$center_dir" checkout --quiet --detach a5cf99439e3bf92b65f19d60c013bca088cf221a
-          test "$(git -C "$center_dir" rev-parse HEAD)" = a5cf99439e3bf92b65f19d60c013bca088cf221a
+          git -C "$center_dir" checkout --quiet --detach 185dac80204f60abbaa63ffeb5af7d7054b685d7
+          test "$(git -C "$center_dir" rev-parse HEAD)" = 185dac80204f60abbaa63ffeb5af7d7054b685d7
           (cd "$center_dir" && npm ci)
           printf 'LICENSE_CENTER_CHECKOUT=%s\n' "$center_dir" >> "$GITHUB_ENV"
       - name: Lint

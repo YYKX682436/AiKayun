@@ -19,14 +19,21 @@ for (const name of ['api', 'web']) {
     ? '${AIKAYUN_API_DIGEST:?Set API digest from the signed release manifest}'
     : '${AIKAYUN_WEB_DIGEST:?Set Web digest from the signed release manifest}'
   const reference = metadata.images[name].reference
-  if (!reference.includes('@sha256:')) throw new Error(`${name} image must be referenced by digest`)
-  compose = compose.replaceAll(marker, reference)
+  const repository = `ghcr.io/yykx682436/aikayun-${name}`
+  const prefix = `${repository}@sha256:`
+  if (!reference.startsWith(prefix) || !/^[a-f0-9]{64}$/.test(reference.slice(prefix.length))) {
+    throw new Error(`${name} image must use its fixed repository and a SHA-256 digest`)
+  }
+  compose = compose.replaceAll(marker, reference.slice(prefix.length))
 }
 if (/\blatest\b/.test(compose) || /\bbuild\s*:/u.test(compose)) throw new Error('Release Compose must use immutable image digests and contain no build steps')
 await writeFile(join(output, 'compose.yaml'), compose, { flag: 'wx', mode: 0o644 })
 await cp(new URL('../../../../deploy/Caddyfile', import.meta.url), join(output, 'deploy/Caddyfile'))
 await cp(new URL('../../../../deploy/bootstrap-production-db-roles.sh', import.meta.url), join(output, 'deploy/bootstrap-production-db-roles.sh'))
+await cp(new URL('../../../../deploy/prepare-state-volume.sh', import.meta.url), join(output, 'deploy/prepare-state-volume.sh'))
 await cp(new URL('../../../../scripts/release/extract-oci-bundle.sh', import.meta.url), join(output, 'extract-release-bundle.sh'))
+await cp(new URL('../../../../scripts/install/install-ai-kayun.sh', import.meta.url), join(output, 'install.sh'))
+await cp(join(supportDirectory, 'license-trust-bundle.jws'), join(output, 'license-trust-bundle.jws'))
 await cp(migrationChecksumsPath, join(output, 'migration-checksums.json'))
 await writeFile(join(output, 'license-offline-root.jwk.json'), `${JSON.stringify(config.offline_root.publicJwk)}\n`, { flag: 'wx', mode: 0o644 })
 for (const entry of await readdir(supportDirectory, { withFileTypes: true })) {
@@ -55,6 +62,8 @@ await readFile(join(output, 'release-verifier.mjs'))
 await readFile(join(output, 'verify-artifacts.mjs'))
 await readFile(join(output, 'release-signing-root.jwk.json'))
 await readFile(join(output, 'extract-release-bundle.sh'))
+await readFile(join(output, 'install.sh'))
+await readFile(join(output, 'deploy/prepare-state-volume.sh'))
 
 const releaseIndex = {
   schema: 1,
@@ -79,8 +88,10 @@ await writeFile(join(output, 'README.md'), [
   '2. Verify `release-manifest.json` and its detached JWS with `release-signing-root.jwk.json` using `release-verifier.mjs`; step 1 authenticates this JWS root.',
   '3. Compare every artifact SHA-256 and every OCI image reference with the signed manifest before using `compose.yaml`.',
   '4. Bootstrap bundle extraction on Linux with Docker using the digest-pinned pull/create/cp interface. The signed HTTPS artifact `extract-release-bundle.sh` provides that interface without Node, pnpm or source; it is also included in the OCI payload for later installer runs.',
-  '5. Set the required HTTPS hostname and create secret files with mode 0400 or 0600. Database, payment and delivery secrets read by API/migration must be owned by UID/GID 1000; file-based Compose secrets preserve host ownership and mode. The PostgreSQL bootstrap password can remain root-owned. Never store the authorization root private key in this bundle.',
-  '6. Use only the image digests rendered into `compose.yaml`; do not replace them with tags.',
+  '5. The bundle includes one currently valid offline-root-signed Trust Bundle JWS. The signed shell installer accepts no user-provided signing key; it verifies Cosign, JWS, every artifact hash and the OCI bundle before deployment.',
+  '6. The installer requires an existing Linux Docker Engine/Compose v2, public DNS for the store hostname, open TCP 80/443 and sufficient disk. It does not install Docker or change firewall rules.',
+  '7. Use the server-local `setup-token` command only after HTTPS/ACME is ready. The token is printed only to that terminal and expires after 30 minutes.',
+  '8. Use only the image digests rendered into `compose.yaml`; do not replace them with tags.',
   '',
   'The signed release index and artifacts are served from the HTTPS download location recorded in the signed manifest and index.',
   '',
