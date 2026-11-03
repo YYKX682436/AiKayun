@@ -22,6 +22,7 @@ for platform in linux/amd64 linux/arm64; do
   if [[ "$platform" == linux/amd64 ]]; then test_runner_image="$node_amd64_image"; else test_runner_image="$node_arm64_image"; fi
   for scenario in \
     first-install-tls-failure-resume first-install-https-ready \
+    fresh-install-untrusted-code resume-untrusted-code \
     release-download-failure manifest-modified root-substitution compose-image-modified \
     dns-failure disk-low ports-in-use occupied-deployment; do
     printf 'Installer scenario: %s (%s)\n' "$scenario" "$platform"

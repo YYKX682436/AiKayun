@@ -28,7 +28,7 @@ case "$actual_arch" in x86_64) actual_arch=amd64 ;; aarch64) actual_arch=arm64 ;
 }
 [[ -d "$PAYLOAD_DIR" && -f "$INSTALLER" ]] || { printf 'Controlled release payload is missing.\n' >&2; exit 2; }
 case "$SCENARIO" in
-  first-install-tls-failure-resume|first-install-https-ready|release-download-failure|manifest-modified|root-substitution|compose-image-modified|dns-failure|disk-low|ports-in-use|occupied-deployment) ;;
+  first-install-tls-failure-resume|first-install-https-ready|release-download-failure|manifest-modified|root-substitution|compose-image-modified|dns-failure|disk-low|ports-in-use|occupied-deployment|fresh-install-untrusted-code|resume-untrusted-code) ;;
   *) printf 'Unknown isolated installer scenario.\n' >&2; exit 2 ;;
 esac
 if [[ "$SCENARIO" != occupied-deployment && -e "$TARGET_DIR" ]]; then
@@ -339,7 +339,12 @@ if [[ "$url" == https://downloads.customer.com/releases/9.8.7-rc.3/* ]]; then
   relative="$(printf '%s' "$url" | sed 's#^https://downloads.customer.com/releases/9.8.7-rc.3/##')"
   [[ "$relative" != *'..'* && -f "$AIKAYUN_TEST_PAYLOAD/$relative" ]] || exit 8
   cp "$AIKAYUN_TEST_PAYLOAD/$relative" "$output"
-  if [[ "$AIKAYUN_TEST_SCENARIO" == manifest-modified && "$relative" == release-manifest.json ]]; then
+  if [[ "$AIKAYUN_TEST_SCENARIO" == fresh-install-untrusted-code && \
+      ("$relative" == release-verifier.mjs || "$relative" == verify-artifacts.mjs) ]]; then
+    printf '%s\n' 'import { writeFileSync } from "node:fs"; writeFileSync("/tmp/aikayun-untrusted-release-code-executed", "executed"); process.exit(0);' > "$output"
+  elif [[ "$AIKAYUN_TEST_SCENARIO" == fresh-install-untrusted-code && "$relative" == extract-release-bundle.sh ]]; then
+    printf '%s\n' '#!/bin/sh' 'touch /tmp/aikayun-untrusted-release-code-executed' 'exit 0' > "$output"
+  elif [[ "$AIKAYUN_TEST_SCENARIO" == manifest-modified && "$relative" == release-manifest.json ]]; then
     node -e 'const fs=require("node:fs"),p=process.argv[1],m=JSON.parse(fs.readFileSync(p,"utf8"));m.source_commit="f".repeat(40);fs.writeFileSync(p,JSON.stringify(m))' "$output"
   elif [[ "$AIKAYUN_TEST_SCENARIO" == root-substitution && "$relative" == release-signing-root.jwk.json ]]; then
     node -e 'const fs=require("node:fs"),{generateKeyPairSync}=require("node:crypto"),p=process.argv[1],k=generateKeyPairSync("ec",{namedCurve:"prime256v1"}).publicKey.export({format:"jwk"});fs.writeFileSync(p,JSON.stringify({kty:k.kty,crv:k.crv,x:k.x,y:k.y})+"\n")' "$output"
@@ -415,7 +420,9 @@ volume_file() { printf '%s/volumes/%s' "$FAKE_STATE" "$1"; }
 printf 'managed-by=aikayun-7-3\nproject=aikayun\ncompose-volume=postgres_data\n' \
   > "$(volume_file aikayun_postgres_data)"
 preexisting_volume_hash="$(sha256sum "$(volume_file aikayun_postgres_data)" | awk '{print $1}')"
+if [[ "$SCENARIO" == fresh-install-untrusted-code ]]; then export AIKAYUN_TEST_SCENARIO=first-install-https-ready; fi
 preexisting_log="$(run_installer 1 install --release-origin https://downloads.customer.com --version 9.8.7-rc.3 --domain store.customer.com)"
+export AIKAYUN_TEST_SCENARIO="$SCENARIO"
 grep -Fq 'persistent Docker volume already exists' "$preexisting_log"
 [[ "$(sha256sum "$(volume_file aikayun_postgres_data)" | awk '{print $1}')" == "$preexisting_volume_hash" ]]
 [[ ! -e "$TARGET_DIR" ]]
@@ -453,7 +460,7 @@ case "$SCENARIO" in
     ! grep -Fq 'volume_create:' "$EVENT_LOG"
     exit 0
     ;;
-  dns-failure|disk-low|ports-in-use|release-download-failure|manifest-modified|root-substitution|compose-image-modified)
+  dns-failure|disk-low|ports-in-use|release-download-failure|manifest-modified|root-substitution|compose-image-modified|fresh-install-untrusted-code)
     failure_log="$(run_installer 1 install --release-origin https://downloads.customer.com --version 9.8.7-rc.3 --domain store.customer.com)"
     case "$SCENARIO" in
       dns-failure) grep -Fq 'does not resolve in DNS' "$failure_log" || { cat "$failure_log" >&2; exit 1; } ;;
@@ -461,12 +468,17 @@ case "$SCENARIO" in
       ports-in-use) grep -Fq 'port 80 or 443 is in use' "$failure_log" || { cat "$failure_log" >&2; exit 1; } ;;
       release-download-failure) grep -Fq 'Could not download the versioned release index' "$failure_log" || { cat "$failure_log" >&2; exit 1; } ;;
       manifest-modified) grep -Fq 'release JWS signature or embedded JWS root failed verification' "$failure_log" || { cat "$failure_log" >&2; exit 1; } ;;
-      root-substitution) grep -Fq 'release JWS signature or embedded JWS root failed verification' "$failure_log" || { cat "$failure_log" >&2; exit 1; } ;;
-      compose-image-modified) grep -Fq 'release artifact does not match its signed SHA-256 and size' "$failure_log" || { cat "$failure_log" >&2; exit 1; } ;;
+      root-substitution) grep -Fq 'Installer-owned verification rejected a release artifact before any downloaded verifier could run' "$failure_log" || { cat "$failure_log" >&2; exit 1; } ;;
+      compose-image-modified) grep -Fq 'Installer-owned verification rejected a release artifact before any downloaded verifier could run' "$failure_log" || { cat "$failure_log" >&2; exit 1; } ;;
+      fresh-install-untrusted-code) grep -Fq 'Installer-owned verification rejected a release artifact before any downloaded verifier could run' "$failure_log" || { cat "$failure_log" >&2; exit 1; } ;;
     esac
     assert_no_workdir
     [[ ! -e "$TARGET_DIR" ]]
     ! grep -Eq '^(volume_create:|compose_up:|docker_pull)' "$EVENT_LOG"
+    if [[ "$SCENARIO" == fresh-install-untrusted-code ]]; then
+      [[ ! -e /tmp/aikayun-untrusted-release-code-executed ]]
+      ! grep -Fq 'executed' "$failure_log"
+    fi
     exit 0
     ;;
 esac
@@ -497,6 +509,40 @@ grep -Fq 'is not empty' "$duplicate_log"
 [[ "$(sha256sum "$FAKE_STATE/identity/"* | sha256sum | awk '{print $1}')" == "$identity_hash" ]]
 [[ "$(sha256sum "$TARGET_DIR/secrets/"* | sha256sum | awk '{print $1}')" == "$secrets_hash" ]]
 assert_no_secret_leak "$duplicate_log"
+
+if [[ "$SCENARIO" == resume-untrusted-code ]]; then
+  snapshot_persistent_state() {
+    find "$TARGET_DIR" "$FAKE_STATE" -type f ! -path "$EVENT_LOG" -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
+  }
+  backup_directory="$HARNESS_ROOT/release-backups"
+  mkdir -m 0700 "$backup_directory"
+  before_resume_snapshot="$(snapshot_persistent_state)"
+  for artifact_name in release-verifier.mjs verify-artifacts.mjs extract-release-bundle.sh; do
+    backup_path="$backup_directory/$artifact_name"
+    stored_path="$TARGET_DIR/release/$artifact_name"
+    cp -p "$stored_path" "$backup_path"
+    case "$artifact_name" in
+      *.mjs) printf '%s\n' 'import { writeFileSync } from "node:fs"; writeFileSync("/tmp/aikayun-untrusted-release-code-executed", "executed"); process.exit(0);' > "$stored_path" ;;
+      *.sh) printf '%s\n' '#!/bin/sh' 'touch /tmp/aikayun-untrusted-release-code-executed' 'exit 0' > "$stored_path" ;;
+    esac
+    chmod 0600 "$stored_path"
+    rm -f /tmp/aikayun-untrusted-release-code-executed
+    events_before="$(wc -l < "$EVENT_LOG")"
+    tampered_resume_log="$(run_installer 1 resume)"
+    grep -Fq 'Installer-owned verification rejected a stored release artifact before any downloaded verifier could run' "$tampered_resume_log" || {
+      cat "$tampered_resume_log" >&2
+      exit 1
+    }
+    [[ ! -e /tmp/aikayun-untrusted-release-code-executed ]]
+    ! grep -Fq 'executed' "$tampered_resume_log"
+    ! tail -n +"$((events_before + 1))" "$EVENT_LOG" | grep -Eq '^(volume_create:|docker_pull|compose_up:|compose_run:)'
+    cp -p "$backup_path" "$stored_path"
+    [[ "$(snapshot_persistent_state)" == "$before_resume_snapshot" ]]
+    assert_no_secret_leak "$tampered_resume_log"
+  done
+  printf 'Resume rejected tampered verifier and extractor artifacts before execution, preserving deployment data and volumes.\n'
+  exit 0
+fi
 
 if [[ "$SCENARIO" == first-install-tls-failure-resume ]]; then
   export AIKAYUN_TEST_TLS_READY=1

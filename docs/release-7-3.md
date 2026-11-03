@@ -16,6 +16,14 @@ R1 从商城工作树 `aa3e3fb290a549789189ad771606b949749e9e49` 开始。本轮
 
 完整验收仍不开放正式商业发行：本机没有正式 HTTPS release origin、受保护发布端/GHCR 权限、生产 Cosign/JWS 私钥及固定公钥、生产授权 issuer/root 配置或当前 root 签名 Trust Bundle。上述隔离运行未使用测试根冒充生产根，真实公网安装、ACME、客户卡密及商业激活仍为外部阻断。
 
+## ⑦-3-R2：先由安装器验证，再运行发行代码
+
+R2 修复了安装器在 Cosign 验证 manifest 后，先运行发行包下载的 `release-verifier.mjs` 与 `verify-artifacts.mjs`，再检查它们自身 SHA-256 的执行顺序；`resume` 也有同类先执行风险。现由安装器固定代码在 digest 固定的 Node 工具镜像内读取 Cosign 已认证的 manifest，并先独立核验发行目录：路径必须为规范 ASCII 相对路径、无重复项和路径穿越；manifest、JWS 与 Cosign bundle 必须是普通单链接文件；目录树拒绝 symlink、特殊文件及未列出的路径；每个已签名 artifact 必须是普通单链接文件，长度与 SHA-256 必须精确匹配。核验只读挂载发行目录并流式计算摘要。只有全部通过后，才执行下载的 JWS verifier、artifact verifier 或 root 执行的 `extract-release-bundle.sh`。现有 Cosign workflow identity、JWS 根签名、OCI digest、HTTPS/OCI bundle 逐字节比较及镜像签名检查保持不变。`resume` 在校验已记录的 manifest SHA 和 Cosign 签名后，先执行同一套安装器内置核验，再运行已保存发行包里的程序。
+
+隔离 Linux 安装器回归在 `linux/amd64` 与 `linux/arm64` 各运行 12 个场景，共 24 次通过。两个架构均覆盖 fresh install 与 resume：分别把 `release-verifier.mjs`、`verify-artifacts.mjs`、`extract-release-bundle.sh` 替换为“写 marker 后退出 0”的恶意代码。安装器在运行这些代码之前拒绝文件；marker 未出现、错误输出不含攻击标记、没有镜像拉取/卷创建/Compose 启动，resume 恢复原文件后部署目录、秘密、身份、阶段状态与卷快照一致。已有 manifest、发行 root 和 Compose digest 篡改场景也改由安装器内置核验先拒绝。此攻击矩阵使用一次性 JWS 与受控 Cosign shim，证明代码执行次序和数据保护，不证明生产 Sigstore 或公网发行材料可用。
+
+本轮统一 `pnpm verify` 通过：lint 0 error（现有商品页 7 条格式 warning）、API/Web 类型检查、API 41 文件 695/695、money 16/16、发行 manifest 6/6、API/Web production build；浏览器主套件 95/95、备用品牌 1/1、SSR 3/3、开发预览 1/1、生产品牌 1/1。`scripts/test-license-center-interop.sh` 冻结授权中心 SHA `185dac80204f60abbaa63ffeb5af7d7054b685d7` 独立通过 3 文件 136/136；商城与授权中心 checkout 均无源码改动。测试仅使用独立 PostgreSQL 18、临时签名和隔离容器。正式发行域名、受保护发布能力、生产签名/授权根与有效 Trust Bundle 等公网条件仍未提供，因此正式商业发行与真实客户公网安装仍为外部阻断，不标为 PASS。
+
 ## 客户流程
 
 正式发行域名尚未配置，因此以下命令中的 `<release-origin>` 和 `<version>` 是占位符，不是可访问地址。配置并发布真实发行站后，客户执行同一条命令并提供自己的店铺域名：

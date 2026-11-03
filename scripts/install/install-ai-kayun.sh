@@ -199,6 +199,111 @@ node_target() {
     --entrypoint node "$NODE_IMAGE" -e "$1" "${@:2}"
 }
 
+verify_release_artifacts_with_installer() {
+  local directory="$1"
+  docker run --rm --mount "type=bind,source=$directory,target=/release,readonly" \
+    --entrypoint node "$NODE_IMAGE" -e '
+    const fs=require("node:fs");
+    const path=require("node:path");
+    const crypto=require("node:crypto");
+    const root=path.resolve(process.argv[1]);
+    const fail=message=>{ process.stderr.write(`installer-owned release verification failed: ${message}\n`); process.exit(1); };
+    const controls=new Set(["release-manifest.json","release-manifest.jws","release-manifest.cosign.bundle"]);
+    const canonicalRelative=name=>typeof name==="string" && name.length>0 && name.length<=128 &&
+      /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(name) && !name.includes("..") && !name.includes("\\") &&
+      !name.split("/").some(part=>part==="" || part==="." || part==="..");
+    const safeRegular=(file,maxBytes)=>{
+      let info;
+      try { info=fs.lstatSync(file,{bigint:true}); } catch { fail("required control file is missing"); }
+      if(!info.isFile() || info.nlink!==1n || info.size>BigInt(maxBytes)) fail("control file type, link count, or size is unsafe");
+      const fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+      try {
+        const opened=fs.fstatSync(fd,{bigint:true});
+        if(!opened.isFile() || opened.nlink!==1n || opened.dev!==info.dev || opened.ino!==info.ino || opened.size!==info.size)
+          fail("control file changed while opening");
+        const bytes=fs.readFileSync(fd);
+        if(BigInt(bytes.length)!==opened.size) fail("control file changed while reading");
+        return bytes;
+      } finally { fs.closeSync(fd); }
+    };
+    let rootInfo;
+    try { rootInfo=fs.lstatSync(root); } catch { fail("release directory is missing"); }
+    if(!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) fail("release root is not a real directory");
+    for(const name of controls) safeRegular(path.join(root,name),16*1024*1024);
+    const manifestBytes=safeRegular(path.join(root,"release-manifest.json"),16*1024*1024);
+    let manifest;
+    try { manifest=JSON.parse(manifestBytes.toString("utf8")); } catch { fail("signed manifest is not valid JSON"); }
+    if(!manifest || !Array.isArray(manifest.artifacts) || manifest.artifacts.length===0 || manifest.artifacts.length>4096)
+      fail("signed manifest artifact list is invalid");
+    const expected=new Map();
+    for(const artifact of manifest.artifacts) {
+      if(!artifact || !canonicalRelative(artifact.name) || controls.has(artifact.name) ||
+        !Number.isSafeInteger(artifact.size) || artifact.size<0 || !/^[a-f0-9]{64}$/.test(artifact.sha256) || expected.has(artifact.name))
+        fail("signed manifest contains an unsafe or duplicate artifact entry");
+      expected.set(artifact.name,artifact);
+    }
+    const expectedDirectories=new Set();
+    for(const name of expected.keys()) {
+      const parts=name.split("/");
+      for(let index=1;index<parts.length;index++) expectedDirectories.add(parts.slice(0,index).join("/"));
+    }
+    const actualFiles=new Set();
+    const walk=(directory,prefix="")=>{
+      let entries;
+      try { entries=fs.readdirSync(directory,{withFileTypes:true}); } catch { fail("release directory cannot be read"); }
+      for(const entry of entries) {
+        const name=prefix ? `${prefix}/${entry.name}` : entry.name;
+        if(!canonicalRelative(name)) fail("release tree contains an unsafe path");
+        const file=path.join(directory,entry.name);
+        let info;
+        try { info=fs.lstatSync(file,{bigint:true}); } catch { fail("release tree changed while scanning"); }
+        if(info.isSymbolicLink()) fail("release tree contains a symbolic link");
+        if(info.isDirectory()) {
+          if(!expectedDirectories.has(name)) fail("release tree contains an unlisted directory");
+          walk(file,name);
+        } else if(info.isFile()) {
+          if(!controls.has(name) && !expected.has(name)) fail("release tree contains an unlisted file");
+          actualFiles.add(name);
+        } else fail("release tree contains a special file");
+      }
+    };
+    walk(root);
+    for(const name of controls) if(!actualFiles.has(name)) fail("release control file is missing from the tree");
+    for(const [name,artifact] of expected) {
+      if(!actualFiles.has(name)) fail("signed artifact is missing");
+      const file=path.join(root,...name.split("/"));
+      let parent=root;
+      for(const part of name.split("/")) {
+        parent=path.join(parent,part);
+        const info=fs.lstatSync(parent,{bigint:true});
+        if(info.isSymbolicLink() || (parent===file ? !info.isFile() : !info.isDirectory()))
+          fail("signed artifact path contains a symlink or non-regular entry");
+      }
+      const info=fs.lstatSync(file,{bigint:true});
+      if(!info.isFile() || info.nlink!==1n || info.size!==BigInt(artifact.size)) fail("signed artifact type or length mismatch");
+      const fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+      try {
+        const opened=fs.fstatSync(fd,{bigint:true});
+        if(!opened.isFile() || opened.nlink!==1n || opened.dev!==info.dev || opened.ino!==info.ino || opened.size!==info.size)
+          fail("signed artifact changed while opening");
+        const hash=crypto.createHash("sha256");
+        const buffer=Buffer.allocUnsafe(64*1024);
+        let total=0n;
+        for(;;) {
+          const count=fs.readSync(fd,buffer,0,buffer.length,null);
+          if(count===0) break;
+          total+=BigInt(count);
+          if(total>BigInt(artifact.size)) fail("signed artifact grew while hashing");
+          hash.update(buffer.subarray(0,count));
+        }
+        const after=fs.fstatSync(fd,{bigint:true});
+        if(total!==BigInt(artifact.size) || after.dev!==opened.dev || after.ino!==opened.ino || after.size!==opened.size ||
+          hash.digest("hex")!==artifact.sha256) fail("signed artifact length or SHA-256 mismatch");
+      } finally { fs.closeSync(fd); }
+    }
+  ' /release || return 1
+}
+
 fetch_https_file() {
   local url="$1" output="$2"
   curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error \
@@ -266,6 +371,8 @@ download_and_verify_release() {
      -f "$WORK_DIR/release/extract-release-bundle.sh" && -f "$WORK_DIR/release/license-trust-bundle.jws" && \
      -f "$WORK_DIR/release/deploy/prepare-state-volume.sh" ]] || \
     fail 'The signed release is missing a required installation artifact.'
+  verify_release_artifacts_with_installer "$WORK_DIR/release" || \
+    fail 'Installer-owned verification rejected a release artifact before any downloaded verifier could run.'
   docker run --rm --mount "type=bind,source=$WORK_DIR/release,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
     /release/release-verifier.mjs /release/release-manifest.json /release/release-manifest.jws \
     /release/release-signing-root.jwk.json >/dev/null || fail 'The release JWS signature or embedded JWS root failed verification.'
@@ -353,6 +460,8 @@ saved_bundle_verify() {
     verify-blob --bundle /release/release-manifest.cosign.bundle \
     --certificate-identity "$RELEASE_CERT_IDENTITY" --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
     /release/release-manifest.json >/dev/null || fail 'The stored release manifest Cosign signature is invalid.'
+  verify_release_artifacts_with_installer "$RELEASE_DIR" || \
+    fail 'Installer-owned verification rejected a stored release artifact before any downloaded verifier could run.'
   docker run --rm --mount "type=bind,source=$RELEASE_DIR,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
     /release/release-verifier.mjs /release/release-manifest.json /release/release-manifest.jws \
     /release/release-signing-root.jwk.json >/dev/null || fail 'The stored release JWS signature is invalid.'
