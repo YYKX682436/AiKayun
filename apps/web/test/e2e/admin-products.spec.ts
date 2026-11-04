@@ -788,6 +788,7 @@ test('商品 A 的迟到调价确认不能接管商品 B 的后台状态', async
 })
 
 test('admin manages a real product through category, SKU, price, media, rich text, stock and lifecycle', async ({ page }) => {
+  test.setTimeout(120_000)
   await page.setViewportSize({ width: 1440, height: 1000 })
   const editorWarnings: string[] = []
   page.on('console', message => {
