@@ -7,7 +7,9 @@ export type ObservedWorker = 'unpaid_expiry' | 'local_delivery' | 'supplier_deli
  * A best-effort observation, never awaited by the business loop. Each process
  * and worker writes at most one periodic observation and two state transitions
  * per minute. A stuck pool acquisition leaves one in-flight write, not a queue.
- * PostgreSQL supplies timestamps and serializes concurrent instance upserts.
+ * Observations are persisted only after the installation binding is committed;
+ * uninitialized installations remain unknown. PostgreSQL supplies timestamps
+ * and serializes concurrent instance upserts.
  */
 export function createWorkerObserver(db: Kysely<Database>, worker: ObservedWorker) {
   let lastAttempt = -Infinity
@@ -45,10 +47,12 @@ export function createWorkerObserver(db: Kysely<Database>, worker: ObservedWorke
       await sql`SET LOCAL statement_timeout = '1500ms'`.execute(tx)
       await sql`
         INSERT INTO operations_worker_health (worker, last_scan_at, last_success_at, last_failure_at, last_failure_code, last_unavailable_at, last_unavailable_code)
-        VALUES (${worker}, CASE WHEN NOT ${unavailable} THEN clock_timestamp() END,
+        SELECT ${worker}, CASE WHEN NOT ${unavailable} THEN clock_timestamp() END,
           CASE WHEN ${succeeded} THEN clock_timestamp() END,
           CASE WHEN ${failed} THEN clock_timestamp() END, CASE WHEN ${failed} THEN 'SCAN_FAILED' END,
-          CASE WHEN ${unavailable} THEN clock_timestamp() END, CASE WHEN ${unavailable} THEN 'RELEASE_NOT_CONFIGURED' END)
+          CASE WHEN ${unavailable} THEN clock_timestamp() END, CASE WHEN ${unavailable} THEN 'RELEASE_NOT_CONFIGURED' END
+        WHERE EXISTS (SELECT 1 FROM installation_binding b JOIN installation_identity_initializations j ON j.singleton = b.singleton
+          WHERE b.singleton = true AND b.binding_state = 'ready' AND j.state = 'committed')
         ON CONFLICT (worker) DO UPDATE SET
           last_scan_at = CASE WHEN NOT ${unavailable} THEN clock_timestamp() ELSE operations_worker_health.last_scan_at END,
           last_success_at = CASE WHEN ${succeeded} THEN clock_timestamp() ELSE operations_worker_health.last_success_at END,

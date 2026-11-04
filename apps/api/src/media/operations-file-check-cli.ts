@@ -40,10 +40,17 @@ try {
   if (recent.rows[0]?.recent) throw new Error('File checks are limited to once per six hours')
   // Persist running before scanning. SIGKILL, timeout or loss of DB connection
   // leaves an explicitly unknown/incomplete result, never an old green result.
-  await session.query(`INSERT INTO operations_file_checks (kind, started_at, completed_at, status, counts)
+  const started = await session.query(`INSERT INTO operations_file_checks (kind, started_at, completed_at, status, counts)
     SELECT kind, clock_timestamp(), NULL, 'running', '{}'::jsonb FROM unnest($1::text[]) AS kind
+    WHERE EXISTS (SELECT 1 FROM installation_binding b JOIN installation_identity_initializations j ON j.singleton = b.singleton
+      WHERE b.singleton = true AND b.binding_state = 'ready' AND j.state = 'committed')
     ON CONFLICT (kind) DO UPDATE SET started_at = EXCLUDED.started_at,
       completed_at = NULL, status = 'running', counts = '{}'::jsonb`, [kinds])
+  if (started.rowCount !== kinds.length) {
+    process.stderr.write('File check unavailable: installation identity is not initialized.\n')
+    process.exitCode = 1
+    throw new Error('IDENTITY_NOT_INITIALIZED')
+  }
   timer = setTimeout(() => process.exit(2), MAX_RUNTIME_MS)
   const outcomes: Record<string, string> = {}
   for (const kind of kinds) {

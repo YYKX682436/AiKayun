@@ -10,6 +10,8 @@ import type { Pool as PgPool } from 'pg'
 import type { Database } from '../src/db/types.js'
 import { installationIdentityMigration } from '../src/db/migrations/202610290001_installation_identity.js'
 import { licensePendingKeyBindingMigration } from '../src/db/migrations/202611030002_license_pending_key_binding.js'
+import { operationsWorkerHealthMigration } from '../src/db/migrations/202611040001_operations_worker_health.js'
+import { fileCheckResultsMigration } from '../src/db/migrations/202611040002_file_check_results.js'
 import {
   initializeInstallationIdentity,
   verifyInstallationIdentity,
@@ -403,6 +405,20 @@ const integration = describe.skipIf(!testDatabaseUrl)('installation identity Pos
       expect((await sandbox.pool.query('SELECT count(*)::text AS count FROM installation_binding')).rows[0]?.count).toBe('1')
     })
   }, 30_000)
+
+  it.each(['worker', 'file'] as const)('rejects legacy %s observations when no identity exists', async kind => {
+    await withSandbox(async sandbox => {
+      if (kind === 'worker') {
+        await operationsWorkerHealthMigration.up(sandbox.db)
+        await sandbox.pool.query("INSERT INTO operations_worker_health (worker, last_scan_at) VALUES ('local_delivery', clock_timestamp())")
+      } else {
+        await fileCheckResultsMigration.up(sandbox.db)
+        await sandbox.pool.query("INSERT INTO operations_file_checks (kind, started_at, status) VALUES ('media', clock_timestamp(), 'running')")
+      }
+      await expectIdentityError(initialize(sandbox), 'not_verified', 'existing_business_data_requires_adoption')
+      expect((await sandbox.pool.query('SELECT count(*)::int AS count FROM installation_binding')).rows[0]?.count).toBe(0)
+    })
+  })
 
   it('rejects automatic fresh initialization over commercial data and requires explicit adoption', async () => {
     await withSandbox(async (sandbox) => {

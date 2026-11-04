@@ -7,6 +7,8 @@ import { promisify } from 'node:util'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Migrator } from 'kysely/migration'
 import { sql, type Kysely } from 'kysely'
+import { Pool } from 'pg'
+import { initializeInstallationIdentity } from '../src/licensing/installation-identity.js'
 import { createDatabase } from '../src/db/pool.js'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
 import type { Database } from '../src/db/types.js'
@@ -18,6 +20,10 @@ let env: NodeJS.ProcessEnv
 let adminDb: Kysely<Database>
 let schema: string
 let originalDatabaseUrl: string | undefined
+let unboundCheck: { code?: number; stderr?: string; stdout?: string } | undefined
+let unboundRows = -1
+let concurrentBeforeCommitRows = -1
+let concurrentResult: string | undefined
 beforeAll(async () => {
   const url = process.env.TEST_DATABASE_URL
   if (!url || !new URL(url).pathname.slice(1).endsWith('_test')) throw new Error('Dedicated test database required')
@@ -36,6 +42,24 @@ beforeAll(async () => {
   await mkdir(join(root, 'media'), { mode: 0o755 })
   await mkdir(join(root, 'private'), { mode: 0o755 })
   env = { ...process.env, NODE_ENV: 'test', DATABASE_URL: process.env.DATABASE_URL, MEDIA_ROOT: join(root, 'media'), PRIVATE_FILE_ROOT: join(root, 'private') }
+  try { await cli() } catch (error) { unboundCheck = error as typeof unboundCheck }
+  unboundRows = Number((await sql<{ count: string }>`SELECT count(*)::text AS count FROM operations_file_checks`.execute(db)).rows[0]?.count)
+  const pool = new Pool({ connectionString: isolated.toString() })
+  let duringBinding: ReturnType<typeof cli> | undefined
+  try {
+    await initializeInstallationIdentity(pool, { identityRoot: join(root, 'identity'), mode: 'fresh', onCheckpoint: async stage => {
+      if (stage !== 'binding_transaction_before_commit') return
+      duringBinding = cli()
+      // Observe the in-flight child without waiting for a lock held until this callback returns.
+      void duringBinding.catch(() => undefined)
+      await new Promise(resolve => setTimeout(resolve, 300))
+      concurrentBeforeCommitRows = Number((await sql<{ count: string }>`SELECT count(*)::text AS count FROM operations_file_checks`.execute(db)).rows[0]?.count)
+    } })
+    try { concurrentResult = (await duringBinding!).stdout } catch { concurrentResult = 'unavailable' }
+    // A statement that started before commit may legally see the old snapshot.
+    if (concurrentResult === 'unavailable') concurrentResult = (await cli()).stdout
+    await sql`DELETE FROM operations_file_checks`.execute(db)
+  } finally { await pool.end() }
 })
 afterAll(async () => {
   if (db) await db.destroy()
@@ -49,6 +73,14 @@ const cli = () => run(process.execPath, ['--import', 'tsx', 'src/media/operation
 const reset = () => sql`DELETE FROM operations_file_checks`.execute(db)
 
 describe('isolated operations file check', () => {
+  it('refuses an uninitialized identity before scanning or recording', () => {
+    expect(unboundCheck?.code).toBe(1)
+    expect(unboundCheck?.stderr).toContain('File check unavailable: installation identity is not initialized.')
+    expect(unboundCheck?.stdout).toBe('')
+    expect(unboundRows).toBe(0)
+    expect(concurrentBeforeCommitRows).toBe(0)
+    expect(JSON.parse(concurrentResult!)).toEqual({ media: 'ok', private: 'ok', draft: 'ok', order: 'ok' })
+  })
   it('records only counts, does not create attachment directories or alter permissions, and limits repeats', async () => {
     await reset()
     const result = await cli()

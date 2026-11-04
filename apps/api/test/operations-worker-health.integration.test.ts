@@ -12,6 +12,7 @@ import { createWorkerObserver } from '../src/ops/worker-health.js'
 import { createReadinessCheck } from '../src/ops/readiness.js'
 import { createOperationsDiagnostics } from '../src/operations/diagnostics.js'
 import { startLicenseRenewalWorker } from '../src/licensing/license-renewal-worker.js'
+import { initializeInstallationIdentity } from '../src/licensing/installation-identity.js'
 import type { TrustedReleaseLicenseConfig } from '../src/licensing/trusted-release-config.js'
 import type { TrustBundleStore } from '../src/licensing/trust/trust-bundle-store.js'
 import type { FastifyBaseLogger } from 'fastify'
@@ -21,6 +22,9 @@ let db: Kysely<Database>
 let adminDb: Kysely<Database>
 let schema: string
 let isolatedUrl: string
+let identityRoot: string
+let beforeCommitCount = -1
+let beforeInitializationCount = -1
 beforeAll(async () => {
   const url = process.env.TEST_DATABASE_URL
   if (!url || !new URL(url).pathname.slice(1).endsWith('_test')) throw new Error('Dedicated test database required')
@@ -33,11 +37,33 @@ beforeAll(async () => {
   db = new Kysely<Database>({ dialect: new PostgresDialect({ pool: new Pool({ connectionString: isolatedUrl }) }) })
   const result = await new Migrator({ db, provider: new AppMigrationProvider(), migrationTableSchema: schema }).migrateToLatest()
   if (result.error) throw result.error
+  identityRoot = await mkdtemp(join(tmpdir(), 'aikayun-worker-identity-'))
+  createWorkerObserver(db, 'unpaid_expiry')(true)
+  await new Promise(resolve => setTimeout(resolve, 100))
+  beforeInitializationCount = Number((await sql<{ count: string }>`SELECT count(*)::text AS count FROM operations_worker_health`.execute(db)).rows[0]?.count)
+  const identityPool = new Pool({ connectionString: isolatedUrl })
+  try {
+    await expect(initializeInstallationIdentity(identityPool, { identityRoot, mode: 'fresh', onCheckpoint: async stage => {
+      if (stage !== 'binding_transaction_before_commit') return
+      createWorkerObserver(db, 'unpaid_expiry')(true)
+      await new Promise(resolve => setTimeout(resolve, 100))
+      beforeCommitCount = Number((await sql<{ count: string }>`SELECT count(*)::text AS count FROM operations_worker_health`.execute(db)).rows[0]?.count)
+      throw new Error('synthetic binding rollback')
+    } })).rejects.toThrow('Instance identity initialization could not be completed')
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(Number((await sql<{ count: string }>`SELECT count(*)::text AS count FROM operations_worker_health`.execute(db)).rows[0]?.count)).toBe(0)
+    await initializeInstallationIdentity(identityPool, { identityRoot, mode: 'fresh' })
+    // A new observation after the committed binding must eventually persist.
+    createWorkerObserver(db, 'unpaid_expiry')(true)
+    await waitForRows(1)
+    await sql`DELETE FROM operations_worker_health`.execute(db)
+  } finally { await identityPool.end() }
 })
 afterAll(async () => {
   if (db) await db.destroy()
   if (adminDb && schema) await sql.raw(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).execute(adminDb)
   if (adminDb) await adminDb.destroy()
+  if (identityRoot) await rm(identityRoot, { recursive: true, force: true })
 })
 
 async function waitForRows(count: number) {
@@ -50,6 +76,10 @@ async function waitForRows(count: number) {
 }
 
 describe('worker observations', () => {
+  it('does not write before identity initialization or before binding commit', () => {
+    expect(beforeInitializationCount).toBe(0)
+    expect(beforeCommitCount).toBe(0)
+  })
   it('records independent idle scans and fixed failure codes across observers', async () => {
     const local = createWorkerObserver(db, 'local_delivery')
     const supplier = createWorkerObserver(db, 'supplier_delivery')
