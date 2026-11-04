@@ -130,14 +130,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
-        with:
-          node-version-file: .node-version
-          cache: pnpm
       - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996
         with:
           version: 10.29.3
           run_install: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version-file: .node-version
+          cache: pnpm
       - name: Install locked release tooling
         run: pnpm install --frozen-lockfile
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130

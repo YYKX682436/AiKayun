@@ -13,7 +13,7 @@ export function createReadinessCheck(db: Kysely<Database>, config: AppConfig) {
   const check = async (): Promise<boolean> => {
     const names = await compiledNames
     if (!names?.length) return false
-    const [schema] = await Promise.all([
+    const [schema, ...directories] = await Promise.allSettled([
       db.transaction().execute(async tx => {
         await sql`SET LOCAL statement_timeout = '1500ms'`.execute(tx)
         const applied = await sql<{ name: string }>`SELECT name FROM kysely_migration ORDER BY name`.execute(tx)
@@ -81,7 +81,7 @@ export function createReadinessCheck(db: Kysely<Database>, config: AppConfig) {
         await access(root, constants.R_OK | constants.W_OK | constants.X_OK)
       }),
     ])
-    return schema
+    return schema.status === 'fulfilled' && schema.value === true && directories.every(result => result.status === 'fulfilled')
   }
   return async (): Promise<boolean> => {
     if (cached && performance.now() < cached.until) return cached.value

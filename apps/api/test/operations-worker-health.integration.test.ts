@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { Migrator } from 'kysely/migration'
 import { sql, Kysely, PostgresDialect } from 'kysely'
 import { Pool } from 'pg'
-import { mkdtemp, rm, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AppMigrationProvider } from '../src/db/migration-provider.js'
@@ -127,6 +127,49 @@ describe('worker observations', () => {
 })
 
 describe('bounded readiness', () => {
+  it('keeps the entire scan in flight when a directory fails before a stalled database branch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'aikayun-ready-branches-'))
+    const mediaRoot = join(root, 'missing-media')
+    const privateRoot = join(root, 'private')
+    await mkdir(privateRoot)
+    const pool = new Pool({ connectionString: isolatedUrl, max: 1 })
+    const held = await pool.connect()
+    let acquisitions = 0
+    const counted = new Kysely<Database>({ dialect: new PostgresDialect({ pool: {
+      connect: () => { acquisitions++; return pool.connect() },
+      end: () => pool.end(),
+    } }) })
+    let now = performance.now()
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+    let released = false
+    try {
+      const ready = createReadinessCheck(counted, readConfig({ NODE_ENV: 'test', MEDIA_ROOT: mediaRoot, PRIVATE_FILE_ROOT: privateRoot }))
+      const started = Date.now()
+      expect(await ready()).toBe(false)
+      expect(Date.now() - started).toBeLessThan(2500)
+      expect(acquisitions).toBe(1)
+      for (let cycle = 0; cycle < 3; cycle++) {
+        now += 5000
+        expect(await Promise.all(Array.from({ length: 20 }, () => ready()))).toEqual(Array(20).fill(false))
+        expect(acquisitions).toBe(1)
+      }
+      await mkdir(mediaRoot)
+      held.release()
+      released = true
+      // Wait for the old database branch to finish and release the single-flight marker.
+      for (let i = 0; i < 100 && pool.idleCount === 0; i++) await new Promise(resolve => setTimeout(resolve, 10))
+      expect(pool.idleCount).toBe(1)
+      await new Promise(resolve => setTimeout(resolve, 20))
+      now += 5000
+      expect(await ready()).toBe(true)
+      expect(acquisitions).toBe(2)
+    } finally {
+      if (!released) held.release()
+      clock.mockRestore()
+      await counted.destroy()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
   it('limits real HTTP probe scans, including the ten-second Docker interval', async () => {
     const mediaRoot = await mkdtemp(join(tmpdir(), 'aikayun-ready-http-media-'))
     const privateRoot = await mkdtemp(join(tmpdir(), 'aikayun-ready-http-private-'))
