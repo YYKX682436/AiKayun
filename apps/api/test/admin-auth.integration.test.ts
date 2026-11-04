@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { beforeAll, afterAll, describe, expect, it } from 'vitest'
+import { beforeAll, afterAll, afterEach, describe, expect, it, vi } from 'vitest'
 import { sql } from 'kysely'
 import { multiplyUnitAmount, settleAmount } from '@aikayun/money'
 import sharp from 'sharp'
@@ -608,9 +608,13 @@ afterAll(async () => {
   rmSync(mediaTestRoot, { recursive: true, force: true })
   rmSync(privateTestRoot, { recursive: true, force: true })
 })
+afterEach(() => { vi.restoreAllMocks() })
 
 describe('Fastify API with PostgreSQL 18', () => {
   it('serves enveloped health checks, readiness and generated OpenAPI', async () => {
+    let now = performance.now()
+    vi.spyOn(performance, 'now').mockImplementation(() => now)
+    const freshReady = () => { now += 5001; return app.inject('/api/v1/health/ready') }
     const live = await app.inject('/api/v1/health/live')
     expect(live.statusCode).toBe(200)
     expect(live.json().data.service).toBe('aikayun-api')
@@ -621,20 +625,20 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(ready.json().data.database).toBe('ready')
 
     rmSync(privateTestRoot, { recursive: true, force: true })
-    const missingDirectory = await app.inject('/api/v1/health/ready')
+    const missingDirectory = await freshReady()
     expect(missingDirectory.statusCode).toBe(503)
     expect(missingDirectory.json().error.code).toBe('NOT_READY')
     mkdirSync(privateTestRoot, { recursive: true })
     const schemaFault = await sql`ALTER TABLE operations_worker_health RENAME COLUMN last_scan_at TO broken_scan`.execute(db)
     expect(schemaFault).toBeDefined()
     try {
-      const brokenSchema = await app.inject('/api/v1/health/ready')
+      const brokenSchema = await freshReady()
       expect(brokenSchema.statusCode).toBe(503)
       expect((await app.inject('/api/v1/health/live')).statusCode).toBe(200)
     } finally {
       await sql`ALTER TABLE operations_worker_health RENAME COLUMN broken_scan TO last_scan_at`.execute(db)
     }
-    expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(200)
+    expect((await freshReady()).statusCode).toBe(200)
     // Alter only the isolated test database and restore each object immediately.
     for (const [breakSql, restoreSql] of [
       ['ALTER TABLE payment_attempts RENAME COLUMN amount TO broken_amount', 'ALTER TABLE payment_attempts RENAME COLUMN broken_amount TO amount'],
@@ -644,21 +648,21 @@ describe('Fastify API with PostgreSQL 18', () => {
       ['ALTER TABLE wallet_ledger_entries DISABLE TRIGGER wallet_ledger_entries_apply', 'ALTER TABLE wallet_ledger_entries ENABLE TRIGGER wallet_ledger_entries_apply'],
     ]) {
       await sql.raw(breakSql!).execute(db)
-      try { expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(503) }
+      try { expect((await freshReady()).statusCode).toBe(503) }
       finally { await sql.raw(restoreSql!).execute(db) }
-      expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(200)
+      expect((await freshReady()).statusCode).toBe(200)
     }
     const deletedMigration = await sql<{ name: string; timestamp: string }>`
       DELETE FROM kysely_migration WHERE name = '202611040001_operations_worker_health' RETURNING name, timestamp
     `.execute(db)
     expect(deletedMigration.rows).toHaveLength(1)
     try {
-      expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(503)
+      expect((await freshReady()).statusCode).toBe(503)
     } finally {
       const migration = deletedMigration.rows[0]!
       await sql`INSERT INTO kysely_migration (name, timestamp) VALUES (${migration.name}, ${migration.timestamp})`.execute(db)
     }
-    expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(200)
+    expect((await freshReady()).statusCode).toBe(200)
 
     expect((await app.inject('/api/v1/admin/operations/diagnostics')).statusCode).toBe(401)
     const auth = await loginAdmin()

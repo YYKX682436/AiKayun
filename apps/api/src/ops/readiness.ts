@@ -9,6 +9,7 @@ import { AppMigrationProvider } from '../db/migration-provider.js'
 export function createReadinessCheck(db: Kysely<Database>, config: AppConfig) {
   const compiledNames = new AppMigrationProvider().getMigrations().then(migrations => Object.keys(migrations).sort()).catch(() => null)
   let inFlight: Promise<boolean> | undefined
+  let cached: { value: boolean; until: number } | undefined
   const check = async (): Promise<boolean> => {
     const names = await compiledNames
     if (!names?.length) return false
@@ -83,14 +84,28 @@ export function createReadinessCheck(db: Kysely<Database>, config: AppConfig) {
     return schema
   }
   return async (): Promise<boolean> => {
+    if (cached && performance.now() < cached.until) return cached.value
     if (!inFlight) {
-      inFlight = check().catch(() => false).finally(() => { inFlight = undefined })
+      const started = performance.now()
+      const raw = check().catch(() => false)
+      let rawFinished = false
+      let boundedFinished = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const bounded = Promise.race([raw, new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), 2000) })])
+        .then(value => {
+          if (timer) clearTimeout(timer)
+          // Bound the age of a healthy result from the start, not completion.
+          cached = { value, until: started + 5000 }
+          boundedFinished = true
+          if (rawFinished && inFlight === bounded) inFlight = undefined
+          return value
+        })
+      inFlight = bounded
+      void raw.then(() => {
+        rawFinished = true
+        if (boundedFinished && inFlight === bounded) inFlight = undefined
+      })
     }
-    let timer: ReturnType<typeof setTimeout> | undefined
-    try {
-      return await Promise.race([inFlight, new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), 2000) })])
-    } finally {
-      if (timer) clearTimeout(timer)
-    }
+    return inFlight
   }
 }

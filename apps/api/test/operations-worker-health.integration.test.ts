@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { randomUUID } from 'node:crypto'
 import { Migrator } from 'kysely/migration'
 import { sql, Kysely, PostgresDialect } from 'kysely'
@@ -17,6 +17,7 @@ import type { TrustedReleaseLicenseConfig } from '../src/licensing/trusted-relea
 import type { TrustBundleStore } from '../src/licensing/trust/trust-bundle-store.js'
 import type { FastifyBaseLogger } from 'fastify'
 import { readConfig } from '../src/config.js'
+import { createApp } from '../src/app.js'
 
 let db: Kysely<Database>
 let adminDb: Kysely<Database>
@@ -126,6 +127,117 @@ describe('worker observations', () => {
 })
 
 describe('bounded readiness', () => {
+  it('limits real HTTP probe scans, including the ten-second Docker interval', async () => {
+    const mediaRoot = await mkdtemp(join(tmpdir(), 'aikayun-ready-http-media-'))
+    const privateRoot = await mkdtemp(join(tmpdir(), 'aikayun-ready-http-private-'))
+    const pool = new Pool({ connectionString: isolatedUrl })
+    let scans = 0
+    const counted = new Kysely<Database>({ dialect: new PostgresDialect({ pool }), log(event) {
+      if (event.query.sql.includes('SELECT name FROM kysely_migration')) scans++
+    } })
+    let now = performance.now()
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+    const config = readConfig({ NODE_ENV: 'test', MEDIA_ROOT: mediaRoot, PRIVATE_FILE_ROOT: privateRoot })
+    const app = await createApp({ db: counted, config, logger: false })
+    try {
+      const responses = await Promise.all(Array.from({ length: 50 }, () => app.inject('/api/v1/health/ready')))
+      expect(responses.every(response => response.statusCode === 200)).toBe(true)
+      for (let i = 0; i < 100; i++) expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(200)
+      expect(scans).toBe(1)
+      for (let i = 0; i < 3; i++) {
+        now += 10_000
+        expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(200)
+      }
+      expect(scans).toBe(4)
+    } finally {
+      clock.mockRestore()
+      await app.close()
+      await counted.destroy()
+      await Promise.all([mediaRoot, privateRoot].map(path => rm(path, { recursive: true, force: true })))
+    }
+  }, 30_000)
+  it('coalesces requests, expires both outcomes and recovers after schema and connection failures', async () => {
+    const mediaRoot = await mkdtemp(join(tmpdir(), 'aikayun-ready-media-'))
+    const privateRoot = await mkdtemp(join(tmpdir(), 'aikayun-ready-private-'))
+    const pool = new Pool({ connectionString: isolatedUrl, max: 1, application_name: 'readiness-count-test' })
+    const offline = new Pool({ host: '127.0.0.1', port: 1, user: 'unused', database: 'unavailable_test', connectionTimeoutMillis: 250 })
+    let disconnected = false
+    let acquisitions = 0
+    const selectablePool = {
+      connect: () => { acquisitions++; return disconnected ? offline.connect() : pool.connect() },
+      end: async () => { await Promise.all([pool.end(), offline.end()]) },
+    }
+    let scans = 0
+    const counted = new Kysely<Database>({ dialect: new PostgresDialect({ pool: selectablePool }), log(event) {
+      if (event.query.sql.includes('SELECT name FROM kysely_migration')) scans++
+    } })
+    let now = performance.now()
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now)
+    try {
+      const config = readConfig({ NODE_ENV: 'test', MEDIA_ROOT: mediaRoot, PRIVATE_FILE_ROOT: privateRoot })
+      const ready = createReadinessCheck(counted, config)
+      expect(await Promise.all(Array.from({ length: 50 }, () => ready()))).toEqual(Array(50).fill(true))
+      for (let i = 0; i < 100; i++) expect(await ready()).toBe(true)
+      expect(scans).toBe(1)
+      now += 4999
+      expect(await ready()).toBe(true)
+      expect(scans).toBe(1)
+      now += 1
+      expect(await ready()).toBe(true)
+      expect(scans).toBe(2)
+      // A normal Docker probe every ten seconds triggers one fresh scan each.
+      for (let i = 0; i < 3; i++) { now += 10_000; expect(await ready()).toBe(true) }
+      expect(scans).toBe(5)
+
+      await sql`ALTER TABLE orders RENAME COLUMN total_amount TO broken_total`.execute(db)
+      try {
+        expect(await ready()).toBe(true) // bounded cached result
+        now += 5000
+        expect(await ready()).toBe(false)
+        expect(scans).toBe(6)
+        expect(await ready()).toBe(false)
+        expect(scans).toBe(6)
+      } finally { await sql`ALTER TABLE orders RENAME COLUMN broken_total TO total_amount`.execute(db) }
+      now += 5000
+      expect(await ready()).toBe(true)
+      expect(scans).toBe(7)
+
+      // An unreachable PostgreSQL socket fails acquisition; recovery reconnects
+      // to the real database after the cached failure expires.
+      disconnected = true
+      now += 5000
+      expect(await ready()).toBe(false)
+      expect(acquisitions).toBe(8)
+      expect(scans).toBe(7)
+      expect(await ready()).toBe(false)
+      disconnected = false
+      now += 5000
+      expect(await ready()).toBe(true)
+      expect(acquisitions).toBe(9)
+      expect(scans).toBe(8)
+
+      // A pool acquisition that outlives the deadline must not publish its late success.
+      const held = await pool.connect()
+      now += 5000
+      const started = Date.now()
+      const timedOut = await ready()
+      expect(timedOut).toBe(false)
+      expect(Date.now() - started).toBeLessThan(2500)
+      now += 5000
+      expect(await ready()).toBe(false)
+      expect(scans).toBe(8)
+      held.release()
+      for (let i = 0; i < 100 && scans === 8; i++) await new Promise(resolve => setTimeout(resolve, 10))
+      expect(scans).toBe(9)
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(await ready()).toBe(true)
+      expect(scans).toBe(10)
+    } finally {
+      clock.mockRestore()
+      await counted.destroy()
+      await Promise.all([mediaRoot, privateRoot].map(path => rm(path, { recursive: true, force: true })))
+    }
+  }, 30_000)
   it('rejects a storage root that is a symbolic link', async () => {
     const parent = await mkdtemp(join(tmpdir(), 'aikayun-health-link-'))
     const realRoot = await mkdtemp(join(tmpdir(), 'aikayun-health-target-'))
