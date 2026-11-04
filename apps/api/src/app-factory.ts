@@ -63,6 +63,9 @@ import { createTrustDatabaseCoordinator } from './licensing/trust/trust-database
 import type { TrustBundleStore } from './licensing/trust/trust-bundle-store.js'
 import { registerAdminLicenseActivationRoutes } from './licensing/admin-activation.js'
 import type { TestLicenseTlsOptions } from './licensing/license-request-http.js'
+import { createReadinessCheck } from './ops/readiness.js'
+import { registerOperationsFileRoutes, registerOperationsRiskRoutes, registerOperationsWorkerRoutes } from './operations/risk.js'
+import { registerOperationsDiagnosticsRoutes } from './operations/diagnostics.js'
 
 export async function createAppInternal(options: {
   db: Kysely<Database>
@@ -135,14 +138,24 @@ export async function createAppInternal(options: {
   const app = Fastify({
     logger: options.logger === false ? false : {
       level: config.nodeEnv === 'production' ? 'info' : 'debug',
+      // Never serialize an exception's message, stack, cause, or attached data.
+      serializers: { err: () => ({ type: 'Error', message: 'Operation failed', stack: '', code: 'UNEXPECTED_ERROR' }) },
       redact: {
         paths: ['req.headers.cookie', 'req.headers.authorization', 'req.headers.x-csrf-token', 'res.headers.set-cookie', 'req.body', 'req.body.bearerToken', 'req.body.credentials', 'req.headers.x-signature'],
         censor: '[REDACTED]',
       },
     },
+    disableRequestLogging: true,
     trustProxy: config.trustProxy,
     bodyLimit: 64 * 1024,
   }).withTypeProvider<TypeBoxTypeProvider>()
+  app.addHook('onRequest', async (request) => {
+    request.log.info({ method: request.method, route: request.routeOptions.url ?? 'unmatched' }, 'request started')
+  })
+  app.addHook('onResponse', async (request, reply) => {
+    request.log.info({ method: request.method, route: request.routeOptions.url ?? 'unmatched',
+      statusCode: reply.statusCode, responseTime: reply.elapsedTime }, 'request completed')
+  })
   if (!options.licenseForTests?.pool) app.addHook('onClose', async () => { await licensePool.end() })
 
   app.decorateRequest('admin', null)
@@ -171,7 +184,7 @@ export async function createAppInternal(options: {
   })
   await app.register(cookie)
   await app.register(rateLimit, { global: false })
-  await app.register(swaggerUi, { routePrefix: '/api/docs' })
+  if (config.nodeEnv !== 'production') await app.register(swaggerUi, { routePrefix: '/api/docs' })
 
   app.addHook('onSend', async (request, reply, payload) => {
     if (request.url.startsWith('/api/v1/public/')
@@ -196,20 +209,14 @@ export async function createAppInternal(options: {
         error: { code: untypedError.code, message, details: untypedError.details }, meta: { requestId: request.id },
       })
     }
-    const error = untypedError as FastifyError & { validation?: unknown; constraint?: unknown }
+    const error = untypedError as FastifyError & { validation?: unknown }
     const status = error.statusCode && error.statusCode >= 400 && error.statusCode < 500
       ? error.statusCode
       : 500
     if (status >= 500) {
-      // PostgreSQL's error.detail can contain the complete rejected row,
-      // including private delivery plaintext. Keep diagnostic identifiers,
-      // with the logger's request ID/route, rather than serializing that row.
-      request.log.error({
-        errorName: error.name,
-        errorCode: typeof error.code === 'string' && /^[A-Z0-9_]{1,64}$/u.test(error.code) ? error.code : undefined,
-        databaseConstraint: typeof error.constraint === 'string' && /^[A-Za-z0-9_]{1,128}$/u.test(error.constraint)
-          ? error.constraint : undefined,
-      }, 'request failed')
+      // Errors may embed a rejected database row or a provider response in
+      // arbitrary fields, including name and code. Log only a fixed category.
+      request.log.error({ errorCode: 'INTERNAL_ERROR' }, 'request failed')
     }
     const code = error.validation
       ? 'VALIDATION_ERROR'
@@ -239,6 +246,7 @@ export async function createAppInternal(options: {
     },
   }, async (request) => success({ status: 'ok' as const, service: 'aikayun-api' as const }, request.id))
 
+  const checkReadiness = createReadinessCheck(db, config)
   app.get('/api/v1/health/ready', {
     schema: {
       tags: ['health'],
@@ -249,13 +257,16 @@ export async function createAppInternal(options: {
       },
     },
   }, async (request, reply) => {
-    try {
-      await db.selectNoFrom((expression) => expression.val(1).as('ready')).executeTakeFirstOrThrow()
+    if (await checkReadiness()) {
       return success({ status: 'ok', service: 'aikayun-api', database: 'ready' }, request.id)
-    } catch {
-      return reply.code(503).send(failure('NOT_READY', 'The database is not available', request.id))
     }
+    return reply.code(503).send(failure('NOT_READY', 'The service is not ready', request.id))
   })
+
+  registerOperationsDiagnosticsRoutes(app, db, config)
+  registerOperationsRiskRoutes(app, db, config)
+  registerOperationsWorkerRoutes(app, db, config)
+  registerOperationsFileRoutes(app, db, config)
 
   const dummyPasswordHash = await hashPassword(randomBytes(32).toString('base64url'))
   registerInitialAdminSetupRoutes(app, db, config, options.adminSetupForTests)

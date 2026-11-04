@@ -1,7 +1,14 @@
 name: aikayun
 
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   db:
+    logging: *bounded-logging
     image: ${AIKAYUN_POSTGRES_IMAGE:?Set PostgreSQL image reference from the signed release manifest}
     restart: unless-stopped
     environment:
@@ -21,6 +28,7 @@ services:
     networks: [private]
 
   db-role-init:
+    logging: *bounded-logging
     image: ${AIKAYUN_POSTGRES_IMAGE:?Set PostgreSQL image reference from the signed release manifest}
     entrypoint: ["sh", "/deploy/bootstrap-production-db-roles.sh"]
     environment:
@@ -42,6 +50,7 @@ services:
     networks: [private]
 
   state-volume-init:
+    logging: *bounded-logging
     image: ${AIKAYUN_POSTGRES_IMAGE:?Set PostgreSQL image reference from the signed release manifest}
     user: "0:0"
     entrypoint: ["sh", "/deploy/prepare-state-volume.sh"]
@@ -52,6 +61,7 @@ services:
     networks: [private]
 
   migrate:
+    logging: *bounded-logging
     image: ${AIKAYUN_API_IMAGE:?Set API image reference from the signed release manifest}
     user: "1000:1000"
     command: ["dist/db/migrate.js"]
@@ -89,6 +99,7 @@ services:
     networks: [private]
 
   production-install-init:
+    logging: *bounded-logging
     image: ${AIKAYUN_API_IMAGE:?Set API image reference from the signed release manifest}
     user: "1000:1000"
     command: ["dist/production-install-init.js"]
@@ -124,6 +135,7 @@ services:
     networks: [private]
 
   api:
+    logging: *bounded-logging
     image: ${AIKAYUN_API_IMAGE:?Set API image reference from the signed release manifest}
     user: "1000:1000"
     restart: unless-stopped
@@ -174,6 +186,7 @@ services:
     networks: [private]
 
   web:
+    logging: *bounded-logging
     image: ${AIKAYUN_WEB_IMAGE:?Set Web image reference from the signed release manifest}
     restart: unless-stopped
     environment:
@@ -201,6 +214,7 @@ services:
     networks: [private]
 
   caddy:
+    logging: *bounded-logging
     image: ${AIKAYUN_CADDY_IMAGE:?Set Caddy image reference from the signed release manifest}
     restart: unless-stopped
     environment:

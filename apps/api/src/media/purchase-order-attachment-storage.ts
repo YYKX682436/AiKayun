@@ -24,6 +24,18 @@ async function syncDirectory(path: string): Promise<void> {
   try { await handle.sync() } finally { await handle.close() }
 }
 
+async function readDirectoryIfPresent(path: string) {
+  try {
+    const info = await lstat(path)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Invalid attachment directory')
+    return await readdir(path, { withFileTypes: true })
+  }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+}
+
 export class PurchaseOrderAttachmentStorage {
   private readonly root: string
   private readonly stagingRoot: string
@@ -117,16 +129,16 @@ export class PurchaseOrderAttachmentStorage {
   }
 
   async scanFiles(): Promise<PurchaseOrderAttachmentFileInfo[]> {
-    await this.ensureReady()
+    await readDirectoryIfPresent(this.root)
     const files: PurchaseOrderAttachmentFileInfo[] = []
-    for (const entry of await readdir(this.stagingRoot, { withFileTypes: true })) {
+    for (const entry of await readDirectoryIfPresent(this.stagingRoot)) {
       const id = entry.name.endsWith('.part') ? entry.name.slice(0, -5) : ''
       if (!uuidPattern.test(id)) continue
       const path = join(this.stagingRoot, entry.name)
       const stat = await lstat(path)
       files.push({ id, path, storageKey: '', modifiedAt: stat.mtime, location: 'staging' })
     }
-    for (const shard of await readdir(this.objectsRoot, { withFileTypes: true })) {
+    for (const shard of await readDirectoryIfPresent(this.objectsRoot)) {
       if (!shard.isDirectory() || !/^[0-9a-f]{2}$/u.test(shard.name)) continue
       for (const entry of await readdir(join(this.objectsRoot, shard.name), { withFileTypes: true })) {
         const id = entry.name.endsWith('.webp') ? entry.name.slice(0, -5) : ''

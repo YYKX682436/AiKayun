@@ -137,6 +137,18 @@ export async function processPurchaseImageUpload(
   })
 }
 
+async function readDirectoryIfPresent(path: string) {
+  try {
+    const info = await lstat(path)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Invalid attachment directory')
+    return await readdir(path, { withFileTypes: true })
+  }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+}
+
 export class PurchaseAttachmentStorage {
   private readonly root: string
   private readonly stagingRoot: string
@@ -225,9 +237,9 @@ export class PurchaseAttachmentStorage {
   }
 
   async scanFiles(): Promise<PurchaseAttachmentFileInfo[]> {
-    await this.ensureReady()
+    await readDirectoryIfPresent(this.root)
     const files: PurchaseAttachmentFileInfo[] = []
-    for (const entry of await readdir(this.stagingRoot, { withFileTypes: true })) {
+    for (const entry of await readDirectoryIfPresent(this.stagingRoot)) {
       const id = entry.name.endsWith('.part') ? entry.name.slice(0, -5) : ''
       if (!uuidPattern.test(id)) continue
       const path = join(this.stagingRoot, entry.name)
@@ -235,7 +247,7 @@ export class PurchaseAttachmentStorage {
       if (!metadata) continue
       files.push({ path, storageKey: '', id, sizeBytes: metadata.size, modifiedAt: metadata.mtime, location: 'staging' })
     }
-    for (const shardEntry of await readdir(this.objectsRoot, { withFileTypes: true })) {
+    for (const shardEntry of await readDirectoryIfPresent(this.objectsRoot)) {
       if (!shardEntry.isDirectory() || !/^[0-9a-f]{2}$/u.test(shardEntry.name)) continue
       const shardPath = join(this.objectsRoot, shardEntry.name)
       for (const entry of await readdir(shardPath, { withFileTypes: true })) {

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeAll, afterAll, describe, expect, it } from 'vitest'
@@ -28,6 +28,7 @@ const testEmail = 'admin@example.com'
 const testPassword = 'TestOnly-Valid-Password-2026!'
 const testOrigin = 'http://localhost:3000'
 const mediaTestRoot = mkdtempSync(join(tmpdir(), 'aikayun-d5-media-test-'))
+const privateTestRoot = mkdtempSync(join(tmpdir(), 'aikayun-d5-private-test-'))
 
 let app: FastifyInstance
 let db: Kysely<Database>
@@ -595,6 +596,7 @@ beforeAll(async () => {
     PUBLIC_ORIGIN: testOrigin,
     COOKIE_SECURE: 'false',
     MEDIA_ROOT: mediaTestRoot,
+    PRIVATE_FILE_ROOT: privateTestRoot,
   })
   app = await createApp({ db, config, logger: false, productIdentityFactory })
   await app.ready()
@@ -604,6 +606,7 @@ afterAll(async () => {
   if (app) await app.close()
   if (db) await db.destroy()
   rmSync(mediaTestRoot, { recursive: true, force: true })
+  rmSync(privateTestRoot, { recursive: true, force: true })
 })
 
 describe('Fastify API with PostgreSQL 18', () => {
@@ -616,6 +619,57 @@ describe('Fastify API with PostgreSQL 18', () => {
     const ready = await app.inject('/api/v1/health/ready')
     expect(ready.statusCode).toBe(200)
     expect(ready.json().data.database).toBe('ready')
+
+    rmSync(privateTestRoot, { recursive: true, force: true })
+    const missingDirectory = await app.inject('/api/v1/health/ready')
+    expect(missingDirectory.statusCode).toBe(503)
+    expect(missingDirectory.json().error.code).toBe('NOT_READY')
+    mkdirSync(privateTestRoot, { recursive: true })
+    const schemaFault = await sql`ALTER TABLE operations_worker_health RENAME COLUMN last_scan_at TO broken_scan`.execute(db)
+    expect(schemaFault).toBeDefined()
+    try {
+      const brokenSchema = await app.inject('/api/v1/health/ready')
+      expect(brokenSchema.statusCode).toBe(503)
+      expect((await app.inject('/api/v1/health/live')).statusCode).toBe(200)
+    } finally {
+      await sql`ALTER TABLE operations_worker_health RENAME COLUMN broken_scan TO last_scan_at`.execute(db)
+    }
+    expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(200)
+    // Alter only the isolated test database and restore each object immediately.
+    for (const [breakSql, restoreSql] of [
+      ['ALTER TABLE payment_attempts RENAME COLUMN amount TO broken_amount', 'ALTER TABLE payment_attempts RENAME COLUMN broken_amount TO amount'],
+      ['ALTER TABLE order_refunds RENAME COLUMN status TO broken_status', 'ALTER TABLE order_refunds RENAME COLUMN broken_status TO status'],
+      ['ALTER TABLE withdrawals RENAME CONSTRAINT withdrawals_customer_idempotency_unique TO broken_withdrawal_constraint', 'ALTER TABLE withdrawals RENAME CONSTRAINT broken_withdrawal_constraint TO withdrawals_customer_idempotency_unique'],
+      ['ALTER INDEX payment_attempts_one_active_order_unique RENAME TO broken_payment_index', 'ALTER INDEX broken_payment_index RENAME TO payment_attempts_one_active_order_unique'],
+      ['ALTER TABLE wallet_ledger_entries DISABLE TRIGGER wallet_ledger_entries_apply', 'ALTER TABLE wallet_ledger_entries ENABLE TRIGGER wallet_ledger_entries_apply'],
+    ]) {
+      await sql.raw(breakSql!).execute(db)
+      try { expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(503) }
+      finally { await sql.raw(restoreSql!).execute(db) }
+      expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(200)
+    }
+    const deletedMigration = await sql<{ name: string; timestamp: string }>`
+      DELETE FROM kysely_migration WHERE name = '202611040001_operations_worker_health' RETURNING name, timestamp
+    `.execute(db)
+    expect(deletedMigration.rows).toHaveLength(1)
+    try {
+      expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(503)
+    } finally {
+      const migration = deletedMigration.rows[0]!
+      await sql`INSERT INTO kysely_migration (name, timestamp) VALUES (${migration.name}, ${migration.timestamp})`.execute(db)
+    }
+    expect((await app.inject('/api/v1/health/ready')).statusCode).toBe(200)
+
+    expect((await app.inject('/api/v1/admin/operations/diagnostics')).statusCode).toBe(401)
+    const auth = await loginAdmin()
+    const diagnostics = await app.inject({ url: '/api/v1/admin/operations/diagnostics', headers: { cookie: auth.sessionCookie } })
+    expect(diagnostics.statusCode).toBe(200)
+    expect(diagnostics.json().data.checks.find((row: { key: string }) => row.key === 'historical_obligations')?.status).toBe('unknown')
+    const logoutCsrf = await getCsrf()
+    const logout = await app.inject({ method: 'POST', url: '/api/v1/admin/auth/logout', headers: {
+      origin: testOrigin, cookie: `${auth.sessionCookie}; ${logoutCsrf.cookie}`, 'x-csrf-token': logoutCsrf.token,
+    } })
+    expect(logout.statusCode).toBe(200)
 
     const openapi = await app.inject('/api/docs/json')
     expect(openapi.statusCode).toBe(200)
@@ -1015,6 +1069,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       'customer_sessions', 'customers', 'guest_order_sessions',
       'installation_binding', 'installation_identity_initializations', 'instance_license_state',
       'local_license_operation_attempts', 'local_license_operations',
+      'operations_file_checks', 'operations_worker_health',
       'order_inventory_events', 'order_inventory_reservations', 'order_item_fulfillment_attempts',
       'order_item_fulfillment_deliveries', 'order_item_procurement_sources', 'order_item_purchase_attachments', 'order_item_purchase_snapshots', 'order_items',
       'order_refund_allocations', 'order_refund_audit_events', 'order_refund_manual_attempts',

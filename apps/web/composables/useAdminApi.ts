@@ -117,7 +117,7 @@ export function useAdminApi() {
     } catch (error) {
       const normalized = normalizeError(error)
       if (normalized.status === 401 && import.meta.client) {
-        await navigateTo({ path: '/admin/login', query: { redirect: route.fullPath } })
+        await navigateTo({ path: '/admin/login', query: { redirect: route.path } })
       }
       throw normalized
     }
@@ -130,7 +130,7 @@ export function useAdminApi() {
     } catch (error) {
       const normalized = normalizeError(error)
       if (normalized.status === 401 && import.meta.client) {
-        await navigateTo({ path: '/admin/login', query: { redirect: route.fullPath } })
+        await navigateTo({ path: '/admin/login', query: { redirect: route.path } })
       }
       throw normalized
     }
@@ -157,7 +157,7 @@ export function useAdminApi() {
           return
         }
         const error = normalizeError({ statusCode: xhr.status, data: payload })
-        if (error.status === 401) await navigateTo({ path: '/admin/login', query: { redirect: route.fullPath } })
+        if (error.status === 401) await navigateTo({ path: '/admin/login', query: { redirect: route.path } })
         reject(error)
       }
       const form = new FormData()

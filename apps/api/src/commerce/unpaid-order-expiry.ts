@@ -2,6 +2,7 @@ import type { FastifyBaseLogger } from 'fastify'
 import type { Kysely } from 'kysely'
 import type { Database } from '../db/types.js'
 import { expireDueUnpaidOrders } from './orders.js'
+import { createWorkerObserver } from '../ops/worker-health.js'
 
 const pollIntervalMs = 60_000
 const batchSize = 100
@@ -15,6 +16,7 @@ export function startUnpaidOrderExpiryWorker(
   db: Kysely<Database>,
   logger: FastifyBaseLogger,
 ): () => Promise<void> {
+  const observe = createWorkerObserver(db, 'unpaid_expiry')
   let stopped = false
   let timer: ReturnType<typeof setTimeout> | undefined
   let activeRun: Promise<void> | undefined
@@ -35,9 +37,11 @@ export function startUnpaidOrderExpiryWorker(
           closedCount += closed
           if (closed < batchSize) break
         }
+        observe(true)
         if (closedCount > 0) logger.info({ closedCount }, 'expired unpaid orders closed')
-      } catch (error) {
-        logger.warn({ err: error }, 'unpaid order expiry pass failed')
+      } catch {
+        observe(false)
+        logger.warn({ errorCode: 'SCAN_FAILED' }, 'unpaid order expiry pass failed')
       } finally {
         activeRun = undefined
         schedule()

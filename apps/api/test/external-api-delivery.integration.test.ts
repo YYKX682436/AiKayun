@@ -1,3 +1,4 @@
+import { readOperationsRisk, readOperationsWorkers } from '../src/operations/risk.js'
 import { randomUUID, randomBytes } from 'node:crypto'
 import { appendFile, mkdtemp, rm, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -691,6 +692,7 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
     const partialCatalog = await createCatalog('0.00', 'quantity')
     await saveApiVersion(partialCatalog, admin, supplier, { productId: 'partial-fixture-product', mode: 'partial' })
     expect((await setApiReadiness(partialCatalog, admin, true)).statusCode).toBe(200)
+    const riskBefore = (await readOperationsRisk(db)).rows.find(row => row.kind === 'delivery_failed')?.count ?? 0
     const partialOrder = await createOrder(customer, partialCatalog, 5)
     const partialOrderId = partialOrder.json().data.order.id as string
     const partialItemId = partialOrder.json().data.order.items[0].id as string
@@ -703,6 +705,7 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
     expect(deliveredFirstBatch).toEqual({ fulfilled_quantity: 3, fulfillment_reserved_quantity: 1 })
     operations = await pendingOperations(partialItemId)
     expect(operations.map(row => row.state).sort()).toEqual(['failed', 'processing', 'succeeded', 'succeeded', 'succeeded'])
+    expect((await readOperationsRisk(db)).rows.find(row => row.kind === 'delivery_failed')?.count ?? 0).toBe(riskBefore + 1)
 
     const processingOperation = operations.find(row => row.state === 'processing')!
     await db.updateTable('supplier_api_delivery_operations').set({ next_action_at: new Date() }).where('id', '=', processingOperation.id).execute()
@@ -719,6 +722,7 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
     await runDigitalDeliveryRecoveryPass(db, config)
     await runDigitalDeliveryRecoveryPass(db, config)
     await assertItemDelivered(partialOrderId, partialItemId, 5)
+    expect((await readOperationsRisk(db)).rows.find(row => row.kind === 'delivery_failed')?.count ?? 0).toBe(riskBefore)
     const inventory = await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
       .where('product_variant_id', '=', partialCatalog.skuId).executeTakeFirstOrThrow()
     expect(inventory).toEqual({ stocked: 15, reserved: 0 })
@@ -1375,7 +1379,7 @@ describe('⑤-5 mixed digital orders and transactional rollback', () => {
     }, 30_000)
   }
 
-  it('redacts private delivery plaintext from unexpected PostgreSQL errors while retaining diagnostic codes', async () => {
+  it('redacts private delivery plaintext and uses a fixed safe diagnostic code', async () => {
     const order = await paidApiOrder('manual')
     const secret = 'phase55-private-delivery-never-log-this'
     await sql`ALTER TABLE order_item_fulfillment_deliveries ADD CONSTRAINT phase55_logging_failure CHECK (content IS DISTINCT FROM ${sql.lit(secret)})`.execute(db)
@@ -1389,8 +1393,8 @@ describe('⑤-5 mixed digital orders and transactional rollback', () => {
       expect(await response.text()).not.toContain(secret)
       await expect.poll(() => process.logs(), { timeout: 1000, intervals: [10, 20] }).toContain('request failed')
       expect(process.logs()).not.toContain(secret)
-      expect(process.logs()).toContain('23514')
-      expect(process.logs()).toContain('phase55_logging_failure')
+      expect(process.logs()).toContain('INTERNAL_ERROR')
+      expect(process.logs()).not.toContain('phase55_logging_failure')
     } finally {
       await process.kill()
       await sql`ALTER TABLE order_item_fulfillment_deliveries DROP CONSTRAINT phase55_logging_failure`.execute(db)
@@ -1524,9 +1528,11 @@ describe('⑤-5 refund and in-flight supplier crossing', () => {
 
   it('does not begin new fulfillment after a full refund and releases only unused stock on safe closure', async () => {
     const order = await paidApiOrder()
+    const dueBeforeRefund = (await readOperationsWorkers(db)).workers.find(worker => worker.worker === 'local_delivery')!.backlog
     const refund = await inject({ method: 'POST', url: `/api/v1/customer/orders/${order.orderId}/refunds`, headers: customerHeaders(order.customer),
       payload: { idempotencyKey: randomUUID(), amount: '5.00', reason: 'refund before any external operation is submitted' } })
     expect(refund.statusCode, refund.body).toBe(201)
+    expect((await readOperationsWorkers(db)).workers.find(worker => worker.worker === 'local_delivery')!.backlog).toBe(dueBeforeRefund - 1)
     const approved = await inject({ method: 'POST', url: `/api/v1/admin/orders/${order.orderId}/refunds/${refund.json().data.refunds.items[0].id}/approve`,
       headers: adminHeaders(order.admin), payload: { idempotencyKey: randomUUID() } })
     expect(approved.statusCode, approved.body).toBe(200)

@@ -1,3 +1,4 @@
+import { createWorkerObserver, type ObservedWorker } from '../ops/worker-health.js'
 import { createHash, randomUUID } from 'node:crypto'
 import type { FastifyBaseLogger } from 'fastify'
 import { sql, type Kysely, type Transaction } from 'kysely'
@@ -1564,11 +1565,12 @@ export function startDigitalDeliveryWorker(
 ): () => Promise<void> {
   // Slow supplier I/O cannot delay local delivery. Both loops share the same
   // database, worker lifecycle and persisted order/operation state machine.
-  const stopLocal = startPoll(() => runLocalDeliveryPass(db, config))
-  const stopSupplier = startPoll(() => processSupplierOperations(db, config))
+  const stopLocal = startPoll('local_delivery', () => runLocalDeliveryPass(db, config))
+  const stopSupplier = startPoll('supplier_delivery', () => processSupplierOperations(db, config))
   return async () => { await Promise.all([stopLocal(), stopSupplier()]) }
 
-  function startPoll(pass: () => Promise<void>): () => Promise<void> {
+  function startPoll(worker: ObservedWorker, pass: () => Promise<void>): () => Promise<void> {
+    const observe = createWorkerObserver(db, worker)
     let stopped = false
     let timer: ReturnType<typeof setTimeout> | undefined
     let activeRun: Promise<void> | undefined
@@ -1584,14 +1586,10 @@ export function startDigitalDeliveryWorker(
       activeRun = (async () => {
         try {
           await pass()
-        } catch (error) {
-          const candidateError = error && typeof error === 'object'
-            ? error as { code?: unknown; name?: unknown }
-            : {}
-          logger.warn({
-            errorName: typeof candidateError.name === 'string' ? candidateError.name : 'unknown',
-            databaseCode: typeof candidateError.code === 'string' ? candidateError.code : undefined,
-          }, 'digital delivery recovery scan failed')
+          observe(true)
+        } catch {
+          observe(false)
+          logger.warn({ errorCode: 'SCAN_FAILED' }, 'digital delivery recovery scan failed')
         } finally {
           activeRun = undefined
           schedule()

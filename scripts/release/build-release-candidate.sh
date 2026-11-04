@@ -235,14 +235,14 @@ done
 
 for platform in linux/amd64 linux/arm64; do
   "$source_root/scripts/release/test-runtime-platform.sh" "$platform" "$api_staging_index_ref" "$web_staging_index_ref" \
-    '202611030002_license_pending_key_binding'
+    '202611040002_file_check_results'
 done
 migration_path="$work/migration-checksums.json"
 container_id="$(docker create --platform linux/amd64 "$api_staging_index_ref")"
 docker cp "$container_id:/app/dist/db/migration-checksums.json" "$migration_path"
 docker rm "$container_id" >/dev/null
 migration_head="$(jq -er '.migration_head | select(test("^[0-9]{12}_[A-Za-z0-9_-]+$"))' "$migration_path")"
-[[ "$migration_head" == '202611030002_license_pending_key_binding' ]] || fail 'Release migration head differs from the reviewed matrix.'
+[[ "$migration_head" == '202611040002_file_check_results' ]] || fail 'Release migration head differs from the reviewed matrix.'
 
 sha_of() { sha256sum "$1" | cut -d ' ' -f1; }
 jq -n \

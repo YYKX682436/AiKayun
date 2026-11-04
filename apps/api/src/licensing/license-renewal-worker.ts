@@ -1,3 +1,4 @@
+import { createWorkerObserver } from '../ops/worker-health.js'
 import { createHash } from 'node:crypto'
 import { sql, type Kysely } from 'kysely'
 import type { FastifyBaseLogger } from 'fastify'
@@ -55,6 +56,7 @@ export interface LicenseRenewalWorkerOptions {
 /** The worker holds a PostgreSQL session lock, never a business transaction, during network I/O. */
 export function startLicenseRenewalWorker(options: LicenseRenewalWorkerOptions): () => Promise<void> {
   if (options.test && process.env.NODE_ENV !== 'test') throw new Error('license_worker_test_options_forbidden')
+  const observe = createWorkerObserver(options.db, 'license_renewal')
   let stopped = false
   let timer: ReturnType<typeof setTimeout> | undefined
   let active: Promise<void> | undefined
@@ -62,7 +64,8 @@ export function startLicenseRenewalWorker(options: LicenseRenewalWorkerOptions):
 
   const pass = async () => {
     const config = options.test?.releaseConfig ?? await loadEmbeddedTrustedReleaseLicenseConfig()
-    if (!config || stopped) return
+    if (!config) return 'unavailable' as const
+    if (stopped) return 'skipped' as const
     const session = await options.pool.connect()
     let locked = false
     let lost = false
@@ -71,7 +74,7 @@ export function startLicenseRenewalWorker(options: LicenseRenewalWorkerOptions):
     try {
       const lock = await session.query<{ acquired: boolean }>('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired', [LOCK_KEY])
       locked = lock.rows[0]?.acquired === true
-      if (!locked || stopped || lost) return
+      if (!locked || stopped || lost) return 'skipped' as const
       const trustCoordinator = createTrustDatabaseCoordinator({ db: options.db, identityRoot: options.identityRoot })
       const assertHeld = async () => {
         if (lost) throw new Error('license_renewal_worker_lock_lost')
@@ -219,9 +222,15 @@ export function startLicenseRenewalWorker(options: LicenseRenewalWorkerOptions):
   const run = () => {
     if (stopped) return
     active = (async () => {
-      try { await pass(); failures = 0 } catch (error) {
+      try {
+        const result = await pass()
+        failures = 0
+        if (result === 'unavailable') observe('unavailable')
+        else if (result !== 'skipped') observe(true)
+      } catch {
+        observe(false)
         failures = Math.min(failures + 1, 6)
-        options.logger.warn({ err: error }, 'license renewal pass failed')
+        options.logger.warn({ errorCode: 'SCAN_FAILED' }, 'license renewal pass failed')
       } finally {
         active = undefined
         if (!stopped) {

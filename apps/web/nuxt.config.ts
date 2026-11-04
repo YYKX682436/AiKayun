@@ -5,6 +5,7 @@ export default defineNuxtConfig({
   buildDir: process.env.AIKAYUN_E2E_BUILD_DIR ?? '.nuxt',
   nitro: {
     preset: 'node_server',
+    errorHandler: '~/server/error-handler.ts',
     esbuild: { options: { target: 'node24' } },
   },
   vite: {

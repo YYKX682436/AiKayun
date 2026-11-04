@@ -113,3 +113,20 @@ test('client navigation keeps retryable errors on the requested public route', a
   expect(await page.locator('body').innerText()).not.toContain('private database stack marker')
   await resetApi()
 })
+
+
+test('unauthenticated admin SSR redirect preserves only the requested path', async ({ request }) => {
+  const sensitive = 'sensitive-callback-signature-marker'
+  const requestedPath = `/admin/orders/${productId}`
+  const response = await request.get(`${requestedPath}?token=${sensitive}&sign=${sensitive}`, {
+    maxRedirects: 0, headers: { cookie: `private=${sensitive}`, authorization: `Bearer ${sensitive}` },
+  })
+  expect(response.status()).toBe(302)
+  const location = response.headers().location
+  expect(location).toBeDefined()
+  const destination = new URL(location!, 'http://127.0.0.1:3110')
+  expect(destination.pathname).toBe('/admin/login')
+  expect(destination.searchParams.get('redirect')).toBe(requestedPath)
+  expect(location).not.toContain(sensitive)
+  expect(await response.text()).not.toContain(sensitive)
+})

@@ -141,6 +141,15 @@ async function validateRasterImage(path: string): Promise<boolean> {
   }
 }
 
+async function assertOptionalDirectory(path: string): Promise<void> {
+  try {
+    const info = await lstat(path)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Private file storage contains an invalid directory')
+  } catch (error) {
+    if (errnoCode(error) !== 'ENOENT') throw error
+  }
+}
+
 export class PrivateFileStorage {
   readonly root: string
   private canonicalRoot: string | null = null
@@ -182,6 +191,28 @@ export class PrivateFileStorage {
       await chmod(directory, 0o700)
     }
     this.canonicalRoot = canonical
+  }
+
+  // Audit reads must not create directories or chmod existing storage.
+  private async inspectRoot(): Promise<string> {
+    const info = await lstat(this.root)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Private file storage root is invalid')
+    this.canonicalRoot = await realpath(this.root)
+    return this.canonicalRoot
+  }
+
+  private async inspectObjectDirectory(id: string): Promise<string> {
+    this.assertId(id)
+    const root = await this.inspectRoot()
+    const objects = resolve(root, 'objects')
+    const shard = resolve(objects, id.slice(0, 2))
+    for (const directory of [objects, shard]) {
+      const info = await lstat(directory)
+      if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Private file object directory is invalid')
+      const canonical = resolve(await realpath(directory))
+      if (!insideRoot(root, canonical) || canonical !== directory) throw new Error('Private file object directory escaped its root')
+    }
+    return shard
   }
 
   private async ensureObjectDirectory(id: string): Promise<string> {
@@ -338,10 +369,10 @@ export class PrivateFileStorage {
     }
   }
 
-  async openVerified(id: string, expected: { sizeBytes: number; sha256: string }) {
+  async openVerified(id: string, expected: { sizeBytes: number; sha256: string }, options: { readOnly?: boolean } = {}) {
     let handle: Awaited<ReturnType<typeof open>> | undefined
     try {
-      const shard = await this.ensureObjectDirectory(id)
+      const shard = await (options.readOnly ? this.inspectObjectDirectory(id) : this.ensureObjectDirectory(id))
       const path = this.objectPath(id)
       const info = await lstat(path)
       if (!info.isFile() || info.isSymbolicLink()) {
@@ -408,10 +439,12 @@ export class PrivateFileStorage {
     }
   }
 
-  async scanGeneratedFiles(): Promise<Array<{ id: string; path: string; mtimeMs: number; staged: boolean }>> {
-    await this.ensureReady()
+  async scanGeneratedFiles(options: { readOnly?: boolean } = {}): Promise<Array<{ id: string; path: string; mtimeMs: number; staged: boolean }>> {
+    if (options.readOnly) await this.inspectRoot()
+    else await this.ensureReady()
     const found: Array<{ id: string; path: string; mtimeMs: number; staged: boolean }> = []
     const objectsRoot = resolve(this.canonicalRoot!, 'objects')
+    if (options.readOnly) await assertOptionalDirectory(objectsRoot)
     for (const shard of await readdir(objectsRoot, { withFileTypes: true }).catch((error: unknown) => {
       if (errnoCode(error) === 'ENOENT') return []
       throw error
@@ -427,6 +460,7 @@ export class PrivateFileStorage {
       }
     }
     const stagingRoot = resolve(this.canonicalRoot!, '.staging')
+    if (options.readOnly) await assertOptionalDirectory(stagingRoot)
     for (const child of await readdir(stagingRoot, { withFileTypes: true }).catch((error: unknown) => {
       if (errnoCode(error) === 'ENOENT') return []
       throw error

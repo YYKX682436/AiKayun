@@ -62,6 +62,8 @@ import { licenseRenewalRetryMigration } from './migrations/202611010004_license_
 import { trustedBundleHeadMigration } from './migrations/202611010005_trusted_bundle_head.js'
 import { adminSetupStateMigration } from './migrations/202611030001_admin_setup_state.js'
 import { licensePendingKeyBindingMigration } from './migrations/202611030002_license_pending_key_binding.js'
+import { operationsWorkerHealthMigration } from './migrations/202611040001_operations_worker_health.js'
+import { fileCheckResultsMigration } from './migrations/202611040002_file_check_results.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -125,6 +127,8 @@ export class AppMigrationProvider implements MigrationProvider {
       '202611010005_trusted_bundle_head': trustedBundleHeadMigration,
       '202611030001_admin_setup_state': adminSetupStateMigration,
       '202611030002_license_pending_key_binding': licensePendingKeyBindingMigration,
+      '202611040001_operations_worker_health': operationsWorkerHealthMigration,
+      '202611040002_file_check_results': fileCheckResultsMigration,
     }
     verifyMigrationChecksums(migrations)
     return migrations

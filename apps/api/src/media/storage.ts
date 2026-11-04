@@ -233,7 +233,7 @@ export class MediaStorage {
     const objectsRoot = resolve(this.root, 'objects')
     try {
       const objectsInfo = await lstat(objectsRoot)
-      if (!objectsInfo.isDirectory() || objectsInfo.isSymbolicLink()) return found
+      if (!objectsInfo.isDirectory() || objectsInfo.isSymbolicLink()) throw new Error('Media objects path is not a regular directory')
       const shards = await readdir(objectsRoot, { withFileTypes: true })
       for (const shard of shards) {
         if (!shard.isDirectory() || shard.isSymbolicLink() || !/^[0-9a-f]{2}$/.test(shard.name)) continue
@@ -258,7 +258,7 @@ export class MediaStorage {
     const stagingRoot = resolve(this.root, '.staging')
     try {
       const stagingInfo = await lstat(stagingRoot)
-      if (!stagingInfo.isDirectory() || stagingInfo.isSymbolicLink()) return found
+      if (!stagingInfo.isDirectory() || stagingInfo.isSymbolicLink()) throw new Error('Media staging path is not a regular directory')
       const children = await readdir(stagingRoot, { withFileTypes: true })
       for (const child of children) {
         if (!child.isFile() || child.isSymbolicLink()

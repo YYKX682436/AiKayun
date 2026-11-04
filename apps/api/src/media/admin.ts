@@ -352,7 +352,7 @@ export async function registerProductMediaRoutes(
           && 'statusCode' in error && (error as { statusCode?: number }).statusCode === 400) {
           return reply.code(400).send(failure('INVALID_MULTIPART_BODY', 'Send exactly one supported image file', request.id))
         }
-        if (!(error instanceof CatalogError)) request.log.error({ err: error }, 'product media upload processing failed')
+        if (!(error instanceof CatalogError)) request.log.error({ errorCode: 'MEDIA_UPLOAD_FAILED' }, 'product media upload processing failed')
         return fail(reply, error, request.id)
       } finally {
         if (ownsProcessingSlot) activeImageProcessing -= 1
@@ -518,8 +518,8 @@ export async function registerProductMediaRoutes(
         let opened: Awaited<ReturnType<MediaStorage['openForRead']>>
         try {
           opened = await storage.openForRead(row.media_id, row.variant, row.storage_key, row.size_bytes)
-        } catch (error) {
-          request.log.error({ err: error, mediaId: id, variant }, 'published media file is missing or invalid')
+        } catch {
+          request.log.error({ errorCode: 'MEDIA_FILE_UNAVAILABLE', mediaId: id, variant }, 'published media file is missing or invalid')
           return reply.code(503).send(failure('MEDIA_FILE_UNAVAILABLE', 'The image file is temporarily unavailable', request.id))
         }
         if (request.method === 'HEAD') return reply.send()

@@ -8,6 +8,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     to: '/admin',
   },
   {
+    label: '运维中心',
+    icon: 'i-lucide-activity',
+    to: '/admin/operations',
+  },
+  {
     label: '商品管理',
     icon: 'i-lucide-package',
     to: '/admin/products',

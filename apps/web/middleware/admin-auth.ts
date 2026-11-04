@@ -5,6 +5,6 @@ export default defineNuxtRouteMiddleware(async (to) => {
     const requestFetch = useRequestFetch()
     await requestFetch('/api/v1/admin/session')
   } catch {
-    return navigateTo({ path: '/admin/login', query: { redirect: to.fullPath } })
+    return navigateTo({ path: '/admin/login', query: { redirect: to.path } })
   }
 })

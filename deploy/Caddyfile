@@ -1,3 +1,18 @@
+{
+	log default {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri delete
+				request>headers delete
+				request>remote_ip delete
+				request>remote_port delete
+			}
+		}
+	}
+}
+
 {$SITE_ADDRESS} {
 encode zstd gzip
 

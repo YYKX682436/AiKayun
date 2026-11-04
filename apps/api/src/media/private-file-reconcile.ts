@@ -48,7 +48,7 @@ export async function reconcilePrivateFiles(
     let actual: 'verified' | 'missing' | 'corrupt' | 'unknown' = 'unknown'
     if (row.size_bytes !== null && row.sha256 && row.media_type) {
       try {
-        const opened = await storage.openVerified(row.id, { sizeBytes: row.size_bytes, sha256: row.sha256.trim() })
+        const opened = await storage.openVerified(row.id, { sizeBytes: row.size_bytes, sha256: row.sha256.trim() }, { readOnly: !repair })
         await opened.handle.close()
         actual = 'verified'
       } catch (error) {
@@ -113,7 +113,7 @@ export async function reconcilePrivateFiles(
   }
 
   const known = new Set((await db.selectFrom('private_file_objects').select('id').execute()).map(row => row.id))
-  const generated = await storage.scanGeneratedFiles()
+  const generated = await storage.scanGeneratedFiles({ readOnly: !repair })
   const orphans = generated.filter(file => !known.has(file.id) && file.mtimeMs <= staleBefore)
   report.orphanFiles = orphans.length
   if (orphans.length) report.needsAttention = true
