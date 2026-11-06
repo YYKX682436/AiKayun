@@ -70,7 +70,7 @@ fi
 
 reports="$temporary_root/promotion-reports"
 mkdir -m 0700 "$reports"
-for image in api web postgres caddy; do
+for image in api web postgres caddy backup; do
   for arch in amd64 arm64; do
     jq -n --arg platform "linux/$arch" '{schema_version:1,scanner:"trivy",image:"fixture",platform:$platform,gate:"passed",
       scanner_errors:[],high_critical_count:0,secret_finding_count:0,vulnerabilities:[],secret_findings:[]}' \

@@ -17,7 +17,7 @@ skopeo_image="${6:?Pinned Skopeo image is required}"
 [[ "$tag" != latest ]] || { echo 'The latest tag cannot be a release authority.' >&2; exit 2; }
 [[ -n "${DOCKER_CONFIG:-}" && -s "$DOCKER_CONFIG/config.json" ]] || { echo 'Authenticated staging registry credentials are required.' >&2; exit 2; }
 
-for image in api web postgres caddy; do
+for image in api web postgres caddy backup; do
   for arch in amd64 arm64; do
     report="$report_dir/${image}-${arch}.json"
     [[ -s "$report" ]] || { echo "Missing Trivy scan report: ${image}-${arch}" >&2; exit 1; }

@@ -19,16 +19,21 @@ command -v pnpm >/dev/null 2>&1 || { printf 'pnpm is required to construct the i
 release_directory="$(node "$repository_root/scripts/install/create-installer-test-release.mjs" "$temporary_root")"
 
 for platform in linux/amd64 linux/arm64; do
+  if [[ -n "${AIKAYUN_TEST_ONLY_PLATFORM:-}" && "$platform" != "$AIKAYUN_TEST_ONLY_PLATFORM" ]]; then continue; fi
   if [[ "$platform" == linux/amd64 ]]; then test_runner_image="$node_amd64_image"; else test_runner_image="$node_arm64_image"; fi
   for scenario in \
     first-install-tls-failure-resume first-install-https-ready \
-    fresh-install-untrusted-code resume-untrusted-code \
+    fresh-install-untrusted-code resume-untrusted-code backup-customer-command-integrity \
     release-download-failure manifest-modified root-substitution compose-image-modified \
     dns-failure disk-low ports-in-use occupied-deployment; do
+    if [[ -n "${AIKAYUN_TEST_ONLY_SCENARIO:-}" && "$scenario" != "$AIKAYUN_TEST_ONLY_SCENARIO" ]]; then continue; fi
     printf 'Installer scenario: %s (%s)\n' "$scenario" "$platform"
     docker run --rm --network none --platform "$platform" \
       --mount "type=bind,source=$repository_root/scripts/install/test-ai-kayun-installer-inner.sh,target=/fixture/inner.sh,readonly" \
       --mount "type=bind,source=$release_directory,target=/fixture/release,readonly" \
+      --mount "type=bind,source=$repository_root/node_modules,target=/node_modules,readonly" \
+      --mount "type=bind,source=$repository_root/apps/api/node_modules,target=/fixture/node_modules,readonly" \
+      --mount "type=bind,source=$repository_root/packages,target=/packages,readonly" \
       --env "AIKAYUN_TEST_EXPECTED_ARCH=${platform#linux/}" \
       --entrypoint bash "$test_runner_image" /fixture/inner.sh /fixture/release "$scenario"
   done

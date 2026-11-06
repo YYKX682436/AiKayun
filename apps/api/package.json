@@ -46,6 +46,7 @@
     "pg": "8.23.1",
     "sharp": "0.35.5",
     "structured-headers": "1.0.1",
+    "tar": "7.5.22",
     "typebox": "1.3.37"
   },
   "devDependencies": {

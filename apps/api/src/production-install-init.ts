@@ -18,18 +18,21 @@ export async function ensureBoundProductionPendingKey(
   if (process.env.NODE_ENV !== 'production') throw new Error('production_pending_key_environment_required')
   const client = await pool.connect()
   let candidate: { keyId: string; sha256: string; created: boolean } | undefined
+  let watermarkIdentity: { databaseId: string; instanceId: string; identityJkt: string } | undefined
   try {
     await client.query('BEGIN')
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [pendingKeyBindingLock])
-    const stored = await client.query<{ pending_key_id: string | null; pending_key_sha256: string | null }>(`
-      SELECT pending_key_id, pending_key_sha256
+    const stored = await client.query<{ pending_key_id: string | null; pending_key_sha256: string | null;
+      database_id: string; instance_id: string; identity_jkt: string }>(`
+      SELECT pending_key_id, pending_key_sha256, database_id::text, instance_id::text, identity_jkt
       FROM installation_binding WHERE singleton = true FOR UPDATE
     `)
     const row = stored.rows[0]
     if (!row) throw new Error('installation_binding_missing')
+    watermarkIdentity = { databaseId: row.database_id, instanceId: row.instance_id, identityJkt: row.identity_jkt }
 
     if (row.pending_key_id === null && row.pending_key_sha256 === null) {
-      const created = await ensureProductionLicensePendingKey(root, forbiddenRoots)
+      const created = await ensureProductionLicensePendingKey(root, forbiddenRoots, watermarkIdentity)
       const key = await loadLicensePendingKey(root, forbiddenRoots)
       if (created.keyId !== key.keyId) throw new Error('pending_key_changed_during_initialization')
       candidate = {
@@ -45,7 +48,7 @@ export async function ensureBoundProductionPendingKey(
       if (updated.rowCount !== 1) throw new Error('pending_key_binding_update_failed')
     } else if (row.pending_key_id && row.pending_key_sha256) {
       candidate = { keyId: row.pending_key_id, sha256: row.pending_key_sha256, created: false }
-      await verifyBoundProductionLicensePendingKey(root, candidate, forbiddenRoots)
+      await verifyBoundProductionLicensePendingKey(root, candidate, forbiddenRoots, watermarkIdentity)
     } else {
       throw new Error('pending_key_binding_corrupt')
     }
@@ -54,14 +57,14 @@ export async function ensureBoundProductionPendingKey(
     return { keyId: candidate.keyId, created: candidate.created }
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined)
-    if (candidate) {
+    if (candidate && watermarkIdentity) {
       const committed = await pool.query<{ pending_key_id: string | null; pending_key_sha256: string | null }>(`
         SELECT pending_key_id, pending_key_sha256
         FROM installation_binding WHERE singleton = true
       `).catch(() => undefined)
       const actual = committed?.rows[0]
       if (actual?.pending_key_id === candidate.keyId && actual.pending_key_sha256 === candidate.sha256) {
-        await verifyBoundProductionLicensePendingKey(root, candidate, forbiddenRoots)
+        await verifyBoundProductionLicensePendingKey(root, candidate, forbiddenRoots, watermarkIdentity)
         return { keyId: candidate.keyId, created: candidate.created }
       }
     }
@@ -90,15 +93,16 @@ export async function runProductionInstallInitialization(mode: 'init' | 'verify'
     const pendingKey = mode === 'init'
       ? await ensureBoundProductionPendingKey(pool, config.licensePendingKeyRoot, pendingKeyForbiddenRoots)
       : await (async () => {
-          const binding = await pool.query<{ pending_key_id: string | null; pending_key_sha256: string | null }>(`
-            SELECT pending_key_id, pending_key_sha256
+          const binding = await pool.query<{ pending_key_id: string | null; pending_key_sha256: string | null;
+            database_id: string; instance_id: string; identity_jkt: string }>(`
+            SELECT pending_key_id, pending_key_sha256, database_id::text, instance_id::text, identity_jkt
             FROM installation_binding WHERE singleton = true
           `)
           const row = binding.rows[0]
           if (!row?.pending_key_id || !row.pending_key_sha256) throw new Error('pending_key_binding_missing')
           const key = await verifyBoundProductionLicensePendingKey(config.licensePendingKeyRoot, {
             keyId: row.pending_key_id, sha256: row.pending_key_sha256,
-          }, pendingKeyForbiddenRoots)
+          }, pendingKeyForbiddenRoots, { databaseId: row.database_id, instanceId: row.instance_id, identityJkt: row.identity_jkt })
           return { keyId: key.keyId, created: false }
         })()
     // Only public identifiers and stage state are emitted. The private key and AES key are never logged.

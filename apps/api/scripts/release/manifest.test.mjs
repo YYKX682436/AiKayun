@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash, generateKeyPairSync, createPublicKey } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -18,8 +18,9 @@ const imageReferences = {
   web: 'ghcr.io/yykx682436/aikayun-web',
   postgres: 'docker.io/library/postgres',
   caddy: 'docker.io/library/caddy',
+  backup: 'ghcr.io/yykx682436/aikayun-backup-restic',
 }
-const images = Object.fromEntries(['api', 'web', 'postgres', 'caddy'].map((name, index) => [name, {
+const images = Object.fromEntries(['api', 'web', 'postgres', 'caddy', 'backup'].map((name, index) => [name, {
   reference: `${imageReferences[name]}@sha256:${hex(String(index + 3))}`,
   platform_digests: platformDigests,
   sbom_sha256: { 'linux/amd64': hex(String(index + 7)), 'linux/arm64': hex(String(index + 8)) },
@@ -155,7 +156,7 @@ test('release artifact verifier checks exact file size and SHA-256 and rejects s
   await assert.rejects(verifyReleaseArtifacts(manifestPath, artifactDirectory), /size or SHA-256 mismatch/u)
 })
 
-test('release bundle assembly pins all four signed image references into Compose and includes installer and Trust Bundle', async t => {
+test('release bundle assembly pins images and includes the signed host backup broker, installer and Trust Bundle', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'aikayun-release-assembly-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const support = join(directory, 'support')
@@ -179,17 +180,28 @@ test('release bundle assembly pins all four signed image references into Compose
     kty: 'OKP', crv: 'Ed25519', x: Buffer.alloc(32, 7).toString('base64url'),
   } } }))
   await writeFile(checksumsPath, JSON.stringify({ schema: 1, migration_head: '202611030002_license_pending_key_binding', migrations: [] }))
+  const backupBroker = join(support, 'backup-host-broker.sh')
+  await writeFile(backupBroker, '# signed test host broker fixture\n')
 
   const supportFiles = [
     'release-verifier.mjs', 'verify-artifacts.mjs', 'release-signing-root.jwk.json', 'license-trust-bundle.jws',
     ...['api', 'web'].flatMap(image => [`NOTICE-${image}-linux-amd64.txt`, `NOTICE-${image}-linux-arm64.txt`]),
-    ...['api', 'web', 'postgres', 'caddy'].flatMap(image => [
+    ...['api', 'web', 'postgres', 'caddy', 'backup'].flatMap(image => [
       `NOTICE-image-${image}-linux-amd64.txt`, `NOTICE-image-${image}-linux-arm64.txt`,
       `${image}-linux-amd64.cdx.json`, `${image}-linux-arm64.cdx.json`,
     ]),
+    'NOTICE-backup-reader-scan-linux-amd64.txt', 'NOTICE-backup-reader-scan-linux-arm64.txt',
   ]
   for (const filename of supportFiles) {
-    await writeFile(join(support, filename), filename === 'license-trust-bundle.jws' ? trustBundle : `fixture ${filename}\n`)
+    let content = filename === 'license-trust-bundle.jws' ? trustBundle : `fixture ${filename}\n`
+    if (filename.startsWith('NOTICE-backup-reader-scan-')) {
+      const arch = filename.includes('amd64') ? 'amd64' : 'arm64'
+      const notice = await readFile(join(support, `NOTICE-image-backup-linux-${arch}.txt`))
+      content = `${JSON.stringify({ schema: 'aikayun.backup-reader-notice-scan.v1',
+        scanner: 'aquasec/trivy@sha256:33f816d414b9d582d25bb737ffa4a632ae34e222f7ec1b50252cef0ce2266006',
+        scope: 'notice-files-only', arch, notice_sha256: createHash('sha256').update(notice).digest('hex'), findings: 0 })}\n`
+    }
+    await writeFile(join(support, filename), content)
   }
 
   execFileSync(process.execPath, [join(import.meta.dirname, 'assemble-release.mjs'),
@@ -204,5 +216,7 @@ test('release bundle assembly pins all four signed image references into Compose
   assert.equal(await readFile(join(output, 'install.sh'), 'utf8'),
     await readFile(new URL('../../../../scripts/install/install-ai-kayun.sh', import.meta.url), 'utf8'))
   assert.equal(await readFile(join(output, 'license-trust-bundle.jws'), 'utf8'), trustBundle)
+  assert.equal(await readFile(join(output, 'backup-host-broker.sh'), 'utf8'), '# signed test host broker fixture\n')
+  assert.equal((await stat(join(output, 'backup-host-broker.sh'))).mode & 0o777, 0o644)
   assert.equal(JSON.parse(await readFile(join(output, 'release-index.json'), 'utf8')).version, version)
 })

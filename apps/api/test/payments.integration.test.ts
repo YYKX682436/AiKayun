@@ -15,6 +15,7 @@ import { expireDueUnpaidOrders } from '../src/commerce/orders.js'
 import { startZpayHttpFixture } from './fixtures/zpay-http-server.js'
 import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
 import { createSignedBusinessLicense } from './fixtures/signed-business-license.js'
+import { readBackupPendingSummary } from '../src/backup/pending-summary.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
   ?? 'postgresql://aikayun:local-test-password@127.0.0.1:5432/aikayun_test'
@@ -1904,12 +1905,15 @@ describe('online payment settlement through a real local HTTP provider and Postg
       .executeTakeFirstOrThrow()).toEqual({ refunded_amount: '0.00', refund_reserved_amount: '8.00' })
     const allocationId = allocation.id as string
     const startPath = `/api/v1/admin/orders/${orderId}/refunds/${refundId}/allocations/${allocationId}/manual-attempts`
+    const summaryBeforeManualAttempt = await readBackupPendingSummary(db)
+    expect(summaryBeforeManualAttempt.refundsPending).toBeGreaterThanOrEqual(1)
     const started = await inject({
       method: 'POST', url: startPath, headers: {
         origin: testOrigin, cookie: `${admin.cookie}; ${admin.csrfCookie}`, 'x-csrf-token': admin.csrfToken,
       }, payload: { idempotencyKey: randomUUID() },
     })
     expect(started.statusCode).toBe(200)
+    expect((await readBackupPendingSummary(db)).refundAttemptsUncertain).toBe(summaryBeforeManualAttempt.refundAttemptsUncertain + 1)
     const attemptIdForRefund = started.json().data.refunds.items[0].allocations[0].manualAttempts[0].id as string
     const resolvePath = `${startPath}/${attemptIdForRefund}/resolve`
     const badSuccess = await inject({
@@ -1937,6 +1941,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
       }, payload: { idempotencyKey: randomUUID(), outcome: 'unknown', resolutionNote: '商户退款流水尚未核实。' },
     })
     expect(unknown.statusCode).toBe(200)
+    expect((await readBackupPendingSummary(db)).refundAttemptsUncertain).toBe(summaryBeforeManualAttempt.refundAttemptsUncertain + 1)
     expect(unknown.json().data.refunds.items[0]).toMatchObject({ status: 'processing', reservedAmount: '8.00', succeededAmount: '0.00' })
     expect(await db.selectFrom('payment_receipts').select(['refunded_amount', 'refund_reserved_amount']).where('id', '=', receipt.id)
       .executeTakeFirstOrThrow()).toEqual({ refunded_amount: '0.00', refund_reserved_amount: '8.00' })
@@ -1947,6 +1952,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
       }, payload: { idempotencyKey: randomUUID(), outcome: 'failed', resolutionNote: '已核对未发生实际转账。' },
     })
     expect(failed.statusCode).toBe(200)
+    expect((await readBackupPendingSummary(db)).refundAttemptsUncertain).toBe(summaryBeforeManualAttempt.refundAttemptsUncertain)
     expect(failed.json().data.refunds.items[0]).toMatchObject({ status: 'failed', reservedAmount: '0.00', succeededAmount: '0.00' })
     expect(await db.selectFrom('order_refund_allocations').select('status').where('refund_id', '=', refundId).execute())
       .toEqual([{ status: 'released' }])

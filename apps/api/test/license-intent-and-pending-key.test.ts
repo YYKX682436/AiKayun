@@ -7,6 +7,7 @@ import vector from './fixtures/activation-intent-7-1b-3c-1.json' with { type: 'j
 import { calculateJwkThumbprint } from 'jose'
 import { activationCodeSha256, buildActivationIntent, ed25519IdentityJkt } from '../src/licensing/license-intent.js'
 import { parsePendingKeyCliArguments, runPendingKeyCli } from '../src/licensing/pending-encryption-key-cli.js'
+import { advanceTrustedTimeWatermarkFile } from '../src/licensing/trusted-time-watermark.js'
 import {
   decryptLicensePendingBytes,
   encryptLicensePendingBytes,
@@ -114,6 +115,32 @@ describe('independent AES-256-GCM pending key store', () => {
       expect(afterPartialWrite.created).toBe(true)
       expect(afterPartialWrite.keyId).not.toBe(created.keyId)
       expect(await readdir(directory)).toEqual(['license-pending-aes-256-gcm.json'])
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV
+      else process.env.NODE_ENV = previous
+    }
+  })
+
+  it('accepts only an identity-bound trusted time watermark beside the Pending Key', async () => {
+    const directory = await root()
+    const previous = process.env.NODE_ENV
+    process.env.NODE_ENV = 'production'
+    const identity = { databaseId: randomUUID(), instanceId: randomUUID(), identityJkt: Buffer.alloc(32, 5).toString('base64url') }
+    const watermark = join(directory, 'license-time-watermark.json')
+    try {
+      const first = await ensureProductionLicensePendingKey(directory, [], identity)
+      await advanceTrustedTimeWatermarkFile(directory, identity, Date.now())
+      const original = await readFile(watermark)
+      await expect(ensureProductionLicensePendingKey(directory, [], identity)).resolves.toEqual({ keyId: first.keyId, created: false })
+      expect(await readFile(watermark)).toEqual(original)
+
+      const wrongIdentity = { ...identity, instanceId: randomUUID() }
+      await expect(ensureProductionLicensePendingKey(directory, [], wrongIdentity))
+        .rejects.toMatchObject({ code: 'pending_key_watermark_invalid' })
+      await writeFile(watermark, original)
+      await writeFile(join(directory, 'unexpected.json'), '{}', { mode: 0o600 })
+      await expect(ensureProductionLicensePendingKey(directory, [], identity))
+        .rejects.toMatchObject({ code: 'pending_key_root_contents_invalid' })
     } finally {
       if (previous === undefined) delete process.env.NODE_ENV
       else process.env.NODE_ENV = previous

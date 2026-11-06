@@ -13,13 +13,16 @@ caddy_image='docker.io/library/caddy@sha256:e70b164da81ef698b3ad19af799ea6086ce6
 syft_image='anchore/syft@sha256:825cad3a952c87676a6d07e9a3bb05ac9c401d598360070e970aa46d54c1727e'
 trivy_image='aquasec/trivy@sha256:33f816d414b9d582d25bb737ffa4a632ae34e222f7ec1b50252cef0ce2266006'
 skopeo_image='quay.io/skopeo/stable@sha256:87a0dd8d9a093c87681706a2cb8ae51757af8c12340f04ab024c85badc6dcc07'
+go_toolchain_image='golang@sha256:c65ecfe613b539ac74c62a4c3b2c27e8f8a6076384c8f27e8a3c0f3be17cc385'
 owner="${GITHUB_REPOSITORY_OWNER,,}"
 release_tag="v${version}"
 api_repository="ghcr.io/${owner}/aikayun-api"
 web_repository="ghcr.io/${owner}/aikayun-web"
+backup_repository="ghcr.io/${owner}/aikayun-backup-restic"
 bundle_repository="ghcr.io/${owner}/aikayun-release-bundle"
 staging_api_repository="ghcr.io/${owner}/aikayun-staging-api"
 staging_web_repository="ghcr.io/${owner}/aikayun-staging-web"
+staging_backup_repository="ghcr.io/${owner}/aikayun-staging-backup-restic"
 staging_bundle_repository="ghcr.io/${owner}/aikayun-staging-release-bundle"
 staging_tag="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
@@ -119,12 +122,12 @@ fi
 printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin >/dev/null
 registry_logged_in=1
 owner_type="$(gh api "/users/${GITHUB_REPOSITORY_OWNER}" --jq .type)"
-for package in aikayun-staging-api aikayun-staging-web aikayun-staging-release-bundle; do
+for package in aikayun-staging-api aikayun-staging-web aikayun-staging-backup-restic aikayun-staging-release-bundle; do
   if [[ "$owner_type" == Organization ]]; then path="/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}/visibility"; else path="/user/packages/container/${package}/visibility"; fi
   visibility="$(GH_TOKEN="$AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN" gh api "$path" --jq .visibility)"
   [[ "$visibility" == private ]] || fail "The required staging package must already exist and remain private: $package"
 done
-for repository in "$api_repository" "$web_repository" "$bundle_repository"; do
+for repository in "$api_repository" "$web_repository" "$backup_repository" "$bundle_repository"; do
   set +e
   docker manifest inspect "${repository}:${version}" > "$work/tag-check.stdout" 2> "$work/tag-check.stderr"
   status=$?
@@ -158,14 +161,21 @@ docker buildx build --platform linux/amd64,linux/arm64 --push --sbom=true --prov
 docker buildx build --platform linux/amd64,linux/arm64 --push --sbom=true --provenance=false \
   --metadata-file "$work/web-build-metadata.json" "${build_args[@]}" \
   --tag "${staging_web_repository}:${staging_tag}" -f "$source_root/apps/web/Dockerfile" "$source_root"
+docker buildx build --platform linux/amd64,linux/arm64 --push --sbom=true --provenance=false \
+  --metadata-file "$work/backup-build-metadata.json" "${build_args[@]}" --target restic-runtime \
+  --tag "${staging_backup_repository}:${staging_tag}" -f "$source_root/apps/api/Dockerfile" "$source_root"
 api_index_digest="$(jq -er '.["containerimage.digest"] | select(test("^sha256:[a-f0-9]{64}$"))' "$work/api-build-metadata.json")"
 web_index_digest="$(jq -er '.["containerimage.digest"] | select(test("^sha256:[a-f0-9]{64}$"))' "$work/web-build-metadata.json")"
 api_staging_index_ref="${staging_api_repository}@${api_index_digest}"
 web_staging_index_ref="${staging_web_repository}@${web_index_digest}"
 api_index_ref="${api_repository}@${api_index_digest}"
 web_index_ref="${web_repository}@${web_index_digest}"
+backup_index_digest="$(jq -er '.["containerimage.digest"] | select(test("^sha256:[a-f0-9]{64}$"))' "$work/backup-build-metadata.json")"
+backup_staging_index_ref="${staging_backup_repository}@${backup_index_digest}"
+backup_index_ref="${backup_repository}@${backup_index_digest}"
 docker buildx imagetools inspect --raw "$api_staging_index_ref" > "$work/api-index.json"
 docker buildx imagetools inspect --raw "$web_staging_index_ref" > "$work/web-index.json"
+docker buildx imagetools inspect --raw "$backup_staging_index_ref" > "$work/backup-index.json"
 docker buildx imagetools inspect --raw "$postgres_image" > "$work/postgres-index.json"
 docker buildx imagetools inspect --raw "$caddy_image" > "$work/caddy-index.json"
 
@@ -178,10 +188,11 @@ api_amd64="$(digest_for api linux/amd64)"; api_arm64="$(digest_for api linux/arm
 web_amd64="$(digest_for web linux/amd64)"; web_arm64="$(digest_for web linux/arm64)"
 postgres_amd64="$(digest_for postgres linux/amd64)"; postgres_arm64="$(digest_for postgres linux/arm64)"
 caddy_amd64="$(digest_for caddy linux/amd64)"; caddy_arm64="$(digest_for caddy linux/arm64)"
+backup_amd64="$(digest_for backup linux/amd64)"; backup_arm64="$(digest_for backup linux/arm64)"
 
 for platform in linux/amd64 linux/arm64; do
   arch="${platform#linux/}"
-  for image_name in api web postgres caddy; do
+  for image_name in api web postgres caddy backup; do
     case "$image_name:$arch" in
       api:amd64) repository="$staging_api_repository"; child="$api_amd64" ;;
       api:arm64) repository="$staging_api_repository"; child="$api_arm64" ;;
@@ -191,6 +202,8 @@ for platform in linux/amd64 linux/arm64; do
       postgres:arm64) repository='docker.io/library/postgres'; child="$postgres_arm64" ;;
       caddy:amd64) repository='docker.io/library/caddy'; child="$caddy_amd64" ;;
       caddy:arm64) repository='docker.io/library/caddy'; child="$caddy_arm64" ;;
+      backup:amd64) repository="$staging_backup_repository"; child="$backup_amd64" ;;
+      backup:arm64) repository="$staging_backup_repository"; child="$backup_arm64" ;;
     esac
     image_ref="${repository}@${child}"
     tar_path="$work/${image_name}-${arch}.tar"
@@ -199,6 +212,11 @@ for platform in linux/amd64 linux/arm64; do
     docker save --output "$tar_path" "$image_ref"
     docker run --rm -v "$work:/work" "$syft_image" \
       "docker-archive:/work/$(basename "$tar_path")" -o "cyclonedx-json=/work/sbom/$(basename "$sbom_path")"
+    # Do not ship the experimental helper before its complete image/license
+    # evidence chain is integrated into the signed release workflow.
+    if [[ "$image_name" == api ]]; then
+      node "$source_root/scripts/release/reject-unverified-restic-helper.mjs" "$sbom_path"
+    fi
     "$source_root/scripts/release/scan-oci-image.sh" "$image_name" "$platform" "$image_ref" \
       "$tar_path" "$trivy_image" "$work" "$scan_report_dir"
     chmod 0644 "$sbom_path"
@@ -215,6 +233,11 @@ for platform in linux/amd64 linux/arm64; do
     docker cp "$container_id:/nodejs/LICENSE" "$system_notice_root/nodejs/" >/dev/null 2>&1 || true
     docker cp "$container_id:/lib/apk/db/installed" "$system_notice_root/lib/apk/db/installed" \
       >/dev/null 2>&1 || true
+    backup_binary_from_image=''
+    if [[ "$image_name" == backup ]]; then
+      backup_binary_from_image="$work/backup-restic-image-${arch}"
+      docker cp "$container_id:/usr/bin/restic" "$backup_binary_from_image"
+    fi
     if [[ "$image_name" == api || "$image_name" == web ]]; then
       if [[ "$image_name" == api ]]; then
         docker cp "$container_id:/app/node_modules" "$modules_dir/"
@@ -223,8 +246,18 @@ for platform in linux/amd64 linux/arm64; do
       fi
     fi
     docker rm "$container_id" >/dev/null
-    node "$source_root/scripts/release/generate-sbom-notice.mjs" "$sbom_path" \
-      "$work/notices/NOTICE-image-${image_name}-${platform//\//-}.txt" "$image_ref" "$system_notice_root"
+    if [[ "$image_name" == backup ]]; then
+      evidence_root="$work/restic-evidence-${arch}"
+      docker buildx build --platform "$platform" --target restic-evidence --output "type=local,dest=$evidence_root" \
+        -f "$source_root/apps/api/Dockerfile" "$source_root"
+      cmp -s "$backup_binary_from_image" "$evidence_root/restic" || fail 'The scanned backup image binary differs from its license evidence build.'
+      docker pull "$go_toolchain_image" >/dev/null
+      node "$source_root/scripts/release/prepare-backup-reader-notice.mjs" "$sbom_path" "$evidence_root" \
+        "$system_notice_root" "$image_ref" "$arch" "$work/notices/NOTICE-image-backup-${platform//\//-}.txt"
+    else
+      node "$source_root/scripts/release/generate-sbom-notice.mjs" "$sbom_path" \
+        "$work/notices/NOTICE-image-${image_name}-${platform//\//-}.txt" "$image_ref" "$system_notice_root"
+    fi
     if [[ "$image_name" == api || "$image_name" == web ]]; then
       node "$source_root/apps/api/scripts/release/generate-notice.mjs" \
         "$modules_dir/node_modules" "$work/notices/NOTICE-${image_name}-${platform//\//-}.txt" \
@@ -244,31 +277,10 @@ docker rm "$container_id" >/dev/null
 migration_head="$(jq -er '.migration_head | select(test("^[0-9]{12}_[A-Za-z0-9_-]+$"))' "$migration_path")"
 [[ "$migration_head" == '202611040002_file_check_results' ]] || fail 'Release migration head differs from the reviewed matrix.'
 
-sha_of() { sha256sum "$1" | cut -d ' ' -f1; }
-jq -n \
-  --arg version "$version" --arg built_at "$build_time" --arg source_commit "$GITHUB_SHA" \
-  --arg distribution_origin "$AIKAYUN_RELEASE_ORIGIN" --arg api_reference "$api_index_ref" \
-  --arg api_amd64 "$api_amd64" --arg api_arm64 "$api_arm64" \
-  --arg api_amd64_sbom "$(sha_of "$work/sbom/api-linux-amd64.cdx.json")" \
-  --arg api_arm64_sbom "$(sha_of "$work/sbom/api-linux-arm64.cdx.json")" \
-  --arg web_reference "$web_index_ref" --arg web_amd64 "$web_amd64" --arg web_arm64 "$web_arm64" \
-  --arg web_amd64_sbom "$(sha_of "$work/sbom/web-linux-amd64.cdx.json")" \
-  --arg web_arm64_sbom "$(sha_of "$work/sbom/web-linux-arm64.cdx.json")" \
-  --arg postgres_reference "$postgres_image" --arg postgres_amd64 "$postgres_amd64" --arg postgres_arm64 "$postgres_arm64" \
-  --arg postgres_amd64_sbom "$(sha_of "$work/sbom/postgres-linux-amd64.cdx.json")" \
-  --arg postgres_arm64_sbom "$(sha_of "$work/sbom/postgres-linux-arm64.cdx.json")" \
-  --arg caddy_reference "$caddy_image" --arg caddy_amd64 "$caddy_amd64" --arg caddy_arm64 "$caddy_arm64" \
-  --arg caddy_amd64_sbom "$(sha_of "$work/sbom/caddy-linux-amd64.cdx.json")" \
-  --arg caddy_arm64_sbom "$(sha_of "$work/sbom/caddy-linux-arm64.cdx.json")" \
-  --argjson license_center_signer_kids "$AIKAYUN_LICENSE_CENTER_SIGNER_KIDS" \
-  '{version:$version,built_at:$built_at,source_commit:$source_commit,distribution_origin:$distribution_origin,
-    license_center_signer_kids:$license_center_signer_kids,
-    images:{
-      api:{reference:$api_reference,platform_digests:{"linux/amd64":$api_amd64,"linux/arm64":$api_arm64},sbom_sha256:{"linux/amd64":$api_amd64_sbom,"linux/arm64":$api_arm64_sbom}},
-      web:{reference:$web_reference,platform_digests:{"linux/amd64":$web_amd64,"linux/arm64":$web_arm64},sbom_sha256:{"linux/amd64":$web_amd64_sbom,"linux/arm64":$web_arm64_sbom}},
-      postgres:{reference:$postgres_reference,platform_digests:{"linux/amd64":$postgres_amd64,"linux/arm64":$postgres_arm64},sbom_sha256:{"linux/amd64":$postgres_amd64_sbom,"linux/arm64":$postgres_arm64_sbom}},
-      caddy:{reference:$caddy_reference,platform_digests:{"linux/amd64":$caddy_amd64,"linux/arm64":$caddy_arm64},sbom_sha256:{"linux/amd64":$caddy_amd64_sbom,"linux/arm64":$caddy_arm64_sbom}}
-    }}' > "$work/image-metadata.json"
+# The signed manifest schema stores platform hashes without the OCI prefix.
+# Keep the original prefixed variables for staging pulls and scan references.
+source "$source_root/scripts/release/write-image-metadata.sh"
+write_release_image_metadata "$work/image-metadata.json"
 
 cp "$work/sbom/"*.cdx.json "$work/support/"
 cp "$work/notices/"NOTICE-*.txt "$work/support/"
@@ -279,6 +291,8 @@ pnpm exec esbuild "$source_root/apps/api/scripts/release/verify-only.mjs" --bund
   --outfile="$work/support/release-verifier.mjs"
 pnpm exec esbuild "$source_root/apps/api/scripts/release/verify-artifacts.mjs" --bundle --platform=node --format=esm --target=node24 \
   --outfile="$work/support/verify-artifacts.mjs"
+cp "$source_root/scripts/release/backup-host-broker.sh" "$work/support/backup-host-broker.sh"
+chmod 0644 "$work/support/backup-host-broker.sh"
 release_dir="$work/release-package"
 node "$source_root/apps/api/scripts/release/assemble-release.mjs" "$work/image-metadata.json" \
   "$work/trusted-license-config.json" "$migration_path" "$work/support" "$release_dir"
@@ -326,15 +340,19 @@ api_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.s
   "$api_staging_index_ref" "$api_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
 web_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.sh" \
   "$web_staging_index_ref" "$web_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
+backup_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.sh" \
+  "$backup_staging_index_ref" "$backup_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
 bundle_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.sh" \
   "$bundle_staging_ref" "$bundle_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
 [[ "$api_promoted_digest" == "$api_index_digest" && "$web_promoted_digest" == "$web_index_digest" && \
+  "$backup_promoted_digest" == "$backup_index_digest" && \
   "$bundle_promoted_digest" == "$bundle_digest" ]] || fail 'OCI promotion did not preserve the verified staging digests.'
 cosign sign --yes "$api_index_ref" >/dev/null
 cosign sign --yes "$web_index_ref" >/dev/null
+cosign sign --yes "$backup_index_ref" >/dev/null
 cosign sign --yes "${bundle_repository}@${bundle_digest}" >/dev/null
 
-for package in aikayun-api aikayun-web aikayun-release-bundle; do
+for package in aikayun-api aikayun-web aikayun-backup-restic aikayun-release-bundle; do
   if [[ "$owner_type" == Organization ]]; then path="/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}/visibility"; else path="/user/packages/container/${package}/visibility"; fi
   visibility="$(GH_TOKEN="$AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN" gh api --method PATCH "$path" -f visibility=public --jq .visibility)"
   [[ "$visibility" == public ]] || fail "GHCR package is not anonymously readable: $package"
@@ -342,8 +360,8 @@ done
 
 docker logout ghcr.io >/dev/null
 registry_logged_in=0
-for image in "$api_index_ref" "$web_index_ref" "${bundle_repository}@${bundle_digest}"; do docker pull "$image" >/dev/null; done
-for image in "$api_index_ref" "$web_index_ref" "${bundle_repository}@${bundle_digest}"; do
+for image in "$api_index_ref" "$web_index_ref" "$backup_index_ref" "${bundle_repository}@${bundle_digest}"; do docker pull "$image" >/dev/null; done
+for image in "$api_index_ref" "$web_index_ref" "$backup_index_ref" "${bundle_repository}@${bundle_digest}"; do
   cosign verify --certificate-identity "$release_identity" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com "$image" >/dev/null
 done
@@ -382,6 +400,6 @@ docker run --rm -v "$customer_download:/release:ro" --entrypoint node "$node_bas
   > "$work/customer-linux-artifact-verification.json"
 manifest_sha256="$(jq -er '.manifest_sha256' "$work/jws-verified.json")"
 printf '%s\n' "Release ID: ${release_id}" "Source: ${GITHUB_SHA}" "Manifest SHA-256: ${manifest_sha256}" \
-  "API image: ${api_index_ref}" "Web image: ${web_index_ref}" "Release bundle: ${bundle_repository}@${bundle_digest}" \
+  "API image: ${api_index_ref}" "Web image: ${web_index_ref}" "Backup reader image: ${backup_index_ref}" "Release bundle: ${bundle_repository}@${bundle_digest}" \
   'Anonymous GHCR and HTTPS verification: passed' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 printf 'Commercial release candidate gates passed: %s (%s)\n' "$release_id" "$manifest_sha256"

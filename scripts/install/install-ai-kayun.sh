@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 set -Eeuo pipefail
 set +x
 umask 077
@@ -24,12 +24,14 @@ SELECTED_API_IMAGE=''
 SELECTED_WEB_IMAGE=''
 SELECTED_POSTGRES_IMAGE=''
 SELECTED_CADDY_IMAGE=''
+SELECTED_BACKUP_RESTIC_IMAGE=''
 RELEASE_BASE=''
 
 cleanup() {
   local status=$?
   if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then rm -rf -- "$WORK_DIR"; fi
   if [[ -n "$STAGING_DIR" && -d "$STAGING_DIR" ]]; then rm -rf -- "$STAGING_DIR"; fi
+  if declare -F backup_stream_cleanup >/dev/null 2>&1; then backup_stream_cleanup; fi
   return "$status"
 }
 trap cleanup EXIT
@@ -65,7 +67,7 @@ begin_lock() {
 
 require_host_commands() {
   local name
-  for name in awk base64 basename chmod chown cp curl date df diff dirname docker env find flock getent grep head id install mkdir mktemp mv rmdir rm sed sha256sum sleep sort stat tr uname; do
+  for name in awk base64 basename cat chmod chown cmp cp curl date df diff dirname docker env find flock getent grep head id install mkdir mkfifo mktemp mv realpath rmdir rm sed sha256sum sleep sort stat timeout tr uname; do
     command -v "$name" >/dev/null 2>&1 || fail "Required host command is missing: $name. Install the standard Linux utility package that provides it."
   done
   command -v bash >/dev/null 2>&1 || fail 'Bash is required to run the controlled installer.'
@@ -399,7 +401,7 @@ verify_release_image_references() {
   compose_references="$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$directory/compose.yaml" | sort -u)"
   [[ "$compose_references" == "$(printf '%s\n' "$manifest_references" | sort -u)" ]] || \
     fail 'The release Compose image references do not exactly match the four signed manifest digests.'
-  for name in api web postgres caddy; do
+  for name in api web postgres caddy backup; do
     image="$(docker run --rm --mount "type=bind,source=$directory,target=/release,readonly" \
       --entrypoint node "$NODE_IMAGE" -e '
         const fs=require("node:fs"); const m=JSON.parse(fs.readFileSync("/release/release-manifest.json","utf8"));
@@ -407,9 +409,11 @@ verify_release_image_references() {
         if(!i || typeof i.reference!=="string" || !/@sha256:[a-f0-9]{64}$/.test(i.reference)) process.exit(1);
         process.stdout.write(i.reference);
       ' "$name")" || fail "The signed manifest has no valid $name image digest."
-    grep -Fqx "    image: $image" "$directory/compose.yaml" || fail "Compose does not use the signed $name image digest."
+    if [[ "$name" != backup ]]; then
+      grep -Fqx "    image: $image" "$directory/compose.yaml" || fail "Compose does not use the signed $name image digest."
+    fi
     docker pull "$image" >/dev/null || fail "Could not pull the digest-pinned $name image."
-    if [[ "$name" == api || "$name" == web ]]; then
+    if [[ "$name" == api || "$name" == web || "$name" == backup ]]; then
       docker run --rm --entrypoint cosign "$COSIGN_IMAGE" verify \
         --certificate-identity "$RELEASE_CERT_IDENTITY" --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
         "$image" >/dev/null || fail "Cosign rejected the $name image signature."
@@ -487,18 +491,19 @@ load_release_image_digests() {
   local -a image_references_array
   image_references="$(node_target '
     const fs=require("node:fs"); const m=JSON.parse(fs.readFileSync("/target/release/release-manifest.json","utf8"));
-    const values=[m.images?.api?.reference,m.images?.web?.reference,m.images?.postgres?.reference,m.images?.caddy?.reference];
+    const values=[m.images?.api?.reference,m.images?.web?.reference,m.images?.postgres?.reference,m.images?.caddy?.reference,m.images?.backup?.reference];
     if(values.some(v=>typeof v!=="string" || !/@sha256:[a-f0-9]{64}$/.test(v))) process.exit(1);
     process.stdout.write(values.join("\n"));
-  ')" || fail 'Could not load the four verified image references.'
+  ')" || fail 'Could not load the five verified image references.'
   mapfile -t image_references_array <<< "$image_references"
-  [[ "${#image_references_array[@]}" == 4 ]] || fail 'The signed release manifest must contain exactly four images.'
+  [[ "${#image_references_array[@]}" == 5 ]] || fail 'The signed release manifest must contain exactly five images.'
   SELECTED_API_IMAGE="${image_references_array[0]}"
   SELECTED_WEB_IMAGE="${image_references_array[1]}"
   SELECTED_POSTGRES_IMAGE="${image_references_array[2]}"
   SELECTED_CADDY_IMAGE="${image_references_array[3]}"
+  SELECTED_BACKUP_RESTIC_IMAGE="${image_references_array[4]}"
   for image_reference in "${image_references_array[@]}"; do
-    [[ "$image_reference" =~ ^(ghcr\.io/yykx682436/aikayun-(api|web)|docker\.io/library/(postgres|caddy))@sha256:[a-f0-9]{64}$ ]] || \
+    [[ "$image_reference" =~ ^(ghcr\.io/yykx682436/aikayun-(api|web|backup-restic)|docker\.io/library/(postgres|caddy))@sha256:[a-f0-9]{64}$ ]] || \
       fail 'A signed image reference does not use its canonical repository and immutable digest.'
   done
 }
@@ -810,7 +815,7 @@ install_new() {
   chmod -R a+rX "$STAGING_DIR/release"
   chmod 0400 "$STAGING_DIR/release/license-trust-bundle.jws"
   chown 1000:1000 "$STAGING_DIR/release/license-trust-bundle.jws"
-  install -m 0755 "$STAGING_DIR/release/install.sh" "$STAGING_DIR/aikayun"
+  install -m 0555 "$STAGING_DIR/release/install.sh" "$STAGING_DIR/aikayun"
   SELECTED_RELEASE_ORIGIN="${SELECTED_RELEASE_ORIGIN%/}"
   write_state verified "$STAGING_DIR"
   if [[ -d "$TARGET_DIR" ]]; then rmdir -- "$TARGET_DIR" || fail '/opt/aikayun became non-empty while installation was being verified.'; fi
@@ -915,6 +920,24 @@ parse_install_options() {
   done
 }
 
+verify_backup_launcher() {
+  local running
+  [[ "$0" == "$TARGET_DIR/aikayun" && -f "$TARGET_DIR/aikayun" && ! -L "$TARGET_DIR/aikayun" && \
+     "$(realpath -e "$TARGET_DIR/aikayun")" == "$TARGET_DIR/aikayun" && \
+     "$(stat -c '%u:%g:%a:%h' "$TARGET_DIR/aikayun")" == '0:0:555:1' ]] || \
+    fail 'The installed operator command is missing, modified, or unsafe.'
+  running="$(realpath -e "$0")" || fail 'The executing operator command path is unavailable.'
+  [[ "$running" == "$TARGET_DIR/aikayun" ]] || fail 'The executing operator command is not the fixed installed artifact.'
+  cmp -s "$TARGET_DIR/aikayun" "$RELEASE_DIR/install.sh" || fail 'The executing operator command differs from the signed installer artifact.'
+}
+
+verify_backup_host_broker() {
+  local broker="$RELEASE_DIR/backup-host-broker.sh"
+  [[ -f "$broker" && ! -L "$broker" && "$(realpath -e "$broker")" == "$broker" && \
+     "$(stat -c '%u:%g:%a:%h' "$broker")" == '0:0:644:1' ]] || \
+    fail 'The signed host backup broker is missing or unsafe.'
+}
+
 main() {
   local command="${1:-help}"
   case "$command" in
@@ -953,6 +976,29 @@ main() {
       begin_lock
       require_host_commands
       setup_token_command
+      ;;
+    backup)
+      (($# >= 2)) || fail 'Usage: sudo /opt/aikayun/aikayun backup create|list|verify|initialize-repository|recover-maintenance'
+      local backup_operation="$2"
+      shift 2
+      if [[ "$backup_operation" == help || "$backup_operation" == -h || "$backup_operation" == --help ]]; then
+        printf '%s\n' 'Usage: sudo /opt/aikayun/aikayun backup create|list [LIMIT]|verify SET_ID|initialize-repository|recover-maintenance'
+        return 0
+      fi
+      case "$backup_operation" in
+        create|list|verify|initialize-repository|recover-maintenance) ;;
+        *) fail 'Unsupported backup command.' ;;
+      esac
+      require_root
+      host_preflight
+      begin_lock
+      saved_bundle_verify
+      verify_backup_launcher
+      verify_backup_host_broker
+      # The signed broker is sourced only after every installed artifact and
+      # the actual executing command have been checked against the saved JWS.
+      source "$RELEASE_DIR/backup-host-broker.sh"
+      run_backup_host_broker "$backup_operation" "$@"
       ;;
     *) usage; fail "Unknown command: $command" ;;
   esac

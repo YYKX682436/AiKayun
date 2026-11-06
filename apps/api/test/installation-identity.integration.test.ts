@@ -20,6 +20,7 @@ import {
 } from '../src/licensing/installation-identity.js'
 import { parseIdentityCliArguments } from '../src/licensing/installation-identity-cli.js'
 import { ensureBoundProductionPendingKey } from '../src/production-install-init.js'
+import { advanceTrustedTimeWatermarkFile } from '../src/licensing/trusted-time-watermark.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const integration = describe.skipIf(!testDatabaseUrl)('installation identity PostgreSQL integration', () => {
@@ -540,6 +541,42 @@ const integration = describe.skipIf(!testDatabaseUrl)('installation identity Pos
       } finally {
         if (previous === undefined) delete process.env.NODE_ENV
         else process.env.NODE_ENV = previous
+      }
+    })
+  })
+
+  it('preserves and validates the trusted time watermark beside the bound Pending Key', async () => {
+    await withSandbox(async (sandbox) => {
+      await initialize(sandbox)
+      const pendingRoot = await mkdtemp(join(tmpdir(), 'aikayun-pending-watermark-bound-test-'))
+      identityRoots.add(pendingRoot)
+      const previous = process.env.NODE_ENV
+      process.env.NODE_ENV = 'production'
+      try {
+        const pending = await ensureBoundProductionPendingKey(sandbox.pool, pendingRoot, [sandbox.identityRoot])
+        const binding = await sandbox.pool.query<{ database_id: string; instance_id: string; identity_jkt: string }>(
+          'SELECT database_id::text, instance_id::text, identity_jkt FROM installation_binding WHERE singleton = true',
+        )
+        const row = binding.rows[0]!
+        const watermarkPath = join(pendingRoot, 'license-time-watermark.json')
+        await advanceTrustedTimeWatermarkFile(pendingRoot, { databaseId: row.database_id, instanceId: row.instance_id,
+          identityJkt: row.identity_jkt }, Date.now())
+        const original = await readFile(watermarkPath)
+        await expect(ensureBoundProductionPendingKey(sandbox.pool, pendingRoot, [sandbox.identityRoot]))
+          .resolves.toEqual({ keyId: pending.keyId, created: false })
+        expect(await readFile(watermarkPath)).toEqual(original)
+
+        await writeFile(watermarkPath, '{"schema":1}\n')
+        await expect(ensureBoundProductionPendingKey(sandbox.pool, pendingRoot, [sandbox.identityRoot]))
+          .rejects.toMatchObject({ code: 'pending_key_watermark_invalid' })
+        await writeFile(watermarkPath, original)
+        await expect(ensureBoundProductionPendingKey(sandbox.pool, pendingRoot, [sandbox.identityRoot]))
+          .resolves.toEqual({ keyId: pending.keyId, created: false })
+      } finally {
+        if (previous === undefined) delete process.env.NODE_ENV
+        else process.env.NODE_ENV = previous
+        await rm(pendingRoot, { recursive: true, force: true })
+        identityRoots.delete(pendingRoot)
       }
     })
   })

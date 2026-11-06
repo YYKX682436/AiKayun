@@ -114,7 +114,7 @@ function databasePassword(env: NodeJS.ProcessEnv): string | undefined {
   return selected.endsWith('_FILE') ? configuredSecret(env, selected.slice(0, -5)) : env[selected]
 }
 
-function parsePaymentCredentialKeyRing(value: string | undefined): PaymentCredentialKeyRing | null {
+export function parsePaymentCredentialKeyRing(value: string | undefined): PaymentCredentialKeyRing | null {
   if (!value) return null
   let parsed: unknown
   try {
@@ -151,7 +151,7 @@ function parsePaymentCredentialKeyRing(value: string | undefined): PaymentCreden
   return { activeKeyId: record.activeKeyId, keys }
 }
 
-function parseCodePoolEncryptionKeyRing(value: string | undefined): PaymentCredentialKeyRing | null {
+export function parseCodePoolEncryptionKeyRing(value: string | undefined): PaymentCredentialKeyRing | null {
   if (!value) return null
   let parsed: unknown
   try {

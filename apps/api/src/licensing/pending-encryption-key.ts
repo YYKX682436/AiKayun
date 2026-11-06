@@ -2,11 +2,14 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID }
 import { constants as fsConstants, existsSync } from 'node:fs'
 import { link, lstat, mkdir, open, realpath, readdir, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { readTrustedTimeWatermark } from './trusted-time-watermark.js'
+import type { TimeWatermarkIdentity } from './trusted-time-watermark.js'
 
 const keyFileName = 'license-pending-aes-256-gcm.json'
 const keyPurpose = 'aikayun-license-pending-aes-256-gcm-v1'
 const keyIdPattern = /^[A-Za-z0-9_-]{1,48}$/u
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
+const watermarkFileName = 'license-time-watermark.json'
 
 export class LicensePendingKeyError extends Error {
   constructor(readonly code: string) {
@@ -142,6 +145,20 @@ function errorCode(error: unknown): string | undefined {
     : undefined
 }
 
+async function stagedKeyFiles(root: string, names: string[], identity?: TimeWatermarkIdentity): Promise<string[]> {
+  const staged = names.filter(name => name !== keyFileName && name !== watermarkFileName)
+  if (staged.some(name => !/^\.pending-key-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u.test(name))) {
+    fail('pending_key_root_contents_invalid')
+  }
+  if (names.includes(watermarkFileName)) {
+    if (!identity) fail('pending_key_watermark_identity_unavailable')
+    let watermark
+    try { watermark = await readTrustedTimeWatermark(root, identity) } catch { fail('pending_key_watermark_invalid') }
+    if (watermark!.status !== 'valid') fail('pending_key_watermark_invalid')
+  }
+  return staged
+}
+
 /** Explicit one-shot initializer. The CLI gates this to development/test and never overwrites a key. */
 export async function initializeTemporaryLicensePendingKey(root: string, environment: string, forbiddenRoots: string[] = []): Promise<{ keyId: string }> {
   if ((environment !== 'development' && environment !== 'test') || process.env.NODE_ENV !== environment) {
@@ -171,6 +188,7 @@ export async function initializeTemporaryLicensePendingKey(root: string, environ
 export async function ensureProductionLicensePendingKey(
   root: string,
   forbiddenRoots: string[] = [],
+  identity?: TimeWatermarkIdentity,
 ): Promise<{ keyId: string; created: boolean }> {
   if (process.env.NODE_ENV !== 'production') fail('production_pending_key_environment_required')
   assertPathIsolated(root, forbiddenRoots)
@@ -187,10 +205,7 @@ export async function ensureProductionLicensePendingKey(
 
   let names: string[]
   try { names = await readdir(canonicalRoot) } catch { fail('pending_key_root_unavailable') }
-  const temporaryNames = names!.filter(name => name !== keyFileName)
-  if (temporaryNames.some(name => !/^\.pending-key-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u.test(name))) {
-    fail('pending_key_root_contents_invalid')
-  }
+  const temporaryNames = await stagedKeyFiles(canonicalRoot, names!, identity)
   const keyFileExists = names!.includes(keyFileName)
   if (temporaryNames.length > 0) {
     const recovered = await recoverStagedKeyFiles(canonicalRoot, temporaryNames, keyFileExists)
@@ -221,6 +236,7 @@ export async function verifyBoundProductionLicensePendingKey(
   root: string,
   expected: { keyId: string; sha256: string },
   forbiddenRoots: string[] = [],
+  identity?: TimeWatermarkIdentity,
 ): Promise<LicensePendingKey> {
   if (process.env.NODE_ENV !== 'production') fail('production_pending_key_environment_required')
   assertPathIsolated(root, forbiddenRoots)
@@ -240,10 +256,7 @@ export async function verifyBoundProductionLicensePendingKey(
   }
   let names: string[]
   try { names = await readdir(canonicalRoot) } catch { fail('pending_key_root_unavailable') }
-  const temporaryNames = names!.filter(name => name !== keyFileName)
-  if (temporaryNames.some(name => !/^\.pending-key-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u.test(name))) {
-    fail('pending_key_root_contents_invalid')
-  }
+  const temporaryNames = await stagedKeyFiles(canonicalRoot, names!, identity)
   if (temporaryNames.length > 0) await recoverStagedKeyFiles(canonicalRoot, temporaryNames, true)
   const key = await loadLicensePendingKey(canonicalRoot, forbiddenRoots)
   const digest = createHash('sha256').update(key.key).digest('hex')

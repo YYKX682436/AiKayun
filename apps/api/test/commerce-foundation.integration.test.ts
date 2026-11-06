@@ -8,6 +8,7 @@ import { AppMigrationProvider } from '../src/db/migration-provider.js'
 import type { Database, FulfillmentMethod, OrderSkuOptionSnapshot, ProductInventoryMode, ProductType } from '../src/db/types.js'
 import { recordWalletOrderPayment } from '../src/finance/wallet.js'
 import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
+import { readBackupPendingSummary } from '../src/backup/pending-summary.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const digest = 'a'.repeat(64)
@@ -924,6 +925,7 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
   })
 
   it('freezes withdrawal cash and prevents duplicate payout attempts while the result is uncertain', async () => {
+    const summaryBefore = await readBackupPendingSummary(db)
     const customerId = await createCustomer('withdrawal')
     await addWalletCredit(customerId, 'cash', '100.00')
     await expect(db.transaction().execute(async (trx) => {
@@ -972,6 +974,9 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
       started_by_admin_id: adminId, provider_reference: null, completed_at: null,
     }).execute()
     await db.updateTable('withdrawal_payout_attempts').set({ status: 'unknown' }).where('id', '=', firstAttemptId).execute()
+    const summaryUnknown = await readBackupPendingSummary(db)
+    expect(summaryUnknown.withdrawalsPending).toBe(summaryBefore.withdrawalsPending + 1)
+    expect(summaryUnknown.withdrawalAttemptsUncertain).toBe(summaryBefore.withdrawalAttemptsUncertain + 1)
     expect((await db.selectFrom('withdrawals').select('status').where('id', '=', withdrawalId).executeTakeFirstOrThrow()).status)
       .toBe('transfer_uncertain')
     await expect(db.insertInto('withdrawal_payout_attempts').values({
@@ -1011,6 +1016,9 @@ describe('Stage ④-1 commerce foundation with PostgreSQL 18', () => {
     })
     expect((await db.selectFrom('withdrawals').select('status').where('id', '=', withdrawalId).executeTakeFirstOrThrow()).status)
       .toBe('completed')
+    const summaryCompleted = await readBackupPendingSummary(db)
+    expect(summaryCompleted.withdrawalsPending).toBe(summaryBefore.withdrawalsPending)
+    expect(summaryCompleted.withdrawalAttemptsUncertain).toBe(summaryBefore.withdrawalAttemptsUncertain)
     expect(await db.selectFrom('wallet_accounts').select(['cash_available', 'cash_frozen'])
       .where('customer_id', '=', customerId).executeTakeFirstOrThrow()).toEqual({ cash_available: '40.00', cash_frozen: '0.00' })
     expect(await db.selectFrom('wallet_ledger_entries').select('id').where('withdrawal_id', '=', withdrawalId)

@@ -3615,7 +3615,8 @@ describe.skipIf(!testDatabaseUrl || !centerCheckout)('3C-3A frozen authorization
     let child: ReturnType<typeof spawn> | undefined
     let preparedBundle: string | undefined
     try {
-      await fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId)
+      await retryTransientChallenge(() =>
+        fixture.activationClientForCase().submitPendingActivation(fixture.operation.operationId))
       const projection = createLicenseStateProjectionClient({ db: fixture.db, pool: fixture.pool,
         identityRoot: fixture.identityRoot, pendingKeyRoot: fixture.pendingRoot,
         releaseConfig, trustStore: fixture.trustStore, testTls: testTlsOptions() })

@@ -113,6 +113,15 @@ export interface AcceptedTrustBundle {
   readonly resolver: TrustedSigningKeyResolver;
 }
 
+export interface ReadonlyTrustBundleInspection {
+  readonly status: 'uninitialized' | 'accepted';
+  readonly bundleVersion: string | null;
+  readonly artifactSha256: string | null;
+  readonly stateDigest: string | null;
+  readonly revokedKeyCount: number;
+  readonly retiredKeyCount: number;
+}
+
 interface BundleRecord {
   bundle_version: string;
   artifact_sha256: string;
@@ -486,6 +495,90 @@ export class TrustBundleStore {
       }
       return accepted;
     });
+  }
+
+  /**
+   * Verify the durable Trust Store and its PostgreSQL head without recovering,
+   * cleaning, creating, or rewriting any files. This is for backup and
+   * diagnostics only; operational reads must continue to use getAccepted().
+   * Expiry is intentionally not evaluated here: a signed historical bundle
+   * may be expired while its persisted history still needs to be backed up.
+   */
+  async inspectPersistedReadOnly(): Promise<ReadonlyTrustBundleInspection> {
+    if (!await this.assertReadOnlyDirectoryLayout()) {
+      return Object.freeze({ status: 'uninitialized', bundleVersion: null, artifactSha256: null,
+        stateDigest: null, revokedKeyCount: 0, retiredKeyCount: 0 });
+    }
+    const checkpoint = await this.readCheckpoint();
+    const state = await this.readState();
+    if (!checkpoint && !state) {
+      return Object.freeze({ status: 'uninitialized', bundleVersion: null, artifactSha256: null,
+        stateDigest: null, revokedKeyCount: 0, retiredKeyCount: 0 });
+    }
+    if (!checkpoint || checkpoint.pending || !checkpoint.committed || !state ||
+        !sameRecord(state.record, checkpoint.committed) ||
+        compareBundleVersions(this.minimumBundleVersion, checkpoint.minimum_bundle_version) < 0 ||
+        compareBundleVersions(checkpoint.committed.bundle_version, this.minimumBundleVersion) < 0) {
+      throw new Error('trust_bundle_store_requires_manual_recovery');
+    }
+    const loaded = await this.loadRecord(checkpoint.committed);
+    const stateDigest = trustedBundleStateDigest({ artifactSha256: loaded.record.artifact_sha256,
+      bundleVersion: loaded.record.bundle_version, revokedKids: loaded.record.revoked_kids,
+      retiredKids: loaded.record.retired_kids });
+    return Object.freeze({ status: 'accepted', bundleVersion: loaded.record.bundle_version,
+      artifactSha256: loaded.record.artifact_sha256, stateDigest,
+      revokedKeyCount: loaded.record.revoked_kids.length, retiredKeyCount: loaded.record.retired_kids.length });
+  }
+
+  /** Check the persisted files against PostgreSQL without recovery or writes. */
+  async inspectAcceptedReadOnly(): Promise<ReadonlyTrustBundleInspection> {
+    if (!this.coordinator) throw new Error('trust_bundle_database_coordinator_required');
+    return this.coordinator.withRead(async head => {
+      const inspection = await this.inspectPersistedReadOnly();
+      if (inspection.status === 'uninitialized') {
+        if (head.headDigest !== null || head.headVersion !== null || head.pendingArtifactSha256 !== null || head.licenseId !== null) {
+          throw new Error('trust_bundle_store_does_not_match_database_head');
+        }
+        return inspection;
+      }
+      if (head.headDigest !== inspection.stateDigest || head.headVersion !== inspection.bundleVersion) {
+        throw new Error('trust_bundle_store_does_not_match_database_head');
+      }
+      return inspection;
+    });
+  }
+
+  /** Checks the persisted shape without the normal reader's stale-temp cleanup. */
+  private async assertReadOnlyDirectoryLayout(): Promise<boolean> {
+    let directory;
+    try { directory = await lstat(this.directory); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+    const permissions = Number(directory.mode) & 0o777;
+    if (!directory.isDirectory() || directory.isSymbolicLink() || directory.nlink < 1 ||
+        permissions !== 0o700 || (Number(directory.mode) & 0o7000) !== 0 ||
+        (typeof process.getuid === 'function' && directory.uid !== process.getuid())) {
+      throw new Error('Trust bundle state directory must be a private regular directory');
+    }
+    const allowed = new Set([STATE_FILE_NAME, CHECKPOINT_FILE_NAME, '.trust-bundle.kernel-lock']);
+    const names = await readdir(this.directory);
+    if (names.some(name => !allowed.has(name))) throw new Error('trust_bundle_store_requires_manual_recovery');
+    for (const name of names) {
+      const path = join(this.directory, name);
+      const metadata = await lstat(path);
+      const kernelLock = name === '.trust-bundle.kernel-lock';
+      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 ||
+          (typeof process.getuid === 'function' && metadata.uid !== process.getuid()) ||
+          (kernelLock ? (metadata.mode & 0o7777) !== 0o600 : !isPrivateStateFileMode(metadata.mode))) {
+        throw new Error('trust_bundle_store_requires_manual_recovery');
+      }
+    }
+    const hasState = names.includes(STATE_FILE_NAME);
+    const hasCheckpoint = names.includes(CHECKPOINT_FILE_NAME);
+    if (hasState !== hasCheckpoint) throw new Error('trust_bundle_store_requires_manual_recovery');
+    return true;
   }
 
   private async getAcceptedLocal(trustedTime: TrustedTimeSource): Promise<AcceptedTrustBundle> {

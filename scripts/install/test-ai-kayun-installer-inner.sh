@@ -14,6 +14,7 @@ INSTALLER="$PAYLOAD_DIR/install.sh"
 TEST_SOCKET="$HARNESS_ROOT/docker.sock"
 SOCKET_PID=''
 PORT_PID=''
+HANDOFF_PID=''
 trap 'printf "Installer flow assertion failed at line %s: %s\\n" "$LINENO" "$BASH_COMMAND" >&2; if [[ -f "$EVENT_LOG" ]]; then tail -30 "$EVENT_LOG" >&2; fi' ERR
 DOCKER_CONTEXT=''
 DOCKER_HOST=''
@@ -28,7 +29,7 @@ case "$actual_arch" in x86_64) actual_arch=amd64 ;; aarch64) actual_arch=arm64 ;
 }
 [[ -d "$PAYLOAD_DIR" && -f "$INSTALLER" ]] || { printf 'Controlled release payload is missing.\n' >&2; exit 2; }
 case "$SCENARIO" in
-  first-install-tls-failure-resume|first-install-https-ready|release-download-failure|manifest-modified|root-substitution|compose-image-modified|dns-failure|disk-low|ports-in-use|occupied-deployment|fresh-install-untrusted-code|resume-untrusted-code) ;;
+  first-install-tls-failure-resume|first-install-https-ready|release-download-failure|manifest-modified|root-substitution|compose-image-modified|dns-failure|disk-low|ports-in-use|occupied-deployment|fresh-install-untrusted-code|resume-untrusted-code|backup-customer-command-integrity) ;;
   *) printf 'Unknown isolated installer scenario.\n' >&2; exit 2 ;;
 esac
 if [[ "$SCENARIO" != occupied-deployment && -e "$TARGET_DIR" ]]; then
@@ -49,6 +50,7 @@ cleanup_fixture() {
   fi
   if [[ -n "$SOCKET_PID" ]]; then kill "$SOCKET_PID" 2>/dev/null || true; fi
   if [[ -n "$PORT_PID" ]]; then kill "$PORT_PID" 2>/dev/null || true; fi
+  if [[ -n "$HANDOFF_PID" ]]; then kill "$HANDOFF_PID" 2>/dev/null || true; fi
   rm -rf -- "$HARNESS_ROOT"
   return "$status"
 }
@@ -79,6 +81,9 @@ if [[ "$1" == context ]]; then
   esac
   exit 0
 fi
+if [[ "$1" == --host ]]; then shift 2; fi
+if [[ "$1" == --version ]]; then printf 'Docker version 29.9.3, build fixture\n'; exit 0; fi
+if [[ "$1" == compose && "$2" == version ]]; then printf 'v5.7.0\n'; exit 0; fi
 if [[ "$1" == info ]]; then
   case "$3" in
     *OSType*) printf 'linux\n' ;;
@@ -90,7 +95,14 @@ if [[ "$1" == info ]]; then
   exit 0
 fi
 if [[ "$1" == pull ]]; then event docker_pull; exit 0; fi
-if [[ "$1" == network && "$2" == inspect ]]; then event docker_network_inspect; exit 1; fi
+if [[ "$1" == network && "$2" == inspect ]]; then
+  event docker_network_inspect
+  if [[ "${AIKAYUN_TEST_BROKER_HOLD:-}" == 1 ]]; then
+    : > "$AIKAYUN_TEST_STATE/broker-waiting"
+    while [[ -e "$AIKAYUN_TEST_STATE/broker-hold" ]]; do sleep 0.05; done
+  fi
+  exit 1
+fi
 if [[ "$1" == volume && "$2" == inspect ]]; then
   volume="$3"
   format=''
@@ -180,7 +192,9 @@ if [[ "$1" == run ]]; then
   entrypoint=''
   while (($#)); do
     case "$1" in
-      --rm|--interactive|-i) shift ;;
+      --rm|--interactive|-i|--read-only) shift ;;
+      --pull=*) shift ;;
+      --network|--cap-drop|--security-opt) shift 2 ;;
       --mount)
         mount_spec="$2"
         mount_source="$(printf '%s' "$mount_spec" | sed -n 's/.*source=\([^,]*\).*/\1/p')"
@@ -197,7 +211,7 @@ if [[ "$1" == run ]]; then
     event controlled_cosign_identity
     exit 0
   fi
-  if [[ "$entrypoint" == node ]]; then
+  if [[ "$entrypoint" == node || "$entrypoint" == /nodejs/bin/node ]]; then
     if [[ "$1" == -e ]]; then
       shift
       script="$1"
@@ -509,6 +523,85 @@ grep -Fq 'is not empty' "$duplicate_log"
 [[ "$(sha256sum "$FAKE_STATE/identity/"* | sha256sum | awk '{print $1}')" == "$identity_hash" ]]
 [[ "$(sha256sum "$TARGET_DIR/secrets/"* | sha256sum | awk '{print $1}')" == "$secrets_hash" ]]
 assert_no_secret_leak "$duplicate_log"
+
+if [[ "$SCENARIO" == backup-customer-command-integrity ]]; then
+  customer_command() {
+    local expected="$1" output status
+    output="$HARNESS_ROOT/customer-backup-$RANDOM.log"
+    if "$TARGET_DIR/aikayun" backup create >"$output" 2>&1; then status=0; else status=$?; fi
+    if [[ "$status" != "$expected" ]]; then cat "$output" >&2; printf 'Expected customer backup status %s, got %s.\n' "$expected" "$status" >&2; exit 1; fi
+    printf '%s\n' "$output"
+  }
+
+  [[ -f "$TARGET_DIR/aikayun" && ! -L "$TARGET_DIR/aikayun" ]]
+  [[ "$(stat -c '%u:%g:%a:%h' "$TARGET_DIR/aikayun")" == 0:0:555:1 ]]
+  cmp -s "$TARGET_DIR/aikayun" "$TARGET_DIR/release/install.sh"
+  broker="$TARGET_DIR/release/backup-host-broker.sh"
+  [[ -f "$broker" && ! -L "$broker" ]]
+
+  cp -p "$broker" "$HARNESS_ROOT/original-backup-host-broker.sh"
+  printf '# tampered fixture\n' >> "$broker"
+  before_events="$(wc -l < "$EVENT_LOG")"
+  tampered_log="$(customer_command 1)"
+  grep -Fq 'Installer-owned verification rejected a stored release artifact before any downloaded verifier could run' "$tampered_log" || { cat "$tampered_log" >&2; exit 1; }
+  ! tail -n +"$((before_events + 1))" "$EVENT_LOG" | grep -Eq '^(docker_network_inspect|compose_down:|docker_stop:|service_stop:)'
+  cp -p "$HARNESS_ROOT/original-backup-host-broker.sh" "$broker"
+
+  mv "$broker" "$HARNESS_ROOT/missing-backup-host-broker.sh"
+  missing_log="$(customer_command 1)"
+  grep -Fq 'Installer-owned verification rejected a stored release artifact before any downloaded verifier could run' "$missing_log" || { cat "$missing_log" >&2; exit 1; }
+  mv "$HARNESS_ROOT/missing-backup-host-broker.sh" "$broker"
+
+  cp -p "$TARGET_DIR/release/release-manifest.jws" "$HARNESS_ROOT/original-release-manifest.jws"
+  printf 'tampered signature fixture\n' > "$TARGET_DIR/release/release-manifest.jws"
+  signature_log="$(customer_command 1)"
+  grep -Fq 'The stored release JWS signature is invalid' "$signature_log"
+  cp -p "$HARNESS_ROOT/original-release-manifest.jws" "$TARGET_DIR/release/release-manifest.jws"
+
+  {
+    printf '%s\n' '#!/bin/bash'
+    printf '%s\n' 'export AIKAYUN_TEST_DOCKER_CONTEXT=local-fixture'
+    printf '%s\n' 'export AIKAYUN_TEST_DOCKER_ENDPOINT=unix:///tmp/aikayun-installer-flow-test/docker.sock'
+    printf '%s\n' 'export AIKAYUN_TEST_EVENT_LOG=/tmp/aikayun-installer-flow-test/state/events.log'
+    printf '%s\n' 'export AIKAYUN_TEST_PAYLOAD=/fixture/release'
+    printf '%s\n' 'export AIKAYUN_TEST_PREFLIGHT_OVERRIDE=0'
+    printf '%s\n' 'export AIKAYUN_TEST_SCENARIO=backup-customer-command-integrity'
+    printf '%s\n' 'export AIKAYUN_TEST_STATE=/tmp/aikayun-installer-flow-test/state'
+    printf '%s\n' 'export AIKAYUN_TEST_TLS_READY=1'
+    printf '%s\n' 'export AIKAYUN_TEST_BROKER_HOLD=1'
+    printf 'exec %q "$@"\n' "$FAKE_BIN/docker"
+  } >/usr/bin/docker
+  chmod 0755 /usr/bin/docker
+
+  [[ ! -e /var/lib/aikayun-backup && ! -e /etc/aikayun-backup ]] || {
+    printf 'Fixed backup paths already exist in the isolated runner.\n' >&2; exit 2;
+  }
+  mkdir -m 0700 -p /var/lib/aikayun-backup /var/lib/aikayun-backup/repository \
+    /var/lib/aikayun-backup/journal /var/lib/aikayun-backup/publications /var/lib/aikayun-backup/staging \
+    /etc/aikayun-backup
+  printf 'fixture backup password\n' > /etc/aikayun-backup/restic-password
+  chmod 0600 /etc/aikayun-backup/restic-password
+
+  touch "$FAKE_STATE/broker-hold"
+  AIKAYUN_TEST_BROKER_HOLD=1 "$TARGET_DIR/aikayun" backup create >"$HARNESS_ROOT/customer-backup-running.log" 2>&1 &
+  command_pid=$!
+  for _ in {1..100}; do
+    [[ -f "$FAKE_STATE/broker-waiting" ]] && break
+    kill -0 "$command_pid" 2>/dev/null || { cat "$HARNESS_ROOT/customer-backup-running.log" >&2; exit 1; }
+    sleep 0.05
+  done
+  [[ -f "$FAKE_STATE/broker-waiting" ]] || { cat "$HARNESS_ROOT/customer-backup-running.log" >&2; exit 1; }
+  second_log="$(customer_command 1)"
+  grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' "$second_log"
+  installer_log="$(run_installer 1 status)"
+  grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' "$installer_log"
+  rm -f "$FAKE_STATE/broker-hold"
+  if wait "$command_pid"; then echo 'The fixture broker unexpectedly passed its unavailable-network check.' >&2; exit 1; fi
+  grep -Fq 'The fixed private network is unavailable' "$HARNESS_ROOT/customer-backup-running.log"
+
+  printf 'Signed customer launcher verified artifacts before broker entry; altered, missing, and invalid-signature artifacts were rejected before service operations. Backup and installer lock contention passed.\n'
+  exit 0
+fi
 
 if [[ "$SCENARIO" == resume-untrusted-code ]]; then
   snapshot_persistent_state() {

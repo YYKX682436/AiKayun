@@ -10,7 +10,7 @@ trivy_image="${5:?Pinned Trivy image is required}"
 work_dir="${6:?Temporary working directory is required}"
 report_dir="${7:?Persistent scan report directory is required}"
 
-[[ "$image_name" =~ ^(api|web|postgres|caddy)$ ]] || { echo 'Invalid image name.' >&2; exit 2; }
+[[ "$image_name" =~ ^(api|web|postgres|caddy|backup)$ ]] || { echo 'Invalid image name.' >&2; exit 2; }
 [[ "$platform" =~ ^linux/(amd64|arm64)$ ]] || { echo 'Invalid Linux platform.' >&2; exit 2; }
 [[ "$image_ref" == *@sha256:* ]] || { echo 'Scanner input must be digest-pinned.' >&2; exit 2; }
 

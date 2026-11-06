@@ -1,4 +1,5 @@
 import { readOperationsRisk, readOperationsWorkers } from '../src/operations/risk.js'
+import { readBackupPendingSummary } from '../src/backup/pending-summary.js'
 import { randomUUID, randomBytes } from 'node:crypto'
 import { appendFile, mkdtemp, rm, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -563,6 +564,7 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
   }, 30_000)
 
   it('keeps a timed-out create unknown after provider execution and recovers it by the same idempotency key', async () => {
+    const summaryBefore = await readBackupPendingSummary(db)
     supplierFixture.reset()
     const admin = await createAdmin()
     const customer = await createCustomer()
@@ -586,6 +588,10 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
       await firstPass
       const operation = (await pendingOperations(itemId))[0]!
       expect(operation).toMatchObject({ state: 'unknown', attempt_status: 'unknown' })
+      const summaryUnknown = await readBackupPendingSummary(db)
+      expect(summaryUnknown.supplierOperationsUnfinished).toBe(summaryBefore.supplierOperationsUnfinished + 1)
+      expect(summaryUnknown.fulfillmentAttemptsUnfinished).toBe(summaryBefore.fulfillmentAttemptsUnfinished + 1)
+      expect(summaryUnknown.deliveryItemsUnfinished).toBe(summaryBefore.deliveryItemsUnfinished + 1)
       expect(supplierFixture.stats()).toMatchObject({ createRequests: 1, executions: 1, queries: queryBaseline.queries })
       await db.updateTable('supplier_api_delivery_operations').set({ next_action_at: new Date() })
         .where('id', '=', operation.id).execute()
@@ -637,6 +643,7 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
   }, 30_000)
 
   it('uses leases for two concurrent workers and recovers an expired in-flight create through query', async () => {
+    const summaryBefore = await readBackupPendingSummary(db)
     supplierFixture.reset()
     const admin = await createAdmin()
     const customer = await createCustomer()
@@ -657,6 +664,10 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
       await gate.entered
       let operation = (await pendingOperations(itemId))[0]!
       expect(operation.state).toBe('create_in_flight')
+      const summaryInFlight = await readBackupPendingSummary(db)
+      expect(summaryInFlight.supplierOperationsUnfinished).toBe(summaryBefore.supplierOperationsUnfinished + 1)
+      expect(summaryInFlight.fulfillmentAttemptsUnfinished).toBe(summaryBefore.fulfillmentAttemptsUnfinished + 1)
+      expect(summaryInFlight.deliveryItemsUnfinished).toBe(summaryBefore.deliveryItemsUnfinished + 1)
       await runDigitalDeliveryRecoveryPass(db, config)
       expect(supplierFixture.stats()).toMatchObject({ createRequests: 1, executions: 1, queries: queryBaseline.queries })
 
@@ -665,6 +676,7 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
       await runDigitalDeliveryRecoveryPass(db, config)
       operation = (await pendingOperations(itemId))[0]!
       expect(operation.state).toBe('succeeded_pending_finalize')
+      expect((await readBackupPendingSummary(db)).supplierOperationsUnfinished).toBe(summaryBefore.supplierOperationsUnfinished + 1)
       leasedOperationId = operation.id
       persisted = await db.selectFrom('supplier_api_delivery_operations').selectAll().where('id', '=', operation.id).executeTakeFirstOrThrow()
       eventCount = (await db.selectFrom('supplier_api_delivery_events').select('id').where('operation_id', '=', operation.id).execute()).length
@@ -681,6 +693,9 @@ describe('external API delivery on real PostgreSQL and HTTP fixtures', () => {
     expect((await db.selectFrom('supplier_api_delivery_events').select('id').where('operation_id', '=', leasedOperationId).execute()).length).toBe(eventCount)
     await runDigitalDeliveryRecoveryPass(db, config)
     await assertItemDelivered(orderId, itemId, 1)
+    const summaryDelivered = await readBackupPendingSummary(db)
+    expect(summaryDelivered.supplierOperationsUnfinished).toBe(summaryBefore.supplierOperationsUnfinished)
+    expect(summaryDelivered.deliveryItemsUnfinished).toBe(summaryBefore.deliveryItemsUnfinished)
     expect(supplierFixture.stats().executions).toBe(1)
   }, 30_000)
 

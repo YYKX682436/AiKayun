@@ -10,12 +10,13 @@ import {
 const digestPattern = /^[a-f0-9]{64}$/
 const semverPattern = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$/
 const platforms = ['linux/amd64', 'linux/arm64']
-const imageNames = ['api', 'web', 'postgres', 'caddy']
+const imageNames = ['api', 'web', 'postgres', 'caddy', 'backup']
 const imageRepositories = {
   api: 'ghcr.io/yykx682436/aikayun-api',
   web: 'ghcr.io/yykx682436/aikayun-web',
   postgres: 'docker.io/library/postgres',
   caddy: 'docker.io/library/caddy',
+  backup: 'ghcr.io/yykx682436/aikayun-backup-restic',
 }
 
 export function isCanonicalReleaseSemVer(value) {

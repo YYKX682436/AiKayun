@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { createServer as createHttpsServer } from 'node:https'
 import type { AddressInfo } from 'node:net'
-import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CompactSign, calculateJwkThumbprint, exportJWK, generateKeyPair } from 'jose'
@@ -20,6 +20,8 @@ import {
 import { fetchTrustedTimeAnchor } from '../src/licensing/trust/time-anchor-client.js'
 import { TrustBundleStore } from '../src/licensing/trust/trust-bundle-store.js'
 import type { TrustStoreWriteStage } from '../src/licensing/trust/trust-bundle-store.js'
+import { trustedBundleStateDigest } from '../src/licensing/trust/trust-database-coordinator.js'
+import type { TrustDatabaseCoordinator, TrustDatabaseState } from '../src/licensing/trust/trust-database-coordinator.js'
 import { verifyTrustBundleSignature } from '../src/licensing/trust/trust-bundle.js'
 import type { Ed25519PublicJwk, TrustBundleKeyRecord, TrustedOfflineRootPin } from '../src/licensing/trust/trust-bundle.js'
 import { getEmbeddedLicenseTrustCapabilityStatus } from '../src/licensing/trust/service.js'
@@ -527,6 +529,63 @@ describe('trust bundle signature, lifecycle and monotonic persistence', () => {
     expect((await store.accept(v2, BASE)).bundleVersion).toBe('2')
     await expect(store.accept(otherV2, BASE)).rejects.toThrow(/same trust bundle version/iu)
     await expect(store.accept(v1, BASE)).rejects.toThrow(/minimum version|rollback/iu)
+  })
+
+  it('inspects the signed Trust Store against its database head without recovery or writes', async () => {
+    const root = await makePair()
+    const center = await makePair()
+    const key = await publicEntry(center)
+    const directory = await temporaryStoreDirectory()
+    const store = storeFor(directory, root)
+    await store.accept(await bundle(root, CENTER_ISSUER, { version: '1', keys: [key] }), BASE)
+    const accepted = await store.getAccepted(BASE)
+    const dbState: TrustDatabaseState = {
+      headDigest: trustedBundleStateDigest(accepted), headVersion: accepted.bundleVersion,
+      pendingArtifactSha256: null, pendingToken: null, licenseId: null,
+    }
+    const coordinator = {
+      withRead: async <T>(work: (state: TrustDatabaseState) => Promise<T>) => work(dbState),
+    } as unknown as TrustDatabaseCoordinator
+    const beforeNames = await readdir(directory)
+    const before = new Map(await Promise.all(beforeNames.map(async name => [name, await readFile(join(directory, name))] as const)))
+    const inspection = await storeFor(directory, root).withCoordinator(coordinator).inspectAcceptedReadOnly()
+    expect(inspection).toMatchObject({ status: 'accepted', bundleVersion: accepted.bundleVersion,
+      artifactSha256: accepted.artifactSha256, stateDigest: dbState.headDigest, revokedKeyCount: 0, retiredKeyCount: 0 })
+    expect(await readdir(directory)).toEqual(beforeNames)
+    for (const [name, bytes] of before) expect(await readFile(join(directory, name))).toEqual(bytes)
+
+    const mismatch = { ...dbState, headDigest: 'A'.repeat(43) }
+    const mismatchCoordinator = { withRead: async <T>(work: (state: TrustDatabaseState) => Promise<T>) => work(mismatch) } as unknown as TrustDatabaseCoordinator
+    await expect(storeFor(directory, root).withCoordinator(mismatchCoordinator).inspectAcceptedReadOnly())
+      .rejects.toThrow('trust_bundle_store_does_not_match_database_head')
+    for (const [name, bytes] of before) expect(await readFile(join(directory, name))).toEqual(bytes)
+  })
+
+  it('leaves a pending Trust Store transition untouched for explicit recovery', async () => {
+    const root = await makePair()
+    const center = await makePair()
+    const key = await publicEntry(center)
+    const directory = await temporaryStoreDirectory()
+    const first = storeFor(directory, root)
+    await first.accept(await bundle(root, CENTER_ISSUER, { version: '1', keys: [key] }), BASE)
+    const accepted = await first.getAccepted(BASE)
+    const v2 = await bundle(root, CENTER_ISSUER, { version: '2', at: BASE + 1, keys: [key] })
+    const interrupted = storeFor(directory, root, CENTER_ISSUER, '1', stage => {
+      if (stage === 'checkpoint_prepare_after_directory_fsync') throw new Error('simulated crash boundary')
+    })
+    await expect(interrupted.accept(v2, BASE + 1)).rejects.toThrow('simulated crash boundary')
+    const beforeNames = await readdir(directory)
+    const before = new Map(await Promise.all(beforeNames.map(async name => [name, await readFile(join(directory, name))] as const)))
+    const state: TrustDatabaseState = {
+      headDigest: trustedBundleStateDigest(accepted), headVersion: accepted.bundleVersion,
+      pendingArtifactSha256: null, pendingToken: null, licenseId: null,
+    }
+    const coordinator = { withRead: async <T>(work: (value: TrustDatabaseState) => Promise<T>) => work(state) } as unknown as TrustDatabaseCoordinator
+    await expect(storeFor(directory, root).withCoordinator(coordinator).inspectAcceptedReadOnly())
+      .rejects.toThrow('trust_bundle_store_requires_manual_recovery')
+    expect(await readdir(directory)).toEqual(beforeNames)
+    for (const [name, bytes] of before) expect(await readFile(join(directory, name))).toEqual(bytes)
+    expect((await storeFor(directory, root).getAccepted(BASE + 1)).bundleVersion).toBe('1')
   })
 
   it('accepts v1(A) to v2(A+B), preserves normal retirement, removes A only after verify_until, then tombstones it', async () => {
