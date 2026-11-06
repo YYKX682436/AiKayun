@@ -15,7 +15,7 @@ TEST_SOCKET="$HARNESS_ROOT/docker.sock"
 SOCKET_PID=''
 PORT_PID=''
 HANDOFF_PID=''
-trap 'printf "Installer flow assertion failed at line %s: %s\\n" "$LINENO" "$BASH_COMMAND" >&2; if [[ -f "$EVENT_LOG" ]]; then tail -30 "$EVENT_LOG" >&2; fi' ERR
+trap 'status=$?; trap - ERR; printf "Installer flow assertion failed (exit %s) at %s:%s: %s\\n" "$status" "${BASH_SOURCE[0]}" "${BASH_LINENO[0]:-0}" "$BASH_COMMAND" >&2; if [[ -f "$EVENT_LOG" ]]; then tail -30 "$EVENT_LOG" >&2; fi; exit "$status"' ERR
 DOCKER_CONTEXT=''
 DOCKER_HOST=''
 export DOCKER_CONTEXT DOCKER_HOST
@@ -582,22 +582,45 @@ if [[ "$SCENARIO" == backup-customer-command-integrity ]]; then
   printf 'fixture backup password\n' > /etc/aikayun-backup/restic-password
   chmod 0600 /etc/aikayun-backup/restic-password
 
+  printf 'Backup command fixture: starting the held customer command.\n'
   touch "$FAKE_STATE/broker-hold"
   AIKAYUN_TEST_BROKER_HOLD=1 "$TARGET_DIR/aikayun" backup create >"$HARNESS_ROOT/customer-backup-running.log" 2>&1 &
   command_pid=$!
-  for _ in {1..100}; do
+  # ARM64 runs through QEMU in CI, where verifying the signed artifact set can
+  # take longer than the native runner. Keep the wait bounded but avoid racing
+  # the broker-ready marker against that verification work.
+  for _ in {1..1200}; do
     [[ -f "$FAKE_STATE/broker-waiting" ]] && break
     kill -0 "$command_pid" 2>/dev/null || { cat "$HARNESS_ROOT/customer-backup-running.log" >&2; exit 1; }
     sleep 0.05
   done
-  [[ -f "$FAKE_STATE/broker-waiting" ]] || { cat "$HARNESS_ROOT/customer-backup-running.log" >&2; exit 1; }
+  [[ -f "$FAKE_STATE/broker-waiting" ]] || {
+    cat "$HARNESS_ROOT/customer-backup-running.log" >&2
+    printf 'Customer backup did not reach the broker hold within 60 seconds.\n' >&2
+    exit 1
+  }
+  printf 'Backup command fixture: broker hold reached; checking lock contention.\n'
   second_log="$(customer_command 1)"
-  grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' "$second_log"
+  if ! grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' "$second_log"; then
+    cat "$second_log" >&2
+    printf 'Concurrent customer backup did not report the held deployment lock.\n' >&2
+    exit 1
+  fi
   installer_log="$(run_installer 1 status)"
-  grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' "$installer_log"
+  if ! grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' "$installer_log"; then
+    cat "$installer_log" >&2
+    printf 'Installer status did not report the held deployment lock.\n' >&2
+    exit 1
+  fi
+  printf 'Backup command fixture: backup and installer lock contention passed; releasing broker hold.\n'
   rm -f "$FAKE_STATE/broker-hold"
   if wait "$command_pid"; then echo 'The fixture broker unexpectedly passed its unavailable-network check.' >&2; exit 1; fi
-  grep -Fq 'The fixed private network is unavailable' "$HARNESS_ROOT/customer-backup-running.log"
+  if ! grep -Fq 'The fixed private network is unavailable' "$HARNESS_ROOT/customer-backup-running.log"; then
+    cat "$HARNESS_ROOT/customer-backup-running.log" >&2
+    printf 'Held customer backup did not reach the expected unavailable-network failure.\n' >&2
+    exit 1
+  fi
+  printf 'Backup command fixture: held backup exited fail-closed after the network check.\n'
 
   printf 'Signed customer launcher verified artifacts before broker entry; altered, missing, and invalid-signature artifacts were rejected before service operations. Backup and installer lock contention passed.\n'
   exit 0
