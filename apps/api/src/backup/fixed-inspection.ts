@@ -12,7 +12,8 @@ import { UnsafeMaintenanceRecoveryError } from './maintenance-errors.js'
 import { readMaintenanceJournal } from './journal.js'
 import { assertInitializedRepository } from './repository-initialization.js'
 
-export type FixedInspectionCommand = { mode: 'list'; limit: number; after?: string; revision?: string } | { mode: 'verify'; set: string }
+export type FixedInspectionCommand = { mode: 'list'; limit: number; after?: string; revision?: string } |
+  { mode: 'verify' | 'restore-isolated'; set: string }
 
 /** Internal only. Signed image provenance and the inherited host flock must
  * already be established; there is no fallback or caller-supplied authority. */
@@ -89,13 +90,17 @@ export async function runFixedProductionInspection(command: FixedInspectionComma
         const scratchDirectory = await createTmpfsStaging(options, paths.minimumBytes)
         created = true
         const secure = async () => { await assertTmpfsStaging(options); await assertLock() }
-        result = await inspectDirectCustomerBackup({ ...common, scratchDirectory, assertSecureStorage: secure }, command.set)
+      result = await inspectDirectCustomerBackup({ ...common, scratchDirectory, assertSecureStorage: secure }, command.set,
+        command.mode === 'restore-isolated')
         await target.assertBound(); await assertLock()
         if (controller.signal.aborted) throw new UnsafeMaintenanceRecoveryError('SET_FENCE_UNVERIFIED')
       } catch (error) { failure = error; unsafe = error instanceof UnsafeMaintenanceRecoveryError || controller.signal.aborted }
       if (created && !unsafe) await removeTmpfsStaging(options)
       if (failure) throw failure
       if (!result) throw new Error('BACKUP_INSPECTION_INCOMPLETE')
+      if (command.mode === 'restore-isolated' && result.status === 'verified' &&
+          (!result.restoreEvidence || !/^[a-f0-9]{64}$/.test(result.restoreEvidence.sourceSnapshotId) ||
+            !/^[a-f0-9]{64}$/.test(result.restoreEvidence.manifestSnapshotId))) throw new Error('BACKUP_RESTORE_EVIDENCE_INVALID')
       return result
     })
   } finally {

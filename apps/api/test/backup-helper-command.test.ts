@@ -9,15 +9,17 @@ import { parseHelperCommand, runInternalHelper } from '../src/backup/helper-comm
 const set = '12345678-1234-4234-8234-123456789abc', revision = 'a'.repeat(64)
 beforeEach(() => vi.resetAllMocks())
 describe('internal helper command protocol', () => {
-  it('accepts only bounded create, paginated list, and UUID verify commands', () => {
+  it('accepts only bounded create, paginated list, UUID verify, and isolated restore preparation commands', () => {
     expect(parseHelperCommand(['create'])).toEqual({ mode: 'create' })
     expect(parseHelperCommand(['initialize-repository'])).toEqual({ mode: 'initialize-repository' })
     expect(parseHelperCommand(['recover-maintenance'])).toEqual({ mode: 'recover-maintenance' })
+    expect(parseHelperCommand(['restore-prepare', set])).toEqual({ mode: 'restore-prepare', set })
     expect(parseHelperCommand(['list'])).toEqual({ mode: 'list', limit: 10 })
     expect(parseHelperCommand(['list', '2', set, revision])).toEqual({ mode: 'list', limit: 2, after: set, revision })
     expect(parseHelperCommand(['verify', set])).toEqual({ mode: 'verify', set })
     for (const args of [[], ['create', '/tmp'], ['verify', '../../path'], ['list', '0'], ['list', '11'], ['list', '01'],
-      ['list', '1', set], ['list', '1', set, 'bad'], ['restore'], ['create', '--repo=/tmp'], ['list', '1', set, revision, 'extra']]) {
+      ['list', '1', set], ['list', '1', set, 'bad'], ['restore'], ['restore-prepare', '../../path'],
+      ['restore-prepare', set, '/tmp'], ['create', '--repo=/tmp'], ['list', '1', set, revision, 'extra']]) {
       expect(() => parseHelperCommand(args)).toThrow('BACKUP_COMMAND_INVALID')
     }
   })
@@ -32,6 +34,11 @@ describe('internal helper command protocol', () => {
     expect(result).toEqual({ operation: 'verify', backupSetId: set, status: 'verified', createdAt: '2026-11-05T00:00:00.000Z', releaseId: 'release' })
     expect(JSON.stringify(result)).not.toContain('secret-marker')
     expect(mocked.inspect).toHaveBeenCalledWith({ mode: 'verify', set }, signal)
+    mocked.inspect.mockResolvedValueOnce({ backupSetId: set, status: 'verified', createdAt: '2026-11-05T00:00:00.000Z', releaseId: 'release',
+      restoreEvidence: { sourceSnapshotId: revision, manifestSnapshotId: 'b'.repeat(64) }, manifest: 'secret-marker' })
+    expect(await runInternalHelper({ mode: 'restore-prepare', set }, signal)).toEqual({ operation: 'restore-prepare', backupSetId: set,
+      status: 'verified', sourceSnapshotId: revision, manifestSnapshotId: 'b'.repeat(64) })
+    expect(mocked.inspect).toHaveBeenCalledWith({ mode: 'restore-isolated', set }, signal)
   })
   it('initializes only through the fixed independently provisioned repository path', async () => {
     const signal = new AbortController().signal

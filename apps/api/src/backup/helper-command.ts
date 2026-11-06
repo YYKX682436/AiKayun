@@ -5,13 +5,15 @@ import { runFixedRepositoryInitialization } from './fixed-initialization.js'
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const digest = /^[a-f0-9]{64}$/
-export type HelperCommand = { mode: 'create' } | { mode: 'recover-maintenance' } | { mode: 'initialize-repository' } | FixedInspectionCommand
+export type HelperCommand = { mode: 'create' } | { mode: 'recover-maintenance' } | { mode: 'initialize-repository' } |
+  { mode: 'restore-prepare'; set: string } | FixedInspectionCommand
 
 /** No paths, credentials, endpoints, executable names or environment flags are accepted. */
 export function parseHelperCommand(args: string[]): HelperCommand {
   if (args.length === 1 && args[0] === 'create') return { mode: 'create' }
   if (args.length === 1 && args[0] === 'initialize-repository') return { mode: 'initialize-repository' }
   if (args.length === 1 && args[0] === 'recover-maintenance') return { mode: 'recover-maintenance' }
+  if (args.length === 2 && args[0] === 'restore-prepare' && uuid.test(args[1]!)) return { mode: 'restore-prepare', set: args[1]! }
   if (args.length === 2 && args[0] === 'verify' && uuid.test(args[1]!)) return { mode: 'verify', set: args[1]! }
   if (args[0] === 'list' && (args.length === 1 || args.length === 2 || args.length === 4)) {
     const limit = args.length === 1 ? 10 : Number(args[1])
@@ -50,8 +52,20 @@ export async function runInternalHelper(command: HelperCommand, signal: AbortSig
     if (signal.aborted || !uuid.test(result.backupSetId) || result.state !== 'restoration_recorded') throw new Error('BACKUP_COMMAND_INCOMPLETE')
     return { operation: 'recover-maintenance' as const, backupSetId: result.backupSetId, state: 'restoration_recorded' as const }
   }
-  const result = await runFixedProductionInspection(command, signal)
+  const inspection = command.mode === 'restore-prepare'
+    ? { mode: 'restore-isolated' as const, set: command.set }
+    : command
+  const result = await runFixedProductionInspection(inspection, signal)
   if (signal.aborted) throw new Error('BACKUP_COMMAND_INTERRUPTED')
+  if (command.mode === 'restore-prepare') {
+    if (!('backupSetId' in result) || result.backupSetId !== command.set || result.status !== 'verified' ||
+        !('restoreEvidence' in result) || !result.restoreEvidence ||
+        !digest.test(result.restoreEvidence.sourceSnapshotId) || !digest.test(result.restoreEvidence.manifestSnapshotId)) {
+      throw new Error('BACKUP_RESTORE_SET_NOT_VERIFIED')
+    }
+    return { operation: 'restore-prepare' as const, backupSetId: command.set, status: 'verified' as const,
+      sourceSnapshotId: result.restoreEvidence.sourceSnapshotId, manifestSnapshotId: result.restoreEvidence.manifestSnapshotId }
+  }
   if (command.mode === 'verify') {
     if (!('backupSetId' in result) || result.backupSetId !== command.set || !['verified', 'needs_attention'].includes(result.status) ||
         (result.status === 'needs_attention' && (result.createdAt !== null || result.releaseId !== null)) ||
@@ -61,6 +75,7 @@ export async function runInternalHelper(command: HelperCommand, signal: AbortSig
     return { operation: 'verify' as const, backupSetId: command.set, status: result.status,
       createdAt: result.createdAt, releaseId: result.releaseId }
   }
+  if (command.mode !== 'list') throw new Error('BACKUP_COMMAND_INVALID')
   if (!('items' in result) || result.items.length > command.limit || !digest.test(result.revision) ||
       (result.nextAfter !== null && !uuid.test(result.nextAfter)) || !Number.isSafeInteger(result.untrackedSnapshots) || result.untrackedSnapshots < 0 ||
       typeof result.unknownRecords !== 'boolean' || typeof result.stagingNeedsAttention !== 'boolean' || !['initialization_recorded', 'needs_attention'].includes(result.repositoryInitialization) ||

@@ -178,6 +178,18 @@ try {
       finalized_at: new Date(),
     }).where('operation_id', '=', operationId).where('state', '=', 'response_saved').executeTakeFirstOrThrow()
     assert.deepEqual(await readLicenseOperationCenterEvidence(db, process.env.LICENSE_PENDING_KEY_ROOT, operationId), responseJws)
+    const { advanceTrustedTimeWatermarkFile } = await import('file:///app/dist/licensing/trusted-time-watermark.js')
+    const highWaterMs = Date.now()
+    await db.transaction().execute(async (trx) => {
+      const lockedProjection = await trx.selectFrom('instance_license_state').select('trusted_time_high_water_ms')
+        .where('singleton', '=', true).forUpdate().executeTakeFirstOrThrow()
+      const nextHighWater = Math.max(highWaterMs, Number(lockedProjection.trusted_time_high_water_ms ?? '0') + 1)
+      await advanceTrustedTimeWatermarkFile(process.env.LICENSE_PENDING_KEY_ROOT, {
+        databaseId: binding.database_id, instanceId: binding.instance_id, identityJkt: binding.identity_jkt,
+      }, nextHighWater)
+      await trx.updateTable('instance_license_state').set({ trusted_time_high_water_ms: String(nextHighWater) })
+        .where('singleton', '=', true).executeTakeFirstOrThrow()
+    })
     process.stdout.write(`RESULT_JWS_SHA256=${createHash('sha256').update(resultJws).digest('hex')}\n`)
     process.stdout.write(`CENTER_EVIDENCE_SHA256=${createHash('sha256').update(responseJws).digest('hex')}\n`)
     process.stdout.write('license_pending_fixture_seeded\n')

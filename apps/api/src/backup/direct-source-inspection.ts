@@ -1,6 +1,7 @@
 import { constants } from 'node:fs'
 import { lstat, open, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
+import { posix } from 'node:path'
 import type { ReadonlyTrustBundleInspection } from '../licensing/trust/trust-bundle-store.js'
 import { inspectArchivedTrustStore } from './state-archive-trust.js'
 import type { StateArchiveTrustStoreFiles } from './state-archive-protection.js'
@@ -55,6 +56,50 @@ async function childrenAt(repo: LocalResticRepository, snapshot: string, directo
   const prefix = `${directory}/`
   const children = nodes.filter(node => typeof node.path === 'string' && node.path.startsWith(prefix) && !node.path.slice(prefix.length).includes('/'))
   return { root: roots[0]!, children }
+}
+
+/** Validate every path in a tree before handing that snapshot to Restic's
+ * extractor. Restic still performs content verification during restore; this
+ * separate walk rejects links and non-canonical path components up front. */
+export async function assertSafeResticSnapshotTree(repo: LocalResticRepository, snapshot: string, root: string): Promise<void> {
+  if (!/^\/[A-Za-z0-9._/-]+$/.test(root) || root.split('/').some(part => part === '.' || part === '..')) {
+    throw new Error('BACKUP_SOURCE_PATH_INVALID')
+  }
+  let rootFound = false, nodes = 0
+  const inodes = new Set<number>()
+  await repo.visitSnapshotNodes(snapshot, root, node => {
+    if (node.struct_type !== 'node' || typeof node.path !== 'string' || node.path.includes('\0') ||
+        !posix.isAbsolute(node.path) || posix.normalize(node.path) !== node.path ||
+        (node.path !== root && !node.path.startsWith(`${root}/`)) ||
+        node.path.split('/').some(part => part === '.' || part === '..') ||
+        [...node.path].some(character => character.codePointAt(0)! < 0x20 || character.codePointAt(0) === 0x7f) ||
+        !['dir', 'file'].includes(String(node.type))) {
+      throw new Error('BACKUP_SOURCE_PATH_UNSAFE')
+    }
+    if (!Number.isSafeInteger(node.uid) || (node.uid as number) < 0 || !Number.isSafeInteger(node.gid) || (node.gid as number) < 0) {
+      throw new Error('BACKUP_SOURCE_OWNER_INVALID')
+    }
+    const mode = node.mode as number
+    if (mode < 0 || mode > 0o37777777777 || !Number.isSafeInteger(mode)) throw new Error('BACKUP_SOURCE_MODE_INVALID')
+    const permissionBits = mode % 0o10000
+    if ((permissionBits & 0o7000) !== 0) throw new Error('BACKUP_SOURCE_SPECIAL_MODE_REJECTED')
+    // Restic serializes Go os.FileMode. Directories carry ModeDir in the high
+    // bits, and a sticky directory carries ModeDir|ModeSticky; ordinary files
+    // have no high type bit. Reject every other flag.
+    const modeFlags = mode - permissionBits
+    const allowedModeFlags = node.type === 'dir' ? [0, 0o20000000000, 0o20004000000] : [0]
+    if (!allowedModeFlags.includes(modeFlags)) throw new Error('BACKUP_SOURCE_MODE_TYPE_INVALID')
+    nodes++
+    if (node.path === root) {
+      if (rootFound || node.type !== 'dir') throw new Error('BACKUP_SOURCE_PATH_UNSAFE')
+      rootFound = true
+    } else if (node.type === 'file') {
+      if (!Number.isSafeInteger(node.size) || (node.size as number) < 0 || !Number.isSafeInteger(node.inode) ||
+          inodes.has(node.inode as number)) throw new Error('BACKUP_SOURCE_PATH_UNSAFE')
+      inodes.add(node.inode as number)
+    }
+  })
+  if (!rootFound || nodes < 1) throw new Error('BACKUP_SOURCE_PATH_UNSAFE')
 }
 
 export async function readSnapshotFile(input: {
@@ -172,6 +217,7 @@ async function verifyStateLayout(input: { repo: LocalResticRepository; snapshot:
     }
     protectedInodes.set(node.inode, path)
   }
+  await assertSafeResticSnapshotTree(input.repo, input.snapshot, '/sources/state')
   await input.repo.visitSnapshotNodes(input.snapshot, '/sources/state', node => {
     if (node.type !== 'file' || typeof node.inode !== 'number' || typeof node.path !== 'string') return
     const protectedPath = protectedInodes.get(node.inode)
@@ -218,6 +264,8 @@ export async function verifyDirectSourceSnapshot(input: {
   const storedDump = await input.repo.hashSnapshotFile(input.snapshot, dumpPath, input.databaseDump.size)
   if (storedDump.size !== input.databaseDump.size || storedDump.sha256 !== input.databaseDump.sha256) throw new Error('BACKUP_SOURCE_DUMP_MISMATCH')
   const trustNodes = await verifyStateLayout({ repo: input.repo, snapshot: input.snapshot, appUid: input.appUid, appGid: input.appGid })
+  await assertSafeResticSnapshotTree(input.repo, input.snapshot, '/sources/caddy-data')
+  await assertSafeResticSnapshotTree(input.repo, input.snapshot, '/sources/caddy-config')
   const owner = input.appUid, group = input.appGid
   let identity: Buffer | undefined, intent: Buffer | undefined, privateKey: Buffer | undefined, pendingKey: Buffer | undefined
   let identityFileSha256: string

@@ -52,6 +52,315 @@ backup_hash_file() {
   printf '%s' "${line%% *}"
 }
 
+backup_restore_project_name() { printf 'aikayun-drill-%s' "${1//-/}"; }
+backup_restore_directory() { printf '/var/lib/aikayun-backup/restores/%s' "$1"; }
+
+backup_restore_write_record() {
+  local run_id="$1" project="$2" set_id="$3" source_id="$4" manifest_id="$5" status="$6" code="$7"
+  local directory temporary
+  [[ "$run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ &&
+     "$project" == "$(backup_restore_project_name "$run_id")" &&
+     ( "$set_id" == pending || "$set_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ) &&
+     ( "$source_id" == pending || "$source_id" =~ ^[a-f0-9]{64}$ ) &&
+     ( "$manifest_id" == pending || "$manifest_id" =~ ^[a-f0-9]{64}$ ) &&
+     "$status" =~ ^(started|failed|verified)$ && "$code" =~ ^[A-Z0-9_]{1,80}$ ]] || return 1
+  directory="$(backup_restore_directory "$run_id")"
+  [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%u:%g:%a:%h' "$directory")" == '0:0:700:1' &&
+     "$(realpath -e "$directory")" == "$directory" ]] || return 1
+  temporary="$directory/.record.tmp"
+  [[ ! -e "$temporary" && ! -L "$temporary" ]] || return 1
+  {
+    printf 'schema=1\nrun_id=%s\nproject=%s\nbackup_set_id=%s\nsource_snapshot_id=%s\nmanifest_snapshot_id=%s\nstatus=%s\ncode=%s\n' \
+      "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" "$status" "$code"
+  } > "$temporary"
+  chmod 0600 "$temporary" && chown 0:0 "$temporary" || return 1
+  mv -f -- "$temporary" "$directory/record"
+}
+
+backup_restore_load_record() {
+  local run_id="$1" directory record
+  local -a lines=()
+  [[ "$run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || return 1
+  directory="$(backup_restore_directory "$run_id")"; record="$directory/record"
+  [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%u:%g:%a:%h' "$directory")" == '0:0:700:1' &&
+     "$(realpath -e "$directory")" == "$directory" && -f "$record" && ! -L "$record" &&
+     "$(stat -c '%u:%g:%a:%h' "$record")" == '0:0:600:1' && "$(realpath -e "$record")" == "$record" ]] || return 1
+  mapfile -t lines < "$record"
+  ((${#lines[@]} == 8)) || return 1
+  [[ "${lines[0]}" == schema=1 && "${lines[1]}" == "run_id=$run_id" &&
+     "${lines[2]}" == "project=$(backup_restore_project_name "$run_id")" &&
+     "${lines[3]}" =~ ^backup_set_id=([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|pending)$ &&
+     "${lines[4]}" =~ ^source_snapshot_id=([a-f0-9]{64}|pending)$ &&
+     "${lines[5]}" =~ ^manifest_snapshot_id=([a-f0-9]{64}|pending)$ &&
+     "${lines[6]}" =~ ^status=(started|failed|verified)$ && "${lines[7]}" =~ ^code=[A-Z0-9_]{1,80}$ ]] || return 1
+  BACKUP_RESTORE_RUN_ID="$run_id"
+  BACKUP_RESTORE_PROJECT="${lines[2]#project=}"
+  BACKUP_RESTORE_SET_ID="${lines[3]#backup_set_id=}"
+  BACKUP_RESTORE_SOURCE_ID="${lines[4]#source_snapshot_id=}"
+  BACKUP_RESTORE_MANIFEST_ID="${lines[5]#manifest_snapshot_id=}"
+  BACKUP_RESTORE_STATUS="${lines[6]#status=}"
+  BACKUP_RESTORE_CODE="${lines[7]#code=}"
+  BACKUP_RESTORE_DIRECTORY="$directory"
+}
+
+backup_docker_compose() {
+  timeout --foreground --signal=TERM --kill-after=10s 6h env -i PATH=/usr/bin:/bin HOME=/var/empty LANG=C \
+    docker --host "$BACKUP_DOCKER_ENDPOINT" compose "$@"
+}
+
+backup_restore_volume_names() {
+  local project="$1"
+  printf '%s\n' "$project"_{database,credentials,state,caddy_data,caddy_config,database_input,deployment_keys,manifest}
+}
+
+backup_restore_expected_services() {
+  printf '%s\n' db restore-secrets restore-source restore-manifest restore-database restore-readonly-role restore-input-permissions validate
+}
+
+backup_restore_assert_network() {
+  local run_id="$1" project="$2" name identity
+  name="${project}_restore"
+  identity="$(backup_docker_quick network inspect "$name" --format '{{.Name}}|{{.Driver}}|{{.Scope}}|{{.Internal}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.network"}}|{{index .Labels "com.aikayun.restore.run"}}' 2>/dev/null)" || return 1
+  [[ "$identity" == "$name|bridge|local|true|$project|restore|$run_id" ]]
+}
+
+backup_restore_assert_volume() {
+  local name="$1" run_id="$2" project="$3" identity options
+  identity="$(backup_docker_quick volume inspect "$name" --format '{{.Name}}|{{.Driver}}|{{.Scope}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.aikayun.restore.run"}}' 2>/dev/null)" || return 1
+  options="$(backup_docker_quick volume inspect "$name" --format '{{json .Options}}' 2>/dev/null)" || return 1
+  [[ "$identity" == "$name|local|local|$project|$run_id" && ( "$options" == null || "$options" == '{}' ) ]]
+}
+
+backup_restore_assert_one_network() {
+  local container="$1" network="$2" actual
+  actual="$(backup_docker_quick inspect --type container --format '{{range $name, $value := .NetworkSettings.Networks}}{{$name}} {{end}}' "$container" 2>/dev/null)" || return 1
+  [[ "${actual//[[:space:]]/}" == "$network" ]]
+}
+
+backup_restore_assert_finished_project() {
+  local run_id="$1" project="$2" network="${2}_restore" ids container fields run_label project_label service state image network_mode ports expected_image
+  local seen='|'
+  local -a found=()
+  ids="$(backup_docker_quick ps -a --quiet --no-trunc --filter "label=com.docker.compose.project=$project")" || return 1
+  [[ -n "$ids" ]] || return 1
+  mapfile -t found <<< "$ids"
+  ((${#found[@]} == 8)) || return 1
+  for container in "${found[@]}"; do
+    [[ "$container" =~ ^[a-f0-9]{64}$ ]] || return 1
+    fields="$(backup_docker_quick inspect --type container --format '{{index .Config.Labels "com.aikayun.restore.run"}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.Config.Image}}|{{.HostConfig.NetworkMode}}|{{.State.Status}}|{{json .HostConfig.PortBindings}}' "$container")" || return 1
+    IFS='|' read -r run_label project_label service image network_mode state ports <<< "$fields"
+    [[ "$run_label" == "$run_id" && "$project_label" == "$project" && "$state" == exited &&
+       ( "$ports" == null || "$ports" == '{}' ) ]] || return 1
+    case "$service" in
+      db|restore-database|restore-readonly-role) expected_image="$SELECTED_POSTGRES_IMAGE"; [[ "$network_mode" == "$network" ]] || return 1 ;;
+      restore-secrets) expected_image="$SELECTED_POSTGRES_IMAGE"; [[ "$network_mode" == none ]] || return 1 ;;
+      restore-source|restore-manifest) expected_image="$SELECTED_BACKUP_RESTIC_IMAGE"; [[ "$network_mode" == none ]] || return 1 ;;
+      restore-input-permissions) expected_image="$SELECTED_POSTGRES_IMAGE"; [[ "$network_mode" == none ]] || return 1 ;;
+      validate) expected_image="$SELECTED_API_IMAGE"; [[ "$network_mode" == "$network" ]] || return 1 ;;
+      *) return 1 ;;
+    esac
+    case "$seen" in *"|$service|"*) return 1 ;; esac
+    seen+="$service|"
+    [[ "$image" == "$expected_image" ]] || return 1
+    case "$service" in
+      db|restore-secrets|restore-source|restore-manifest|restore-database|restore-readonly-role|restore-input-permissions|validate) ;;
+      *) return 1 ;;
+    esac
+    case "$service" in db|restore-database|restore-readonly-role|validate) backup_restore_assert_one_network "$container" "$network" || return 1 ;; esac
+  done
+  local expected_service
+  while IFS= read -r expected_service; do [[ "$seen" == *"|$expected_service|"* ]] || return 1; done < <(backup_restore_expected_services)
+}
+
+backup_restore_run_compose() {
+  local run_id="$1" set_id="$2" source_id="$3" manifest_id="$4"
+  local project directory restore_root compose_file env_file bootstrap_password readonly_password
+  local network service id status_code step volume name
+  local -a volumes=() services=() ids=()
+  project="$(backup_restore_project_name "$run_id")"
+  backup_assert_held_lock || return 1
+  directory="$(backup_restore_directory "$run_id")"
+  restore_root=/var/lib/aikayun-backup/restores
+  compose_file="$RELEASE_DIR/compose.restore-isolated.yaml"
+  env_file="$directory/compose.env"
+  bootstrap_password="$directory/postgres-password"
+  readonly_password="$directory/readonly-password"
+  network="${project}_restore"
+  [[ -f "$compose_file" && ! -L "$compose_file" && "$(stat -c '%u:%g:%a:%h' "$compose_file")" == '0:0:644:1' &&
+     "$(realpath -e "$compose_file")" == "$compose_file" ]] || return 1
+  [[ -d "$restore_root" && ! -L "$restore_root" && "$(stat -c '%u:%g:%a' "$restore_root")" == '0:0:700' ]] || return 1
+  [[ ! -e "$env_file" ]] || return 1
+  mapfile -t volumes < <(backup_restore_volume_names "$project")
+  for volume in "${volumes[@]}"; do
+    if backup_docker_quick volume inspect "$volume" >/dev/null 2>&1; then return 1; fi
+  done
+  local prior_containers prior_network
+  prior_containers="$(backup_docker_quick ps -a --quiet --no-trunc --filter "label=com.docker.compose.project=$project")" || return 1
+  prior_network="$(backup_docker_quick network ls --quiet --no-trunc --filter "label=com.docker.compose.project=$project")" || return 1
+  [[ -z "$prior_containers" && -z "$prior_network" ]] || return 1
+  [[ ! -e "$bootstrap_password" && ! -e "$readonly_password" && ! -L "$bootstrap_password" && ! -L "$readonly_password" ]] || return 1
+  head -c 32 /dev/urandom | base64 -w0 > "$bootstrap_password" || return 1
+  head -c 32 /dev/urandom | base64 -w0 > "$readonly_password" || return 1
+  printf '\n' >> "$bootstrap_password"; printf '\n' >> "$readonly_password"
+  chmod 0400 "$bootstrap_password" "$readonly_password" && chown 0:0 "$bootstrap_password" || return 1
+  chown 1000:1000 "$readonly_password" || return 1
+  {
+    printf 'AIKAYUN_RESTORE_RUN_ID=%s\n' "$run_id"
+    printf 'AIKAYUN_RESTORE_PROJECT=%s\n' "$project"
+    printf 'AIKAYUN_RESTORE_SET_ID=%s\n' "$set_id"
+    printf 'AIKAYUN_RESTORE_SOURCE_SNAPSHOT_ID=%s\n' "$source_id"
+    printf 'AIKAYUN_RESTORE_MANIFEST_SNAPSHOT_ID=%s\n' "$manifest_id"
+    printf 'AIKAYUN_RESTORE_MANIFEST_DIRECTORY=/var/lib/aikayun-backup/staging/set-%s/manifest\n' "$set_id"
+    printf 'AIKAYUN_RESTORE_RELEASE_ID=aikayun-%s\n' "$SELECTED_VERSION"
+    printf 'AIKAYUN_API_IMAGE=%s\nAIKAYUN_WEB_IMAGE=%s\nAIKAYUN_POSTGRES_IMAGE=%s\nAIKAYUN_CADDY_IMAGE=%s\n' \
+      "$SELECTED_API_IMAGE" "$SELECTED_WEB_IMAGE" "$SELECTED_POSTGRES_IMAGE" "$SELECTED_CADDY_IMAGE"
+    printf 'AIKAYUN_RESTORE_API_DIGEST=%s\nAIKAYUN_RESTORE_WEB_DIGEST=%s\nAIKAYUN_RESTORE_POSTGRES_DIGEST=%s\nAIKAYUN_RESTORE_CADDY_DIGEST=%s\n' \
+      "${SELECTED_API_IMAGE#*@}" "${SELECTED_WEB_IMAGE#*@}" "${SELECTED_POSTGRES_IMAGE#*@}" "${SELECTED_CADDY_IMAGE#*@}"
+    printf 'AIKAYUN_BACKUP_RESTIC_IMAGE=%s\n' "$SELECTED_BACKUP_RESTIC_IMAGE"
+    printf 'AIKAYUN_RESTORE_REPOSITORY=/var/lib/aikayun-backup/repository\n'
+    printf 'AIKAYUN_RESTORE_PASSWORD_FILE=/etc/aikayun-backup/restic-password\n'
+    printf 'AIKAYUN_RESTORE_BOOTSTRAP_PASSWORD_FILE=%s\n' "$bootstrap_password"
+    printf 'AIKAYUN_RESTORE_READONLY_PASSWORD_FILE=%s\n' "$readonly_password"
+  } > "$env_file"
+  chmod 0600 "$env_file" && chown 0:0 "$env_file" || return 1
+  backup_docker_compose --project-name "$project" --file "$compose_file" --env-file "$env_file" config --quiet || return 1
+  backup_assert_held_lock || return 1
+
+  step=RESTORE_SECRET_VOLUME_PREPARATION_FAILED
+  if ! backup_docker_compose --project-name "$project" --file "$compose_file" --env-file "$env_file" \
+    run --pull never --no-deps --no-TTY --name "$project-restore-secrets" restore-secrets > "$directory/restore-secrets.log" 2>&1; then
+    backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed "$step"
+    return 1
+  fi
+  backup_restore_assert_volume "${project}_credentials" "$run_id" "$project" || return 1
+
+  step=RESTORE_DB_START_FAILED
+  backup_docker_compose --project-name "$project" --file "$compose_file" --env-file "$env_file" \
+    up --detach --pull never --wait db > "$directory/db-start.log" 2>&1 || { backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed "$step"; return 1; }
+  backup_assert_held_lock || return 1
+  backup_restore_assert_network "$run_id" "$project" || { backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed RESTORE_NETWORK_ISOLATION_UNVERIFIED; return 1; }
+  for volume in "${volumes[@]}"; do
+    backup_restore_assert_volume "$volume" "$run_id" "$project" || { backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed RESTORE_VOLUME_OWNERSHIP_UNVERIFIED; return 1; }
+  done
+
+  for service in restore-source restore-manifest; do
+    backup_assert_held_lock || return 1
+    step=RESTORE_SNAPSHOT_DATA_FAILED
+    if ! backup_docker_compose --project-name "$project" --file "$compose_file" --env-file "$env_file" \
+      run --pull never --no-deps --no-TTY --name "$project-$service" "$service" > "$directory/$service.log" 2>&1; then
+      backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed "$step"
+      return 1
+    fi
+  done
+  step=RESTORE_INPUT_NORMALIZATION_FAILED
+  backup_assert_held_lock || return 1
+  if ! backup_docker_compose --project-name "$project" --file "$compose_file" --env-file "$env_file" \
+    run --pull never --no-deps --no-TTY --name "$project-restore-input-permissions" restore-input-permissions \
+    > "$directory/restore-input-permissions.log" 2>&1; then
+    backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed "$step"
+    return 1
+  fi
+  step=RESTORE_DATABASE_FAILED
+  backup_assert_held_lock || return 1
+  if ! backup_docker_compose --project-name "$project" --file "$compose_file" --env-file "$env_file" \
+    run --pull never --no-deps --no-TTY --name "$project-restore-database" restore-database > "$directory/restore-database.log" 2>&1; then
+    backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed "$step"
+    return 1
+  fi
+  step=RESTORE_READONLY_ROLE_FAILED
+  backup_assert_held_lock || return 1
+  if ! backup_docker_compose --project-name "$project" --file "$compose_file" --env-file "$env_file" \
+    run --pull never --no-deps --no-TTY --name "$project-restore-readonly-role" restore-readonly-role > "$directory/restore-readonly-role.log" 2>&1; then
+    backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed "$step"
+    return 1
+  fi
+  step=RESTORE_VALIDATION_FAILED
+  backup_assert_held_lock || return 1
+  if ! backup_docker_compose --project-name "$project" --file "$compose_file" --env-file "$env_file" \
+    run --pull never --no-deps --no-TTY --name "$project-validate" validate > "$directory/validate.log" 2>&1; then
+    backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed "$step"
+    return 1
+  fi
+  local validation_report
+  validation_report="$(sed -n '$p' "$directory/validate.log")" || return 1
+  [[ "$validation_report" =~ ^\{"operation":"restore-validation","status":"verified","runId":"$run_id","backupSetId":"$set_id","sourceSnapshotId":"$source_id","manifestSnapshotId":"$manifest_id", ]] || return 1
+  mv -- "$directory/validate.log" "$directory/validation-report.json"
+  id="$(backup_docker_quick ps -a --quiet --no-trunc --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=validate")" || return 1
+  [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
+  local validation_identity validation_profile ports port_bindings state
+  validation_identity="$(backup_docker_quick inspect --type container --format '{{.Config.Image}}|{{.Config.User}}|{{.Path}}|{{json .Args}}|{{.HostConfig.NetworkMode}}|{{.HostConfig.ReadonlyRootfs}}|{{json .HostConfig.CapDrop}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "com.aikayun.restore.run"}}' "$id")" || return 1
+  [[ "$validation_identity" == "$SELECTED_API_IMAGE|1000:1000|/nodejs/bin/node|[\"/app/dist/backup/isolated-restore-cli.js\"]|$network|true|[\"ALL\"]|$project|validate|$run_id" ]] || return 1
+  backup_restore_assert_one_network "$id" "$network" || return 1
+  port_bindings="$(backup_docker_quick inspect --type container --format '{{json .HostConfig.PortBindings}}' "$id")" || return 1
+  [[ "$port_bindings" == null || "$port_bindings" == '{}' ]] || return 1
+  state="$(backup_docker_quick inspect --type container --format '{{.State.Status}}' "$id")" || return 1
+  [[ "$state" == exited ]] || return 1
+  id="$(backup_docker_quick ps -a --quiet --no-trunc --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=db")" || return 1
+  [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
+  backup_restore_assert_one_network "$id" "$network" || return 1
+  port_bindings="$(backup_docker_quick inspect --type container --format '{{json .HostConfig.PortBindings}}' "$id")" || return 1
+  [[ "$port_bindings" == null || "$port_bindings" == '{}' ]] || return 1
+  backup_docker_compose --project-name "$project" --file "$compose_file" --env-file "$env_file" stop db \
+    > "$directory/db-stop.log" 2>&1 || { backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed RESTORE_DB_STOP_FAILED; return 1; }
+  backup_restore_assert_finished_project "$run_id" "$project" || return 1
+  backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" verified RESTORE_ISOLATED_VERIFIED || return 1
+  rm -f -- "$bootstrap_password" "$readonly_password" "$env_file" "$directory"/*.log
+  printf 'Isolated restore verified. Run ID: %s; Compose project: %s; backup set: %s. The restored PostgreSQL service is stopped.\n' \
+    "$run_id" "$project" "$set_id"
+}
+
+backup_cleanup_isolated_restore() {
+  local run_id="$1" project directory network volume container label service state id count entry
+  local -a volume_names=() containers=()
+  backup_assert_held_lock || return 1
+  backup_restore_load_record "$run_id" || return 1
+  run_id="$BACKUP_RESTORE_RUN_ID"; project="$BACKUP_RESTORE_PROJECT"; directory="$BACKUP_RESTORE_DIRECTORY"
+  network="${project}_restore"
+  mapfile -t volume_names < <(backup_restore_volume_names "$project")
+  local output
+  output="$(backup_docker_quick ps -a --quiet --no-trunc --filter "label=com.docker.compose.project=$project")" || return 1
+  if [[ -n "$output" ]]; then
+    mapfile -t containers <<< "$output"
+    for container in "${containers[@]}"; do
+      backup_assert_held_lock || return 1
+      [[ "$container" =~ ^[a-f0-9]{64}$ ]] || return 1
+      label="$(backup_docker_quick inspect --type container --format '{{index .Config.Labels "com.aikayun.restore.run"}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.State.Status}}' "$container")" || return 1
+      IFS='|' read -r id service state <<< "${label#*|}"
+      [[ "${label%%|*}" == "$run_id" && "$id" == "$project" ]] || return 1
+      case "$service" in
+        db|restore-secrets|restore-source|restore-manifest|restore-database|restore-readonly-role|restore-input-permissions|validate) ;;
+        *) return 1 ;;
+      esac
+      if [[ "$state" == running ]]; then backup_docker --time 10 stop "$container" >/dev/null || return 1; fi
+      state="$(backup_docker_quick inspect --type container --format '{{.State.Status}}' "$container")" || return 1
+      [[ "$state" == exited || "$state" == created ]] || return 1
+    done
+    for container in "${containers[@]}"; do backup_docker rm "$container" >/dev/null || return 1; done
+  fi
+  if backup_docker_quick network inspect "$network" >/dev/null 2>&1; then
+    backup_assert_held_lock || return 1
+    label="$(backup_docker_quick network inspect "$network" --format '{{.Name}}|{{.Internal}}|{{.Scope}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.aikayun.restore.run"}}')" || return 1
+    [[ "$label" == "$network|true|local|$project|$run_id" ]] || return 1
+    backup_docker network rm "$network" >/dev/null || return 1
+  fi
+  for volume in "${volume_names[@]}"; do
+    backup_assert_held_lock || return 1
+    if backup_docker_quick volume inspect "$volume" >/dev/null 2>&1; then
+      backup_restore_assert_volume "$volume" "$run_id" "$project" || return 1
+      backup_docker volume rm "$volume" >/dev/null || return 1
+    fi
+  done
+  for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    [[ "${entry##*/}" == record || "${entry##*/}" == validation-report.json || "${entry##*/}" == .record.tmp ||
+       "${entry##*/}" =~ ^(postgres-password|readonly-password|compose\.env|[a-z-]+\.log)$ ]] || return 1
+    [[ ! -L "$entry" && -f "$entry" && "$(stat -c '%u:%g:%a:%h' "$entry")" =~ ^(0:0:600:1|1000:1000:400:1)$ ]] || return 1
+  done
+  backup_assert_held_lock || return 1
+  rm -rf -- "$directory"
+  printf 'Isolated restore resources cleaned: %s\n' "$run_id"
+}
+
 # The launcher has already authenticated Cosign, JWS and every artifact before
 # sourcing this broker. Pin the live execution artifacts once; subsequent RPCs
 # check those exact bytes without rerunning the full artifact walk hundreds of
@@ -62,6 +371,9 @@ backup_pin_release_identity() {
   BACKUP_PIN_STATE_SHA256="$(backup_hash_file "$STATE_FILE")" || return 1
   BACKUP_PIN_LAUNCHER_SHA256="$(backup_hash_file "$TARGET_DIR/aikayun")" || return 1
   BACKUP_PIN_BROKER_SHA256="$(backup_hash_file "$RELEASE_DIR/backup-host-broker.sh")" || return 1
+  [[ -f "$RELEASE_DIR/compose.restore-isolated.yaml" && ! -L "$RELEASE_DIR/compose.restore-isolated.yaml" &&
+     "$(stat -c '%u:%g:%a:%h' "$RELEASE_DIR/compose.restore-isolated.yaml")" == '0:0:644:1' ]] || return 1
+  BACKUP_PIN_RESTORE_COMPOSE_SHA256="$(backup_hash_file "$RELEASE_DIR/compose.restore-isolated.yaml")" || return 1
 }
 
 backup_verify_pinned_release() {
@@ -78,6 +390,9 @@ backup_verify_pinned_release() {
   [[ -f "$RELEASE_DIR/backup-host-broker.sh" && ! -L "$RELEASE_DIR/backup-host-broker.sh" &&
      "$(stat -c '%u:%g:%a:%h' "$RELEASE_DIR/backup-host-broker.sh")" == '0:0:644:1' &&
      "$(backup_hash_file "$RELEASE_DIR/backup-host-broker.sh")" == "$BACKUP_PIN_BROKER_SHA256" ]] || return 1
+  [[ -f "$RELEASE_DIR/compose.restore-isolated.yaml" && ! -L "$RELEASE_DIR/compose.restore-isolated.yaml" &&
+     "$(stat -c '%u:%g:%a:%h' "$RELEASE_DIR/compose.restore-isolated.yaml")" == '0:0:644:1' &&
+     "$(backup_hash_file "$RELEASE_DIR/compose.restore-isolated.yaml")" == "$BACKUP_PIN_RESTORE_COMPOSE_SHA256" ]] || return 1
 }
 
 backup_decode() {
@@ -442,6 +757,11 @@ backup_rpc_execute() {
         printf 'Backup verified: %s\n' "${BASH_REMATCH[1]}"
         [[ -z "${BACKUP_ACTIVE_SET_ID:-}" || "${BASH_REMATCH[1]}" == "$BACKUP_ACTIVE_SET_ID" ]] || { backup_rpc_reply "$id" ERR BACKUP_CLIENT_RESULT_MISMATCH; return; }
         BACKUP_ACTIVE_SET_ID=''
+      elif [[ "$output" =~ ^\{"operation":"restore-prepare","backupSetId":"([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})","status":"verified","sourceSnapshotId":"([a-f0-9]{64})","manifestSnapshotId":"([a-f0-9]{64})"\}$ ]]; then
+        [[ "${BASH_REMATCH[1]}" == "${BACKUP_RESTORE_SET_ID:-}" ]] || { backup_rpc_reply "$id" ERR BACKUP_CLIENT_RESULT_MISMATCH; return; }
+        BACKUP_RESTORE_SOURCE_ID="${BASH_REMATCH[2]}"
+        BACKUP_RESTORE_MANIFEST_ID="${BASH_REMATCH[3]}"
+        printf 'Verified backup set for isolated restore: %s\n' "${BACKUP_RESTORE_SET_ID}"
       else
         printf 'Backup operation completed. %s\n' "$output"
       fi
@@ -642,7 +962,25 @@ backup_rpc_stream() {
 run_backup_host_broker() {
   local operation="$1"; shift
   local backup_root=/var/lib/aikayun-backup credential_root=/etc/aikayun-backup
-  [[ "$operation" =~ ^(create|list|verify|initialize-repository|recover-maintenance)$ ]] || fail 'Unsupported backup command.'
+  local restore_mode=0 helper_operation="$operation" restore_root=/var/lib/aikayun-backup/restores
+  local -a helper_args=("$@")
+  [[ "$operation" =~ ^(create|list|verify|restore-isolated|cleanup-isolated|initialize-repository|recover-maintenance)$ ]] || fail 'Unsupported backup command.'
+  if [[ "$operation" == cleanup-isolated ]]; then
+    (($# == 1)) || fail 'cleanup-isolated requires the run ID printed by restore-isolated.'
+    backup_docker_endpoint || fail 'A local Unix-socket Docker Engine is required to clean an isolated restore.'
+    backup_assert_held_lock || fail 'The deployment operation lock is no longer held.'
+    backup_pin_release_identity || fail 'The verified host restore release changed before cleanup.'
+    backup_cleanup_isolated_restore "$1" || fail 'Cleanup stopped because a resource failed this drill ownership check.'
+    return 0
+  fi
+  if [[ "$operation" == restore-isolated ]]; then
+    (($# == 1)) && [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || \
+      fail 'restore-isolated requires one backup SET_ID; it never accepts a production restore target.'
+    restore_mode=1
+    BACKUP_RESTORE_SET_ID="$1"
+    helper_operation=restore-prepare
+    helper_args=("$BACKUP_RESTORE_SET_ID")
+  fi
   backup_docker_endpoint || fail 'A local Unix-socket Docker Engine is required for backup.'
   local network_identity
   network_identity="$(backup_docker_quick network inspect aikayun_private --format '{{index .Labels "com.docker.compose.project"}} {{index .Labels "com.docker.compose.network"}} {{.Name}} {{.Scope}}' 2>/dev/null)" || fail 'The fixed private network is unavailable.'
@@ -657,7 +995,27 @@ run_backup_host_broker() {
   backup_assert_held_lock || fail 'The deployment operation lock is no longer held.'
   backup_pin_release_identity || fail 'The verified host backup release changed before helper startup.'
   local run_id
-  run_id="$(cat /proc/sys/kernel/random/uuid)"
+  if ((restore_mode)); then
+    [[ -d "$restore_root" && ! -L "$restore_root" && "$(stat -c '%u:%g:%a' "$restore_root")" == '0:0:700' ]] || {
+      mkdir -m 0700 -- "$restore_root" 2>/dev/null || fail 'Could not create the isolated restore ownership directory.'
+      chown 0:0 "$restore_root" || fail 'Could not secure the isolated restore ownership directory.'
+    }
+    [[ "$(realpath -e "$restore_root")" == "$restore_root" ]] || fail 'The isolated restore ownership directory is unsafe.'
+    run_id="$(cat /proc/sys/kernel/random/uuid)"
+    [[ "$run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || fail 'Could not create an isolated restore run identifier.'
+    BACKUP_RESTORE_RUN_ID="$run_id"
+    BACKUP_RESTORE_PROJECT="$(backup_restore_project_name "$run_id")"
+    BACKUP_RESTORE_SOURCE_ID=pending
+    BACKUP_RESTORE_MANIFEST_ID=pending
+    BACKUP_RESTORE_DIRECTORY="$(backup_restore_directory "$run_id")"
+    mkdir -m 0700 -- "$BACKUP_RESTORE_DIRECTORY" || fail 'Could not create the isolated restore record directory.'
+    chown 0:0 "$BACKUP_RESTORE_DIRECTORY" || fail 'Could not secure the isolated restore record directory.'
+    backup_restore_write_record "$run_id" "$BACKUP_RESTORE_PROJECT" "$BACKUP_RESTORE_SET_ID" pending pending started RESTORE_SET_VERIFICATION_PENDING || \
+      fail 'Could not write the isolated restore ownership record.'
+    printf 'Isolated restore run: %s\n' "$run_id"
+  else
+    run_id="$(cat /proc/sys/kernel/random/uuid)"
+  fi
   [[ "$run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || fail 'Could not create an operation identifier.'
   coproc AIKAYUN_BACKUP_HELPER { backup_docker run --rm --interactive --pull=never --name "aikayun-backup-helper-$run_id" \
     --label "com.aikayun.backup.operation=$run_id" --network aikayun_private --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m \
@@ -666,7 +1024,7 @@ run_backup_host_broker() {
     --mount "type=bind,source=$backup_root,target=$backup_root" \
     --mount "type=bind,source=$credential_root,target=$credential_root,readonly" \
     --env NODE_ENV=production --env AIKAYUN_BACKUP_HOST_BROKER=stdio-v1 \
-    --entrypoint /nodejs/bin/node "$SELECTED_API_IMAGE" /app/dist/backup/helper-cli.js "$operation" "$@"; }
+    --entrypoint /nodejs/bin/node "$SELECTED_API_IMAGE" /app/dist/backup/helper-cli.js "$helper_operation" "${helper_args[@]}"; }
   local helper_pid="$AIKAYUN_BACKUP_HELPER_PID" helper_out="${AIKAYUN_BACKUP_HELPER[0]}" helper_in="${AIKAYUN_BACKUP_HELPER[1]}"
   BACKUP_HELPER_IN="$helper_in"
   local status=0 line read_status
@@ -698,6 +1056,29 @@ run_backup_host_broker() {
   if ! wait "$helper_pid"; then status=1; fi
   exec {helper_out}<&- || true
   exec {helper_in}>&- || true
-  ((status == 0)) || fail 'The backup helper did not complete with a verified result; inspect the maintenance journal before retrying.'
+  if ((status != 0)); then
+    if ((restore_mode)); then
+      backup_restore_write_record "$run_id" "$BACKUP_RESTORE_PROJECT" "$BACKUP_RESTORE_SET_ID" pending pending failed RESTORE_SET_VERIFICATION_FAILED || true
+      fail "The backup set was not accepted for isolated restore. Run cleanup-isolated $run_id after inspecting the failure."
+    fi
+    fail 'The backup helper did not complete with a verified result; inspect the maintenance journal before retrying.'
+  fi
   backup_assert_held_lock || fail 'The deployment operation lock was lost during backup.'
+  if ((restore_mode)); then
+    [[ "${BACKUP_RESTORE_SOURCE_ID:-}" =~ ^[a-f0-9]{64}$ && "${BACKUP_RESTORE_MANIFEST_ID:-}" =~ ^[a-f0-9]{64}$ ]] || {
+      backup_restore_write_record "$run_id" "$BACKUP_RESTORE_PROJECT" "$BACKUP_RESTORE_SET_ID" pending pending failed RESTORE_SNAPSHOT_PAIR_UNVERIFIED || true
+      fail "The verified source and manifest snapshot pair was incomplete. Run cleanup-isolated $run_id."
+    }
+    backup_restore_write_record "$run_id" "$BACKUP_RESTORE_PROJECT" "$BACKUP_RESTORE_SET_ID" \
+      "$BACKUP_RESTORE_SOURCE_ID" "$BACKUP_RESTORE_MANIFEST_ID" started RESTORE_ISOLATED_STARTING || \
+      fail "Could not pin the verified snapshot pair. Run cleanup-isolated $run_id."
+    if ! backup_restore_run_compose "$run_id" "$BACKUP_RESTORE_SET_ID" "$BACKUP_RESTORE_SOURCE_ID" "$BACKUP_RESTORE_MANIFEST_ID"; then
+      if backup_restore_load_record "$run_id" && [[ "$BACKUP_RESTORE_STATUS" != failed ]]; then
+        backup_restore_write_record "$run_id" "$BACKUP_RESTORE_PROJECT" "$BACKUP_RESTORE_SET_ID" \
+          "$BACKUP_RESTORE_SOURCE_ID" "$BACKUP_RESTORE_MANIFEST_ID" failed RESTORE_ISOLATED_FAILED || true
+      fi
+      fail "Isolated restore did not verify; partial resources remain stopped for inspection. Cleanup with: sudo /opt/aikayun/aikayun backup cleanup-isolated $run_id"
+    fi
+    backup_assert_held_lock || fail 'The deployment operation lock was lost during isolated restore.'
+  fi
 }

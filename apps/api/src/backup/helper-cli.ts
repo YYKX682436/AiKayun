@@ -9,7 +9,7 @@ process.on('SIGTERM', interrupt)
 // A broken output pipe is cancellation: never proceed with an unreported set.
 process.stdout.on('error', interrupt)
 const hostBroker = process.env.NODE_ENV === 'production' && process.env.AIKAYUN_BACKUP_HOST_BROKER === 'stdio-v1'
-const safeDiagnosticCode = /^(?:BACKUP|RESTIC|REPOSITORY|STAGING|DEPLOYMENT|INSTALLER|LICENSE|TRUST|DATABASE|PAYMENT|DELIVERY|SET|FENCE|ARCHIVE|DUMP)_[A-Z0-9_]{1,80}$/u
+const safeDiagnosticCode = /^(?:BACKUP|RESTIC|REPOSITORY|STAGING|DEPLOYMENT|INSTALLER|LICENSE|TRUST|DATABASE|PAYMENT|DELIVERY|SET|FENCE|ARCHIVE|DUMP|RESTORE)_[A-Z0-9_]{1,80}$/u
 const writeLine = async (value: unknown) => {
   if (hostBroker) {
     if (value && typeof value === 'object' && 'operation' in value && 'backupSetId' in value && 'status' in value &&

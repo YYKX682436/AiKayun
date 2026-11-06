@@ -293,6 +293,8 @@ pnpm exec esbuild "$source_root/apps/api/scripts/release/verify-artifacts.mjs" -
   --outfile="$work/support/verify-artifacts.mjs"
 cp "$source_root/scripts/release/backup-host-broker.sh" "$work/support/backup-host-broker.sh"
 chmod 0644 "$work/support/backup-host-broker.sh"
+cp "$source_root/scripts/release/compose.restore-isolated.yaml" "$work/support/compose.restore-isolated.yaml"
+chmod 0644 "$work/support/compose.restore-isolated.yaml"
 release_dir="$work/release-package"
 node "$source_root/apps/api/scripts/release/assemble-release.mjs" "$work/image-metadata.json" \
   "$work/trusted-license-config.json" "$migration_path" "$work/support" "$release_dir"

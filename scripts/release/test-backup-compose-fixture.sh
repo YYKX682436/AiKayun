@@ -25,7 +25,7 @@ created=0
 local_docker() { env -i PATH="$PATH" HOME="$HOME" docker "$@"; }
 compose() { env -i PATH="$PATH" HOME="$HOME" \
   AIKAYUN_API_IMAGE="$api_image" AIKAYUN_WEB_IMAGE="$web_image" AIKAYUN_POSTGRES_IMAGE="$postgres_image" AIKAYUN_CADDY_IMAGE="$caddy_image" \
-  AIKAYUN_PUBLIC_HOST=localhost AIKAYUN_PRIVATE_SUBNET="$subnet" \
+  AIKAYUN_DB_NAME="${AIKAYUN_DB_NAME:-aikayun}" AIKAYUN_PUBLIC_HOST=localhost AIKAYUN_PRIVATE_SUBNET="$subnet" \
   AIKAYUN_POSTGRES_ADMIN_PASSWORD_FILE="$work/postgres" AIKAYUN_API_DATABASE_PASSWORD_FILE="$work/api" \
   AIKAYUN_MIGRATOR_DATABASE_PASSWORD_FILE="$work/migrator" AIKAYUN_PAYMENT_CREDENTIAL_KEY_RING_FILE="$work/payment" \
   AIKAYUN_CODE_POOL_ENCRYPTION_KEY_RING_FILE="$work/delivery" AIKAYUN_LICENSE_TRUST_BUNDLE_FILE="$work/trust.jws" \
@@ -87,7 +87,10 @@ subnet="172.29.$((16#${project: -2})).0/24"
 database_host_port="$(node --input-type=module -e 'import net from "node:net"; const s=net.createServer(); s.listen(0,"127.0.0.1",()=>{process.stdout.write(String(s.address().port));s.close()})')"
 [[ "$database_host_port" =~ ^[1-9][0-9]{0,4}$ ]] || { echo 'Could not allocate an isolated database port' >&2; exit 1; }
 for name in postgres api migrator; do openssl rand -hex 32 > "$work/$name"; done
-for name in payment delivery; do printf '{"activeKeyId":"fixture","keys":{"fixture":"%s"}}\n' "$(openssl rand -base64 32)" > "$work/$name"; done
+for name in payment delivery; do
+  printf '{"activeKeyId":"fixture-current","keys":{"fixture-current":"%s","fixture-history":"%s"}}\n' \
+    "$(openssl rand -base64 32)" "$(openssl rand -base64 32)" > "$work/$name"
+done
 printf '%s\n' 'test-only-placeholder-bundle' > "$work/trust.jws"
 cat > "$work/override.yaml" <<YAML
 services:
@@ -105,6 +108,9 @@ services:
   api:
     user: "$app_uid:$app_gid"
     environment: { PUBLIC_ORIGIN: 'https://www.iana.org' }
+    volumes:
+      - "$root/apps/api/test/fixtures/isolated-restore-business-seed.mjs:/test/isolated-restore-business-seed.mjs:ro"
+      - "$root/apps/api/test/fixtures/license-pending-compose-recovery.mjs:/test/license-pending-compose-recovery.mjs:ro"
   web:
     environment: { NUXT_PUBLIC_SITE_URL: 'https://www.iana.org' }
   db:
@@ -158,6 +164,7 @@ if [[ "$mode" == '--start' ]]; then
     # This script is a test-only harness, never a customer or release command.
     # Callback receives only generated fixture identities and temporary paths.
     env -i PATH="$PATH" HOME="$HOME" AIKAYUN_FIXTURE_PROJECT="$project" \
+      TMPDIR="${TMPDIR:-/tmp}" \
       AIKAYUN_FIXTURE_WORK="$work" AIKAYUN_FIXTURE_DOCKER_SOCKET="${endpoint#unix://}" \
       AIKAYUN_FIXTURE_DATABASE_CONTAINER_ID="$database_id" \
       AIKAYUN_FIXTURE_DATABASE_HOST_PORT="$database_port" \
@@ -170,6 +177,8 @@ if [[ "$mode" == '--start' ]]; then
       AIKAYUN_FIXTURE_API_IMAGE="$api_image" AIKAYUN_FIXTURE_WEB_IMAGE="$web_image" \
       AIKAYUN_FIXTURE_RESTIC="${AIKAYUN_FIXTURE_RESTIC:-}" AIKAYUN_FIXTURE_RESTIC_SHA256="${AIKAYUN_FIXTURE_RESTIC_SHA256:-}" NODE_ENV=production \
       AIKAYUN_FIXTURE_RESTIC_IMAGE="${AIKAYUN_FIXTURE_RESTIC_IMAGE:-}" \
+      AIKAYUN_FIXTURE_RESTIC_RUNTIME_IMAGE="${AIKAYUN_FIXTURE_RESTIC_RUNTIME_IMAGE:-${AIKAYUN_FIXTURE_RESTIC_IMAGE:-}}" \
+      AIKAYUN_FIXTURE_POSTGRES_IMAGE="$postgres_image" AIKAYUN_FIXTURE_CADDY_IMAGE="$caddy_image" \
       AIKAYUN_FIXTURE_STATE_VOLUME="${project}_aikayun_state" \
       AIKAYUN_FIXTURE_POSTGRES_VOLUME="${project}_postgres_data" \
       AIKAYUN_FIXTURE_CADDY_DATA_VOLUME="${project}_caddy_data" \

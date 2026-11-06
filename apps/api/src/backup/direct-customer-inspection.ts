@@ -43,9 +43,13 @@ export type DirectCustomerBackupStatus = {
   status: 'verified' | 'needs_attention'
   createdAt: string | null
   releaseId: string | null
+  /** Internal restore preparation evidence; callers must keep this behind the
+   * signed host command and never expose the manifest or business data. */
+  restoreEvidence?: { sourceSnapshotId: string; manifestSnapshotId: string }
 }
 
-export async function inspectDirectCustomerBackup(config: DirectCustomerBackupInspectionConfig, set: string): Promise<DirectCustomerBackupStatus> {
+export async function inspectDirectCustomerBackup(config: DirectCustomerBackupInspectionConfig, set: string,
+  includeRestoreEvidence = false): Promise<DirectCustomerBackupStatus> {
   if (!setPattern.test(set) || typeof config.manifestDirectory !== 'function' || typeof config.assertLock !== 'function' ||
       typeof config.assertSecureStorage !== 'function' || typeof config.assertBackupRelease !== 'function' || typeof config.assertBackupMetadata !== 'function') {
     throw new Error('BACKUP_INSPECTION_ARGUMENT_INVALID')
@@ -64,7 +68,8 @@ export async function inspectDirectCustomerBackup(config: DirectCustomerBackupIn
     if (result.status !== 'verified' || result.manifest.backup_set_id !== set) {
       return { backupSetId: set, status: 'needs_attention', createdAt: null, releaseId: null }
     }
-    return { backupSetId: set, status: 'verified', createdAt: result.manifest.created_at, releaseId: result.manifest.release_id }
+    return { backupSetId: set, status: 'verified', createdAt: result.manifest.created_at, releaseId: result.manifest.release_id,
+      ...(includeRestoreEvidence ? { restoreEvidence: { sourceSnapshotId: result.sourceSnapshotId, manifestSnapshotId: result.snapshotId } } : {}) }
   } catch (error) {
     if (error instanceof UnsafeMaintenanceRecoveryError) throw error
     await config.assertLock()

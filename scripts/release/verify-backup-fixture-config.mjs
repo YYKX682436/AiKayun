@@ -45,7 +45,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [file, project, root, work, port] = process.argv.slice(2)
   if (!file || !project || !root || !work) throw new Error('Usage: verify-backup-fixture-config.mjs CONFIG PROJECT ROOT WORK [LOOPBACK_PORT]')
   const allowedBinds = [`${root}/deploy/Caddyfile`, `${root}/deploy/bootstrap-production-db-roles.sh`,
-    `${root}/deploy/prepare-state-volume.sh`, `${work}/trust.jws`]
+    `${root}/deploy/prepare-state-volume.sh`, `${root}/apps/api/test/fixtures/isolated-restore-business-seed.mjs`,
+    `${root}/apps/api/test/fixtures/license-pending-compose-recovery.mjs`, `${work}/trust.jws`]
   verifyFixtureConfig(JSON.parse(await readFile(file, 'utf8')), project, allowedBinds, port)
   console.log('Isolated Compose configuration verified')
 }

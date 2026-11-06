@@ -43,11 +43,15 @@ class FakeRestic {
       ...selected.map(node => JSON.stringify({ struct_type: 'node', message_type: 'node', ...node }))].join('\n')
   }
   async visitSnapshotNodes(_snapshot: string, path: string, visitor: (node: Record<string, unknown>) => void) {
-    for (const node of this.nodes) if (typeof node.path === 'string' && (node.path === path || node.path.startsWith(`${path}/`))) visitor(node)
-    if (this.hardlink) visitor({ struct_type: 'node', type: 'file', path: this.hardlink.path, inode: this.hardlink.inode })
+    for (const node of this.nodes) if (typeof node.path === 'string' && (node.path === path || node.path.startsWith(`${path}/`))) {
+      visitor({ struct_type: 'node', ...node })
+    }
+    if (this.hardlink) visitor({ struct_type: 'node', type: 'file', path: this.hardlink.path, inode: this.hardlink.inode,
+      uid: process.getuid?.() ?? 501, gid: process.getgid?.() ?? 501, mode: 0o600, size: 1 })
   }
   add(path: string, name: string, type: 'dir' | 'file', uid: number, gid: number, mode: number, bytes?: Buffer, inode?: number) {
-    const node = { path, name, type, uid, gid, mode, ...(type === 'file' ? { size: bytes!.length, inode: inode ?? this.nodes.length + 1000 } : {}) }
+    const node = { struct_type: 'node', path, name, type, uid, gid, mode,
+      ...(type === 'file' ? { size: bytes!.length, inode: inode ?? this.nodes.length + 1000 } : {}) }
     this.nodes.push(node)
     if (type === 'file') this.files.set(path, bytes!)
     return node
@@ -73,6 +77,8 @@ async function fixture() {
   const addDir = (p: string, n: string, uid = appUid, gid = appGid, mode = 0o700) => repo.add(p, n, 'dir', uid, gid, mode)
   const addFile = (p: string, n: string, bytes: Buffer, uid = appUid, gid = appGid, mode = 0o600, inode?: number) =>
     repo.add(p, n, 'file', uid, gid, mode, bytes, inode)
+  addDir('/sources/caddy-data', 'caddy-data', 1000, 1000, 0o700)
+  addDir('/sources/caddy-config', 'caddy-config', 1000, 1000, 0o700)
   addDir('/sources/state', 'state', 0, 0, 0o755)
   addFile('/sources/state/.aikayun-volume-v1', '.aikayun-volume-v1', Buffer.from('aikayun-state-volume-v1\n'), 0, 0, 0o400)
   for (const name of ['identity', 'license-pending', 'license-trust', 'media', 'private-files']) addDir(`/sources/state/${name}`, name)
@@ -93,7 +99,7 @@ async function fixture() {
   addDir('/sources/staging', 'staging', 0, 0, 0o700)
   addDir('/sources/staging/payload', 'payload', 0, 0, 0o700)
   repo.files.set('/sources/staging/payload/database.dump', repo.databaseDump)
-  repo.nodes.push({ path: '/sources/staging/payload/database.dump', name: 'database.dump', type: 'file', uid: process.getuid?.() ?? 501, gid: process.getgid?.() ?? appGid,
+  repo.nodes.push({ struct_type: 'node', path: '/sources/staging/payload/database.dump', name: 'database.dump', type: 'file', uid: process.getuid?.() ?? 501, gid: process.getgid?.() ?? appGid,
     size: repo.databaseDump.length, mode: 0o600, inode: 90001 })
   return { repo, scratch, appUid, appGid, database, keys, identityBytes: identity.identityBytes }
 }
@@ -132,6 +138,6 @@ describe('direct Restic source inspection', () => {
       scratch: f.scratch, databaseDump: { size: f.repo.databaseDump.length, sha256: sha(f.repo.databaseDump) },
       database: f.database, keys: f.keys, appUid: f.appUid, appGid: f.appGid,
       inspectTrustStoreReadOnly: async () => ({ status: 'uninitialized', bundleVersion: null, artifactSha256: null,
-        stateDigest: null, revokedKeyCount: 0, retiredKeyCount: 0 }), assertLock: async () => {} })).rejects.toThrow('BACKUP_STATE_PROTECTION_INVALID')
+        stateDigest: null, revokedKeyCount: 0, retiredKeyCount: 0 }), assertLock: async () => {} })).rejects.toThrow('BACKUP_SOURCE_PATH_UNSAFE')
   })
 })
