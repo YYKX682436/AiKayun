@@ -1,4 +1,4 @@
-# ⑦-5A 生产备份（R3 本地代码验收完成；GitHub CI 待核；商业发行未通过）
+# ⑦-5A 生产备份（R3 本地代码验收完成；CI 记录见本节；商业发行未通过）
 
 本文记录⑦-5A隔离实现和验收证据，不是客户生产操作手册。正式发行签名链、公开 GHCR 和商业 Linux 主机演练没有通过。不得在客户生产环境运行本工作树命令，也不得用旧的 `scripts/backup-compose-data.sh` 替代发行备份。
 
@@ -56,7 +56,7 @@ AMD64 和 ARM64 实际并发第二个 `backup create` 都被共享部署锁拒�
 
 背压修复的 `pnpm lint`、定向备份测试、`scripts/release/test-backup-tmpfs.sh` 均通过。全量 `pnpm verify` 在真实隔离 PostgreSQL 18 与只读授权中心 checkout `185dac80204f60abbaa63ffeb5af7d7054b685d7` 下退出码 0：lint 0 error（7 条既有 Vue 样式 warning）；typecheck 全通过；Money 16/16；API 87 个测试文件，912 passed / 26 skipped；release 7/7；生产构建通过；Playwright 96/96、alternate brand 1/1、SSR error 4/4、dev preview 1/1、production brand 1/1（浏览器合计 103/103）。这属于本地隔离验证，不能替代准确提交 SHA 的 GitHub CI。
 
-本地代码验收条件达到，精确提交 SHA 的 GitHub CI 待核。代码合并条件与正式商业发行分开判定。正式发行仍被基线 `zlib` HIGH 阻断；没有正式签名发行物、生产 Cosign/OIDC 和 GHCR 验证、可信商业 Linux 主机/外部对象存储及客户恢复演练证据。High/Critical 门禁保持失败关闭，不忽略漏洞、不降低等级、不改写 SBOM。本地代码或 CI 通过不代表商业发行 PASS。
+本地全量 `pnpm verify` 通过。首次推送提交 `f4a3c715d5be77cb2d3293a3f4e56ac42eb246dc` 的 GitHub CI 中，lint、typecheck、912 个 API 测试（26 skipped）和 7 个 release manifest 测试通过，随后 host broker shell 回归失败：测试 shim 将 macOS `stat -f` 格式用于 Linux GNU `stat`，不是备份实现断言失败。后续修复让测试 shim 根据 OS 使用相应格式，定向 `test-backup-host-broker.sh` 通过；修复提交的精确 CI 结果按 GitHub Actions 记录核验。代码合并条件与正式商业发行分开判定。正式发行仍被基线 `zlib` HIGH 阻断；没有正式签名发行物、生产 Cosign/OIDC 和 GHCR 验证、可信商业 Linux 主机/外部对象存储及客户恢复演练证据。High/Critical 门禁保持失败关闭，不忽略漏洞、不降低等级、不改写 SBOM。本地代码或 CI 通过不代表商业发行 PASS。
 
 下方 R2 与 R1 章节是历史记录，不覆盖本节 R3 当前证据。
 

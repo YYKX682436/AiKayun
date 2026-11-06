@@ -5,12 +5,15 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 source "$root/scripts/release/backup-host-broker.sh"
 declare -F backup_assert_held_lock >/dev/null
 
-# The production target is Linux (GNU stat); translate only the format used by
-# the pinned-release check so this shell regression also runs on macOS hosts.
+# Keep the production check's GNU stat shape while running this shell
+# regression on both Linux CI hosts and macOS developer machines.
 stat() {
   if [[ "${1:-}" == -c && "${2:-}" == '%u:%g:%a:%h' ]]; then
     local mode_links
-    mode_links="$(command stat -f '%Lp:%l' "${3:?}")" || return
+    case "$(uname -s)" in
+      Darwin) mode_links="$(command stat -f '%Lp:%l' "${3:?}")" || return ;;
+      *) mode_links="$(command stat -c '%a:%h' "${3:?}")" || return ;;
+    esac
     printf '0:0:%s\n' "$mode_links"
   else
     command stat "$@"
