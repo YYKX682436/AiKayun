@@ -833,12 +833,15 @@ export async function initializeInstallationIdentity(
   options: InstallationIdentityOptions,
 ): Promise<InstallationIdentitySnapshot> {
   const root = await createIdentityRoot(options.identityRoot, options.forbiddenRoots ?? [])
-  await validateIdentityRootEntries(root)
   const client = await pool.connect()
   let lockAcquired = false
   try {
     await client.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [lockKey])
     lockAcquired = true
+    // Stage enumeration must share the initialization lock. A concurrent
+    // initializer may atomically rename its stage to `current` after readdir
+    // but before this process lstat's that stage path.
+    await validateIdentityRootEntries(root)
     await assertIdentitySchema(client)
 
     const existingBinding = await readBinding(client)
