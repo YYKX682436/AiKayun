@@ -107,9 +107,9 @@ attachment; filename="______.txt"; filename*=UTF-8''%E9%A1%BE%E5%AE%A2%E6%8E%88%
 | 隔离 Linux arm64 容器 | Debian 12 bookworm、Node 24.22.0、Playwright 1.64.1、Chromium 156.0.8078.4；同一 production server 启动方式，测试 Postgres 位于本轮专用 Docker 网络，容器无外网路由 | `download` / 首次已失败，重复断言未运行 | API 响应仍为 200，DOM 属性、UTF-8 `Content-Disposition`、95 字节和 SHA-256 均正确；下载事件只报告 `download` |
 | 隔离 Linux x64 容器 | Debian 12 bookworm、Node 24.22.0、Playwright 1.64.1、Chromium 156.0.8078.4；同一 production server 启动方式，测试 Postgres 位于本轮专用 Docker 网络；浏览器以容器默认 root 运行 | `download` / 首次已失败，重复断言未运行 | 实际商城 E2E 同样得到 200、正确响应头/字节/摘要，但下载事件报告 `download` |
 | Linux arm64 与 x64 最小静态 HTTP fixture | 不加载 AiKayun；只提供相同 `download` 属性和 `Content-Disposition`，使用 Chromium 156.0.8078.4；x64 fixture 以 UID 1000 运行 | 两边均为 `download` | 均可独立复现，排除了 AiKayun 服务器响应、业务文件和浏览器架构差异 |
-| GitHub Actions | workflow 使用 `ubuntu-24.04` x64、锁定 Playwright 1.64.1 和 `.node-version`；主浏览器任务运行 `PLAYWRIGHT_USE_PRODUCTION_SERVER=true pnpm e2e`，workflow 未设置 HTTP proxy | 旧基线 run `42344017199` 成功（SHA `628a3a2182917e7558ad7219088c2add78baf3ff`）；它早于本轮变更 | 当前提交推送后的精确 SHA/CI 结果在交付记录中核对；旧基线通过不代替本轮 CI |
+| GitHub Actions | workflow 使用 `ubuntu-24.04` x64、锁定 Playwright 1.64.1 和 `.node-version`；主浏览器任务运行 `PLAYWRIGHT_USE_PRODUCTION_SERVER=true pnpm e2e`，workflow 未设置 HTTP proxy；全量 Compose 浏览器套件也运行该文件 | R2 代码 SHA `509f3da24de35661a05b077357f5d94714ee7db3` 的 run `42363252390` 成功；日志记录首个与重复下载均为 `顾客授权说明.txt`、Chromium `156.0.8078.4`、Node `v24.22.0`、Linux | 主机 Ubuntu runner 的真实业务 E2E 和全量 Compose 浏览器套件均通过；附件状态、响应头、95 字节与 SHA-256 和浏览器下载文件名一致。该 CI SHA 是文档更新前的 R2 代码提交 |
 
-macOS 主机与 Linux 容器用的是同一 Playwright/Chromium 版本；Linux arm64 与 x64 容器均失败，macOS 主机通过。独立静态 fixture 也只在 Linux 容器复现。故已将根因收窄到本地容器化 Linux Playwright 下载观测环境与主机运行环境的差异，当前证据不支持架构差异或产品响应错误。没有改小预期文件名，也未改产品下载行为；日常本机 E2E 改在原生 macOS 主机执行，Linux CI 在 GitHub host runner 执行。Linux 容器场景保留严格失败证据，不据此宣称通过。
+macOS 主机与 Linux 容器用的是同一 Playwright/Chromium 版本；Linux arm64 与 x64 容器均失败，macOS 主机通过。独立静态 fixture 也只在 Linux 容器复现。R2 精确 SHA 的 GitHub Ubuntu host runner 通过同一私有文件 E2E 和全量 Compose 浏览器套件，进一步证明失败限定在本地容器化 Linux Playwright 下载观测环境，而非所有 Linux 或产品响应。当前证据不支持架构差异。没有改小预期文件名，也未改产品下载行为；日常本机 E2E 在原生 macOS 主机执行，Linux CI 在 GitHub host runner 执行。Linux 容器场景保留严格失败证据，不据此宣称通过。
 
 ### 定向与完整验证
 
