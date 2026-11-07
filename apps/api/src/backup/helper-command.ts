@@ -81,7 +81,7 @@ export async function runInternalHelper(command: HelperCommand, signal: AbortSig
         readiness: 'blocked' as const, automaticRestore: 'blocked' as const }
     }
     return { operation: 'restore-plan' as const, backupSetId: command.set, backup: 'verified' as const,
-      compatibility: 'matched' as const, identity: 'matched' as const, target: 'current-instance' as const,
+      compatibility: 'matched' as const, identity: 'matched' as const, target: 'unknown' as const,
       technicalChecks: 'passed' as const,
       businessAfterBackup: 'unknown' as const, pendingExternalOperations: 'unknown' as const,
       authorization: 'unknown' as const, disk: 'unknown' as const, externalReconciliation: 'required' as const,

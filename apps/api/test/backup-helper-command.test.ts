@@ -29,12 +29,31 @@ describe('internal helper command protocol', () => {
     mocked.inspect.mockResolvedValueOnce({ backupSetId: set, status: 'verified', restoreEvidence: { sourceSnapshotId: revision, manifestSnapshotId: 'b'.repeat(64) }, private: 'marker' })
     const report = await runInternalHelper({ mode: 'restore-plan', set }, signal)
     expect(report).toEqual({ operation: 'restore-plan', backupSetId: set, backup: 'verified', compatibility: 'matched',
-      identity: 'matched', target: 'current-instance', technicalChecks: 'passed', businessAfterBackup: 'unknown', pendingExternalOperations: 'unknown',
+      identity: 'matched', target: 'unknown', technicalChecks: 'passed', businessAfterBackup: 'unknown', pendingExternalOperations: 'unknown',
       authorization: 'unknown', disk: 'unknown', externalReconciliation: 'required', readiness: 'blocked', automaticRestore: 'blocked' })
     expect(JSON.stringify(report)).not.toContain('marker')
     expect(mocked.inspect).toHaveBeenCalledWith({ mode: 'restore-isolated', set }, signal)
-    mocked.inspect.mockRejectedValueOnce(new Error('DATABASE_UNAVAILABLE'))
-    expect(await runInternalHelper({ mode: 'restore-plan', set }, signal)).toMatchObject({ backup: 'blocked', businessAfterBackup: 'unknown', readiness: 'blocked', automaticRestore: 'blocked' })
+  })
+  it.each([
+    ['source database unavailable', 'DATABASE_UNAVAILABLE'],
+    ['identity mismatch', 'RESTORE_IDENTITY_MISMATCH'],
+    ['historical key cannot decrypt', 'RESTORE_HISTORICAL_KEY_INVALID'],
+    ['schema incompatible', 'RESTORE_SCHEMA_INCOMPATIBLE'],
+    ['authorization expired or unknown', 'RESTORE_AUTHORIZATION_UNKNOWN'],
+    ['cross-server target cannot be proven', 'RESTORE_TARGET_IDENTITY_UNKNOWN'],
+    ['backup or manifest incomplete', 'RESTORE_BACKUP_SET_INCOMPLETE'],
+  ])('fails closed for %s', async (_scenario, diagnostic) => {
+    mocked.inspect.mockRejectedValueOnce(new Error(diagnostic))
+    const report = await runInternalHelper({ mode: 'restore-plan', set }, new AbortController().signal)
+    expect(report).toMatchObject({ backup: 'blocked', compatibility: 'unknown', identity: 'unknown', target: 'unknown',
+      businessAfterBackup: 'unknown', pendingExternalOperations: 'unknown', authorization: 'unknown', disk: 'unknown',
+      externalReconciliation: 'required', readiness: 'blocked', automaticRestore: 'blocked' })
+    expect(JSON.stringify(report)).not.toContain(diagnostic)
+  })
+  it('does not convert an interrupted preflight into a report that could imply completion', async () => {
+    const controller = new AbortController()
+    mocked.inspect.mockImplementationOnce(async () => { controller.abort(); throw new Error('BACKUP_OPERATION_INTERRUPTED') })
+    await expect(runInternalHelper({ mode: 'restore-plan', set }, controller.signal)).rejects.toThrow('BACKUP_OPERATION_INTERRUPTED')
   })
   it('returns only the allowed create and verification fields', async () => {
     const signal = new AbortController().signal

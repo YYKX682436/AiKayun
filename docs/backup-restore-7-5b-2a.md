@@ -6,7 +6,7 @@
 
 命令输出一行白名单 JSON，随后输出中文说明。敏感凭据、客户数据、原始清单、私钥和密钥材料不进入报告。技术验证成功时，`backup=verified`、`compatibility=matched`、`identity=matched`、`target=current-instance`、`technicalChecks=passed` 仅表示备份与当前已验证实例技术匹配；由于容量、业务事实、未决操作和授权状态仍未知，`readiness=blocked` 且 `automaticRestore=blocked`，不授权立即覆盖。
 
-`businessAfterBackup`、`pendingExternalOperations`、`authorization` 和 `disk` 在本阶段均为 `unknown`，`externalReconciliation=required`。备份生成之后可有支付、退款、提现、采购、交付等账外新事实；源库不可读或源服务器损坏时，更不能从旧备份推断其不存在。当前预检没有请求支付服务商、供应商或授权中心；不会通过写请求解决这些未知项。
+`target`、`businessAfterBackup`、`pendingExternalOperations`、`authorization` 和 `disk` 在本阶段均为 `unknown`，`externalReconciliation=required`。即使当前数据库绑定与备份匹配，整个部署身份可能已被复制到另一台机器，不能单凭本机文件证明同机恢复。备份生成之后可有支付、退款、提现、采购、交付等账外新事实；源库不可读或源服务器损坏时，更不能从旧备份推断其不存在。当前预检没有请求支付服务商、供应商或授权中心；不会通过写请求解决这些未知项。
 
 任何 helper 校验失败、绑定不匹配、目标数据库失联、命令中断或并发争锁都会 fail closed；若可生成报告，则以 `backup=blocked`、其余不能确认项 `unknown`、`readiness=blocked`、`automaticRestore=blocked` 返回。若客户入口自身的签名、锁、Docker endpoint 或固定路径前置门禁失败，命令直接拒绝且不启动 helper。没有 `--force`、测试 flag 或人工确认绕过。
 
@@ -16,9 +16,9 @@
 
 ## 验收结果
 
-本机 macOS 的 `pnpm verify` 在独立临时 PostgreSQL 18 `_test` 容器及冻结授权中心 checkout `185dac80204f60abbaa63ffeb5af7d7054b685d7` 下完整结束：lint 0 errors/7 个既有 Vue 排版 warnings；typecheck、build、API/PostgreSQL 916 passed/26 skipped、release 7/7、Playwright 96/96 和 production-brand 1/1 通过。`backup-helper-command.test.ts` 7/7 通过。真实业务未决状态在报告中一直为 unknown；目标容量与当前授权中心状态也未被本机自动证明，故技术报告 readiness 保持 blocked。输出没有秘密字段。
+本机 macOS 的 `pnpm verify` 在独立临时 PostgreSQL 18 `_test` 容器及冻结授权中心 checkout `185dac80204f60abbaa63ffeb5af7d7054b685d7` 下完整结束：lint 0 errors/7 个既有 Vue 排版 warnings；typecheck、build、API/PostgreSQL 924 passed/26 skipped、release 7/7、Playwright 96/96 和 production-brand 1/1 通过。`backup-helper-command.test.ts` 15/15 通过，含七种异常输入 fail-closed 与中断不伪造报告。真实业务未决状态、部署是否曾整体复制、目标容量与当前授权中心状态均保持 unknown，报告 readiness 阻断。输出没有秘密字段。
 
-Linux 专用源路径安全测试没有在 macOS 伪装或放宽。CI run `42382073557` 对代码提交 `3a182f7eaf5a999c368387e6da92f79f060a2761` 总体通过：`backup-source-path-safety.test.ts` 3/3 通过，完整 API/PostgreSQL 916 passed/26 skipped，主浏览器 95 passed 且 reduced-motion 用例一次 flaky 后重试通过；Compose 浏览器 87 passed/9 skipped，持久化与数字交付恢复步骤通过。[GitHub Actions](https://github.com/YYKX682436/AiKayun/actions/runs/42382073557)。明确跳过的包括 `backup-direct-real-set.integration.test.ts` 和 Restic/卷归档集成 fixture，因此此处 CI 不能证明客户恢复计划命令对真实集合的端到端故障矩阵。
+Linux 专用源路径安全测试没有在 macOS 伪装或放宽。CI run `42382073557` 对代码提交 `3a182f7eaf5a999c368387e6da92f79f060a2761` 总体通过：`backup-source-path-safety.test.ts` 3/3 通过，完整 API/PostgreSQL 916 passed/26 skipped，主浏览器 95 passed 且 reduced-motion 用例一次 flaky 后重试通过；Compose 浏览器 87 passed/9 skipped，持久化与数字交付恢复步骤通过。[GitHub Actions](https://github.com/YYKX682436/AiKayun/actions/runs/42382073557)。随后文档提交 `b9bbd7f0b28b4750928bba299f6347a483f0eaa3` 对应 run `42386395139` 通过。明确跳过的包括 `backup-direct-real-set.integration.test.ts` 和 Restic/卷归档集成 fixture，因此此处 CI 不能证明客户恢复计划命令对真实集合的端到端故障矩阵。
 
 当前新增回归对真实 PG18 inspected result 的协议脱敏、双快照 evidence 成功形态、DB unavailable 阻断形态作单元验证；七类恢复风险中，备份后交易/未决外部操作/授权中心实时状态/目标磁盘容量没有自动 oracle，均明确输出 unknown 并阻断。后续需在隔离 Linux 与合成 backup fixture 中逐项演练 schema/身份/key mismatch、跨实例拒绝、并发锁和中断；这些未执行的动态注入不标作通过。
 
