@@ -18,6 +18,8 @@
 
 本机 macOS 的 `pnpm verify` 在独立临时 PostgreSQL 18 `_test` 容器及冻结授权中心 checkout `185dac80204f60abbaa63ffeb5af7d7054b685d7` 下完整结束：lint 0 errors/7 个既有 Vue 排版 warnings；typecheck、build、API/PostgreSQL 916 passed/26 skipped、release 7/7、Playwright 96/96 和 production-brand 1/1 通过。`backup-helper-command.test.ts` 7/7 通过。真实业务未决状态在报告中一直为 unknown；目标容量与当前授权中心状态也未被本机自动证明，故技术报告 readiness 保持 blocked。输出没有秘密字段。
 
-Linux 专用源路径安全测试没有在 macOS 伪装或放宽。本轮提交后的 Ubuntu CI 仍需对准确 SHA 验证 Linux 路径安全门禁。当前新增回归对真实 PG18 inspected result 的协议脱敏、双快照 evidence 成功形态、DB unavailable 阻断形态作单元验证；七类恢复风险中，备份后交易/未决外部操作/授权中心实时状态/目标磁盘容量没有自动 oracle，均明确输出 unknown 并阻断。后续需在隔离 Linux 与合成 backup fixture 中逐项演练 schema/身份/key mismatch、跨实例拒绝、并发锁和中断；这些未执行的动态注入不标作通过。
+Linux 专用源路径安全测试没有在 macOS 伪装或放宽。CI run `42382073557` 对代码提交 `3a182f7eaf5a999c368387e6da92f79f060a2761` 总体通过：`backup-source-path-safety.test.ts` 3/3 通过，完整 API/PostgreSQL 916 passed/26 skipped，主浏览器 95 passed 且 reduced-motion 用例一次 flaky 后重试通过；Compose 浏览器 87 passed/9 skipped，持久化与数字交付恢复步骤通过。[GitHub Actions](https://github.com/YYKX682436/AiKayun/actions/runs/42382073557)。明确跳过的包括 `backup-direct-real-set.integration.test.ts` 和 Restic/卷归档集成 fixture，因此此处 CI 不能证明客户恢复计划命令对真实集合的端到端故障矩阵。
+
+当前新增回归对真实 PG18 inspected result 的协议脱敏、双快照 evidence 成功形态、DB unavailable 阻断形态作单元验证；七类恢复风险中，备份后交易/未决外部操作/授权中心实时状态/目标磁盘容量没有自动 oracle，均明确输出 unknown 并阻断。后续需在隔离 Linux 与合成 backup fixture 中逐项演练 schema/身份/key mismatch、跨实例拒绝、并发锁和中断；这些未执行的动态注入不标作通过。
 
 真实生产卷未读写、任何服务未停止、未调用外部写端点、未覆盖数据库或切换流量。MacOS `pnpm verify` 的结果不替代 Linux 专用安全门禁或精确 SHA CI。不得因路径差异削弱安全检查。
