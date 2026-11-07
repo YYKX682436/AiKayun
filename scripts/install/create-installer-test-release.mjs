@@ -92,6 +92,7 @@ await writeFile(checksumsPath, migrationChecksumsBytes, { mode: 0o600 })
 
 const supportNames = [
   'license-trust-bundle.jws',
+  'compose.restore-isolated.yaml',
   ...['api', 'web'].flatMap(name => ['NOTICE-' + name + '-linux-amd64.txt', 'NOTICE-' + name + '-linux-arm64.txt']),
   ...['api', 'web', 'postgres', 'caddy', 'backup'].flatMap(name => [
     'NOTICE-image-' + name + '-linux-amd64.txt', 'NOTICE-image-' + name + '-linux-arm64.txt',
@@ -128,6 +129,9 @@ execFileSync('pnpm', ['exec', 'esbuild', 'apps/api/scripts/release/verify-artifa
   '--outfile=' + join(supportDirectory, 'verify-artifacts.mjs')], { cwd: repositoryRoot, stdio: 'pipe' })
 await cp(join(repositoryRoot, 'scripts/release/backup-host-broker.sh'), join(supportDirectory, 'backup-host-broker.sh'))
 await chmod(join(supportDirectory, 'backup-host-broker.sh'), 0o644)
+await cp(process.env.AIKAYUN_TEST_RESTORE_COMPOSE_FILE ?? join(repositoryRoot, 'scripts/release/compose.restore-isolated.yaml'),
+  join(supportDirectory, 'compose.restore-isolated.yaml'))
+await chmod(join(supportDirectory, 'compose.restore-isolated.yaml'), 0o644)
 
 execFileSync(process.execPath, [
   join(repositoryRoot, 'apps/api/scripts/release/assemble-release.mjs'),

@@ -41,6 +41,8 @@ await cp(new URL('../../../../scripts/release/extract-oci-bundle.sh', import.met
 await cp(new URL('../../../../scripts/install/install-ai-kayun.sh', import.meta.url), join(output, 'install.sh'))
 await cp(join(supportDirectory, 'backup-host-broker.sh'), join(output, 'backup-host-broker.sh'))
 await chmod(join(output, 'backup-host-broker.sh'), 0o644)
+await cp(join(supportDirectory, 'compose.restore-isolated.yaml'), join(output, 'compose.restore-isolated.yaml'))
+await chmod(join(output, 'compose.restore-isolated.yaml'), 0o644)
 await cp(join(supportDirectory, 'license-trust-bundle.jws'), join(output, 'license-trust-bundle.jws'))
 await cp(migrationChecksumsPath, join(output, 'migration-checksums.json'))
 await writeFile(join(output, 'license-offline-root.jwk.json'), `${JSON.stringify(config.offline_root.publicJwk)}\n`, { flag: 'wx', mode: 0o644 })
@@ -80,6 +82,7 @@ await readFile(join(output, 'release-signing-root.jwk.json'))
 await readFile(join(output, 'extract-release-bundle.sh'))
 await readFile(join(output, 'install.sh'))
 await readFile(join(output, 'backup-host-broker.sh'))
+await readFile(join(output, 'compose.restore-isolated.yaml'))
 await readFile(join(output, 'deploy/prepare-state-volume.sh'))
 
 const releaseIndex = {

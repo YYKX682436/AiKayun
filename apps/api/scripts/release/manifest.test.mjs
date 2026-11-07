@@ -182,6 +182,8 @@ test('release bundle assembly pins images and includes the signed host backup br
   await writeFile(checksumsPath, JSON.stringify({ schema: 1, migration_head: '202611030002_license_pending_key_binding', migrations: [] }))
   const backupBroker = join(support, 'backup-host-broker.sh')
   await writeFile(backupBroker, '# signed test host broker fixture\n')
+  const restoreCompose = join(support, 'compose.restore-isolated.yaml')
+  await writeFile(restoreCompose, '# signed isolated restore Compose fixture\n')
 
   const supportFiles = [
     'release-verifier.mjs', 'verify-artifacts.mjs', 'release-signing-root.jwk.json', 'license-trust-bundle.jws',
@@ -218,5 +220,7 @@ test('release bundle assembly pins images and includes the signed host backup br
   assert.equal(await readFile(join(output, 'license-trust-bundle.jws'), 'utf8'), trustBundle)
   assert.equal(await readFile(join(output, 'backup-host-broker.sh'), 'utf8'), '# signed test host broker fixture\n')
   assert.equal((await stat(join(output, 'backup-host-broker.sh'))).mode & 0o777, 0o644)
+  assert.equal(await readFile(join(output, 'compose.restore-isolated.yaml'), 'utf8'), '# signed isolated restore Compose fixture\n')
+  assert.equal((await stat(join(output, 'compose.restore-isolated.yaml'))).mode & 0o777, 0o644)
   assert.equal(JSON.parse(await readFile(join(output, 'release-index.json'), 'utf8')).version, version)
 })

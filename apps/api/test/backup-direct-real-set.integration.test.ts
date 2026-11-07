@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -35,6 +35,7 @@ const deliveryFile = process.env.AIKAYUN_FIXTURE_DELIVERY_KEY_RING_FILE || ''
 const apiImage = process.env.AIKAYUN_FIXTURE_API_IMAGE || ''
 const webImage = process.env.AIKAYUN_FIXTURE_WEB_IMAGE || ''
 const resticRuntimeImage = process.env.AIKAYUN_FIXTURE_RESTIC_RUNTIME_IMAGE || ''
+const releaseId = process.env.AIKAYUN_FIXTURE_RELEASE_ID || 'fixture-unsigned'
 const sourceVolumes = {
   state: process.env.AIKAYUN_FIXTURE_STATE_VOLUME || '',
   caddyData: process.env.AIKAYUN_FIXTURE_CADDY_DATA_VOLUME || '',
@@ -54,6 +55,10 @@ const fixture = Boolean(/^sha256:[a-f0-9]{64}$/.test(image) &&
 const uninitializedTrust = { status: 'uninitialized' as const, bundleVersion: null, artifactSha256: null,
   stateDigest: null, revokedKeyCount: 0, retiredKeyCount: 0 }
 const sha = (value: Uint8Array | string) => createHash('sha256').update(value).digest('hex')
+const imageDigest = (reference: string, fallback: string) => {
+  const match = reference.match(/@sha256:([a-f0-9]{64})$/u)
+  return match ? `sha256:${match[1]}` : `sha256:${fallback.repeat(64).slice(0, 64)}`
+}
 const noop = async () => {}
 const dockerBinaryPromise = exec('which', ['docker']).then(async result => realpath(result.stdout.trim()))
 let dockerBinary = '', root = ''
@@ -397,10 +402,11 @@ describe.skipIf(!fixture)('real PostgreSQL 18 direct source capture and paired R
     await advanceMaintenanceJournal(journalDirectory, journal, 'complete')
     await new Promise(resolve => setTimeout(resolve, 1500))
 
-    const images = { api: 'sha256:' + 'a'.repeat(64), web: 'sha256:' + 'b'.repeat(64),
-      postgres: 'sha256:' + 'c'.repeat(64), caddy: 'sha256:' + 'd'.repeat(64) }
+    const images = { api: imageDigest(apiImage, 'a'), web: imageDigest(webImage, 'b'),
+      postgres: imageDigest(process.env.AIKAYUN_FIXTURE_POSTGRES_IMAGE || '', 'c'),
+      caddy: imageDigest(process.env.AIKAYUN_FIXTURE_CADDY_IMAGE || '', 'd') }
     const published = await publishDirectCapturedSet({ staged, stagingDirectory: payload, manifestDirectory,
-      scratchDirectory: scratch, journalDirectory, publicationDirectory, repository, releaseId: 'fixture-unsigned',
+      scratchDirectory: scratch, journalDirectory, publicationDirectory, repository, releaseId,
       images, resticVersion: '0.19.1', assertLock: noop, assertSecureStorage: noop,
       async assertRestoredAndRelease() {
         if (!(await servicesRunning())) throw new Error('DIRECT_REAL_FIXTURE_SERVICE_RESTORE_FAILED')
@@ -454,7 +460,7 @@ describe.skipIf(!fixture)('real PostgreSQL 18 direct source capture and paired R
       AIKAYUN_RESTORE_SOURCE_SNAPSHOT_ID: staged.sourceSnapshotId,
       AIKAYUN_RESTORE_MANIFEST_SNAPSHOT_ID: published.snapshotId,
       AIKAYUN_RESTORE_MANIFEST_DIRECTORY: manifestDirectory,
-      AIKAYUN_RESTORE_RELEASE_ID: 'fixture-unsigned',
+      AIKAYUN_RESTORE_RELEASE_ID: releaseId,
       AIKAYUN_RESTORE_TEST_DIAGNOSTICS: 'true',
       AIKAYUN_RESTORE_API_DIGEST: images.api,
       AIKAYUN_RESTORE_WEB_DIGEST: images.web,
@@ -605,5 +611,30 @@ describe.skipIf(!fixture)('real PostgreSQL 18 direct source capture and paired R
     expect(await docker(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${restoreProject}`])).toBe('')
     console.info('Isolated restore PostgreSQL 18 accepted; complete selected historical rows match source exactly')
     console.info('Direct PG18 set verified; source and manifest snapshots paired; stopped duration ms:', downtimeMs)
+
+    const customerBackupRoot = process.env.AIKAYUN_FIXTURE_CUSTOMER_BACKUP_ROOT
+    if (customerBackupRoot) {
+      const targetManifest = join(customerBackupRoot, 'staging', `set-${set}`, 'manifest')
+      await cp(repositoryRoot, join(customerBackupRoot, 'repository'), { recursive: true, preserveTimestamps: true })
+      await mkdir(targetManifest, { recursive: true, mode: 0o700 })
+      await cp(manifestDirectory, targetManifest, { recursive: true, preserveTimestamps: true })
+      await cp(publicationDirectory, join(customerBackupRoot, 'publications'), { recursive: true, preserveTimestamps: true })
+      const passwordDestination = process.env.AIKAYUN_FIXTURE_CUSTOMER_PASSWORD_FILE
+      if (!passwordDestination) throw new Error('DIRECT_REAL_FIXTURE_CUSTOMER_PASSWORD_DESTINATION_REQUIRED')
+      await copyFile(localPassword, passwordDestination)
+      await chmod(passwordDestination, 0o600)
+      const countFiles = async (directory: string): Promise<number> => {
+        let count = 0
+        for (const entry of await readdir(directory, { withFileTypes: true })) {
+          if (entry.isDirectory()) count += await countFiles(join(directory, entry.name))
+          else if (entry.isFile()) count++
+        }
+        return count
+      }
+      console.info(JSON.stringify({ operation: 'customer-restore-fixture-export', backupSetId: set,
+        sourceSnapshotId: staged.sourceSnapshotId, manifestSnapshotId: published.snapshotId,
+        releaseId, repositoryFiles: await countFiles(repositoryRoot), manifestSha256: sha(await readFile(join(targetManifest, 'manifest.json'))),
+      }))
+    }
   }, 360_000)
 })
