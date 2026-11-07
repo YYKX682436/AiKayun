@@ -65,7 +65,7 @@ backup_restore_write_record() {
      ( "$manifest_id" == pending || "$manifest_id" =~ ^[a-f0-9]{64}$ ) &&
      "$status" =~ ^(started|failed|verified)$ && "$code" =~ ^[A-Z0-9_]{1,80}$ ]] || return 1
   directory="$(backup_restore_directory "$run_id")"
-  [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%u:%g:%a:%h' "$directory")" == '0:0:700:1' &&
+  [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%u:%g:%a:%h' "$directory")" == '0:0:700:2' &&
      "$(realpath -e "$directory")" == "$directory" ]] || return 1
   temporary="$directory/.record.tmp"
   [[ ! -e "$temporary" && ! -L "$temporary" ]] || return 1
@@ -78,14 +78,14 @@ backup_restore_write_record() {
 }
 
 backup_restore_load_record() {
-  local run_id="$1" directory record
+  local run_id="$1" directory record line
   local -a lines=()
   [[ "$run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || return 1
   directory="$(backup_restore_directory "$run_id")"; record="$directory/record"
-  [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%u:%g:%a:%h' "$directory")" == '0:0:700:1' &&
+  [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%u:%g:%a:%h' "$directory")" == '0:0:700:2' &&
      "$(realpath -e "$directory")" == "$directory" && -f "$record" && ! -L "$record" &&
      "$(stat -c '%u:%g:%a:%h' "$record")" == '0:0:600:1' && "$(realpath -e "$record")" == "$record" ]] || return 1
-  mapfile -t lines < "$record"
+  while IFS= read -r line || [[ -n "$line" ]]; do lines+=("$line"); done < "$record"
   ((${#lines[@]} == 8)) || return 1
   [[ "${lines[0]}" == schema=1 && "${lines[1]}" == "run_id=$run_id" &&
      "${lines[2]}" == "project=$(backup_restore_project_name "$run_id")" &&
@@ -125,10 +125,26 @@ backup_restore_assert_network() {
 }
 
 backup_restore_assert_volume() {
-  local name="$1" run_id="$2" project="$3" identity options
-  identity="$(backup_docker_quick volume inspect "$name" --format '{{.Name}}|{{.Driver}}|{{.Scope}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.aikayun.restore.run"}}' 2>/dev/null)" || return 1
+  local name="$1" run_id="$2" project="$3" identity options key
+  key="${name#${project}_}"
+  [[ "$name" == "${project}_$key" && "$key" =~ ^(database|credentials|state|caddy_data|caddy_config|database_input|deployment_keys|manifest)$ ]] || return 1
+  identity="$(backup_docker_quick volume inspect "$name" --format '{{.Name}}|{{.Driver}}|{{.Scope}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.volume"}}|{{index .Labels "com.aikayun.restore.run"}}|{{index .Labels "com.aikayun.restore.scope"}}' 2>/dev/null)" || return 1
   options="$(backup_docker_quick volume inspect "$name" --format '{{json .Options}}' 2>/dev/null)" || return 1
-  [[ "$identity" == "$name|local|local|$project|$run_id" && ( "$options" == null || "$options" == '{}' ) ]]
+  [[ "$identity" == "$name|local|local|$project|$key|$run_id|isolated-restore-v1" && ( "$options" == null || "$options" == '{}' ) ]]
+}
+
+backup_restore_create_volumes() {
+  local run_id="$1" project="$2" volume key
+  while IFS= read -r volume; do
+    key="${volume#${project}_}"
+    backup_docker_quick volume create \
+      --label "com.docker.compose.project=$project" \
+      --label "com.docker.compose.volume=$key" \
+      --label "com.aikayun.restore.run=$run_id" \
+      --label com.aikayun.restore.scope=isolated-restore-v1 \
+      "$volume" >/dev/null || return 1
+    backup_restore_assert_volume "$volume" "$run_id" "$project" || return 1
+  done < <(backup_restore_volume_names "$project")
 }
 
 backup_restore_assert_one_network() {
@@ -192,12 +208,23 @@ backup_restore_run_compose() {
   [[ ! -e "$env_file" ]] || return 1
   mapfile -t volumes < <(backup_restore_volume_names "$project")
   for volume in "${volumes[@]}"; do
-    if backup_docker_quick volume inspect "$volume" >/dev/null 2>&1; then return 1; fi
+    if backup_docker_quick volume inspect "$volume" >/dev/null 2>&1; then
+      backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed RESTORE_TARGET_RESOURCE_CONFLICT
+      return 1
+    fi
   done
   local prior_containers prior_network
   prior_containers="$(backup_docker_quick ps -a --quiet --no-trunc --filter "label=com.docker.compose.project=$project")" || return 1
   prior_network="$(backup_docker_quick network ls --quiet --no-trunc --filter "label=com.docker.compose.project=$project")" || return 1
-  [[ -z "$prior_containers" && -z "$prior_network" ]] || return 1
+  if [[ -n "$prior_containers" || -n "$prior_network" ]] || backup_docker_quick network inspect "$network" >/dev/null 2>&1; then
+    backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed RESTORE_TARGET_RESOURCE_CONFLICT
+    return 1
+  fi
+  step=RESTORE_VOLUME_PREPARATION_FAILED
+  if ! backup_restore_create_volumes "$run_id" "$project"; then
+    backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed "$step"
+    return 1
+  fi
   [[ ! -e "$bootstrap_password" && ! -e "$readonly_password" && ! -L "$bootstrap_password" && ! -L "$readonly_password" ]] || return 1
   head -c 32 /dev/urandom | base64 -w0 > "$bootstrap_password" || return 1
   head -c 32 /dev/urandom | base64 -w0 > "$readonly_password" || return 1
@@ -283,7 +310,7 @@ backup_restore_run_compose() {
   fi
   local validation_report
   validation_report="$(sed -n '$p' "$directory/validate.log")" || return 1
-  [[ "$validation_report" =~ ^\{"operation":"restore-validation","status":"verified","runId":"$run_id","backupSetId":"$set_id","sourceSnapshotId":"$source_id","manifestSnapshotId":"$manifest_id", ]] || return 1
+  backup_restore_validation_report_matches "$validation_report" "$run_id" "$set_id" "$source_id" "$manifest_id" || return 1
   mv -- "$directory/validate.log" "$directory/validation-report.json"
   id="$(backup_docker_quick ps -a --quiet --no-trunc --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=validate")" || return 1
   [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
@@ -331,7 +358,7 @@ backup_cleanup_isolated_restore() {
         db|restore-secrets|restore-source|restore-manifest|restore-database|restore-readonly-role|restore-input-permissions|validate) ;;
         *) return 1 ;;
       esac
-      if [[ "$state" == running ]]; then backup_docker --time 10 stop "$container" >/dev/null || return 1; fi
+      if [[ "$state" == running ]]; then backup_docker stop --time 10 "$container" >/dev/null || return 1; fi
       state="$(backup_docker_quick inspect --type container --format '{{.State.Status}}' "$container")" || return 1
       [[ "$state" == exited || "$state" == created ]] || return 1
     done
@@ -354,7 +381,7 @@ backup_cleanup_isolated_restore() {
     [[ -e "$entry" || -L "$entry" ]] || continue
     [[ "${entry##*/}" == record || "${entry##*/}" == validation-report.json || "${entry##*/}" == .record.tmp ||
        "${entry##*/}" =~ ^(postgres-password|readonly-password|compose\.env|[a-z-]+\.log)$ ]] || return 1
-    [[ ! -L "$entry" && -f "$entry" && "$(stat -c '%u:%g:%a:%h' "$entry")" =~ ^(0:0:600:1|1000:1000:400:1)$ ]] || return 1
+    [[ ! -L "$entry" && -f "$entry" && "$(stat -c '%u:%g:%a:%h' "$entry")" =~ ^(0:0:(400|600):1|1000:1000:400:1)$ ]] || return 1
   done
   backup_assert_held_lock || return 1
   rm -rf -- "$directory"
@@ -446,7 +473,7 @@ backup_safe_restic_mount() {
 
 backup_safe_restic_snapshot_path() {
   case "$1" in
-    /sources/state|/sources/state/identity|/sources/state/identity/current|/sources/state/license-pending|/sources/state/license-trust) return 0 ;;
+    /sources/state|/sources/caddy-data|/sources/caddy-config|/sources/state/identity|/sources/state/identity/current|/sources/state/license-pending|/sources/state/license-trust) return 0 ;;
     /sources/state/.aikayun-volume-v1|/sources/state/identity/current/identity.json|\
     /sources/state/identity/current/identity-intent.json|/sources/state/identity/current/instance-private-key.pk8.pem|\
     /sources/state/license-pending/license-pending-aes-256-gcm.json|/sources/state/license-trust/trust-bundle-state.json|\
@@ -506,7 +533,9 @@ backup_validate_restic_command() {
         snapshot="${tail[3]}"; path="${tail[4]}"
       else return 1; fi
       [[ "$snapshot" =~ ^[a-f0-9]{64}$ ]] && backup_safe_restic_snapshot_path "$path" || return 1
-      if [[ "${tail[2]:-}" == --recursive ]]; then [[ "$path" == /sources/state ]] || return 1; fi ;;
+      if [[ "${tail[2]:-}" == --recursive ]]; then
+        [[ "$path" == /sources/state || "$path" == /sources/caddy-data || "$path" == /sources/caddy-config ]] || return 1
+      fi ;;
     dump)
       ((${#tail[@]} == 3)) || return 1
       snapshot="${tail[1]}"; path="${tail[2]}"
@@ -732,6 +761,29 @@ backup_safe_docker_summary() {
   printf '%s' "$summary"
 }
 
+backup_parse_restore_prepare_result() {
+  local output="$1" pattern='^\{"operation":"restore-prepare","backupSetId":"([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})","status":"verified","sourceSnapshotId":"([a-f0-9]{64})","manifestSnapshotId":"([a-f0-9]{64})"\}$'
+  [[ "$output" =~ $pattern ]] || return 1
+  local set_id="${BASH_REMATCH[1]}" source_id="${BASH_REMATCH[2]}" manifest_id="${BASH_REMATCH[3]}"
+  [[ "$set_id" == "${BACKUP_RESTORE_SET_ID:-}" ]] || return 1
+  BACKUP_RESTORE_SOURCE_ID="$source_id"
+  BACKUP_RESTORE_MANIFEST_ID="$manifest_id"
+}
+
+backup_restore_validation_report_matches() {
+  local report="$1" run_id="$2" set_id="$3" source_id="$4" manifest_id="$5"
+  local pattern='^\{"operation":"restore-validation","status":"verified","runId":"'
+  pattern+="$run_id"
+  pattern+='","backupSetId":"'
+  pattern+="$set_id"
+  pattern+='","sourceSnapshotId":"'
+  pattern+="$source_id"
+  pattern+='","manifestSnapshotId":"'
+  pattern+="$manifest_id"
+  pattern+='",'
+  [[ "$report" =~ $pattern ]]
+}
+
 backup_rpc_execute() {
   local id="$1" action="$2"; shift 2
   local -a args=()
@@ -757,11 +809,11 @@ backup_rpc_execute() {
         printf 'Backup verified: %s\n' "${BASH_REMATCH[1]}"
         [[ -z "${BACKUP_ACTIVE_SET_ID:-}" || "${BASH_REMATCH[1]}" == "$BACKUP_ACTIVE_SET_ID" ]] || { backup_rpc_reply "$id" ERR BACKUP_CLIENT_RESULT_MISMATCH; return; }
         BACKUP_ACTIVE_SET_ID=''
-      elif [[ "$output" =~ ^\{"operation":"restore-prepare","backupSetId":"([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})","status":"verified","sourceSnapshotId":"([a-f0-9]{64})","manifestSnapshotId":"([a-f0-9]{64})"\}$ ]]; then
-        [[ "${BASH_REMATCH[1]}" == "${BACKUP_RESTORE_SET_ID:-}" ]] || { backup_rpc_reply "$id" ERR BACKUP_CLIENT_RESULT_MISMATCH; return; }
-        BACKUP_RESTORE_SOURCE_ID="${BASH_REMATCH[2]}"
-        BACKUP_RESTORE_MANIFEST_ID="${BASH_REMATCH[3]}"
+      elif backup_parse_restore_prepare_result "$output"; then
         printf 'Verified backup set for isolated restore: %s\n' "${BACKUP_RESTORE_SET_ID}"
+      elif [[ "$output" == *'"operation":"restore-prepare"'* ]]; then
+        backup_rpc_reply "$id" ERR BACKUP_CLIENT_RESULT_INVALID
+        return
       else
         printf 'Backup operation completed. %s\n' "$output"
       fi

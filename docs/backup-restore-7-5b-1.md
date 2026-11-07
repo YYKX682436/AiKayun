@@ -1,63 +1,86 @@
 # ⑦-5B-1：独立隔离恢复与业务一致性验收
 
-## 范围
+## 范围与客户入口
 
-本阶段只验收已发布、状态为 `verified` 的完整 Restic 备份集合恢复到新的隔离 Compose 项目。它不实现生产原地覆盖恢复、升级、搬服、授权迁移或异常校时，也不代表异地主机灾备验收。
+本阶段仅恢复状态为 `verified` 的完整备份集合到全新、内网隔离的 Compose 项目。未实现生产原地覆盖恢复、升级、搬服、授权迁移或异常校时；本机/Docker-in-Docker 结果不代表异地主机灾备。
 
-客户入口：
+R1 改动限于恢复宿主 broker、恢复验证测试路径和本验收记录；没有改写 ⑦-5A 备份创建算法或历史履约代码。
+
+客户入口为：
 
 ```text
 sudo /opt/aikayun/aikayun backup restore-isolated SET_ID
 sudo /opt/aikayun/aikayun backup cleanup-isolated RUN_ID
 ```
 
-`restore-isolated` 只接受 UUID 备份集合 ID。它通过已签名发行中的 API、PostgreSQL 18、Restic 和恢复 Compose 文件检查发行身份，重新验证完整集合、双快照角色、manifest、源数据库 dump、身份和密钥配对。它从已验证清单固定 source/manifest 快照 ID 后才创建恢复项目。恢复成功后数据库保持停止；`RUN_ID` 可用于显式清理本次演练资源。
+`restore-isolated` 只接受备份集合 UUID。签名发行中的 helper 先验证集合、Restic 仓库和双快照角色，再绑定 manifest、文件校验和、数据库 dump、发行镜像、身份及密钥证据。宿主 broker 持有与安装器共享的操作锁，随后创建独立 project 和带 project/run/scope 标签的卷。恢复后的数据库只供只读验证器访问，成功时数据库停止；失败状态不能变为 `verified`。cleanup 仅删除与 ownership 记录、project、run、允许的 service 和资源标签完全一致的本轮资源。
+
+生产恢复没有客户命令，也没有 DNS 切换或自动经营切换入口。
 
 ## 隔离边界
 
-- 每次使用新且唯一的 Compose project、PostgreSQL 数据卷、凭据卷、状态卷、Caddy 数据卷、部署密钥卷和 manifest/dump 输入卷；创建前拒绝已存在的目标项目或卷。
-- 恢复 Compose 仅含 8 个一次性恢复/校验服务。它不启动商城 API、Web、worker、Caddy 或对外监听端口。
-- 文件恢复器和 Restic 容器使用 `network_mode: none`；验证器与 PostgreSQL 只连 `internal: true` 专用 bridge。Docker inspect 还会核实网络属性、端口绑定、镜像身份、服务集合及资源标签。验证器实际尝试连接 `1.1.1.1:443`，必须失败。
-- PostgreSQL 恢复后新建无写权限的只读登录角色。验证器运行在 UID 1000、只读根文件系统、丢弃全部 capabilities，并使用 `default_transaction_read_only=on`。
-- `validate` 是直接启动发行中的只读校验 CLI，不经过商城服务器或 worker 入口。校验完成后数据库停止，不会与原商城同时经营。
-- 失败时保留本次带唯一 run/project/scope 标签的诊断日志、ownership 记录及停止状态资源；cleanup 必须逐一匹配 ownership 记录、project、run、服务白名单、网络和卷标签，任一项不符就拒绝删除。
+- 每次恢复使用新的 Compose project、PostgreSQL 18 数据卷、凭据卷、状态卷、Caddy data/config 卷、部署密钥卷、dump 卷和 manifest 卷。预先存在的目标卷、网络或 project 资源会在使用前导致 `RESTORE_TARGET_RESOURCE_CONFLICT`。
+- 恢复 Compose 不启动商城 API、Web、worker 或 Caddy，也不发布端口。Restic 和文件输入容器使用 `network_mode: none`；PostgreSQL 与只读验证器只连 `internal: true` 的专用 bridge。
+- 验证器从实际 `1.1.1.1:443` TCP 探测确认外部出站不可达，并检查恢复容器没有端口绑定、镜像/服务身份与预期一致。它以 UID 1000 运行，只读根文件系统、丢弃全部 capabilities，并对 PostgreSQL 使用只读角色和 `default_transaction_read_only=on`。
+- 隔离副本不会启动支付、退款、提现、供应商请求、真实回调、授权激活或续签流程。未决操作只读保留原身份、状态、attempt 与幂等标识。
 
-## 恢复与业务校验
+## 客户入口端到端验收
 
-隔离验证器核对：
+**环境：** 完全可销毁的 Linux Docker-in-Docker 测试环境，Docker Engine 29.9.3，aarch64/overlayfs；客户命令实际从临时 Linux 主机 `/opt/aikayun/aikayun` 执行，连接到独立的内部 Docker Engine。源商城是本轮合成 PostgreSQL 18 Compose fixture：数据库运行，API/Web/Caddy 容器保持停止。没有访问外层现有商城 Docker project 或卷。
 
-- PostgreSQL 18 dump 的 SHA-256/字节数、迁移头、迁移校验清单、数据库 binding、安装身份文件和 Pending Key 文件绑定。
-- 支付与交付密钥环和备份记录摘要；实际解密历史支付渠道、支付尝试凭据、供应商凭据、固定交付版本/记录和其他已支持的加密交付材料。
-- Trust Store 的已初始化发行绑定状态；未配置可信发行 Trust Bundle 的本地 fixture 必须保持为合法的 uninitialized 状态。
-- `local_license_operations`、`local_license_operation_attempts`、加密请求/响应/结果 JWS/中心证据、Pending Key 引用及数据库/文件 trusted-time watermark 配对。
-- 订单项价格/数量快照和订单金额，钱包余额与不可变账本，提现冻结与未决状态，库存预留和库存事件。
-- 公共商品媒体的实际 WebP 文件、私有数字交付文件及历史下载授权引用、采购草稿/采购单附件（若存在）按数据库字节数和 SHA-256。
-- 原订单、订单项、尝试、退款分配、提现尝试、交付记录、幂等身份、付款和授权状态通过恢复前后的逐表行数据 SHA-256 摘要一致性检查。
+**发行：** 使用本轮临时 ECDSA/JWS 签名发行 fixture，通过发行 helper 的文件清单与 SHA-256 校验。Cosign 调用由 test-only `docker` shim 截获并返回成功；真实 Cosign/OIDC、真实 GHCR 拉取及正式商业签名链尚未验证。镜像引用及 digest：
 
-真实 PostgreSQL 18 验收库使用合成但互相关联的数据：待处理文件订单和 `unknown` 支付尝试、成功支付收据及回调证据、处理中退款及保留分配、固定内容加密交付、提现资金冻结及 `unknown` 出款尝试、现金账本、公开媒体变体、可用私有文件和有下载授权的文件型订单。另有带版本化供应商连接、加密历史凭据、映射版本、采购来源、TST 风险预留、`submit` 幂等意图及 `unknown` 执行证据的合成采购订单。采购来源阶段只调用进程内 synthetic transport，不连接供应商。授权 fixture 包含已绑定 Pending Key 的激活/恢复操作、签名 JWS/中心证据及时间水位。恢复后真实解密支付、供应商凭据、采购快照和交付 envelope。
+| 工件 | Digest |
+| --- | --- |
+| API | `ghcr.io/yykx682436/aikayun-api@sha256:cdb82ecceacc64cc708972292f67b22d4e88e6fd0a21274a5d893af3aeee6f3c` |
+| Web | `ghcr.io/yykx682436/aikayun-web@sha256:485689da9baa8ceea11959d30e12eed4f353f30cbfadb4be32e9147540cf9682` |
+| PostgreSQL 18 | `docker.io/library/postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873` |
+| Caddy | `docker.io/library/caddy@sha256:e70b164da81ef698b3ad19af799ea6086ce6d9e48ed4079eb9fe26f6fbf14ee5` |
+| Restic test runtime | `ghcr.io/yykx682436/aikayun-backup-restic@sha256:42a2588b740784d3cd20d178cd47c5afa5eef56060bc368a8e5a8d46f557800e` |
 
-端到端验收在本机 Docker Desktop 的独立 PostgreSQL 18 Compose 项目中运行。数据库共有 4 个订单、4 个订单项、5 个支付尝试、1 个未决退款、1 个未决提现和 1 个 `unknown` 采购操作；交付记录共 2 条，其中 1 条具有文件下载授权。预先选定的业务、采购、授权表逐行规范化 JSON 后计算 SHA-256，恢复前后每张表的行数与摘要一致。公开媒体 3 个 WebP variant、私有数字文件及采购快照分别按数据库 SHA/加密内容核验。
+**备份集合：** `35a8bd9f-3af4-4f67-a8ab-a66ad272be84`；source snapshot `76778dc982929579dba51d52317d04d98b8a0c8efada4d5a73c92efc66056347`；manifest snapshot `508ebf1f853f544c87f96cbae23c0eac7cd87edd908e3a4ffff506f3067cd2b7`。
 
-## 故障闭锁与清理
+成功命令及退出码：
 
-已实现并由单元、broker 和 Compose 配置测试检查的闭锁包括：
+```text
+sudo /opt/aikayun/aikayun backup verify 35a8bd9f-3af4-4f67-a8ab-a66ad272be84                       -> 0
+sudo /opt/aikayun/aikayun backup restore-isolated 35a8bd9f-3af4-4f67-a8ab-a66ad272be84          -> 0
+sudo /opt/aikayun/aikayun backup cleanup-isolated c8f58cd4-ad32-40b5-adb7-6287b3d897a9          -> 0
+```
 
-- Restic source tree 路径检查拒绝 symlink、硬链接、特殊权限、特殊文件和路径穿越；不完整的 source/manifest 快照配对不会被视为已验证。
-- helper 参数拒绝无效恢复 ID；清单 schema 校验拒绝不完整元数据。
-- host broker 限制 Docker 命令、固定已签名 Compose 文件摘要，并校验服务、网络、卷、端口和演练所有权。
-- Compose 输入归一化器会拒绝缺失 dump 或 manifest、manifest 树含链接/特殊文件/额外文件，以及无法归一化的所有者和权限。相关检查已由配置测试检查，未逐项在真实 Compose 中注入。
-- 任一恢复步骤失败都会停在非 `verified` 状态；cleanup 仅删除带有本次 run/project/scope 标签并与 ownership 记录相符的资源。
+最终安装的临时发行包含 broker SHA-256 `22075e1e669dae79c86f2d2389e1f421adee928c5c7eae6b3027c94fd5e9b806`，manifest SHA-256 `0fa242bbd71fadd545b3b9ce7300693a7421faee8ba02a4af095131ed672ef89`。恢复 run `c8f58cd4-ad32-40b5-adb7-6287b3d897a9` 最终记录为 `status=verified`、`code=RESTORE_ISOLATED_VERIFIED`。恢复的 PostgreSQL 容器最终为 `exited`，内部网络标记 `internal=true`，所有容器端口绑定为空。成功后执行客户 cleanup，并确认仅该 run 的容器、网络、8 个命名卷和 ownership 目录已删除。
 
-真实 Compose 故障注入已验证两项：错误 Restic 密码和不存在的 source snapshot 均在恢复源服务退出时失败，不会进入 DB 导入或成功校验；测试只清理由本次随机 project/run/scope 标签证明归属的资源。
+发行验证、共享操作锁、broker 快照身份绑定、完整集合校验、恢复 project 创建、数据库 dump 导入、文件/密钥恢复和只读验证均经过实际客户命令。验证结果摘要：
 
-以下情形没有在真实 Compose 恢复流程中做故障注入，不能算作动态验收通过：缺少 manifest 快照、替换已发布 manifest、错误历史密钥或身份、已有/他 project 的目标卷、恢复中 SIGKILL、真实 ENOSPC、数据库成功而文件失败、文件成功而身份/密钥失败，以及目标发行不兼容的 schema dump。针对它们的防护由逐阶段失败闭锁、输入校验、ownership 检查和恢复后绑定/密钥/文件校验实现；正式生产恢复也尚未实现。
+- PostgreSQL 18 schema head 为 `202611040002_file_check_results`；订单 4、订单项 4、支付尝试 5、退款 1、提现 1、交付 2。
+- `walletLedgerEntries=2`、`inventoryReservations=4`；钱包、库存、退款分配和提现冻结一致性为 `verified`。
+- `unknown` 采购操作 1 条，并保留 procurement request intent、execution evidence、risk reservation/event；supplier operation 为 0。所有未决操作均保留原状态与身份，没有重试外部操作。
+- 历史支付 envelope 解密 7 次、交付 envelope 解密 2 次、采购快照解密 1 次；公开媒体 3 个变体与私有文件对象 1 个通过 SHA-256，文件型下载授权、Trust Store 状态、Pending Key、2 条授权操作和 2 次 attempt、trusted-time watermark 均通过。
+- 报告 `network=egress-blocked`；实际外网 TCP 探测失败。验证报告是从只读验证容器输出的业务摘要，不以行数、文件名或健康状态代替业务验证。
 
-## 验收执行结果
+清理前后，固定备份仓库的文件摘要合计保持 `4f0e24aca555c49e4a47a8c59077ed78b71c9f63d528fbe07140314c24f30555`，仓库大小保持 220257 bytes；合成源数据库容器 ID 与运行状态未变。外层商城 Compose project 未被停止、删除或修改。
 
-2026-11-07 在本机 Docker Desktop 执行 `pnpm verify` 全通过：lint、typecheck、16 个包测试、API 918 项通过（23 项按环境跳过）、release 检查、production build、96 项主浏览器 E2E、alternate-brand、SSR-error、dev-preview 和 production-brand E2E。`test:release` 中的 host broker 与隔离 Compose 配置检查均通过。
+## 动态故障注入
 
-同一轮中的 PostgreSQL 18 端到端备份/恢复测试使用新的临时 project 和卷完成：已验证 source/manifest 快照配对、真实 dump 恢复、隔离验证器的真实外网 TCP 探测失败、恢复前后业务表逐行 SHA-256 一致、订单与未决资金操作保持原状态、媒体/私有文件摘要和历史密钥解密通过。演练 project/卷、测试结果目录、任务专用容器镜像和本轮创建的临时文件已清理；现有商城 Compose project 未停止或改动。
+| 注入 | 实际结果 |
+| --- | --- |
+| 恢复数据库导入后、验证前，对客户 broker shell 发送 SIGKILL | 客户命令 `sudo /opt/aikayun/aikayun backup restore-isolated 35a8bd9f-3af4-4f67-a8ab-a66ad272be84` 退出 137；run `ad4d153a-ad37-447e-a07c-2113643d8a93` 的 PostgreSQL 查询到订单 4，ownership 记录仍为 `started`，未出现 `verified`。`sudo /opt/aikayun/aikayun backup cleanup-isolated ad4d153a-ad37-447e-a07c-2113643d8a93` 退出 0，删除本 run 部分资源。 |
+| 异归属目标数据库卷冲突 | 创建带 `com.aikayun.test-run=75b1r1`、project 为 `foreign-conflict-fixture` 的同名卷。客户 restore 命令对 run `02f615ad-b57e-4460-8d90-7029495fab9f` 退出 1，记录 `RESTORE_TARGET_RESOURCE_CONFLICT`。客户 cleanup 也退出 1 并保留异归属卷；核实卷标签后，测试清理器才移除该注入卷，再由客户 cleanup 退出 0 删除空 run 目录。 |
+| 旧 schema 与目标发行不匹配 | 隔离容器中的 SQL `UPDATE kysely_migration SET name = name || '_r1_incompatible' WHERE name = '202611040002_file_check_results'` 返回 `UPDATE 1`。客户 restore 命令对 run `8f477881-42c4-4bc3-8f85-9696a09cb02e` 退出 1，状态 `failed`；客户 cleanup 退出 0。 |
+| 历史支付密钥错误 | `network=none` 的临时 API 镜像 helper 只在本 run 部署密钥卷中替换 `fixture-history` 的密钥材料，ID、数据库和源备份不变。客户 restore 命令对 run `2d1b278b-f2ec-4b92-b22c-70e279a665c2` 退出 1，状态 `failed`；客户 cleanup 退出 0。 |
+| 单侧失败：文件已恢复、数据库导入未完成 | 只读探针确认 dump 与 manifest 中的 SHA-256/字节数一致，manifest 与两把密钥文件存在；在 `restore-database` 前只停止本 run 的 DB。Compose 导入报错 `could not translate host name "db"`，客户 restore 命令对 run `dfc1bf7b-184b-4da1-93cf-6ab44fe3bf2f` 退出 1，记录 `RESTORE_DATABASE_FAILED`；客户 cleanup 退出 0，没有成功记录。 |
+| 真实磁盘 ENOSPC | **BLOCKED，未执行。** 本轮 Docker-in-Docker overlay 文件系统约有 305 GB 可用空间，恢复卷没有单卷配额；耗尽整个文件系统会危及诊断和清理能力，因此没有声称内核级 ENOSPC 动态通过，也没有用单元测试替代。 |
 
-## 尚未支持的生产边界
+上述失败路径中，业务命令均来自客户运维入口；数据库/文件篡改由仅挂载本轮隔离卷的测试容器或专用测试进程执行。错误 Restic 密码及不存在 source snapshot 的真实 Compose 回归仍保留在 `backup-direct-real-set.integration.test.ts`；本轮 runner 没有配置该集成测试的 `AIKAYUN_FIXTURE_*` 启动参数，因此 `pnpm verify` 明确将它记为 skip。
 
-此功能不提供生产数据覆盖/回滚、原地数据库导入、DNS 切换、真实支付/退款/提现、供应商出站、真实回调接收、授权激活或自动续签入口。上述端到端恢复仅在本机 Docker Desktop 项目与合成数据中完成；不能证明异地主机灾备、远端密钥可用性、外部对象存储恢复或生产切换能力。
+## Restic 元数据契约
+
+先前单独运行的真实 Restic 容器元数据集成检查了 uid/gid、mode、ACL、xattr、硬链接、symlink 和 sparse 文件保存/恢复；本轮 `pnpm verify` 中 `backup-restic-container.integration.test.ts` 因缺少该测试专用 Docker fixture 而明确 skip。统一安全契约要求：在创建 verified source snapshot 前，备份发布路径和恢复 helper 都对完整 state/Caddy data/config 树执行 `verifyDirectSourceSnapshot`；symlink、重复 inode/硬链接、特殊文件、非规范路径和特殊权限会在 verified 发布前拒绝。身份、Pending Key、密钥环和 dump 另要求普通单链接文件。因而 Restic 能表达某种文件对象，并不意味着它能被包含于已验证集合。ACL/xattr 与稀疏内容可由 Restic 恢复，当前校验不因这些元数据本身拒绝。
+
+## 完整验证、CI 与剩余边界
+
+本轮 `pnpm verify` 在隔离 Linux runner 运行，并为需要的集成测试提供独立 loopback PostgreSQL 18 `_test` 数据库和冻结的 AiKayun-License commit `185dac80204f60abbaa63ffeb5af7d7054b685d7`。lint 0 errors/7 warnings、typecheck、build、API 910 passed/31 skipped（87 test files passed/12 skipped）和 7 项 release 检查通过。`apps/api/test/backup-direct-real-set.integration.test.ts` 没有设置 `AIKAYUN_FIXTURE_*` 参数，因此 1 项真实 PG18 备份集成测试明确 skip；这项 runner skip 由上文客户入口真实恢复 run 独立补证。
+
+主 Playwright E2E 为 95 passed/1 failed：`private-file-delivery.spec.ts` 期望 `顾客授权说明.txt`，实际浏览器建议文件名为 `download`。该失败在上一轮也已出现，本轮未改动历史交付/下载逻辑。由于 `pnpm verify` 的 E2E 子命令在该失败处停止，`production-brand` 没有在该完整命令中运行；单独执行 `pnpm --filter @aikayun/web test:e2e:production-brand` 为 1/1 passed。故本轮完整 `pnpm verify` 最终退出码为 1，不能记作全绿。
+
+**正式商业发行尚未验证：** 临时测试发行清单记录的源码提交为 `2550c1c5a64039b2255292626e05fbffb57df137`，宿主 broker 使用本轮工作树内容 SHA-256 `22075e1e669dae79c86f2d2389e1f421adee928c5c7eae6b3027c94fd5e9b806` 并由临时 ECDSA/JWS 密钥签名；Cosign 调用由 test-only shim 返回成功。真实 OIDC 身份、Cosign 签名、GHCR 镜像发布/拉取和正式生产发行根配置不在验收范围。没有执行正式生产恢复、原地覆盖恢复、升级、搬服或异地主机灾备。最终提交 SHA 和 GitHub CI 结果在提交后补入。

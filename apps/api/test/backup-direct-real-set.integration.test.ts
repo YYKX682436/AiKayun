@@ -228,20 +228,29 @@ afterAll(async () => {
 describe.skipIf(!fixture)('real PostgreSQL 18 direct source capture and paired Restic publication', () => {
   it('dumps the real Compose database, snapshots production volumes, restores services, and verifies the pair', async () => {
     const set = randomUUID()
+    const customerBackupRoot = process.env.AIKAYUN_FIXTURE_CUSTOMER_BACKUP_ROOT
     const stagingRoot = join(root, 'staging', set)
     const payload = join(stagingRoot, 'payload')
     const deploymentRoot = join(root, 'deployment')
-    const repositoryRoot = join(root, 'repository')
+    const repositoryRoot = customerBackupRoot ? join(customerBackupRoot, 'repository') : join(root, 'repository')
     const scratch = join(root, 'scratch')
-    const journalDirectory = join(root, 'journal')
-    const publicationDirectory = join(root, 'publications')
-    const manifestDirectory = join(root, 'manifest', set)
-    const localPassword = join(root, 'restic-password')
+    const journalDirectory = customerBackupRoot ? join(customerBackupRoot, 'journal') : join(root, 'journal')
+    const publicationDirectory = customerBackupRoot ? join(customerBackupRoot, 'publications') : join(root, 'publications')
+    const manifestDirectory = customerBackupRoot
+      ? join(customerBackupRoot, 'staging', `set-${set}`, 'manifest')
+      : join(root, 'manifest', set)
+    const customerPasswordFile = process.env.AIKAYUN_FIXTURE_CUSTOMER_PASSWORD_FILE
+    if (customerBackupRoot && !customerPasswordFile) throw new Error('DIRECT_REAL_FIXTURE_CUSTOMER_PASSWORD_DESTINATION_REQUIRED')
+    const localPassword = customerBackupRoot ? customerPasswordFile! : join(root, 'restic-password')
     for (const path of [stagingRoot, payload, deploymentRoot, repositoryRoot, scratch, journalDirectory,
       publicationDirectory, manifestDirectory]) await mkdir(path, { recursive: true, mode: 0o700 })
     await Promise.all([stagingRoot, payload, deploymentRoot, repositoryRoot, scratch, journalDirectory,
       publicationDirectory, manifestDirectory].map(path => chmod(path, 0o700)))
-    await writeFile(localPassword, 'isolated direct Restic password ' + set + '\n', { mode: 0o600 })
+    if (customerBackupRoot) {
+      await chmod(localPassword, 0o600)
+    } else {
+      await writeFile(localPassword, 'isolated direct Restic password ' + set + '\n', { mode: 0o600 })
+    }
     let resticDiagnostic = ''
     const repositoryExecutor = new ResticCommandContainer({ dockerBinary, dockerSocket: socket, image,
       repositoryDirectory: repositoryRoot, passwordFile: localPassword, timeoutMs: 120_000, assertLock: noop,
@@ -260,7 +269,8 @@ describe.skipIf(!fixture)('real PostgreSQL 18 direct source capture and paired R
     await repositoryExecutor.initialize()
     const repository = new LocalResticRepository({ repository: repositoryRoot, passwordFile: localPassword,
       executor: repositoryExecutor, timeoutMs: 120_000 })
-    await repository.initialize()
+    if (customerBackupRoot) await repository.check()
+    else await repository.initialize()
 
     for (const [name, label] of [[stagingVolume, 'backup_staging'], [deploymentVolume, 'backup_deployment']] as const) {
       await docker(['volume', 'create', '--label', 'com.aikayun.fixture=' + project,
@@ -612,17 +622,24 @@ describe.skipIf(!fixture)('real PostgreSQL 18 direct source capture and paired R
     console.info('Isolated restore PostgreSQL 18 accepted; complete selected historical rows match source exactly')
     console.info('Direct PG18 set verified; source and manifest snapshots paired; stopped duration ms:', downtimeMs)
 
-    const customerBackupRoot = process.env.AIKAYUN_FIXTURE_CUSTOMER_BACKUP_ROOT
     if (customerBackupRoot) {
+      const targetRepository = join(customerBackupRoot, 'repository')
       const targetManifest = join(customerBackupRoot, 'staging', `set-${set}`, 'manifest')
-      await cp(repositoryRoot, join(customerBackupRoot, 'repository'), { recursive: true, preserveTimestamps: true })
-      await mkdir(targetManifest, { recursive: true, mode: 0o700 })
-      await cp(manifestDirectory, targetManifest, { recursive: true, preserveTimestamps: true })
-      await cp(publicationDirectory, join(customerBackupRoot, 'publications'), { recursive: true, preserveTimestamps: true })
-      const passwordDestination = process.env.AIKAYUN_FIXTURE_CUSTOMER_PASSWORD_FILE
-      if (!passwordDestination) throw new Error('DIRECT_REAL_FIXTURE_CUSTOMER_PASSWORD_DESTINATION_REQUIRED')
-      await copyFile(localPassword, passwordDestination)
-      await chmod(passwordDestination, 0o600)
+      if (targetRepository !== repositoryRoot) {
+        await cp(repositoryRoot, targetRepository, { recursive: true, preserveTimestamps: true })
+      }
+      if (targetManifest !== manifestDirectory) {
+        await mkdir(targetManifest, { recursive: true, mode: 0o700 })
+        await cp(manifestDirectory, targetManifest, { recursive: true, preserveTimestamps: true })
+      }
+      const targetPublications = join(customerBackupRoot, 'publications')
+      if (targetPublications !== publicationDirectory) {
+        await cp(publicationDirectory, targetPublications, { recursive: true, preserveTimestamps: true })
+      }
+      if (customerPasswordFile && customerPasswordFile !== localPassword) {
+        await copyFile(localPassword, customerPasswordFile)
+        await chmod(customerPasswordFile, 0o600)
+      }
       const countFiles = async (directory: string): Promise<number> => {
         let count = 0
         for (const entry of await readdir(directory, { withFileTypes: true })) {

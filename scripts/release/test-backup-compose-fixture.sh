@@ -86,12 +86,16 @@ fi
 subnet="172.29.$((16#${project: -2})).0/24"
 database_host_port="$(node --input-type=module -e 'import net from "node:net"; const s=net.createServer(); s.listen(0,"127.0.0.1",()=>{process.stdout.write(String(s.address().port));s.close()})')"
 [[ "$database_host_port" =~ ^[1-9][0-9]{0,4}$ ]] || { echo 'Could not allocate an isolated database port' >&2; exit 1; }
-for name in postgres api migrator; do openssl rand -hex 32 > "$work/$name"; done
+openssl rand -base64 32 | tr -d '\n' > "$work/postgres"
+for name in api migrator; do openssl rand -hex 32 > "$work/$name"; done
 for name in payment delivery; do
   printf '{"activeKeyId":"fixture-current","keys":{"fixture-current":"%s","fixture-history":"%s"}}\n' \
     "$(openssl rand -base64 32)" "$(openssl rand -base64 32)" > "$work/$name"
 done
 printf '%s\n' 'test-only-placeholder-bundle' > "$work/trust.jws"
+for name in postgres api migrator payment delivery trust.jws; do
+  chown "$app_uid:$app_gid" "$work/$name"
+done
 cat > "$work/override.yaml" <<YAML
 services:
   state-volume-init:

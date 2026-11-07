@@ -11,7 +11,9 @@ stat() {
   if [[ "${1:-}" == -c && "${2:-}" == '%u:%g:%a:%h' ]]; then
     local mode_links
     case "$(uname -s)" in
-      Darwin) mode_links="$(command stat -f '%Lp:%l' "${3:?}")" || return ;;
+      Darwin)
+        mode_links="$(command stat -f '%Lp:%l' "${3:?}")" || return
+        if [[ -d "${3:?}" ]]; then mode_links="${mode_links%%:*}:2"; fi ;;
       *) mode_links="$(command stat -c '%a:%h' "${3:?}")" || return ;;
     esac
     printf '0:0:%s\n' "$mode_links"
@@ -74,10 +76,36 @@ expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" snapshots
 expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" snapshots --json --tag "aikayun-set-$set_id"
 expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" ls --json "$(printf 'a%.0s' {1..64})" /sources/state
 expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" ls --json --recursive "$(printf 'a%.0s' {1..64})" /sources/state
+expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" ls --json --recursive "$(printf 'a%.0s' {1..64})" /sources/caddy-data
+expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" ls --json --recursive "$(printf 'a%.0s' {1..64})" /sources/caddy-config
 expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" ls --json "$(printf 'a%.0s' {1..64})" /sources/state/license-pending/license-pending-aes-256-gcm.json
 expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" dump "$(printf 'a%.0s' {1..64})" /sources/state/identity/current/identity.json
 expect_rejected backup_validate_restic_command "${restic_command_prefix[@]}" ls --json "$(printf 'a%.0s' {1..64})" /sources/state/private/customer.bin
+expect_rejected backup_validate_restic_command "${restic_command_prefix[@]}" ls --json --recursive "$(printf 'a%.0s' {1..64})" /sources/deployment
+expect_rejected backup_validate_restic_command "${restic_command_prefix[@]}" ls --json "$(printf 'a%.0s' {1..64})" /sources/caddy-config/../state
 expect_rejected backup_validate_restic_command "${restic_command_prefix[@]}" dump "$(printf 'a%.0s' {1..64})" /sources/state/../../etc/passwd
+backup_restore_directory() { printf '%s/restores/%s' "$pin_root" "$1"; }
+chown() { return 0; }
+realpath() { if [[ "${1:-}" == -e ]]; then printf '%s\n' "${2:?}"; else command realpath "$@"; fi; }
+mkdir -m 0700 -p "$pin_root/restores/$operation_id"
+expect_ok backup_restore_write_record "$operation_id" "$(backup_restore_project_name "$operation_id")" \
+  "$set_id" pending pending started RESTORE_SET_VERIFICATION_PENDING
+expect_ok backup_restore_load_record "$operation_id"
+[[ "$BACKUP_RESTORE_STATUS" == started && "$BACKUP_RESTORE_SET_ID" == "$set_id" ]]
+BACKUP_RESTORE_SET_ID="$set_id"
+restore_source_id="$(printf 'a%.0s' {1..64})"
+restore_manifest_id="$(printf 'b%.0s' {1..64})"
+restore_response="{\"operation\":\"restore-prepare\",\"backupSetId\":\"$set_id\",\"status\":\"verified\",\"sourceSnapshotId\":\"$restore_source_id\",\"manifestSnapshotId\":\"$restore_manifest_id\"}"
+expect_ok backup_parse_restore_prepare_result "$restore_response"
+[[ "$BACKUP_RESTORE_SOURCE_ID" == "$restore_source_id" && "$BACKUP_RESTORE_MANIFEST_ID" == "$restore_manifest_id" ]]
+restore_validation_report="{\"operation\":\"restore-validation\",\"status\":\"verified\",\"runId\":\"$operation_id\",\"backupSetId\":\"$set_id\",\"sourceSnapshotId\":\"$restore_source_id\",\"manifestSnapshotId\":\"$restore_manifest_id\",\"schemaHead\":\"fixture\"}"
+expect_ok backup_restore_validation_report_matches "$restore_validation_report" "$operation_id" "$set_id" "$restore_source_id" "$restore_manifest_id"
+expect_rejected backup_restore_validation_report_matches "${restore_validation_report/verified/failed}" "$operation_id" "$set_id" "$restore_source_id" "$restore_manifest_id"
+expect_rejected backup_restore_validation_report_matches "$restore_validation_report" "$operation_id" "$operation_id" "$restore_source_id" "$restore_manifest_id"
+BACKUP_RESTORE_SET_ID="$operation_id"
+expect_rejected backup_parse_restore_prepare_result "$restore_response"
+unset BACKUP_RESTORE_SET_ID BACKUP_RESTORE_SOURCE_ID BACKUP_RESTORE_MANIFEST_ID
+unset -f chown realpath backup_restore_directory
 BACKUP_ACTIVE_SET_ID="$set_id"
 expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" backup --json --tag "aikayun-set-$set_id" \
   --tag aikayun-role-manifest -- "/var/lib/aikayun-backup/staging/set-$set_id/manifest"
@@ -184,6 +212,85 @@ expect_rejected backup_validate_docker_args "${bad_image_create[@]}"
 format='{{json .Id}}'"$tab"'{{json (index .Config.Labels "com.docker.compose.project")}}'"$tab"'{{json (index .Config.Labels "com.docker.compose.service")}}'"$tab"'{{json .State.Status}}'"$tab"'{{json .State.Running}}'"$tab"'{{json .State.Paused}}'"$tab"'{{json .State.Restarting}}'"$tab"'{{json .Mounts}}'
 expect_ok backup_validate_docker_args inspect --type container --format "$format" "$managed_id"
 expect_ok backup_validate_docker_args inspect --type container "$restic_id"
+
+# Restore volumes are created with the same project and drill labels Compose
+# would have applied. Cleanup must also accept the root-owned 0400 bootstrap
+# password and reject unowned contents before removing the run directory.
+volume_run='55555555-5555-4555-8555-555555555555'
+volume_project="$(backup_restore_project_name "$volume_run")"
+volume_scope='isolated-restore-v1'
+restore_volume_fixture='|'
+restore_volume_count=0
+wrong_restore_volume_owner=0
+backup_docker() {
+  local IFS=' ' key value name i
+  local -a args=("$@")
+  [[ "${args[0]:-}" == volume && "${args[1]:-}" == create ]] || return 1
+  name="${args[${#args[@]}-1]}"
+  for ((i=2; i<${#args[@]}-1; i+=2)); do
+    [[ "${args[i]}" == --label ]] || return 1
+    key="${args[i+1]%%=*}"; value="${args[i+1]#*=}"
+    case "$key" in
+      com.docker.compose.project) [[ "$value" == "$volume_project" ]] || return 1 ;;
+      com.docker.compose.volume) [[ "$value" == "${name#${volume_project}_}" ]] || return 1 ;;
+      com.aikayun.restore.run) [[ "$value" == "$volume_run" ]] || return 1 ;;
+      com.aikayun.restore.scope) [[ "$value" == "$volume_scope" ]] || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+  restore_volume_fixture+="$name|"
+  restore_volume_count=$((restore_volume_count + 1))
+}
+backup_docker_quick() {
+  if [[ "${1:-}" == volume && "${2:-}" == create ]]; then backup_docker "$@"; return; fi
+  local name="${3:-}" format="${5:-}" key
+  [[ "${1:-}" == volume && "${2:-}" == inspect && "$restore_volume_count" -gt 0 ]] || return 1
+  [[ "$restore_volume_fixture" == *"|$name|"* ]] || return 1
+  key="${name#${volume_project}_}"
+  case "$format" in
+    '{{.Name}}|{{.Driver}}|{{.Scope}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.volume"}}|{{index .Labels "com.aikayun.restore.run"}}|{{index .Labels "com.aikayun.restore.scope"}}')
+      if ((wrong_restore_volume_owner)); then printf '%s|local|local|foreign|%s|%s|%s' "$name" "$key" "$volume_run" "$volume_scope"
+      else printf '%s|local|local|%s|%s|%s|%s' "$name" "$volume_project" "$key" "$volume_run" "$volume_scope"; fi ;;
+    '{{json .Options}}') printf '{}' ;;
+    *) return 1 ;;
+  esac
+}
+expect_ok backup_restore_create_volumes "$volume_run" "$volume_project"
+[[ "$restore_volume_count" == 8 ]]
+expect_ok backup_restore_assert_volume "${volume_project}_database" "$volume_run" "$volume_project"
+wrong_restore_volume_owner=1
+expect_rejected backup_restore_assert_volume "${volume_project}_database" "$volume_run" "$volume_project"
+wrong_restore_volume_owner=0
+
+backup_assert_held_lock() { return 0; }
+backup_docker_quick() {
+  case "${1:-}" in
+    ps) [[ "${2:-}" == -a ]] && return 0 ;;
+    network|volume) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+clean_run='66666666-6666-4666-8666-666666666666'
+backup_restore_directory() { printf '%s/restores/%s' "$pin_root" "$1"; }
+chown() { return 0; }
+realpath() { if [[ "${1:-}" == -e ]]; then printf '%s\n' "${2:?}"; else command realpath "$@"; fi; }
+mkdir -m 0700 -p "$pin_root/restores/$clean_run"
+expect_ok backup_restore_write_record "$clean_run" "$(backup_restore_project_name "$clean_run")" \
+  "$set_id" "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" failed RESTORE_TEST_FIXTURE
+printf 'test-only secret\n' > "$pin_root/restores/$clean_run/postgres-password"
+chmod 0400 "$pin_root/restores/$clean_run/postgres-password"
+expect_ok backup_cleanup_isolated_restore "$clean_run"
+[[ ! -e "$pin_root/restores/$clean_run" ]]
+
+unsafe_run='77777777-7777-4777-8777-777777777777'
+mkdir -m 0700 -p "$pin_root/restores/$unsafe_run"
+expect_ok backup_restore_write_record "$unsafe_run" "$(backup_restore_project_name "$unsafe_run")" \
+  "$set_id" "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" failed RESTORE_TEST_FIXTURE
+printf 'foreign data\n' > "$pin_root/restores/$unsafe_run/foreign.txt"
+chmod 0600 "$pin_root/restores/$unsafe_run/foreign.txt"
+expect_rejected backup_cleanup_isolated_restore "$unsafe_run"
+[[ -f "$pin_root/restores/$unsafe_run/foreign.txt" ]]
+unset -f backup_docker backup_docker_quick
 
 # A PostgreSQL dump lock heartbeat can arrive while Restic is streaming. The
 # broker must answer that bounded RPC without cancelling or consuming the
