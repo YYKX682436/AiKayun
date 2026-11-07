@@ -83,4 +83,6 @@ sudo /opt/aikayun/aikayun backup cleanup-isolated c8f58cd4-ad32-40b5-adb7-6287b3
 
 主 Playwright E2E 为 95 passed/1 failed：`private-file-delivery.spec.ts` 期望 `顾客授权说明.txt`，实际浏览器建议文件名为 `download`。该失败在上一轮也已出现，本轮未改动历史交付/下载逻辑。由于 `pnpm verify` 的 E2E 子命令在该失败处停止，`production-brand` 没有在该完整命令中运行；单独执行 `pnpm --filter @aikayun/web test:e2e:production-brand` 为 1/1 passed。故本轮完整 `pnpm verify` 最终退出码为 1，不能记作全绿。
 
-**正式商业发行尚未验证：** 临时测试发行清单记录的源码提交为 `2550c1c5a64039b2255292626e05fbffb57df137`，宿主 broker 使用本轮工作树内容 SHA-256 `22075e1e669dae79c86f2d2389e1f421adee928c5c7eae6b3027c94fd5e9b806` 并由临时 ECDSA/JWS 密钥签名；Cosign 调用由 test-only shim 返回成功。真实 OIDC 身份、Cosign 签名、GHCR 镜像发布/拉取和正式生产发行根配置不在验收范围。没有执行正式生产恢复、原地覆盖恢复、升级、搬服或异地主机灾备。最终提交 SHA 和 GitHub CI 结果在提交后补入。
+**GitHub CI：** [Actions run 42340198373](https://github.com/YYKX682436/AiKayun/actions/runs/42340198373) 对提交 `014366b656033a815a808a019fceb671d7063851` 最终为 success。CI 的 `Unit and PostgreSQL integration tests` 步骤中，`backup-direct-real-set.integration.test.ts` 明确 1 skipped，因为没有启用该测试专用 `AIKAYUN_FIXTURE_*` Docker fixture；同一 run 后续的 `Digital delivery SIGKILL, backup restore and untrusted TLS acceptance` 步骤通过。该 CI fixture 不是异地主机灾备；本轮客户入口 PG18 实际恢复证据见上文。
+
+**正式商业发行尚未验证：** 临时测试发行清单记录的源码提交为 `2550c1c5a64039b2255292626e05fbffb57df137`，宿主 broker 使用本轮工作树内容 SHA-256 `22075e1e669dae79c86f2d2389e1f421adee928c5c7eae6b3027c94fd5e9b806` 并由临时 ECDSA/JWS 密钥签名；Cosign 调用由 test-only shim 返回成功。真实 OIDC 身份、Cosign 签名、GHCR 镜像发布/拉取和正式生产发行根配置不在验收范围。没有执行正式生产恢复、原地覆盖恢复、升级、搬服或异地主机灾备。
