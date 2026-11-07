@@ -69,6 +69,21 @@ async function registerCustomer(page: Page, username: string): Promise<void> {
   await expect(page).toHaveURL(/\/account$/u)
 }
 
+async function inspectDownloadResponse(page: Page, url: string) {
+  // Chromium's attachment download event carries a filename but not a Response object;
+  // fetch that same-origin endpoint to inspect its headers and bytes separately.
+  return page.evaluate(async (target) => {
+    const response = await fetch(target, { cache: 'no-store', credentials: 'same-origin' })
+    return {
+      url: response.url,
+      status: response.status,
+      contentType: response.headers.get('content-type'),
+      contentDisposition: response.headers.get('content-disposition'),
+      bytes: Array.from(new Uint8Array(await response.arrayBuffer())),
+    }
+  }, url)
+}
+
 test('uploads and enables through the admin UI, completes a customer order, and downloads verified bytes', async ({ page }) => {
   test.setTimeout(180_000)
   const productName = `私有文件自动交付 ${randomUUID().slice(0, 8)}`
@@ -131,20 +146,71 @@ test('uploads and enables through the admin UI, completes a customer order, and 
   const downloadLink = page.locator('a[download]')
   await expect(downloadLink).toBeVisible()
   await expect(downloadLink).toHaveAttribute('href', /\/api\/v1\/customer\/orders\/.+\/file$/u)
-
+  await expect(downloadLink).toHaveAttribute('download', filename)
+  const downloadUrl = new URL((await downloadLink.getAttribute('href'))!, page.url()).href
+  const firstResponse = await inspectDownloadResponse(page, downloadUrl)
+  const firstResponseSha256 = createHash('sha256').update(Buffer.from(firstResponse.bytes)).digest('hex')
+  const firstEvidence = {
+    download: await downloadLink.getAttribute('download'),
+    href: await downloadLink.getAttribute('href'),
+    url: firstResponse.url,
+    status: firstResponse.status,
+    contentType: firstResponse.contentType,
+    contentDisposition: firstResponse.contentDisposition,
+    bytes: firstResponse.bytes.length,
+    sha256: firstResponseSha256,
+  }
+  expect(firstResponse.status, JSON.stringify(firstEvidence)).toBe(200)
+  expect(firstResponse.contentType, JSON.stringify(firstEvidence)).toContain('text/plain')
+  expect(firstResponse.contentDisposition, JSON.stringify(firstEvidence)).toContain(`filename*=UTF-8''${encodeURIComponent(filename)}`)
+  expect(firstResponseSha256, JSON.stringify(firstEvidence)).toBe(expectedSha256)
+  expect(Buffer.from(firstResponse.bytes)).toEqual(fileBytes)
   const [download] = await Promise.all([page.waitForEvent('download'), downloadLink.click()])
-  expect(download.suggestedFilename()).toBe(filename)
+  const firstDownloadEvidence = JSON.stringify({
+    ...firstEvidence,
+    suggestedFilename: download.suggestedFilename(),
+    browserVersion: page.context().browser()?.version(),
+    node: process.version,
+    platform: process.platform,
+  })
+  console.info(`[private-file-download] ${firstDownloadEvidence}`)
+  expect(download.suggestedFilename(), firstDownloadEvidence).toBe(filename)
   const downloadedPath = await download.path()
   expect(downloadedPath).toBeTruthy()
   const downloadedBytes = await readFile(downloadedPath!)
   expect(downloadedBytes).toEqual(fileBytes)
   expect(createHash('sha256').update(downloadedBytes).digest('hex')).toBe(expectedSha256)
   await expect(downloadLink).toContainText('重新下载')
+  const retryResponse = await inspectDownloadResponse(page, downloadUrl)
+  const retryResponseSha256 = createHash('sha256').update(Buffer.from(retryResponse.bytes)).digest('hex')
+  const retryEvidence = {
+    download: await downloadLink.getAttribute('download'),
+    href: await downloadLink.getAttribute('href'),
+    url: retryResponse.url,
+    status: retryResponse.status,
+    contentType: retryResponse.contentType,
+    contentDisposition: retryResponse.contentDisposition,
+    bytes: retryResponse.bytes.length,
+    sha256: retryResponseSha256,
+  }
+  expect(retryResponse.status, JSON.stringify(retryEvidence)).toBe(200)
+  expect(retryResponse.contentType, JSON.stringify(retryEvidence)).toContain('text/plain')
+  expect(retryResponse.contentDisposition, JSON.stringify(retryEvidence)).toContain(`filename*=UTF-8''${encodeURIComponent(filename)}`)
+  expect(retryResponseSha256, JSON.stringify(retryEvidence)).toBe(expectedSha256)
+  expect(Buffer.from(retryResponse.bytes)).toEqual(fileBytes)
   const [retryDownload] = await Promise.all([
     page.waitForEvent('download', { timeout: 15_000 }),
     downloadLink.click(),
   ])
-  expect(retryDownload.suggestedFilename()).toBe(filename)
+  const retryDownloadEvidence = JSON.stringify({
+    ...retryEvidence,
+    suggestedFilename: retryDownload.suggestedFilename(),
+    browserVersion: page.context().browser()?.version(),
+    node: process.version,
+    platform: process.platform,
+  })
+  console.info(`[private-file-download] ${retryDownloadEvidence}`)
+  expect(retryDownload.suggestedFilename(), retryDownloadEvidence).toBe(filename)
   const retryPath = await retryDownload.path()
   expect(await readFile(retryPath!)).toEqual(fileBytes)
   await expect(downloadLink).toBeVisible()

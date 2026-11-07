@@ -292,7 +292,7 @@ describe('private-file delivery on real PostgreSQL and filesystem', () => {
     const itemIdV1 = orderV1.items[0].id as string
     expect(orderV1.status).toBe('processing')
 
-    const savedV2 = await saveFile(catalog, admin, '交付说明.txt', Buffer.from('第二版内容\n'))
+    const savedV2 = await saveFile(catalog, admin, 'delivery-notes.txt', Buffer.from('第二版内容\n'))
     expect(savedV2.automaticDeliveryReady).toBe(false)
     const staleCheckout = await inject({
       method: 'POST', url: '/api/v1/checkout/orders',
@@ -362,6 +362,8 @@ describe('private-file delivery on real PostgreSQL and filesystem', () => {
       method: 'GET', url: `/api/v1/customer/orders/${orderIdV2}/items/${itemIdV2}/deliveries/${deliveryV2.id}/file`,
       headers: { cookie: customer.cookie },
     })
+    expect(fullV2.statusCode).toBe(200)
+    expect(fullV2.headers['content-disposition']).toBe('attachment; filename="delivery-notes.txt"; filename*=UTF-8\'\'delivery-notes.txt')
     expect(fullV2.rawPayload).toEqual(Buffer.from('第二版内容\n'))
     expect(createHash('sha256').update(fullV2.rawPayload).digest('hex')).toBe(savedV2.currentVersion.sha256)
     expect(deliveriesV1.every(row => row.fulfillment_content_version_id !== deliveryV2.fulfillment_content_version_id)).toBe(true)

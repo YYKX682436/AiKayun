@@ -86,3 +86,40 @@ sudo /opt/aikayun/aikayun backup cleanup-isolated c8f58cd4-ad32-40b5-adb7-6287b3
 **GitHub CI：** [Actions run 42340198373](https://github.com/YYKX682436/AiKayun/actions/runs/42340198373) 对提交 `014366b656033a815a808a019fceb671d7063851` 最终为 success。CI 的 `Unit and PostgreSQL integration tests` 步骤中，`backup-direct-real-set.integration.test.ts` 明确 1 skipped，因为没有启用该测试专用 `AIKAYUN_FIXTURE_*` Docker fixture；同一 run 后续的 `Digital delivery SIGKILL, backup restore and untrusted TLS acceptance` 步骤通过。该 CI fixture 不是异地主机灾备；本轮客户入口 PG18 实际恢复证据见上文。
 
 **正式商业发行尚未验证：** 临时测试发行清单记录的源码提交为 `2550c1c5a64039b2255292626e05fbffb57df137`，宿主 broker 使用本轮工作树内容 SHA-256 `22075e1e669dae79c86f2d2389e1f421adee928c5c7eae6b3027c94fd5e9b806` 并由临时 ECDSA/JWS 密钥签名；Cosign 调用由 test-only shim 返回成功。真实 OIDC 身份、Cosign 签名、GHCR 镜像发布/拉取和正式生产发行根配置不在验收范围。没有执行正式生产恢复、原地覆盖恢复、升级、搬服或异地主机灾备。
+
+## ⑦-5B-1-R2：私有文件下载文件名回归收尾
+
+本轮范围仅为下载文件名 E2E 断言和证据；没有修改私有文件下载 API、授权、私有存储、文件完整性或历史履约实现。测试现同时检查锚点属性、同源下载端点响应及浏览器实际下载事件，不跳过 `suggestedFilename()` 断言。
+
+### 实测响应与差异定位
+
+业务 E2E 的下载按钮 DOM 为 `download="顾客授权说明.txt"`，`href` 为同源路径 `/api/v1/customer/orders/{orderId}/items/{itemId}/deliveries/{deliveryId}/file`。隔离 Postgres 18 fixture 中，首次和重复请求均返回 HTTP 200、`Content-Type: text/plain; charset=utf-8`、95 字节以及相同 SHA-256 `affc7560d89e54efa877f70ca6b33f59f61d1bd572e209460d94ac945110a1c5`。实际 `Content-Disposition` 为：
+
+```text
+attachment; filename="______.txt"; filename*=UTF-8''%E9%A1%BE%E5%AE%A2%E6%8E%88%E6%9D%83%E8%AF%B4%E6%98%8E.txt
+```
+
+该页面的 Playwright `response` / Chromium DevTools 事件不会暴露 attachment 响应，所以测试通过页面上的同源 `fetch` 检查相同 URL 的状态、头部和字节，再继续点击锚点，逐次断言实际 `download.suggestedFilename()`、下载字节和 SHA-256。响应与浏览器环境摘要会随测试输出，失败时也进入断言信息。
+
+| 环境 | 浏览器与服务启动方式 | 首次/重复 `suggestedFilename()` | 结果 |
+| --- | --- | --- | --- |
+| 本机 macOS arm64 | Node 24.22.0、Playwright 1.64.1、Chromium 156.0.8078.4（Playwright Chromium revision 1248）；`PLAYWRIGHT_USE_PRODUCTION_SERVER=true`，测试配置启动独立 Nuxt production server 与 API；HTTP proxy 环境变量未设置 | `顾客授权说明.txt` / `顾客授权说明.txt` | 业务 E2E 通过，响应、字节及摘要正确 |
+| 隔离 Linux arm64 容器 | Debian 12 bookworm、Node 24.22.0、Playwright 1.64.1、Chromium 156.0.8078.4；同一 production server 启动方式，测试 Postgres 位于本轮专用 Docker 网络，容器无外网路由 | `download` / 首次已失败，重复断言未运行 | API 响应仍为 200，DOM 属性、UTF-8 `Content-Disposition`、95 字节和 SHA-256 均正确；下载事件只报告 `download` |
+| 隔离 Linux x64 容器 | Debian 12 bookworm、Node 24.22.0、Playwright 1.64.1、Chromium 156.0.8078.4；同一 production server 启动方式，测试 Postgres 位于本轮专用 Docker 网络；浏览器以容器默认 root 运行 | `download` / 首次已失败，重复断言未运行 | 实际商城 E2E 同样得到 200、正确响应头/字节/摘要，但下载事件报告 `download` |
+| Linux arm64 与 x64 最小静态 HTTP fixture | 不加载 AiKayun；只提供相同 `download` 属性和 `Content-Disposition`，使用 Chromium 156.0.8078.4；x64 fixture 以 UID 1000 运行 | 两边均为 `download` | 均可独立复现，排除了 AiKayun 服务器响应、业务文件和浏览器架构差异 |
+| GitHub Actions | workflow 使用 `ubuntu-24.04` x64、锁定 Playwright 1.64.1 和 `.node-version`；主浏览器任务运行 `PLAYWRIGHT_USE_PRODUCTION_SERVER=true pnpm e2e`，workflow 未设置 HTTP proxy | 旧基线 run `42344017199` 成功（SHA `628a3a2182917e7558ad7219088c2add78baf3ff`）；它早于本轮变更 | 当前提交推送后的精确 SHA/CI 结果在交付记录中核对；旧基线通过不代替本轮 CI |
+
+macOS 主机与 Linux 容器用的是同一 Playwright/Chromium 版本；Linux arm64 与 x64 容器均失败，macOS 主机通过。独立静态 fixture 也只在 Linux 容器复现。故已将根因收窄到本地容器化 Linux Playwright 下载观测环境与主机运行环境的差异，当前证据不支持架构差异或产品响应错误。没有改小预期文件名，也未改产品下载行为；日常本机 E2E 改在原生 macOS 主机执行，Linux CI 在 GitHub host runner 执行。Linux 容器场景保留严格失败证据，不据此宣称通过。
+
+### 定向与完整验证
+
+- 更新后的私有文件 Playwright 回归：本机 macOS arm64 1/1 通过；首个与重复下载都得到 `顾客授权说明.txt`，并通过响应头、字节和 SHA-256 断言。
+- API 私有文件回归：`test/private-file-delivery.integration.test.ts` 10/10 通过，覆盖下载授权、中文 RFC 5987 编码、ASCII `delivery-notes.txt` 文件名、文件字节与 SHA-256。
+- 本机完整浏览器命令 `pnpm e2e`：主套件 96/96、备用品牌 1/1、SSR 错误 4/4、开发预览 1/1 通过；`test:e2e:production-brand` 1/1 通过。
+- `pnpm test:release`：7/7 Node release tests、host broker、隔离 Compose、image metadata 检查通过。
+- `pnpm build` 和 lint/typecheck 通过；lint 为 0 错误、7 条既有 `apps/web/pages/products/[id].vue` 排版警告。
+- 本机完整 `pnpm verify` 已执行，但在 API 测试阶段退出 1：Vitest 为 99 个文件中 85 通过、11 跳过、3 个文件失败（903 tests passed、26 skipped、12 failed）。失败集中于既有备份归档/Restic 路径安全 fixture 在 macOS 文件系统上的路径属性校验（`DEPLOYMENT_ARCHIVE_PATH_INVALID`、`RESTIC_CONTAINER_SOURCE_INVALID`、`RESTIC_READER_PATH_INVALID`），与下载代码无关；因顺序执行在 API 阶段停止，构建、浏览器套件和 production-brand 已按 `pnpm verify` 后续步骤单独执行并通过。Linux x64 CI 将用于核对这些平台相关测试。
+
+### 范围收尾
+
+未修改 PostgreSQL 恢复链、备份创建逻辑或正式生产恢复边界。真实 ENOSPC 故障注入移至⑦-6，必须使用有容量限制的隔离文件系统；禁止通过耗尽宿主机磁盘实现。当前浏览器差异只在隔离 Linux arm64 Playwright 运行时复现，不构成真实客户桌面浏览器或异地主机灾备验收。
