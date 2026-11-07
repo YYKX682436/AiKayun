@@ -6,6 +6,7 @@ import { runFixedRepositoryInitialization } from './fixed-initialization.js'
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const digest = /^[a-f0-9]{64}$/
 export type HelperCommand = { mode: 'create' } | { mode: 'recover-maintenance' } | { mode: 'initialize-repository' } |
+  { mode: 'restore-plan'; set: string } |
   { mode: 'restore-prepare'; set: string } | FixedInspectionCommand
 
 /** No paths, credentials, endpoints, executable names or environment flags are accepted. */
@@ -14,6 +15,7 @@ export function parseHelperCommand(args: string[]): HelperCommand {
   if (args.length === 1 && args[0] === 'initialize-repository') return { mode: 'initialize-repository' }
   if (args.length === 1 && args[0] === 'recover-maintenance') return { mode: 'recover-maintenance' }
   if (args.length === 2 && args[0] === 'restore-prepare' && uuid.test(args[1]!)) return { mode: 'restore-prepare', set: args[1]! }
+  if (args.length === 2 && args[0] === 'restore-plan' && uuid.test(args[1]!)) return { mode: 'restore-plan', set: args[1]! }
   if (args.length === 2 && args[0] === 'verify' && uuid.test(args[1]!)) return { mode: 'verify', set: args[1]! }
   if (args[0] === 'list' && (args.length === 1 || args.length === 2 || args.length === 4)) {
     const limit = args.length === 1 ? 10 : Number(args[1])
@@ -52,11 +54,39 @@ export async function runInternalHelper(command: HelperCommand, signal: AbortSig
     if (signal.aborted || !uuid.test(result.backupSetId) || result.state !== 'restoration_recorded') throw new Error('BACKUP_COMMAND_INCOMPLETE')
     return { operation: 'recover-maintenance' as const, backupSetId: result.backupSetId, state: 'restoration_recorded' as const }
   }
-  const inspection = command.mode === 'restore-prepare'
+  const inspection = command.mode === 'restore-prepare' || command.mode === 'restore-plan'
     ? { mode: 'restore-isolated' as const, set: command.set }
     : command
-  const result = await runFixedProductionInspection(inspection, signal)
+  let result: Awaited<ReturnType<typeof runFixedProductionInspection>>
+  try { result = await runFixedProductionInspection(inspection, signal) }
+  catch (error) {
+    if (command.mode !== 'restore-plan' || signal.aborted) throw error
+    return { operation: 'restore-plan' as const, backupSetId: command.set, backup: 'blocked' as const,
+      compatibility: 'unknown' as const, identity: 'unknown' as const, target: 'unknown' as const,
+      technicalChecks: 'incomplete' as const,
+      businessAfterBackup: 'unknown' as const, pendingExternalOperations: 'unknown' as const,
+      authorization: 'unknown' as const, disk: 'unknown' as const, externalReconciliation: 'required' as const,
+      readiness: 'blocked' as const, automaticRestore: 'blocked' as const }
+  }
   if (signal.aborted) throw new Error('BACKUP_COMMAND_INTERRUPTED')
+  if (command.mode === 'restore-plan') {
+    if (!('backupSetId' in result) || result.backupSetId !== command.set || result.status !== 'verified' ||
+        !('restoreEvidence' in result) || !result.restoreEvidence ||
+        !digest.test(result.restoreEvidence.sourceSnapshotId) || !digest.test(result.restoreEvidence.manifestSnapshotId)) {
+      return { operation: 'restore-plan' as const, backupSetId: command.set, backup: 'blocked' as const,
+        compatibility: 'unknown' as const, identity: 'unknown' as const, target: 'unknown' as const,
+        technicalChecks: 'incomplete' as const,
+        businessAfterBackup: 'unknown' as const, pendingExternalOperations: 'unknown' as const,
+        authorization: 'unknown' as const, disk: 'unknown' as const, externalReconciliation: 'required' as const,
+        readiness: 'blocked' as const, automaticRestore: 'blocked' as const }
+    }
+    return { operation: 'restore-plan' as const, backupSetId: command.set, backup: 'verified' as const,
+      compatibility: 'matched' as const, identity: 'matched' as const, target: 'current-instance' as const,
+      technicalChecks: 'passed' as const,
+      businessAfterBackup: 'unknown' as const, pendingExternalOperations: 'unknown' as const,
+      authorization: 'unknown' as const, disk: 'unknown' as const, externalReconciliation: 'required' as const,
+      readiness: 'blocked' as const, automaticRestore: 'blocked' as const }
+  }
   if (command.mode === 'restore-prepare') {
     if (!('backupSetId' in result) || result.backupSetId !== command.set || result.status !== 'verified' ||
         !('restoreEvidence' in result) || !result.restoreEvidence ||

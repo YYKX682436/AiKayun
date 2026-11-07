@@ -811,6 +811,10 @@ backup_rpc_execute() {
         BACKUP_ACTIVE_SET_ID=''
       elif backup_parse_restore_prepare_result "$output"; then
         printf 'Verified backup set for isolated restore: %s\n' "${BACKUP_RESTORE_SET_ID}"
+      elif [[ "$output" =~ ^\{"operation":"restore-plan","backupSetId":"([0-9a-f-]{36})","backup":"(verified|blocked)","compatibility":"(matched|unknown)","identity":"(matched|unknown)","target":"(current-instance|unknown)","technicalChecks":"(passed|incomplete)","businessAfterBackup":"unknown","pendingExternalOperations":"unknown","authorization":"unknown","disk":"unknown","externalReconciliation":"required","readiness":"blocked","automaticRestore":"blocked"\}$ ]]; then
+        [[ "${BASH_REMATCH[1]}" == "${BACKUP_PLAN_SET_ID:-}" ]] || { backup_rpc_reply "$id" ERR BACKUP_RESTORE_PLAN_INVALID; return; }
+        printf '%s\n' "$output"
+        printf '%s\n' '中文说明：无法证明备份后没有发生新交易；未决支付、采购、提现和授权状态须人工核对。报告不授权覆盖或立即恢复。'
       elif [[ "$output" == *'"operation":"restore-prepare"'* ]]; then
         backup_rpc_reply "$id" ERR BACKUP_CLIENT_RESULT_INVALID
         return
@@ -1016,7 +1020,11 @@ run_backup_host_broker() {
   local backup_root=/var/lib/aikayun-backup credential_root=/etc/aikayun-backup
   local restore_mode=0 helper_operation="$operation" restore_root=/var/lib/aikayun-backup/restores
   local -a helper_args=("$@")
-  [[ "$operation" =~ ^(create|list|verify|restore-isolated|cleanup-isolated|initialize-repository|recover-maintenance)$ ]] || fail 'Unsupported backup command.'
+  [[ "$operation" =~ ^(create|list|verify|restore-plan|restore-isolated|cleanup-isolated|initialize-repository|recover-maintenance)$ ]] || fail 'Unsupported backup command.'
+  if [[ "$operation" == restore-plan ]]; then
+    (($# == 1)) && [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || fail 'restore-plan requires one backup SET_ID.'
+    BACKUP_PLAN_SET_ID="$1"
+  fi
   if [[ "$operation" == cleanup-isolated ]]; then
     (($# == 1)) || fail 'cleanup-isolated requires the run ID printed by restore-isolated.'
     backup_docker_endpoint || fail 'A local Unix-socket Docker Engine is required to clean an isolated restore.'

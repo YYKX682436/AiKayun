@@ -978,15 +978,15 @@ main() {
       setup_token_command
       ;;
     backup)
-      (($# >= 2)) || fail 'Usage: sudo /opt/aikayun/aikayun backup create|list|verify|restore-isolated|cleanup-isolated|initialize-repository|recover-maintenance'
+      (($# >= 2)) || fail 'Usage: sudo /opt/aikayun/aikayun backup create|list|verify|restore-plan|restore-isolated|cleanup-isolated|initialize-repository|recover-maintenance'
       local backup_operation="$2"
       shift 2
       if [[ "$backup_operation" == help || "$backup_operation" == -h || "$backup_operation" == --help ]]; then
-        printf '%s\n' 'Usage: sudo /opt/aikayun/aikayun backup create|list [LIMIT]|verify SET_ID|restore-isolated SET_ID|cleanup-isolated RESTORE_ID|initialize-repository|recover-maintenance'
+        printf '%s\n' 'Usage: sudo /opt/aikayun/aikayun backup create|list [LIMIT]|verify SET_ID|restore-plan SET_ID|restore-isolated SET_ID|cleanup-isolated RESTORE_ID|initialize-repository|recover-maintenance'
         return 0
       fi
       case "$backup_operation" in
-        create|list|verify|restore-isolated|cleanup-isolated|initialize-repository|recover-maintenance) ;;
+        create|list|verify|restore-plan|restore-isolated|cleanup-isolated|initialize-repository|recover-maintenance) ;;
         *) fail 'Unsupported backup command.' ;;
       esac
       require_root

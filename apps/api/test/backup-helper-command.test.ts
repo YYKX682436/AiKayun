@@ -14,14 +14,27 @@ describe('internal helper command protocol', () => {
     expect(parseHelperCommand(['initialize-repository'])).toEqual({ mode: 'initialize-repository' })
     expect(parseHelperCommand(['recover-maintenance'])).toEqual({ mode: 'recover-maintenance' })
     expect(parseHelperCommand(['restore-prepare', set])).toEqual({ mode: 'restore-prepare', set })
+    expect(parseHelperCommand(['restore-plan', set])).toEqual({ mode: 'restore-plan', set })
     expect(parseHelperCommand(['list'])).toEqual({ mode: 'list', limit: 10 })
     expect(parseHelperCommand(['list', '2', set, revision])).toEqual({ mode: 'list', limit: 2, after: set, revision })
     expect(parseHelperCommand(['verify', set])).toEqual({ mode: 'verify', set })
     for (const args of [[], ['create', '/tmp'], ['verify', '../../path'], ['list', '0'], ['list', '11'], ['list', '01'],
       ['list', '1', set], ['list', '1', set, 'bad'], ['restore'], ['restore-prepare', '../../path'],
-      ['restore-prepare', set, '/tmp'], ['create', '--repo=/tmp'], ['list', '1', set, revision, 'extra']]) {
+      ['restore-prepare', set, '/tmp'], ['restore-plan', '../bad'], ['create', '--repo=/tmp'], ['list', '1', set, revision, 'extra']]) {
       expect(() => parseHelperCommand(args)).toThrow('BACKUP_COMMAND_INVALID')
     }
+  })
+  it('reports conservative restore-plan facts and blocks unavailable source checks', async () => {
+    const signal = new AbortController().signal
+    mocked.inspect.mockResolvedValueOnce({ backupSetId: set, status: 'verified', restoreEvidence: { sourceSnapshotId: revision, manifestSnapshotId: 'b'.repeat(64) }, private: 'marker' })
+    const report = await runInternalHelper({ mode: 'restore-plan', set }, signal)
+    expect(report).toEqual({ operation: 'restore-plan', backupSetId: set, backup: 'verified', compatibility: 'matched',
+      identity: 'matched', target: 'current-instance', technicalChecks: 'passed', businessAfterBackup: 'unknown', pendingExternalOperations: 'unknown',
+      authorization: 'unknown', disk: 'unknown', externalReconciliation: 'required', readiness: 'blocked', automaticRestore: 'blocked' })
+    expect(JSON.stringify(report)).not.toContain('marker')
+    expect(mocked.inspect).toHaveBeenCalledWith({ mode: 'restore-isolated', set }, signal)
+    mocked.inspect.mockRejectedValueOnce(new Error('DATABASE_UNAVAILABLE'))
+    expect(await runInternalHelper({ mode: 'restore-plan', set }, signal)).toMatchObject({ backup: 'blocked', businessAfterBackup: 'unknown', readiness: 'blocked', automaticRestore: 'blocked' })
   })
   it('returns only the allowed create and verification fields', async () => {
     const signal = new AbortController().signal
