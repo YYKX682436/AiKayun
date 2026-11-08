@@ -758,12 +758,47 @@ if [[ "$SCENARIO" == upgrade-* ]]; then
       touch "$FAKE_STATE/upgrade-lock-release"
       "$TARGET_DIR/aikayun" upgrade --version 9.8.7-rc.4 > "$HARNESS_ROOT/upgrade-lock-running.log" 2>&1 &
       upgrade_pid=$!
-      for _ in {1..1200}; do
-        [[ -f "$FAKE_STATE/upgrade-lock-held" ]] && break
-        kill -0 "$upgrade_pid" 2>/dev/null || { cat "$HARNESS_ROOT/upgrade-lock-running.log" >&2; exit 1; }
-        sleep 0.05
-      done
-      [[ -f "$FAKE_STATE/upgrade-lock-held" ]] || { cat "$HARNESS_ROOT/upgrade-lock-running.log" >&2; exit 1; }
+      if ! node - "$FAKE_STATE/upgrade-lock-held" "$upgrade_pid" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const marker = process.argv[2];
+const pid = Number(process.argv[3]);
+const deadline = Date.now() + 10 * 60_000;
+let watcher;
+let poll;
+let timeout;
+const finish = (status) => {
+  clearInterval(poll);
+  clearTimeout(timeout);
+  watcher?.close();
+  process.exit(status);
+};
+const alive = () => {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).split(/\s+/)[0] !== 'Z';
+  } catch {
+    return false;
+  }
+};
+const check = () => {
+  if (fs.existsSync(marker)) return finish(0);
+  if (!alive()) return finish(2);
+  if (Date.now() >= deadline) return finish(1);
+};
+watcher = fs.watch(path.dirname(marker), (_event, filename) => {
+  if (filename?.toString() === path.basename(marker)) check();
+});
+poll = setInterval(check, 250);
+timeout = setTimeout(() => finish(1), 10 * 60_000);
+check();
+NODE
+      then
+        cat "$HARNESS_ROOT/upgrade-lock-running.log" >&2
+        printf 'Upgrade did not reach the shared deployment lock before timeout or exited early.\n' >&2
+        wait "$upgrade_pid" || true
+        exit 1
+      fi
       if competing="$("$TARGET_DIR/aikayun" backup list 2>&1)"; then
         printf 'Concurrent backup unexpectedly bypassed the upgrade lock.\n' >&2; exit 1
       else
