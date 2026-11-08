@@ -784,6 +784,14 @@ backup_restore_validation_report_matches() {
   [[ "$report" =~ $pattern ]]
 }
 
+backup_restore_plan_report_matches() {
+  local report="${1:-}" expected_set="${2:-}"
+  local verified_pattern='^\{"operation":"restore-plan","backupSetId":"([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})","backup":"verified","compatibility":"matched","identity":"matched","target":"unknown","technicalChecks":"passed","businessAfterBackup":"unknown","pendingExternalOperations":"unknown","authorization":"unknown","disk":"unknown","externalReconciliation":"required","blockingReason":"target-identity-unverified","readiness":"blocked","automaticRestore":"blocked"\}$'
+  local blocked_pattern='^\{"operation":"restore-plan","backupSetId":"([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})","backup":"blocked","compatibility":"unknown","identity":"unknown","target":"unknown","technicalChecks":"incomplete","businessAfterBackup":"unknown","pendingExternalOperations":"unknown","authorization":"unknown","disk":"unknown","externalReconciliation":"required","blockingReason":"(database-unavailable|identity-or-schema-mismatch|backup-check-failed|backup-not-verified|target-identity-unverified)","readiness":"blocked","automaticRestore":"blocked"\}$'
+  if [[ "$report" =~ $verified_pattern ]]; then [[ "${BASH_REMATCH[1]}" == "$expected_set" ]]; return; fi
+  [[ "$report" =~ $blocked_pattern && "${BASH_REMATCH[1]}" == "$expected_set" ]]
+}
+
 backup_rpc_execute() {
   local id="$1" action="$2"; shift 2
   local -a args=()
@@ -811,10 +819,12 @@ backup_rpc_execute() {
         BACKUP_ACTIVE_SET_ID=''
       elif backup_parse_restore_prepare_result "$output"; then
         printf 'Verified backup set for isolated restore: %s\n' "${BACKUP_RESTORE_SET_ID}"
-      elif [[ "$output" =~ ^\{"operation":"restore-plan","backupSetId":"([0-9a-f-]{36})","backup":"(verified|blocked)","compatibility":"(matched|unknown)","identity":"(matched|unknown)","target":"(current-instance|unknown)","technicalChecks":"(passed|incomplete)","businessAfterBackup":"unknown","pendingExternalOperations":"unknown","authorization":"unknown","disk":"unknown","externalReconciliation":"required","readiness":"blocked","automaticRestore":"blocked"\}$ ]]; then
-        [[ "${BASH_REMATCH[1]}" == "${BACKUP_PLAN_SET_ID:-}" ]] || { backup_rpc_reply "$id" ERR BACKUP_RESTORE_PLAN_INVALID; return; }
+      elif backup_restore_plan_report_matches "$output" "${BACKUP_PLAN_SET_ID:-}"; then
         printf '%s\n' "$output"
-        printf '%s\n' '中文说明：无法证明备份后没有发生新交易；未决支付、采购、提现和授权状态须人工核对。报告不授权覆盖或立即恢复。'
+        printf '%s\n' '中文说明：检查结果已生成（退出码 0 只代表报告生成成功）。readiness=blocked 不授权恢复；无法证明备份后没有发生新交易，未决操作须人工核对。'
+      elif [[ "$output" == *'"operation":"restore-plan"'* ]]; then
+        backup_rpc_reply "$id" ERR BACKUP_RESTORE_PLAN_INVALID
+        return
       elif [[ "$output" == *'"operation":"restore-prepare"'* ]]; then
         backup_rpc_reply "$id" ERR BACKUP_CLIENT_RESULT_INVALID
         return

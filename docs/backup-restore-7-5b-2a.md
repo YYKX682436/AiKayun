@@ -1,25 +1,24 @@
-# ⑦-5B-2A：生产恢复只读预检
+# ⑦-5B-2A：生产恢复只读技术预检
 
-本阶段只提供 `sudo /opt/aikayun/aikayun backup restore-plan SET_ID` 只读预检；不写生产库、不停服务、不操作生产卷、不做恢复、切换或授权迁移。入口复用安装器签名发行验证、共享操作锁、宿主 broker、固定生产 helper、现有双 Restic 快照及完整隔离恢复验证器。预检可短暂使用既有专用 tmpfs staging 进行校验，结束清理该 staging；不创建 Docker 项目或卷。
+## 真实功能
 
-## 报告语义
+客户入口为 `sudo /opt/aikayun/aikayun backup restore-plan SET_ID`。它复用已签名发行校验、共享部署操作锁、宿主 broker、固定生产 helper、完整备份集合及双 Restic 快照验证器，对当前数据库绑定、发行/schema 兼容性和备份技术完整性进行只读检查。
 
-命令输出一行白名单 JSON，随后输出中文说明。敏感凭据、客户数据、原始清单、私钥和密钥材料不进入报告。技术验证成功时，`backup=verified`、`compatibility=matched`、`identity=matched`、`target=current-instance`、`technicalChecks=passed` 仅表示备份与当前已验证实例技术匹配；由于容量、业务事实、未决操作和授权状态仍未知，`readiness=blocked` 且 `automaticRestore=blocked`，不授权立即覆盖。
+可正常生成的报告始终为 `readiness=blocked`、`automaticRestore=blocked`、`target=unknown`。`businessAfterBackup`、`pendingExternalOperations`、`authorization` 和 `disk` 保持 `unknown`，`externalReconciliation=required`。退出码 0 只表示报告生成成功，不表示允许恢复。报告只使用固定字段和阻断原因枚举，不输出原始错误、凭据、客户数据、私钥或密钥材料。
 
-`target`、`businessAfterBackup`、`pendingExternalOperations`、`authorization` 和 `disk` 在本阶段均为 `unknown`，`externalReconciliation=required`。即使当前数据库绑定与备份匹配，整个部署身份可能已被复制到另一台机器，不能单凭本机文件证明同机恢复。备份生成之后可有支付、退款、提现、采购、交付等账外新事实；源库不可读或源服务器损坏时，更不能从旧备份推断其不存在。当前预检没有请求支付服务商、供应商或授权中心；不会通过写请求解决这些未知项。
+检查复用只读数据库连接和专用临时 staging；不停止商城服务、不写业务数据库、不操作生产数据卷、不切换 DNS，也不向支付、供应商或授权中心发送业务写请求。锁丢失、执行中断、清理不确定及无法安全分类的异常不会被转换成正常报告，命令以非零状态失败。宿主 broker 只接受严格白名单报告；协议不符时拒绝成功响应。
 
-任何 helper 校验失败、绑定不匹配、目标数据库失联、命令中断或并发争锁都会 fail closed；若可生成报告，则以 `backup=blocked`、其余不能确认项 `unknown`、`readiness=blocked`、`automaticRestore=blocked` 返回。若客户入口自身的签名、锁、Docker endpoint 或固定路径前置门禁失败，命令直接拒绝且不启动 helper。没有 `--force`、测试 flag 或人工确认绕过。
+## 已通过测试
 
-## 后续正式恢复门槛
+- `backup-helper-command.test.ts`：**21/21**。覆盖安全报告字段、敏感错误脱敏、已知阻断原因、`UnsafeMaintenanceRecoveryError`、锁/发行验证边界丢失、中断和不可分类异常。
+- `scripts/release/test-backup-host-broker.sh`：通过。覆盖 restore-plan 报告白名单和错误协议拒绝。
+- Shell 语法检查及 `git diff --check`：通过。
+- Linux AMD64 安装器入口协议场景退出码 **0**。测试实际经过临时 JWS 签名发行安装的客户 launcher、共享锁和真实宿主 broker；Docker helper 使用受控报告 fixture。verified、数据库不可用、schema/身份/密钥/快照错误报告、命令中断及锁竞争的输出符合阻断协议。
+- 该 Linux 入口测试是**协议模拟**：报告由 helper fixture 提供，没有真实 PG18 备份集合作为客户命令输入，不能证明真实数据故障注入或源业务数据前后摘要一致。
+- 此前完整 `pnpm verify` 已通过；本次提交后的 Linux 完整验证以精确提交 SHA 对应的 GitHub CI 为准。
 
-进入后续受控恢复阶段前，必须单独确认源/目标实例和数据库绑定、具体恢复目标资源所有权、充足磁盘空间、兼容的签名发行与迁移校验、授权中心对目标身份的状态，以及备份之后的新订单和全部外部支付/退款/提现/采购/交付事实。未决操作须按原操作身份人工查单和对账，禁止自动重新提交。授权过期或未知状态不能由本地备份推定为有效。跨服务器恢复是身份迁移，须有授权中心迁移/旧实例失效协议；本阶段不能克隆身份后开放经营。
+## 未支持事项
 
-## 验收结果
+本功能不执行生产数据恢复、覆盖、实例切换、DNS 切换、服务器迁移或授权迁移，也不开放恢复副本经营。备份之后可能发生的新业务事实、未决外部操作、目标机器是否为原机、当前授权中心状态和恢复空间条件不能由本预检证明，因此必须保持未知并阻断。
 
-本机 macOS 的 `pnpm verify` 在独立临时 PostgreSQL 18 `_test` 容器及冻结授权中心 checkout `185dac80204f60abbaa63ffeb5af7d7054b685d7` 下完整结束：lint 0 errors/7 个既有 Vue 排版 warnings；typecheck、build、API/PostgreSQL 924 passed/26 skipped、release 7/7、Playwright 96/96 和 production-brand 1/1 通过。`backup-helper-command.test.ts` 15/15 通过，含七种异常输入 fail-closed 与中断不伪造报告。真实业务未决状态、部署是否曾整体复制、目标容量与当前授权中心状态均保持 unknown，报告 readiness 阻断。输出没有秘密字段。
-
-Linux 专用源路径安全测试没有在 macOS 伪装或放宽。CI run `42382073557` 对代码提交 `3a182f7eaf5a999c368387e6da92f79f060a2761` 总体通过：`backup-source-path-safety.test.ts` 3/3 通过，完整 API/PostgreSQL 916 passed/26 skipped，主浏览器 95 passed 且 reduced-motion 用例一次 flaky 后重试通过；Compose 浏览器 87 passed/9 skipped，持久化与数字交付恢复步骤通过。[GitHub Actions](https://github.com/YYKX682436/AiKayun/actions/runs/42382073557)。随后文档提交 `b9bbd7f0b28b4750928bba299f6347a483f0eaa3` 对应 run `42386395139` 通过。明确跳过的包括 `backup-direct-real-set.integration.test.ts` 和 Restic/卷归档集成 fixture，因此此处 CI 不能证明客户恢复计划命令对真实集合的端到端故障矩阵。
-
-当前新增回归对真实 PG18 inspected result 的协议脱敏、双快照 evidence 成功形态、DB unavailable 阻断形态作单元验证；七类恢复风险中，备份后交易/未决外部操作/授权中心实时状态/目标磁盘容量没有自动 oracle，均明确输出 unknown 并阻断。后续需在隔离 Linux 与合成 backup fixture 中逐项演练 schema/身份/key mismatch、跨实例拒绝、并发锁和中断；这些未执行的动态注入不标作通过。
-
-真实生产卷未读写、任何服务未停止、未调用外部写端点、未覆盖数据库或切换流量。MacOS `pnpm verify` 的结果不替代 Linux 专用安全门禁或精确 SHA CI。不得因路径差异削弱安全检查。
+真实 PostgreSQL 18 与双 Restic 快照的完整客户恢复演练、七类灾难注入及源数据前后不变性验证**尚未通过**。在任何后续生产恢复方案获准前，这些真实灾难测试必须作为独立验收门槛完成；本阶段的协议模拟或 CI 通过不能替代它们。

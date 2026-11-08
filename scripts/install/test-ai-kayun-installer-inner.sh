@@ -97,6 +97,11 @@ fi
 if [[ "$1" == pull ]]; then event docker_pull; exit 0; fi
 if [[ "$1" == network && "$2" == inspect ]]; then
   event docker_network_inspect
+  if [[ -e "$AIKAYUN_TEST_STATE/restore-plan-enabled" ]]; then
+    event restore_plan_network_fixture
+    printf 'aikayun private aikayun_private local\n'
+    exit 0
+  fi
   if [[ "${AIKAYUN_TEST_BROKER_HOLD:-}" == 1 ]]; then
     : > "$AIKAYUN_TEST_STATE/broker-waiting"
     while [[ -e "$AIKAYUN_TEST_STATE/broker-hold" ]]; do sleep 0.05; done
@@ -186,6 +191,34 @@ fi
 if [[ "$1" == rm ]]; then event container_remove; exit 0; fi
 
 if [[ "$1" == run ]]; then
+  if [[ "$*" == *'/app/dist/backup/helper-cli.js'* && " $* " == *' restore-plan '* ]]; then
+    event restore_plan_helper_entered
+    plan_set="$(cat "$AIKAYUN_TEST_STATE/restore-plan-set")"
+    plan_mode="$(cat "$AIKAYUN_TEST_STATE/restore-plan-mode")"
+    case "$plan_mode" in
+      verified|after-transaction|pending-operation|authorization-unknown|target-clone)
+        report="{\"operation\":\"restore-plan\",\"backupSetId\":\"$plan_set\",\"backup\":\"verified\",\"compatibility\":\"matched\",\"identity\":\"matched\",\"target\":\"unknown\",\"technicalChecks\":\"passed\",\"businessAfterBackup\":\"unknown\",\"pendingExternalOperations\":\"unknown\",\"authorization\":\"unknown\",\"disk\":\"unknown\",\"externalReconciliation\":\"required\",\"blockingReason\":\"target-identity-unverified\",\"readiness\":\"blocked\",\"automaticRestore\":\"blocked\"}" ;;
+      database-unavailable)
+        report="{\"operation\":\"restore-plan\",\"backupSetId\":\"$plan_set\",\"backup\":\"blocked\",\"compatibility\":\"unknown\",\"identity\":\"unknown\",\"target\":\"unknown\",\"technicalChecks\":\"incomplete\",\"businessAfterBackup\":\"unknown\",\"pendingExternalOperations\":\"unknown\",\"authorization\":\"unknown\",\"disk\":\"unknown\",\"externalReconciliation\":\"required\",\"blockingReason\":\"database-unavailable\",\"readiness\":\"blocked\",\"automaticRestore\":\"blocked\"}" ;;
+      schema-mismatch|identity-mismatch)
+        report="{\"operation\":\"restore-plan\",\"backupSetId\":\"$plan_set\",\"backup\":\"blocked\",\"compatibility\":\"unknown\",\"identity\":\"unknown\",\"target\":\"unknown\",\"technicalChecks\":\"incomplete\",\"businessAfterBackup\":\"unknown\",\"pendingExternalOperations\":\"unknown\",\"authorization\":\"unknown\",\"disk\":\"unknown\",\"externalReconciliation\":\"required\",\"blockingReason\":\"identity-or-schema-mismatch\",\"readiness\":\"blocked\",\"automaticRestore\":\"blocked\"}" ;;
+      historical-key-invalid|snapshot-corrupt|key-or-snapshot-corrupt)
+        report="{\"operation\":\"restore-plan\",\"backupSetId\":\"$plan_set\",\"backup\":\"blocked\",\"compatibility\":\"unknown\",\"identity\":\"unknown\",\"target\":\"unknown\",\"technicalChecks\":\"incomplete\",\"businessAfterBackup\":\"unknown\",\"pendingExternalOperations\":\"unknown\",\"authorization\":\"unknown\",\"disk\":\"unknown\",\"externalReconciliation\":\"required\",\"blockingReason\":\"backup-check-failed\",\"readiness\":\"blocked\",\"automaticRestore\":\"blocked\"}" ;;
+      interrupt) exit 130 ;;
+      lockhold)
+        report="{\"operation\":\"restore-plan\",\"backupSetId\":\"$plan_set\",\"backup\":\"verified\",\"compatibility\":\"matched\",\"identity\":\"matched\",\"target\":\"unknown\",\"technicalChecks\":\"passed\",\"businessAfterBackup\":\"unknown\",\"pendingExternalOperations\":\"unknown\",\"authorization\":\"unknown\",\"disk\":\"unknown\",\"externalReconciliation\":\"required\",\"blockingReason\":\"target-identity-unverified\",\"readiness\":\"blocked\",\"automaticRestore\":\"blocked\"}" ;;
+      *) exit 2 ;;
+    esac
+    if [[ "$plan_mode" == lockhold ]]; then
+      : > "$AIKAYUN_TEST_STATE/restore-plan-helper-waiting"
+      while [[ -e "$AIKAYUN_TEST_STATE/restore-plan-helper-hold" ]]; do sleep 0.05; done
+    fi
+    printf 'REQ\t1\tclient-result\t%s\n' "$(printf '%s' "$report" | base64 -w0)"
+    IFS= read -r response || exit 1
+    [[ "$response" == $'RES\t1\tOK\t' ]] || exit 1
+    event "restore_plan_helper_result:$plan_mode"
+    exit 0
+  fi
   shift
   mount_source=''
   mount_target=''
@@ -622,7 +655,77 @@ if [[ "$SCENARIO" == backup-customer-command-integrity ]]; then
   fi
   printf 'Backup command fixture: held backup exited fail-closed after the network check.\n'
 
-  printf 'Signed customer launcher verified artifacts before broker entry; altered, missing, and invalid-signature artifacts were rejected before service operations. Backup and installer lock contention passed.\n'
+  # Exercise the installed customer entrypoint and the real signed host
+  # broker protocol. The isolated fake Docker helper only supplies bounded
+  # report payloads; it never provides a live database or external service.
+  plan_set='99999999-9999-4999-8999-999999999999'
+  plan_command() {
+    printf '%s\n' "$plan_set" > "$FAKE_STATE/restore-plan-set"
+    printf '%s\n' "$1" > "$FAKE_STATE/restore-plan-mode"
+    : > "$FAKE_STATE/restore-plan-enabled"
+    "$TARGET_DIR/aikayun" backup restore-plan "$plan_set"
+  }
+  snapshot_drill_state() {
+    find "$TARGET_DIR/secrets" "$FAKE_STATE/identity" "$FAKE_STATE/volumes" /var/lib/aikayun-backup/repository \
+      /var/lib/aikayun-backup/publications -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
+  }
+  before_plan_snapshot="$(snapshot_drill_state)"
+  for plan_case in verified after-transaction pending-operation authorization-unknown target-clone \
+      database-unavailable schema-mismatch identity-mismatch historical-key-invalid snapshot-corrupt; do
+    plan_output="$(plan_command "$plan_case")"
+    plan_json="$(printf '%s\n' "$plan_output" | sed -n '/^{"operation":"restore-plan"/p')"
+    [[ -n "$plan_json" ]] || { printf 'restore-plan scenario %s omitted machine report.\n' "$plan_case" >&2; exit 1; }
+    printf 'Customer command: sudo /opt/aikayun/aikayun backup restore-plan %s scenario=%s exit=0 report=%s\n' \
+      "$plan_set" "$plan_case" "$plan_json"
+    printf '%s\n' "$plan_output" | CASE="$plan_case" node -e 'let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{const l=d.split("\n").find(x=>x.startsWith("{")); const r=JSON.parse(l); if(r.readiness!=="blocked"||r.automaticRestore!=="blocked"||r.target!=="unknown"||r.businessAfterBackup!=="unknown"||r.pendingExternalOperations!=="unknown"||r.authorization!=="unknown"||r.disk!=="unknown"||r.externalReconciliation!=="required")process.exit(1); if(process.env.CASE==="verified" && (r.backup!=="verified"||r.technicalChecks!=="passed"))process.exit(1); if(process.env.CASE==="database-unavailable" && (r.backup!=="blocked"||r.blockingReason!=="database-unavailable"))process.exit(1); if(["schema-mismatch","identity-mismatch"].includes(process.env.CASE) && r.blockingReason!=="identity-or-schema-mismatch")process.exit(1); if(["historical-key-invalid","snapshot-corrupt"].includes(process.env.CASE) && r.blockingReason!=="backup-check-failed")process.exit(1); if(["after-transaction","pending-operation"].includes(process.env.CASE) && r.backup!=="verified")process.exit(1); if(process.env.CASE==="target-clone" && r.target!=="unknown")process.exit(1);})'
+    [[ "$(snapshot_drill_state)" == "$before_plan_snapshot" ]]
+    ! grep -Eq '^(compose_down:|docker_stop:|service_stop:|volume_create:|compose_up:|docker_pull)' "$EVENT_LOG"
+  done
+  printf '%s\n' "$plan_set" > "$FAKE_STATE/restore-plan-set"
+  printf '%s\n' interrupt > "$FAKE_STATE/restore-plan-mode"
+  if "$TARGET_DIR/aikayun" backup restore-plan "$plan_set" > "$HARNESS_ROOT/restore-plan-interrupt.log" 2>&1; then
+    printf 'Interrupted restore-plan fixture unexpectedly returned success.\n' >&2; exit 1
+  else
+    plan_interrupt_status=$?
+  fi
+  ! grep -Fq '"operation":"restore-plan"' "$HARNESS_ROOT/restore-plan-interrupt.log"
+  printf 'Customer command interruption scenario=%s exit=%s report=none\n' interrupt "$plan_interrupt_status"
+
+  touch "$FAKE_STATE/restore-plan-helper-hold"
+  printf '%s\n' "$plan_set" > "$FAKE_STATE/restore-plan-set"
+  printf '%s\n' lockhold > "$FAKE_STATE/restore-plan-mode"
+  "$TARGET_DIR/aikayun" backup restore-plan "$plan_set" > "$HARNESS_ROOT/restore-plan-held.log" 2>&1 &
+  plan_pid=$!
+  for _ in {1..1200}; do
+    [[ -f "$FAKE_STATE/restore-plan-helper-waiting" ]] && break
+    kill -0 "$plan_pid" 2>/dev/null || { cat "$HARNESS_ROOT/restore-plan-held.log" >&2; exit 1; }
+    sleep 0.05
+  done
+  [[ -f "$FAKE_STATE/restore-plan-helper-waiting" ]] || { printf 'restore-plan helper did not reach its hold.\n' >&2; exit 1; }
+  if competing="$("$TARGET_DIR/aikayun" backup restore-plan "$plan_set" 2>&1)"; then
+    printf 'Concurrent restore-plan unexpectedly bypassed the shared lock.\n' >&2; exit 1
+  else
+    plan_competing_status=$?
+  fi
+  grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' <<< "$competing"
+  installer_competing="$(run_installer 1 status)"
+  grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' "$installer_competing"
+  if create_competing="$("$TARGET_DIR/aikayun" backup create 2>&1)"; then
+    printf 'Concurrent backup create unexpectedly bypassed the shared lock.\n' >&2; exit 1
+  else
+    create_competing_status=$?
+  fi
+  grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' <<< "$create_competing"
+  rm -f "$FAKE_STATE/restore-plan-helper-hold"
+  wait "$plan_pid"
+  after_plan_snapshot="$(snapshot_drill_state)"
+  [[ "$after_plan_snapshot" == "$before_plan_snapshot" ]]
+  printf 'Customer concurrent restore-plan exit=%s; backup create exit=%s; helper completed blocked report after lock release. Fixture file snapshot unchanged.\n' \
+    "$plan_competing_status" "$create_competing_status"
+  printf 'Restore-plan fixture source file snapshot SHA-256: before=%s after=%s; no Docker stop/create/pull/Compose mutation event observed.\n' \
+    "$before_plan_snapshot" "$after_plan_snapshot"
+
+  printf 'Signed customer launcher ran restore-plan in isolated blocked/unknown scenarios; malformed/unauthorized restoration states stayed blocked, interrupted execution failed closed, and concurrent backup/installer commands observed the shared lock. Fixture source material stayed unchanged.\n'
   exit 0
 fi
 

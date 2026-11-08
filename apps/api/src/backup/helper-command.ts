@@ -2,6 +2,7 @@ import { runFixedProductionBackup } from './fixed-runtime.js'
 import { runFixedProductionInspection, type FixedInspectionCommand } from './fixed-inspection.js'
 import { runFixedMaintenanceRecovery } from './fixed-recovery.js'
 import { runFixedRepositoryInitialization } from './fixed-initialization.js'
+import { UnsafeMaintenanceRecoveryError } from './maintenance-errors.js'
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const digest = /^[a-f0-9]{64}$/
@@ -60,12 +61,25 @@ export async function runInternalHelper(command: HelperCommand, signal: AbortSig
   let result: Awaited<ReturnType<typeof runFixedProductionInspection>>
   try { result = await runFixedProductionInspection(inspection, signal) }
   catch (error) {
-    if (command.mode !== 'restore-plan' || signal.aborted) throw error
+    if (command.mode !== 'restore-plan' || signal.aborted || error instanceof UnsafeMaintenanceRecoveryError) throw error
+    const message = error && typeof error === 'object' && 'message' in error && typeof error.message === 'string' ? error.message : ''
+    if (['BACKUP_LOCK_LOST', 'BACKUP_INSPECTION_LOCK_UNVERIFIED', 'BACKUP_DEPLOYMENT_CHANGED', 'BACKUP_HOST_CHANNEL_CLOSED'].includes(message)) {
+      throw new UnsafeMaintenanceRecoveryError('INSTALLER_VERIFICATION_UNCERTAIN')
+    }
+    const errorCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : ''
+    const blockingReason = message === 'BACKUP_DATABASE_TARGET_UNVERIFIED' ||
+      ['ECONNREFUSED', 'ETIMEDOUT', '08001', '08006', '57P01', '57P03'].includes(errorCode) ? 'database-unavailable' as const
+      : ['BACKUP_INSPECTION_RELEASE_OR_BINDING_MISMATCH', 'RESTORE_IDENTITY_MISMATCH', 'RESTORE_SCHEMA_INCOMPATIBLE'].includes(message) ? 'identity-or-schema-mismatch' as const
+        : message === 'RESTORE_TARGET_IDENTITY_UNKNOWN' ? 'target-identity-unverified' as const
+        : /^(?:RESTORE|RESTIC|BACKUP)_[A-Z0-9_]+$/u.test(message) ? 'backup-check-failed' as const
+          : undefined
+    if (!blockingReason) throw new Error('BACKUP_RESTORE_PLAN_CHECK_UNCLASSIFIED', { cause: error })
     return { operation: 'restore-plan' as const, backupSetId: command.set, backup: 'blocked' as const,
       compatibility: 'unknown' as const, identity: 'unknown' as const, target: 'unknown' as const,
       technicalChecks: 'incomplete' as const,
       businessAfterBackup: 'unknown' as const, pendingExternalOperations: 'unknown' as const,
       authorization: 'unknown' as const, disk: 'unknown' as const, externalReconciliation: 'required' as const,
+      blockingReason,
       readiness: 'blocked' as const, automaticRestore: 'blocked' as const }
   }
   if (signal.aborted) throw new Error('BACKUP_COMMAND_INTERRUPTED')
@@ -78,6 +92,7 @@ export async function runInternalHelper(command: HelperCommand, signal: AbortSig
         technicalChecks: 'incomplete' as const,
         businessAfterBackup: 'unknown' as const, pendingExternalOperations: 'unknown' as const,
         authorization: 'unknown' as const, disk: 'unknown' as const, externalReconciliation: 'required' as const,
+        blockingReason: 'backup-not-verified' as const,
         readiness: 'blocked' as const, automaticRestore: 'blocked' as const }
     }
     return { operation: 'restore-plan' as const, backupSetId: command.set, backup: 'verified' as const,
@@ -85,6 +100,7 @@ export async function runInternalHelper(command: HelperCommand, signal: AbortSig
       technicalChecks: 'passed' as const,
       businessAfterBackup: 'unknown' as const, pendingExternalOperations: 'unknown' as const,
       authorization: 'unknown' as const, disk: 'unknown' as const, externalReconciliation: 'required' as const,
+      blockingReason: 'target-identity-unverified' as const,
       readiness: 'blocked' as const, automaticRestore: 'blocked' as const }
   }
   if (command.mode === 'restore-prepare') {

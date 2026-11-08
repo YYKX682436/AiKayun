@@ -98,6 +98,35 @@ restore_manifest_id="$(printf 'b%.0s' {1..64})"
 restore_response="{\"operation\":\"restore-prepare\",\"backupSetId\":\"$set_id\",\"status\":\"verified\",\"sourceSnapshotId\":\"$restore_source_id\",\"manifestSnapshotId\":\"$restore_manifest_id\"}"
 expect_ok backup_parse_restore_prepare_result "$restore_response"
 [[ "$BACKUP_RESTORE_SOURCE_ID" == "$restore_source_id" && "$BACKUP_RESTORE_MANIFEST_ID" == "$restore_manifest_id" ]]
+BACKUP_PLAN_SET_ID="$set_id"
+restore_plan_report="{\"operation\":\"restore-plan\",\"backupSetId\":\"$set_id\",\"backup\":\"verified\",\"compatibility\":\"matched\",\"identity\":\"matched\",\"target\":\"unknown\",\"technicalChecks\":\"passed\",\"businessAfterBackup\":\"unknown\",\"pendingExternalOperations\":\"unknown\",\"authorization\":\"unknown\",\"disk\":\"unknown\",\"externalReconciliation\":\"required\",\"blockingReason\":\"target-identity-unverified\",\"readiness\":\"blocked\",\"automaticRestore\":\"blocked\"}"
+expect_ok backup_restore_plan_report_matches "$restore_plan_report" "$set_id"
+invalid_plan="${restore_plan_report/\"target\":\"unknown\"/\"target\":\"current-instance\"}"
+expect_rejected backup_restore_plan_report_matches "$invalid_plan" "$set_id"
+invalid_plan="${restore_plan_report/\"automaticRestore\":\"blocked\"/\"automaticRestore\":\"allowed\"}"
+expect_rejected backup_restore_plan_report_matches "$invalid_plan" "$set_id"
+invalid_plan="${restore_plan_report/\"backup\":\"verified\"/\"backup\":\"blocked\"}"
+expect_rejected backup_restore_plan_report_matches "$invalid_plan" "$set_id"
+blocked_plan="${restore_plan_report/\"backup\":\"verified\"/\"backup\":\"blocked\"}"
+blocked_plan="${blocked_plan/\"compatibility\":\"matched\"/\"compatibility\":\"unknown\"}"
+blocked_plan="${blocked_plan/\"identity\":\"matched\"/\"identity\":\"unknown\"}"
+blocked_plan="${blocked_plan/\"technicalChecks\":\"passed\"/\"technicalChecks\":\"incomplete\"}"
+blocked_plan="${blocked_plan/\"blockingReason\":\"target-identity-unverified\"/\"blockingReason\":\"database-unavailable\"}"
+expect_ok backup_restore_plan_report_matches "$blocked_plan" "$set_id"
+rpc_reply_file="$(mktemp)"
+exec {rpc_reply_fd}>"$rpc_reply_file"
+BACKUP_HELPER_IN="$rpc_reply_fd"
+plan_output="$(backup_rpc_execute 91 client-result "$(printf '%s' "$restore_plan_report" | base64 -w0)")"
+exec {rpc_reply_fd}>&-
+[[ "$plan_output" == *'"readiness":"blocked"'* && "$plan_output" == *'退出码 0 只代表报告生成成功'* ]]
+[[ "$(cat "$rpc_reply_file")" == $'RES\t91\tOK\t' ]]
+exec {rpc_reply_fd}>"$rpc_reply_file"
+invalid_plan="${restore_plan_report/\"target\":\"unknown\"/\"target\":\"current-instance\"}"
+invalid_output="$(backup_rpc_execute 92 client-result "$(printf '%s' "$invalid_plan" | base64 -w0)" 2>/dev/null)"
+exec {rpc_reply_fd}>&-
+[[ -z "$invalid_output" && "$(cat "$rpc_reply_file")" == $'RES\t92\tERR\tBACKUP_RESTORE_PLAN_INVALID' ]]
+rm -f -- "$rpc_reply_file"
+unset BACKUP_PLAN_SET_ID
 restore_validation_report="{\"operation\":\"restore-validation\",\"status\":\"verified\",\"runId\":\"$operation_id\",\"backupSetId\":\"$set_id\",\"sourceSnapshotId\":\"$restore_source_id\",\"manifestSnapshotId\":\"$restore_manifest_id\",\"schemaHead\":\"fixture\"}"
 expect_ok backup_restore_validation_report_matches "$restore_validation_report" "$operation_id" "$set_id" "$restore_source_id" "$restore_manifest_id"
 expect_rejected backup_restore_validation_report_matches "${restore_validation_report/verified/failed}" "$operation_id" "$set_id" "$restore_source_id" "$restore_manifest_id"
