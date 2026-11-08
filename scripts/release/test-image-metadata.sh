@@ -12,6 +12,8 @@ version='1.2.3'
 build_time='2026-11-05T00:00:00.000Z'
 GITHUB_SHA=$(printf 'c%.0s' {1..40})
 AIKAYUN_RELEASE_ORIGIN='https://release.vendor.com'
+AIKAYUN_UPGRADE_FROM_RELEASES='aikayun-1.2.2,aikayun-1.2.2-rc.1'
+AIKAYUN_ROLLBACK_TO_RELEASES='aikayun-1.2.2'
 AIKAYUN_LICENSE_CENTER_SIGNER_KIDS='["BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"]'
 a=$(printf 'a%.0s' {1..64}); b=$(printf 'b%.0s' {1..64})
 api_index_ref="ghcr.io/yykx682436/aikayun-api@sha256:$a"
@@ -36,6 +38,8 @@ printf 'fixture' > "$work/artifacts/test.txt"
 node "$source_root/apps/api/scripts/release/create-manifest.mjs" "$work/image-metadata.json" "$work/artifacts" "$work/migrations.json" "$work/config.json" "$work/release-manifest.json" >/dev/null
 [[ "$(jq -r '.images.api.platform_digests["linux/amd64"]' "$work/release-manifest.json")" == "$a" ]]
 [[ "$(jq -r '.images.backup.reference' "$work/release-manifest.json")" == "$backup_index_ref" ]]
+[[ "$(jq -r '.database.upgrade_from_releases | join(",")' "$work/release-manifest.json")" == "$AIKAYUN_UPGRADE_FROM_RELEASES" ]]
+[[ "$(jq -r '.database.rollback_to_releases | join(",")' "$work/release-manifest.json")" == "$AIKAYUN_ROLLBACK_TO_RELEASES" ]]
 for image in api web postgres caddy backup; do
   for arch in amd64 arm64; do
     var="${image}_${arch}"; original=${!var}; printf -v "$var" '%s' 'sha256:invalid'

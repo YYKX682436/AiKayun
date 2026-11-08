@@ -12,6 +12,16 @@ on:
         description: Type PUBLISH-<version> after reviewing the source and protected release settings
         required: true
         type: string
+      upgrade_from_releases:
+        description: Comma-separated signed release IDs that this version explicitly accepts
+        required: false
+        default: ''
+        type: string
+      rollback_to_releases:
+        description: Comma-separated signed release IDs that this version supports rolling back to
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -163,6 +173,8 @@ jobs:
           AIKAYUN_RELEASE_POLICY_READ_TOKEN: ${{ secrets.AIKAYUN_RELEASE_POLICY_READ_TOKEN }}
           AIKAYUN_RELEASE_VERSION: ${{ inputs.version }}
           AIKAYUN_RELEASE_CONFIRMATION: ${{ inputs.confirmation }}
+          AIKAYUN_UPGRADE_FROM_RELEASES: ${{ inputs.upgrade_from_releases }}
+          AIKAYUN_ROLLBACK_TO_RELEASES: ${{ inputs.rollback_to_releases }}
         run: scripts/release/build-release-candidate.sh "$AIKAYUN_RELEASE_VERSION" "$AIKAYUN_RELEASE_CONFIRMATION"
       - name: Preserve sanitized Trivy reports for blocked candidates
         if: failure()

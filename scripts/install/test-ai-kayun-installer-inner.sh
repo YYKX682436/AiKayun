@@ -5,6 +5,7 @@ umask 077
 
 PAYLOAD_DIR="$1"
 SCENARIO="$2"
+CANDIDATE_PAYLOAD_DIR="${3:-}"
 HARNESS_ROOT=/tmp/aikayun-installer-flow-test
 FAKE_BIN="$HARNESS_ROOT/bin"
 FAKE_STATE="$HARNESS_ROOT/state"
@@ -29,9 +30,15 @@ case "$actual_arch" in x86_64) actual_arch=amd64 ;; aarch64) actual_arch=arm64 ;
 }
 [[ -d "$PAYLOAD_DIR" && -f "$INSTALLER" ]] || { printf 'Controlled release payload is missing.\n' >&2; exit 2; }
 case "$SCENARIO" in
-  first-install-tls-failure-resume|first-install-https-ready|release-download-failure|manifest-modified|root-substitution|compose-image-modified|dns-failure|disk-low|ports-in-use|occupied-deployment|fresh-install-untrusted-code|resume-untrusted-code|backup-customer-command-integrity) ;;
+  first-install-tls-failure-resume|first-install-https-ready|release-download-failure|manifest-modified|root-substitution|compose-image-modified|dns-failure|disk-low|ports-in-use|occupied-deployment|fresh-install-untrusted-code|resume-untrusted-code|backup-customer-command-integrity|upgrade-success|upgrade-incompatible|upgrade-migration-mismatch|upgrade-trust-mismatch|upgrade-signature-invalid|upgrade-start-failure|upgrade-lock-competition) ;;
   *) printf 'Unknown isolated installer scenario.\n' >&2; exit 2 ;;
 esac
+if [[ "$SCENARIO" == upgrade-* ]]; then
+  [[ -n "$CANDIDATE_PAYLOAD_DIR" && -d "$CANDIDATE_PAYLOAD_DIR" && -f "$CANDIDATE_PAYLOAD_DIR/release-manifest.json" ]] || {
+    printf 'Signed upgrade candidate fixture is missing.\n' >&2
+    exit 2
+  }
+fi
 if [[ "$SCENARIO" != occupied-deployment && -e "$TARGET_DIR" ]]; then
   printf 'Refusing to use an occupied target path.\n' >&2
   exit 2
@@ -40,7 +47,7 @@ fi
   printf 'Unexpected temporary installer directory exists.\n' >&2
   exit 2
 }
-mkdir -p "$FAKE_BIN" "$FAKE_STATE/volumes" "$FAKE_STATE/identity"
+mkdir -p "$FAKE_BIN" "$FAKE_STATE/volumes" "$FAKE_STATE/identity" "$FAKE_STATE/services"
 : > "$EVENT_LOG"
 
 cleanup_fixture() {
@@ -71,6 +78,7 @@ set -Eeuo pipefail
 set +x
 event() { printf '%s\n' "$*" >> "$AIKAYUN_TEST_EVENT_LOG"; }
 volume_file() { printf '%s/volumes/%s' "$AIKAYUN_TEST_STATE" "$1"; }
+service_file() { printf '%s/services/%s' "$AIKAYUN_TEST_STATE" "$1"; }
 
 if [[ "$1" == context ]]; then
   shift
@@ -94,7 +102,16 @@ if [[ "$1" == info ]]; then
   event docker_info
   exit 0
 fi
-if [[ "$1" == pull ]]; then event docker_pull; exit 0; fi
+if [[ "$1" == pull ]]; then
+  image="${2:-}"
+  if [[ -n "${AIKAYUN_TEST_CANDIDATE_VERSION:-}" && "$image" == *":$AIKAYUN_TEST_CANDIDATE_VERSION" ]]; then
+    printf '%s\n' candidate > "$AIKAYUN_TEST_STATE/active-payload"
+  elif [[ "$image" == *":9.8.7-rc.3" ]]; then
+    printf '%s\n' current > "$AIKAYUN_TEST_STATE/active-payload"
+  fi
+  event "docker_pull:$image"
+  exit 0
+fi
 if [[ "$1" == network && "$2" == inspect ]]; then
   event docker_network_inspect
   if [[ -e "$AIKAYUN_TEST_STATE/restore-plan-enabled" ]]; then
@@ -164,11 +181,24 @@ if [[ "$1" == ps ]]; then
   exit 0
 fi
 if [[ "$1" == inspect ]]; then
+  container="${@: -1}"
+  service="${container#fixture-}"
+  container_state="$(cat "$(service_file "$service")" 2>/dev/null || printf 'running|0|healthy')"
+  container_status="${container_state%%|*}"
+  remaining="${container_state#*|}"
+  container_exit="${remaining%%|*}"
+  remaining="${remaining#*|}"
+  container_health="${remaining%%|*}"
+  container_image="${remaining#*|}"
   case "$3" in
-    *PortBindings*) printf '80/tcp=80\n443/tcp=443\n443/udp=443\n' ;;
-    *State.Health*) printf 'healthy\n' ;;
-    *State.Status*) printf 'running\n' ;;
-    *) printf 'running\n' ;;
+    *PortBindings*)
+      [[ "$service" == caddy && "$container_status" == running ]] && printf '80/tcp=80\n443/tcp=443\n443/udp=443\n' ;;
+    *State.Health*) [[ "$container_status" == running ]] && printf '%s\n' "$container_health" || printf '%s\n' "$container_status" ;;
+    *State.Status*State.ExitCode*) printf '%s|%s\n' "$container_status" "$container_exit" ;;
+    *State.Status*) printf '%s\n' "$container_status" ;;
+    *State.ExitCode*) printf '%s\n' "$container_exit" ;;
+    *Config.Image*) printf '%s\n' "$container_image" ;;
+    *) printf '%s\n' "$container_status" ;;
   esac
   exit 0
 fi
@@ -176,7 +206,11 @@ if [[ "$1" == image && "$2" == inspect ]]; then
   if [[ "$5" == *RepoDigests* ]]; then
     printf 'ghcr.io/yykx682436/aikayun-release-bundle@sha256:%064d\n' 0
   else
-    printf '9.8.7-rc.3\n'
+    if [[ "$(cat "$AIKAYUN_TEST_STATE/active-payload" 2>/dev/null || true)" == candidate ]]; then
+      printf '%s\n' "$AIKAYUN_TEST_CANDIDATE_VERSION"
+    else
+      printf '%s\n' "$AIKAYUN_TEST_CURRENT_VERSION"
+    fi
   fi
   exit 0
 fi
@@ -184,7 +218,9 @@ if [[ "$1" == create ]]; then event oci_container_create; printf 'fixture-releas
 if [[ "$1" == cp ]]; then
   destination="$3"
   mkdir -p "$destination"
-  cp -a "$AIKAYUN_TEST_PAYLOAD/." "$destination/"
+  active_payload="$(cat "$AIKAYUN_TEST_STATE/active-payload" 2>/dev/null || printf current)"
+  if [[ "$active_payload" == candidate ]]; then source_payload="$AIKAYUN_TEST_CANDIDATE_PAYLOAD"; else source_payload="$AIKAYUN_TEST_PAYLOAD"; fi
+  cp -a "$source_payload/." "$destination/"
   event oci_bundle_copy
   exit 0
 fi
@@ -220,8 +256,8 @@ if [[ "$1" == run ]]; then
     exit 0
   fi
   shift
-  mount_source=''
-  mount_target=''
+  mount_sources=()
+  mount_targets=()
   entrypoint=''
   while (($#)); do
     case "$1" in
@@ -230,8 +266,8 @@ if [[ "$1" == run ]]; then
       --network|--cap-drop|--security-opt) shift 2 ;;
       --mount)
         mount_spec="$2"
-        mount_source="$(printf '%s' "$mount_spec" | sed -n 's/.*source=\([^,]*\).*/\1/p')"
-        mount_target="$(printf '%s' "$mount_spec" | sed -n 's/.*target=\([^,]*\).*/\1/p')"
+        mount_sources+=("$(printf '%s' "$mount_spec" | sed -n 's/.*source=\([^,]*\).*/\1/p')")
+        mount_targets+=("$(printf '%s' "$mount_spec" | sed -n 's/.*target=\([^,]*\).*/\1/p')")
         shift 2 ;;
       --entrypoint) entrypoint="$2"; shift 2 ;;
       *) image="$1"; shift; break ;;
@@ -249,71 +285,138 @@ if [[ "$1" == run ]]; then
       shift
       script="$1"
       shift
-      MOUNT_SOURCE="$mount_source" MOUNT_TARGET="$mount_target" node -e '
+      MOUNT_SOURCE_0="${mount_sources[0]:-}" MOUNT_TARGET_0="${mount_targets[0]:-}" \
+      MOUNT_SOURCE_1="${mount_sources[1]:-}" MOUNT_TARGET_1="${mount_targets[1]:-}" \
+      node -e '
         const {spawnSync}=require("node:child_process");
         let source=process.argv[1];
-        if(process.env.MOUNT_TARGET) source=source.split(process.env.MOUNT_TARGET+"/").join(process.env.MOUNT_SOURCE+"/");
-        const args=process.argv.slice(2).map(value=>process.env.MOUNT_TARGET && (value===process.env.MOUNT_TARGET || value.startsWith(process.env.MOUNT_TARGET+"/"))
-          ? value.replace(process.env.MOUNT_TARGET,process.env.MOUNT_SOURCE) : value);
+        const mounts=[0,1].map(i=>({source:process.env[`MOUNT_SOURCE_${i}`],target:process.env[`MOUNT_TARGET_${i}`]})).filter(x=>x.source&&x.target);
+        const remap=value=>mounts.reduce((mapped,mount)=>{
+          const escaped=mount.target.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+          return mapped.replace(new RegExp(`${escaped}(?=/|[\\"\\s]|$)`,"g"),mount.source);
+        },value);
+        source=remap(source);
+        const args=process.argv.slice(2).map(remap);
         const result=spawnSync(process.execPath,["-e",source,...args],{stdio:"inherit"});
         process.exit(result.status===null?1:result.status);
       ' "$script" "$@"
       exit $?
     fi
-    command_path="$1"
-    shift
-    node_args=()
-    if [[ -n "$mount_source" && -n "$mount_target" ]]; then
-      command_path="$(printf '%s' "$command_path" | sed "s|$mount_target|$mount_source|")"
-      for argument in "$@"; do
-        if [[ "$argument" == "$mount_target" || "$argument" == "$mount_target"/* ]]; then
-          node_args+=("${argument/#$mount_target/$mount_source}")
-        else
-          node_args+=("$argument")
-        fi
-      done
-    else
-      node_args=("$@")
-    fi
-    exec node "$command_path" "${node_args[@]}"
+    MOUNT_SOURCE_0="${mount_sources[0]:-}" MOUNT_TARGET_0="${mount_targets[0]:-}" \
+    MOUNT_SOURCE_1="${mount_sources[1]:-}" MOUNT_TARGET_1="${mount_targets[1]:-}" \
+    node -e '
+      const {spawnSync}=require("node:child_process");
+      const mounts=[0,1].map(i=>({source:process.env[`MOUNT_SOURCE_${i}`],target:process.env[`MOUNT_TARGET_${i}`]})).filter(x=>x.source&&x.target);
+      const remap=value=>mounts.reduce((mapped,mount)=>{
+        const escaped=mount.target.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+        return mapped.replace(new RegExp(`${escaped}(?=/|[\\"\\s]|$)`,"g"),mount.source);
+      },value);
+      const result=spawnSync(process.execPath,[remap(process.argv[1]),...process.argv.slice(2).map(remap)],{stdio:"inherit"});
+      process.exit(result.status===null?1:result.status);
+    ' "$1" "${@:2}"
+    exit $?
   fi
   exit 2
 fi
 
 if [[ "$1" == compose ]]; then
   shift
+  compose_file=''
   while (($#)); do
     case "$1" in
-      --project-name|--file|--env-file) shift 2 ;;
+      --project-name) shift 2 ;;
+      --file) compose_file="$2"; shift 2 ;;
+      --env-file) shift 2 ;;
       *) break ;;
     esac
   done
   subcommand="$1"
   shift
+  manifest_path="${compose_file%/compose.yaml}/release-manifest.json"
+  release_version="$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).version)' "$manifest_path" 2>/dev/null || true)"
+  service_is_candidate=0
+  [[ -n "${AIKAYUN_TEST_CANDIDATE_VERSION:-}" && "$release_version" == "$AIKAYUN_TEST_CANDIDATE_VERSION" ]] && service_is_candidate=1
   case "$subcommand" in
     version) printf '2.32.0\n' ;;
     config)
       node -e '
         const fs=require("node:fs");
-        const expected=JSON.parse(fs.readFileSync(process.env.AIKAYUN_TEST_PAYLOAD+"/release-manifest.json","utf8")).images;
+        const expected=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).images;
         for(const name of ["api","web","postgres","caddy"]) {
           const key="AIKAYUN_"+name.toUpperCase()+"_IMAGE";
-          if(process.env[key]!==expected[name].reference) process.exit(1);
+          if(process.env[key]!==expected[name].reference) {
+            process.stderr.write(`${key} expected ${expected[name].reference} got ${process.env[key]}\n`);
+            process.exit(1);
+          }
         }
-      '
-      event compose_config_four_signed_refs
+      ' "$manifest_path"
+      event "compose_config:$release_version"
       ;;
     up)
-      service="$*"
-      event "compose_up:$service"
-      [[ "$service" != *caddy* ]] || : > "$AIKAYUN_TEST_STATE/caddy-started"
+      services=()
+      while (($#)); do
+        case "$1" in
+          -d|--force-recreate|--no-recreate|--no-deps) shift ;;
+          --timeout) shift 2 ;;
+          *) services+=("$1"); shift ;;
+        esac
+      done
+      service_text="${services[*]}"
+      if [[ "$service_is_candidate" == 1 && "${AIKAYUN_TEST_SCENARIO:-}" == upgrade-start-failure && \
+        "${AIKAYUN_UPGRADE_PROBE_ONLY:-false}" == true && " ${services[*]} " == *' api '* && \
+        ! -e "$AIKAYUN_TEST_STATE/probe-start-failed" ]]; then
+        : > "$AIKAYUN_TEST_STATE/probe-start-failed"
+        event "compose_up_failed:$release_version:$service_text"
+        exit 1
+      fi
+      event "compose_up:$release_version:$service_text:probe=${AIKAYUN_UPGRADE_PROBE_ONLY:-false}"
+      for service in "${services[@]}"; do
+        [[ -n "$service" ]] || continue
+        case "$service" in
+          api) image_ref="$AIKAYUN_API_IMAGE" ;;
+          web) image_ref="$AIKAYUN_WEB_IMAGE" ;;
+          db) image_ref="$AIKAYUN_POSTGRES_IMAGE" ;;
+          caddy) image_ref="$AIKAYUN_CADDY_IMAGE" ;;
+          *) image_ref=fixture ;;
+        esac
+        printf 'running|0|healthy|%s\n' "$image_ref" > "$(service_file "$service")"
+        [[ "$service" != caddy ]] || : > "$AIKAYUN_TEST_STATE/caddy-started"
+      done
+      ;;
+    stop)
+      services=()
+      while (($#)); do
+        case "$1" in --timeout) shift 2 ;; *) services+=("$1"); shift ;; esac
+      done
+      event "compose_stop:$release_version:${services[*]}"
+      for service in "${services[@]}"; do
+        [[ -n "$service" ]] || continue
+        printf 'exited|0|none\n' > "$(service_file "$service")"
+        [[ "$service" != caddy ]] || rm -f "$AIKAYUN_TEST_STATE/caddy-started"
+      done
       ;;
     run)
+      entrypoint=''
       while (($#)); do
-        case "$1" in --rm|--no-deps) shift ;; -e) shift 2 ;; *) break ;; esac
+        case "$1" in
+          --rm|--no-deps) shift ;;
+          -e|--entrypoint) [[ "$1" == --entrypoint ]] && entrypoint="$2"; shift 2 ;;
+          *) break ;;
+        esac
       done
       service="$1"
-      event "compose_run:$service"
+      shift
+      event "compose_run:$release_version:$service"
+      if [[ "$*" == *upgrade-database-check-cli.js* ]]; then
+        [[ "$entrypoint" == /nodejs/bin/node ]] || { event upgrade_database_check_was_not_readonly; exit 1; }
+        event compose_upgrade_database_check_readonly
+        if [[ "$AIKAYUN_TEST_SCENARIO" == upgrade-lock-competition ]]; then
+          : > "$AIKAYUN_TEST_STATE/upgrade-lock-held"
+          while [[ -e "$AIKAYUN_TEST_STATE/upgrade-lock-release" ]]; do sleep 0.05; done
+        fi
+      elif [[ "$service" == migrate ]]; then
+        event compose_migration_default_entrypoint
+      fi
       if [[ "$service" == production-install-init ]]; then
         mkdir -p "$AIKAYUN_TEST_STATE/identity"
         [[ -f "$AIKAYUN_TEST_STATE/identity/installation.json" ]] || \
@@ -327,7 +430,7 @@ if [[ "$1" == compose ]]; then
       service="$1"
       shift
       if [[ "$*" == *setup-token-cli.js*issue* ]]; then
-        [[ "$(tail -n 1 "$AIKAYUN_TEST_EVENT_LOG")" == https_probe_ready ]] || exit 1
+        grep -Fq 'https_probe_ready' "$AIKAYUN_TEST_EVENT_LOG" || exit 1
         event setup_token_issue
         printf 'SIMULATED_SETUP_TOKEN_256BIT\n'
       elif [[ "$*" == *production-install-init.js*verify* ]]; then
@@ -337,7 +440,8 @@ if [[ "$1" == compose ]]; then
       fi
       ;;
     ps)
-      if [[ "${1:-}" == -q ]]; then printf 'fixture-%s\n' "${2:-service}"; fi
+      service="${@: -1}"
+      if [[ -f "$(service_file "$service")" ]]; then printf 'fixture-%s\n' "$service"; fi
       ;;
     *) exit 2 ;;
   esac
@@ -382,10 +486,17 @@ if [[ "$url" == https://downloads.customer.com/.well-known/aikayun-release.json 
   exit 0
 fi
 if [[ "$AIKAYUN_TEST_SCENARIO" == release-download-failure && "$url" == */release-index.json ]]; then exit 8; fi
-if [[ "$url" == https://downloads.customer.com/releases/9.8.7-rc.3/* ]]; then
-  relative="$(printf '%s' "$url" | sed 's#^https://downloads.customer.com/releases/9.8.7-rc.3/##')"
-  [[ "$relative" != *'..'* && -f "$AIKAYUN_TEST_PAYLOAD/$relative" ]] || exit 8
-  cp "$AIKAYUN_TEST_PAYLOAD/$relative" "$output"
+if [[ "$url" =~ ^https://downloads\.customer\.com/releases/([^/]+)/(.+)$ ]]; then
+  release_version="${BASH_REMATCH[1]}"
+  relative="${BASH_REMATCH[2]}"
+  release_payload="$AIKAYUN_TEST_PAYLOAD"
+  if [[ -n "${AIKAYUN_TEST_CANDIDATE_VERSION:-}" && "$release_version" == "$AIKAYUN_TEST_CANDIDATE_VERSION" ]]; then
+    release_payload="$AIKAYUN_TEST_CANDIDATE_PAYLOAD"
+  elif [[ "$release_version" != "$AIKAYUN_TEST_CURRENT_VERSION" ]]; then
+    exit 8
+  fi
+  [[ "$relative" != *'..'* && -f "$release_payload/$relative" ]] || exit 8
+  cp "$release_payload/$relative" "$output"
   if [[ "$AIKAYUN_TEST_SCENARIO" == fresh-install-untrusted-code && \
       ("$relative" == release-verifier.mjs || "$relative" == verify-artifacts.mjs) ]]; then
     printf '%s\n' 'import { writeFileSync } from "node:fs"; writeFileSync("/tmp/aikayun-untrusted-release-code-executed", "executed"); process.exit(0);' > "$output"
@@ -397,7 +508,7 @@ if [[ "$url" == https://downloads.customer.com/releases/9.8.7-rc.3/* ]]; then
     node -e 'const fs=require("node:fs"),{generateKeyPairSync}=require("node:crypto"),p=process.argv[1],k=generateKeyPairSync("ec",{namedCurve:"prime256v1"}).publicKey.export({format:"jwk"});fs.writeFileSync(p,JSON.stringify({kty:k.kty,crv:k.crv,x:k.x,y:k.y})+"\n")' "$output"
   elif [[ "$AIKAYUN_TEST_SCENARIO" == compose-image-modified && "$relative" == compose.yaml ]]; then
     node -e 'const fs=require("node:fs"),p=process.argv[1],m=JSON.parse(fs.readFileSync(process.argv[2],"utf8")),old=m.images.api.reference,bad=old.slice(0,-1)+(old.endsWith("f")?"e":"f"),text=fs.readFileSync(p,"utf8");if(!text.includes(old))process.exit(1);fs.writeFileSync(p,text.replace(old,bad))' \
-      "$output" "$AIKAYUN_TEST_PAYLOAD/release-manifest.json"
+      "$output" "$release_payload/release-manifest.json"
   fi
   exit 0
 fi
@@ -425,6 +536,14 @@ DF_FIXTURE
 chmod 0700 "$FAKE_BIN/df"
 
 export AIKAYUN_TEST_PAYLOAD="$PAYLOAD_DIR"
+export AIKAYUN_TEST_CANDIDATE_PAYLOAD="$CANDIDATE_PAYLOAD_DIR"
+AIKAYUN_TEST_CURRENT_VERSION="$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).version)' "$PAYLOAD_DIR/release-manifest.json")"
+AIKAYUN_TEST_CANDIDATE_VERSION=''
+if [[ -n "$CANDIDATE_PAYLOAD_DIR" ]]; then
+  AIKAYUN_TEST_CANDIDATE_VERSION="$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).version)' "$CANDIDATE_PAYLOAD_DIR/release-manifest.json")"
+fi
+export AIKAYUN_TEST_CURRENT_VERSION AIKAYUN_TEST_CANDIDATE_VERSION
+printf '%s\n' current > "$FAKE_STATE/active-payload"
 export AIKAYUN_TEST_STATE="$FAKE_STATE"
 export AIKAYUN_TEST_EVENT_LOG="$EVENT_LOG"
 export AIKAYUN_TEST_SCENARIO="$SCENARIO"
@@ -446,6 +565,18 @@ run_installer() {
   fi
   printf '%s\n' "$output"
 }
+run_customer_command() {
+  expected_status="$1"
+  shift
+  output="$HARNESS_ROOT/customer-command-$RANDOM.log"
+  if "$TARGET_DIR/aikayun" "$@" >"$output" 2>&1; then status=0; else status=$?; fi
+  if [[ "$status" != "$expected_status" ]]; then
+    cat "$output" >&2
+    printf 'Expected customer command exit %s, got %s for %s.\n' "$expected_status" "$status" "$1" >&2
+    exit 1
+  fi
+  printf '%s\n' "$output"
+}
 assert_no_workdir() {
   [[ -z "$(find /var/tmp -maxdepth 1 -type d -name 'aikayun-install.*' -print -quit)" ]] || {
     printf 'Installer leaked its temporary work directory.\n' >&2
@@ -463,6 +594,7 @@ assert_no_secret_leak() {
   done
 }
 volume_file() { printf '%s/volumes/%s' "$FAKE_STATE" "$1"; }
+service_file() { printf '%s/services/%s' "$FAKE_STATE" "$1"; }
 
 printf 'managed-by=aikayun-7-3\nproject=aikayun\ncompose-volume=postgres_data\n' \
   > "$(volume_file aikayun_postgres_data)"
@@ -470,7 +602,7 @@ preexisting_volume_hash="$(sha256sum "$(volume_file aikayun_postgres_data)" | aw
 if [[ "$SCENARIO" == fresh-install-untrusted-code ]]; then export AIKAYUN_TEST_SCENARIO=first-install-https-ready; fi
 preexisting_log="$(run_installer 1 install --release-origin https://downloads.customer.com --version 9.8.7-rc.3 --domain store.customer.com)"
 export AIKAYUN_TEST_SCENARIO="$SCENARIO"
-grep -Fq 'persistent Docker volume already exists' "$preexisting_log"
+grep -Fq 'persistent Docker volume already exists' "$preexisting_log" || { cat "$preexisting_log" >&2; exit 1; }
 [[ "$(sha256sum "$(volume_file aikayun_postgres_data)" | awk '{print $1}')" == "$preexisting_volume_hash" ]]
 [[ ! -e "$TARGET_DIR" ]]
 rm -f "$(volume_file aikayun_postgres_data)"
@@ -557,6 +689,99 @@ grep -Fq 'is not empty' "$duplicate_log"
 [[ "$(sha256sum "$TARGET_DIR/secrets/"* | sha256sum | awk '{print $1}')" == "$secrets_hash" ]]
 assert_no_secret_leak "$duplicate_log"
 
+if [[ "$SCENARIO" == upgrade-* ]]; then
+  snapshot_upgrade_data() {
+    find "$TARGET_DIR/secrets" "$FAKE_STATE/identity" "$FAKE_STATE/volumes" -type f -print0 | sort -z | \
+      xargs -0 sha256sum | sha256sum | awk '{print $1}'
+  }
+  old_manifest_sha="$(sha256sum "$TARGET_DIR/release/release-manifest.json" | awk '{print $1}')"
+  old_env_sha="$(sha256sum "$TARGET_DIR/.env" | awk '{print $1}')"
+  old_data_snapshot="$(snapshot_upgrade_data)"
+  old_default_migration_count="$(grep -c '^compose_migration_default_entrypoint$' "$EVENT_LOG" || true)"
+  before_upgrade_events="$(wc -l < "$EVENT_LOG")"
+
+  case "$SCENARIO" in
+    upgrade-success)
+      upgrade_log="$(run_customer_command 0 upgrade --version 9.8.7-rc.4)"
+      grep -Fq 'AiKayun upgraded from 9.8.7-rc.3 to 9.8.7-rc.4' "$upgrade_log"
+      [[ "$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1])).version)' "$TARGET_DIR/install-state.json")" == 9.8.7-rc.4 ]]
+      [[ "$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1])).upgrade.previous_version)' "$TARGET_DIR/install-state.json")" == 9.8.7-rc.3 ]]
+      [[ "$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1])).upgrade.rollback_status)' "$TARGET_DIR/install-state.json")" == blocked_after_acceptance ]]
+      [[ "$(sha256sum "$TARGET_DIR/release/release-manifest.json" | awk '{print $1}')" == \
+        "$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1])).manifest_sha256)' "$TARGET_DIR/install-state.json")" ]]
+      [[ -d "$TARGET_DIR/previous-release" && ! -L "$TARGET_DIR/previous-release" ]]
+      [[ "$(sha256sum "$TARGET_DIR/previous-release/release-manifest.json" | awk '{print $1}')" == "$old_manifest_sha" ]]
+      node -e '
+        const fs=require("node:fs");
+        const manifest=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+        const env=fs.readFileSync(process.argv[2],"utf8");
+        for(const key of ["api","web"]) if(!env.includes(`AIKAYUN_${key.toUpperCase()}_IMAGE=${manifest.images[key].reference}\n`)) process.exit(1);
+      ' "$TARGET_DIR/release/release-manifest.json" "$TARGET_DIR/.env"
+      [[ "$(snapshot_upgrade_data)" == "$old_data_snapshot" ]]
+      [[ "$(grep -c '^compose_migration_default_entrypoint$' "$EVENT_LOG" || true)" == "$old_default_migration_count" ]]
+      grep -Fq 'compose_upgrade_database_check_readonly' "$EVENT_LOG"
+      ! grep -Eq '^volume_create:' <(tail -n "+$((before_upgrade_events + 1))" "$EVENT_LOG")
+      [[ ! -e "$FAKE_STATE/upgrade-lock-held" && ! -e "$TARGET_DIR/.upgrade-journal.json" ]]
+      printf 'Signed customer upgrade succeeded; exact migration registry was checked read-only; business volumes, secrets, and identity hashes stayed unchanged.\n'
+      ;;
+    upgrade-incompatible|upgrade-migration-mismatch|upgrade-trust-mismatch)
+      upgrade_log="$(run_customer_command 1 upgrade --version 9.8.7-rc.4)"
+      grep -Fq 'first-stage upgrade and rollback compatibility policy' "$upgrade_log"
+      [[ "$(tail -n +"$((before_upgrade_events + 1))" "$EVENT_LOG" | grep -c '^compose_stop:' || true)" == 0 ]]
+      [[ "$(sha256sum "$TARGET_DIR/.env" | awk '{print $1}')" == "$old_env_sha" ]]
+      [[ "$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1])).version)' "$TARGET_DIR/install-state.json")" == 9.8.7-rc.3 ]]
+      [[ "$(snapshot_upgrade_data)" == "$old_data_snapshot" ]]
+      [[ ! -e "$TARGET_DIR/.release-upgrade-new" && ! -e "$TARGET_DIR/.upgrade-journal.json" ]]
+      printf 'Signed compatibility rejection completed before stopping services or changing persistent data.\n'
+      ;;
+    upgrade-signature-invalid)
+      upgrade_log="$(run_customer_command 1 upgrade --version 9.8.7-rc.4)"
+      grep -Fq 'release JWS signature or embedded JWS root failed verification' "$upgrade_log"
+      [[ "$(tail -n +"$((before_upgrade_events + 1))" "$EVENT_LOG" | grep -c '^compose_stop:' || true)" == 0 ]]
+      [[ "$(snapshot_upgrade_data)" == "$old_data_snapshot" ]]
+      [[ ! -e "$TARGET_DIR/.release-upgrade-new" ]]
+      printf 'Candidate signature rejection completed before stopping services or changing persistent data.\n'
+      ;;
+    upgrade-start-failure)
+      upgrade_log="$(run_customer_command 1 upgrade --version 9.8.7-rc.4)"
+      grep -Fq 'candidate API probe failed before public traffic' "$upgrade_log"
+      grep -Fq 'prior program restored' "$upgrade_log"
+      [[ "$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1])).version)' "$TARGET_DIR/install-state.json")" == 9.8.7-rc.3 ]]
+      [[ "$(sha256sum "$TARGET_DIR/release/release-manifest.json" | awk '{print $1}')" == "$old_manifest_sha" ]]
+      [[ "$(sha256sum "$TARGET_DIR/.env" | awk '{print $1}')" == "$old_env_sha" ]]
+      [[ "$(snapshot_upgrade_data)" == "$old_data_snapshot" ]]
+      [[ "$(cat "$(service_file caddy)")" == running\|0\|healthy\|* ]]
+      [[ ! -e "$TARGET_DIR/previous-release" && ! -e "$TARGET_DIR/.upgrade-journal.json" ]]
+      printf 'Candidate startup probe failure restored the old program before business workers or public traffic started.\n'
+      ;;
+    upgrade-lock-competition)
+      touch "$FAKE_STATE/upgrade-lock-release"
+      "$TARGET_DIR/aikayun" upgrade --version 9.8.7-rc.4 > "$HARNESS_ROOT/upgrade-lock-running.log" 2>&1 &
+      upgrade_pid=$!
+      for _ in {1..1200}; do
+        [[ -f "$FAKE_STATE/upgrade-lock-held" ]] && break
+        kill -0 "$upgrade_pid" 2>/dev/null || { cat "$HARNESS_ROOT/upgrade-lock-running.log" >&2; exit 1; }
+        sleep 0.05
+      done
+      [[ -f "$FAKE_STATE/upgrade-lock-held" ]] || { cat "$HARNESS_ROOT/upgrade-lock-running.log" >&2; exit 1; }
+      if competing="$("$TARGET_DIR/aikayun" backup list 2>&1)"; then
+        printf 'Concurrent backup unexpectedly bypassed the upgrade lock.\n' >&2; exit 1
+      else
+        competing_status=$?
+      fi
+      [[ "$competing_status" != 0 ]]
+      grep -Fq 'Another install, resume, setup-token, backup, or upgrade command holds the deployment lock' <<< "$competing"
+      rm -f "$FAKE_STATE/upgrade-lock-release"
+      wait "$upgrade_pid"
+      grep -Fq 'AiKayun upgraded from 9.8.7-rc.3 to 9.8.7-rc.4' "$HARNESS_ROOT/upgrade-lock-running.log"
+      [[ "$(snapshot_upgrade_data)" == "$old_data_snapshot" ]]
+      printf 'Backup command observed the shared deployment lock while the signed upgrade held it.\n'
+      ;;
+  esac
+  assert_no_workdir
+  exit 0
+fi
+
 if [[ "$SCENARIO" == backup-customer-command-integrity ]]; then
   customer_command() {
     local expected="$1" output status
@@ -634,13 +859,13 @@ if [[ "$SCENARIO" == backup-customer-command-integrity ]]; then
   }
   printf 'Backup command fixture: broker hold reached; checking lock contention.\n'
   second_log="$(customer_command 1)"
-  if ! grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' "$second_log"; then
+  if ! grep -Fq 'Another install, resume, setup-token, backup, or upgrade command holds the deployment lock' "$second_log"; then
     cat "$second_log" >&2
     printf 'Concurrent customer backup did not report the held deployment lock.\n' >&2
     exit 1
   fi
   installer_log="$(run_installer 1 status)"
-  if ! grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' "$installer_log"; then
+  if ! grep -Fq 'Another install, resume, setup-token, backup, or upgrade command holds the deployment lock' "$installer_log"; then
     cat "$installer_log" >&2
     printf 'Installer status did not report the held deployment lock.\n' >&2
     exit 1
@@ -707,15 +932,15 @@ if [[ "$SCENARIO" == backup-customer-command-integrity ]]; then
   else
     plan_competing_status=$?
   fi
-  grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' <<< "$competing"
+  grep -Fq 'Another install, resume, setup-token, backup, or upgrade command holds the deployment lock' <<< "$competing"
   installer_competing="$(run_installer 1 status)"
-  grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' "$installer_competing"
+  grep -Fq 'Another install, resume, setup-token, backup, or upgrade command holds the deployment lock' "$installer_competing"
   if create_competing="$("$TARGET_DIR/aikayun" backup create 2>&1)"; then
     printf 'Concurrent backup create unexpectedly bypassed the shared lock.\n' >&2; exit 1
   else
     create_competing_status=$?
   fi
-  grep -Fq 'Another install, resume, or setup-token command holds the deployment lock' <<< "$create_competing"
+  grep -Fq 'Another install, resume, setup-token, backup, or upgrade command holds the deployment lock' <<< "$create_competing"
   rm -f "$FAKE_STATE/restore-plan-helper-hold"
   wait "$plan_pid"
   after_plan_snapshot="$(snapshot_drill_state)"

@@ -37,4 +37,44 @@ for platform in linux/amd64 linux/arm64; do
       --env "AIKAYUN_TEST_EXPECTED_ARCH=${platform#linux/}" \
       --entrypoint bash "$test_runner_image" /fixture/inner.sh /fixture/release "$scenario"
   done
+
+  for scenario in upgrade-success upgrade-incompatible upgrade-migration-mismatch \
+    upgrade-trust-mismatch upgrade-signature-invalid upgrade-start-failure upgrade-lock-competition; do
+    if [[ -n "${AIKAYUN_TEST_ONLY_SCENARIO:-}" && "$scenario" != "$AIKAYUN_TEST_ONLY_SCENARIO" ]]; then continue; fi
+    candidate_directory="$temporary_root/$scenario-${platform#linux/}"
+    mkdir -p "$candidate_directory"
+    candidate_env=(AIKAYUN_TEST_RELEASE_VERSION=9.8.7-rc.4
+      AIKAYUN_TEST_API_IMAGE_REFERENCE=ghcr.io/yykx682436/aikayun-api@sha256:$(printf 'e%.0s' {1..64})
+      AIKAYUN_TEST_WEB_IMAGE_REFERENCE=ghcr.io/yykx682436/aikayun-web@sha256:$(printf 'f%.0s' {1..64}))
+    case "$scenario" in
+      upgrade-success|upgrade-start-failure|upgrade-lock-competition)
+        candidate_env+=(AIKAYUN_TEST_UPGRADE_FROM_RELEASES=aikayun-9.8.7-rc.3
+          AIKAYUN_TEST_ROLLBACK_TO_RELEASES=aikayun-9.8.7-rc.3) ;;
+      upgrade-migration-mismatch)
+        printf '{"schema":1,"migration_head":"202611030003_changed","migrations":[]}\n' \
+          > "$temporary_root/migration-checksums-changed.json"
+        candidate_env+=(AIKAYUN_TEST_UPGRADE_FROM_RELEASES=aikayun-9.8.7-rc.3
+          AIKAYUN_TEST_ROLLBACK_TO_RELEASES=aikayun-9.8.7-rc.3
+          AIKAYUN_TEST_MIGRATION_CHECKSUMS_FILE="$temporary_root/migration-checksums-changed.json") ;;
+      upgrade-trust-mismatch)
+        candidate_env+=(AIKAYUN_TEST_UPGRADE_FROM_RELEASES=aikayun-9.8.7-rc.3
+          AIKAYUN_TEST_ROLLBACK_TO_RELEASES=aikayun-9.8.7-rc.3
+          AIKAYUN_TEST_TRUST_CONFIGURATION_ID=66666666-6666-4666-8666-666666666666) ;;
+      upgrade-incompatible|upgrade-signature-invalid) ;;
+    esac
+    env "${candidate_env[@]}" node "$repository_root/scripts/install/create-installer-test-release.mjs" "$candidate_directory"
+    if [[ "$scenario" == upgrade-signature-invalid ]]; then
+      printf 'controlled invalid candidate signature\n' > "$candidate_directory/release/release-manifest.jws"
+    fi
+    printf 'Installer scenario: %s (%s)\n' "$scenario" "$platform"
+    docker run --rm --network none --platform "$platform" \
+      --mount "type=bind,source=$repository_root/scripts/install/test-ai-kayun-installer-inner.sh,target=/fixture/inner.sh,readonly" \
+      --mount "type=bind,source=$release_directory,target=/fixture/release,readonly" \
+      --mount "type=bind,source=$candidate_directory/release,target=/fixture/candidate,readonly" \
+      --mount "type=bind,source=$repository_root/node_modules,target=/node_modules,readonly" \
+      --mount "type=bind,source=$repository_root/apps/api/node_modules,target=/fixture/node_modules,readonly" \
+      --mount "type=bind,source=$repository_root/packages,target=/packages,readonly" \
+      --env "AIKAYUN_TEST_EXPECTED_ARCH=${platform#linux/}" \
+      --entrypoint bash "$test_runner_image" /fixture/inner.sh /fixture/release "$scenario" /fixture/candidate
+  done
 done

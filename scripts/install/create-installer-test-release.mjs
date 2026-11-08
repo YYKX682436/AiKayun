@@ -8,6 +8,9 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const outputDirectory = resolve(process.argv[2] ?? '')
 if (!process.argv[2]) throw new Error('Usage: node create-installer-test-release.mjs OUTPUT_DIRECTORY')
 const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repositoryRoot, encoding: 'utf8' }).trim()
+const version = process.env.AIKAYUN_TEST_RELEASE_VERSION ?? '9.8.7-rc.3'
+const releaseId = `aikayun-${version}`
+const releaseList = name => process.env[name] ? process.env[name].split(',') : []
 
 const releaseDirectory = join(outputDirectory, 'release')
 const supportDirectory = join(outputDirectory, 'support')
@@ -39,17 +42,19 @@ const images = Object.fromEntries(Object.entries(imageRepositories).map(([name, 
   },
 ]))
 const metadata = {
-  version: '9.8.7-rc.3',
+  version,
   built_at: '2026-11-03T00:00:00.000Z',
   source_commit: sourceCommit,
   distribution_origin: 'https://downloads.customer.com',
   license_center_signer_kids: ['B'.repeat(43)],
+  upgrade_from_releases: releaseList('AIKAYUN_TEST_UPGRADE_FROM_RELEASES'),
+  rollback_to_releases: releaseList('AIKAYUN_TEST_ROLLBACK_TO_RELEASES'),
   images,
 }
 const generatedConfig = {
   schema_version: 1,
-  trust_configuration_id: '55555555-5555-4555-8555-555555555555',
-  release_id: 'aikayun-9.8.7-rc.3',
+  trust_configuration_id: process.env.AIKAYUN_TEST_TRUST_CONFIGURATION_ID ?? '55555555-5555-4555-8555-555555555555',
+  release_id: releaseId,
   expected_center_issuer: 'https://license.customer.com',
   expected_center_origin: 'https://license.customer.com',
   offline_root: {
@@ -70,7 +75,7 @@ const trustBundle = process.env.AIKAYUN_TEST_TRUST_BUNDLE_FILE
 await writeFile(join(outputDirectory, 'trusted-release-license-config.generated.js'),
   `export const generatedTrustedReleaseLicenseConfig = Object.freeze(${JSON.stringify(config)})\n`, { mode: 0o600 })
 await writeFile(join(outputDirectory, 'release-identity.generated.js'),
-  `export const generatedReleaseIdentity = Object.freeze(${JSON.stringify({ product: 'aikayun', release_id: 'aikayun-9.8.7-rc.3', version: '9.8.7-rc.3' })})\n`,
+  `export const generatedReleaseIdentity = Object.freeze(${JSON.stringify({ product: 'aikayun', release_id: releaseId, version })})\n`,
   { mode: 0o600 })
 const migrationChecksumsBytes = process.env.AIKAYUN_TEST_MIGRATION_CHECKSUMS_FILE
   ? await readFile(process.env.AIKAYUN_TEST_MIGRATION_CHECKSUMS_FILE)

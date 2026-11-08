@@ -143,6 +143,7 @@ services:
       NODE_ENV: production
       API_HOST: 0.0.0.0
       API_PORT: "3001"
+      AIKAYUN_UPGRADE_PROBE_ONLY: ${AIKAYUN_UPGRADE_PROBE_ONLY:-false}
       PUBLIC_ORIGIN: https://${AIKAYUN_PUBLIC_HOST:?Set the HTTPS storefront host}
       COOKIE_SECURE: "true"
       TRUST_PROXY_CIDRS: ${AIKAYUN_PRIVATE_SUBNET:-172.30.0.0/24}

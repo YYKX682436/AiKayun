@@ -27,9 +27,13 @@ jq -n \
   --arg backup_reference "$backup_index_ref" --arg backup_amd64 "${backup_amd64#sha256:}" --arg backup_arm64 "${backup_arm64#sha256:}" \
   --arg backup_amd64_sbom "$(sha_of "$work/sbom/backup-linux-amd64.cdx.json")" \
   --arg backup_arm64_sbom "$(sha_of "$work/sbom/backup-linux-arm64.cdx.json")" \
+  --arg upgrade_from_releases_csv "${AIKAYUN_UPGRADE_FROM_RELEASES:-}" \
+  --arg rollback_to_releases_csv "${AIKAYUN_ROLLBACK_TO_RELEASES:-}" \
   --argjson license_center_signer_kids "$AIKAYUN_LICENSE_CENTER_SIGNER_KIDS" \
   '{version:$version,built_at:$built_at,source_commit:$source_commit,distribution_origin:$distribution_origin,
     license_center_signer_kids:$license_center_signer_kids,
+    upgrade_from_releases: (if $upgrade_from_releases_csv == "" then [] else ($upgrade_from_releases_csv | split(",")) end),
+    rollback_to_releases: (if $rollback_to_releases_csv == "" then [] else ($rollback_to_releases_csv | split(",")) end),
     images:{
       api:{reference:$api_reference,platform_digests:{"linux/amd64":$api_amd64,"linux/arm64":$api_arm64},sbom_sha256:{"linux/amd64":$api_amd64_sbom,"linux/arm64":$api_arm64_sbom}},
       web:{reference:$web_reference,platform_digests:{"linux/amd64":$web_amd64,"linux/arm64":$web_arm64},sbom_sha256:{"linux/amd64":$web_amd64_sbom,"linux/arm64":$web_arm64_sbom}},

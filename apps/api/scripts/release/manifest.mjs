@@ -89,8 +89,15 @@ export function validateReleaseManifest(value) {
       !/^[0-9]{12}_[A-Za-z0-9_-]+$/.test(database.migration_head) || !digestPattern.test(database.migration_checksums_sha256) ||
       !Array.isArray(database.readable_heads) || !database.readable_heads.includes(database.migration_head) ||
       !Array.isArray(database.writable_heads) || !database.writable_heads.includes(database.migration_head) ||
-      !Array.isArray(database.upgrade_from_releases) || !Array.isArray(database.rollback_to_releases) ||
       database.requires_write_quiescence !== true) throw new Error('Invalid database compatibility declaration')
+  for (const [name, releases] of [['upgrade_from_releases', database.upgrade_from_releases],
+    ['rollback_to_releases', database.rollback_to_releases]]) {
+    if (!Array.isArray(releases) || releases.length > 32 || new Set(releases).size !== releases.length ||
+        releases.some(release => typeof release !== 'string' || release.length > 64 || !release.startsWith('aikayun-') ||
+          !isCanonicalReleaseSemVer(release.slice('aikayun-'.length)) || release === value.release_id)) {
+      throw new Error(`Invalid database ${name} declaration`)
+    }
+  }
   exactKeys(value.license, ['protocol_versions', 'trust_configuration_id', 'issuer', 'offline_root_kid',
     'online_signer_kids', 'minimum_bundle_version'],
     'license release configuration')

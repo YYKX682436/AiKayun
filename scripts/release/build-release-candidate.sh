@@ -55,6 +55,16 @@ need() { [[ -n "${!1:-}" ]] || fail "Required protected release setting is missi
 [[ "$center_commit" =~ ^[a-f0-9]{40}$ ]] || fail 'Pinned authorization-center source commit is invalid.'
 node --input-type=module -e 'import { isCanonicalReleaseSemVer } from "./apps/api/scripts/release/manifest.mjs"; if (!isCanonicalReleaseSemVer(process.argv[1])) process.exit(1)' "$version" || \
   fail 'Release version must be canonical OCI-compatible SemVer without build metadata.'
+node --input-type=module -e '
+  import { isCanonicalReleaseSemVer } from "./apps/api/scripts/release/manifest.mjs";
+  const current = `aikayun-${process.argv[1]}`;
+  for (const value of process.argv.slice(2)) {
+    const ids = value ? value.split(",") : [];
+    if (new Set(ids).size !== ids.length || ids.some(id => id.length > 64 || !id.startsWith("aikayun-") ||
+      !isCanonicalReleaseSemVer(id.slice("aikayun-".length)) || id === current)) process.exit(1);
+  }
+' "$version" "${AIKAYUN_UPGRADE_FROM_RELEASES:-}" "${AIKAYUN_ROLLBACK_TO_RELEASES:-}" || \
+  fail 'Upgrade and rollback release inputs must be unique comma-separated signed release IDs.'
 [[ "$confirmation" == "PUBLISH-${version}" ]] || fail 'Release confirmation text does not match the requested version.'
 [[ "${GITHUB_REPOSITORY,,}" == 'yykx682436/aikayun' ]] || fail 'Unexpected GitHub source repository.'
 [[ ! -e "$scan_report_dir" ]] || fail 'A scan-report directory for this workflow attempt already exists.'

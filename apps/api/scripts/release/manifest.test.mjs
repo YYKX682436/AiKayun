@@ -120,6 +120,29 @@ test('rejects release ID and SemVer reuse', () => {
   assert.throws(() => validateReleaseManifest({ ...candidate, version: '0.1.0-rc.01' }), /identity/u)
 })
 
+test('signed compatibility lists accept only unique canonical release IDs', () => {
+  const candidate = makeManifest()
+  candidate.version = '0.1.0-rc.2'
+  candidate.release_id = 'aikayun-0.1.0-rc.2'
+  candidate.distribution.release_path = '/releases/0.1.0-rc.2/'
+  candidate.database.upgrade_from_releases = ['aikayun-0.1.0-rc.1']
+  candidate.database.rollback_to_releases = ['aikayun-0.1.0']
+  assert.equal(validateReleaseManifest(candidate), candidate)
+  for (const invalid of [
+    ['aikayun-0.1.0', 'aikayun-0.1.0'],
+    ['aikayun-0.1.0-rc.01'],
+    ['0.1.0'],
+    ['aikayun-0.1.0-rc.2'],
+  ]) {
+    assert.throws(() => validateReleaseManifest({ ...candidate, database: {
+      ...candidate.database, upgrade_from_releases: invalid,
+    } }), /database upgrade_from_releases/u)
+  }
+  assert.throws(() => validateReleaseManifest({ ...candidate, database: {
+    ...candidate.database, rollback_to_releases: new Array(33).fill('aikayun-0.1.0'),
+  } }), /database rollback_to_releases/u)
+})
+
 test('release signing key cannot overlap authorization online signers', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'aikayun-release-key-overlap-'))
   t.after(() => rm(directory, { recursive: true, force: true }))

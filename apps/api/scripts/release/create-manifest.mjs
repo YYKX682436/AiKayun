@@ -8,6 +8,11 @@ if (!metadataPath || !artifactDirectory || !migrationChecksumsPath || !licenseCo
   throw new Error('Usage: node create-manifest.mjs IMAGE_METADATA ARTIFACT_DIRECTORY MIGRATION_CHECKSUMS LICENSE_CONFIG OUTPUT')
 }
 const metadata = JSON.parse(await readFile(metadataPath, 'utf8'))
+const upgradeFromReleases = metadata.upgrade_from_releases ?? []
+const rollbackToReleases = metadata.rollback_to_releases ?? []
+if (!Array.isArray(upgradeFromReleases) || !Array.isArray(rollbackToReleases)) {
+  throw new Error('Release compatibility lists must be JSON arrays')
+}
 const migrationsBytes = await readFile(migrationChecksumsPath)
 const migrations = JSON.parse(migrationsBytes.toString('utf8'))
 const licenseConfig = JSON.parse(await readFile(licenseConfigPath, 'utf8'))
@@ -49,8 +54,8 @@ const manifest = {
     migration_checksums_sha256: createHash('sha256').update(migrationsBytes).digest('hex'),
     readable_heads: [migrations.migration_head],
     writable_heads: [migrations.migration_head],
-    upgrade_from_releases: [],
-    rollback_to_releases: [],
+    upgrade_from_releases: upgradeFromReleases,
+    rollback_to_releases: rollbackToReleases,
     requires_write_quiescence: true,
   },
   license: {

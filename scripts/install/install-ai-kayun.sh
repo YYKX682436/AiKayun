@@ -6,6 +6,12 @@ umask 077
 readonly TARGET_DIR='/opt/aikayun'
 readonly RELEASE_DIR='/opt/aikayun/release'
 readonly STATE_FILE='/opt/aikayun/install-state.json'
+readonly PREVIOUS_RELEASE_DIR='/opt/aikayun/previous-release'
+readonly UPGRADE_STAGING_DIR='/opt/aikayun/.release-upgrade-new'
+readonly UPGRADE_OLDER_RELEASE_DIR='/opt/aikayun/.release-upgrade-older'
+readonly UPGRADE_JOURNAL_FILE='/opt/aikayun/.upgrade-journal.json'
+readonly UPGRADE_STATE_BACKUP='/opt/aikayun/.upgrade-state-backup'
+readonly UPGRADE_ENV_BACKUP='/opt/aikayun/.upgrade-env-backup'
 readonly LOCK_FILE='/run/lock/aikayun-install.lock'
 readonly NODE_IMAGE='node:24.22.0-trixie-slim@sha256:a6155384446670e9719bdc4fd0ebe4d4b29fb32a8d6aa523da3547a6cfbcf22c'
 readonly COSIGN_IMAGE='ghcr.io/sigstore/cosign/cosign:v2.5.3@sha256:f1946d0f30fc8e3777b02f2201e02efdba9fe38f4918162f937052fac98e083f'
@@ -26,9 +32,38 @@ SELECTED_POSTGRES_IMAGE=''
 SELECTED_CADDY_IMAGE=''
 SELECTED_BACKUP_RESTIC_IMAGE=''
 RELEASE_BASE=''
+UPGRADE_PRE_ACCEPTANCE=0
+UPGRADE_CANDIDATE_DIR=''
+CURRENT_RELEASE_VERSION=''
+CURRENT_RELEASE_MANIFEST_SHA256=''
+CURRENT_API_IMAGE=''
+CURRENT_WEB_IMAGE=''
+CURRENT_POSTGRES_IMAGE=''
+CURRENT_CADDY_IMAGE=''
+CURRENT_BACKUP_RESTIC_IMAGE=''
+CANDIDATE_RELEASE_VERSION=''
+CANDIDATE_RELEASE_MANIFEST_SHA256=''
+CANDIDATE_API_IMAGE=''
+CANDIDATE_WEB_IMAGE=''
+CANDIDATE_POSTGRES_IMAGE=''
+CANDIDATE_CADDY_IMAGE=''
+CANDIDATE_BACKUP_RESTIC_IMAGE=''
 
 cleanup() {
   local status=$?
+  if [[ "$UPGRADE_PRE_ACCEPTANCE" == 1 ]]; then
+    set +e
+    rollback_upgrade_before_acceptance
+    rollback_status=$?
+    set -e
+    if [[ "$rollback_status" != 0 ]]; then
+      printf 'AiKayun installer: automatic rollback could not be completed. The database and persistent volumes were kept; inspect the upgrade state before retrying.\n' >&2
+    fi
+  fi
+  if [[ "$UPGRADE_PRE_ACCEPTANCE" != 1 && ! -e "$UPGRADE_JOURNAL_FILE" && \
+     -d "$UPGRADE_STAGING_DIR" && ! -L "$UPGRADE_STAGING_DIR" ]]; then
+    rm -rf -- "$UPGRADE_STAGING_DIR"
+  fi
   if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then rm -rf -- "$WORK_DIR"; fi
   if [[ -n "$STAGING_DIR" && -d "$STAGING_DIR" ]]; then rm -rf -- "$STAGING_DIR"; fi
   if declare -F backup_stream_cleanup >/dev/null 2>&1; then backup_stream_cleanup; fi
@@ -45,11 +80,13 @@ Usage:
   install.sh install --release-origin HTTPS_ORIGIN --version VERSION --domain STORE_FQDN
   install.sh status
   install.sh resume
+  install.sh upgrade --version VERSION
   install.sh diagnose
   install.sh setup-token
 
 install/resume require Linux, root, Docker Engine, Docker Compose v2, DNS for the
-store hostname, and free TCP ports 80 and 443. The installer never installs Docker
+store hostname, and free TCP ports 80 and 443. Upgrade requires a verified, fully
+initialized deployment and the same local Docker Engine. The installer never installs Docker
 or changes firewall rules. The release origin is a locator; signing roots and the
 Cosign workflow identity are fixed by this installer.
 USAGE
@@ -62,7 +99,8 @@ require_root() {
 begin_lock() {
   mkdir -p /run/lock
   exec 9>"$LOCK_FILE"
-  if ! flock -n 9; then fail 'Another install, resume, or setup-token command holds the deployment lock.'; fi
+  if ! flock -n 9; then fail 'Another install, resume, setup-token, backup, or upgrade command holds the deployment lock.'; fi
+  [[ "$(stat -c '%u:%g:%a:%h' "$LOCK_FILE")" == '0:0:600:1' ]] || fail 'The shared deployment lock file is unsafe.'
 }
 
 require_host_commands() {
@@ -449,13 +487,29 @@ saved_bundle_verify() {
   [[ "$(stat -c '%u:%g:%a:%h' "$TARGET_DIR/.install-owner")" == '0:0:600:1' ]] || fail 'The deployment ownership marker permissions changed.'
   [[ "$(cat "$TARGET_DIR/.install-owner")" == aikayun-install-v1 ]] || fail 'The deployment ownership marker is invalid.'
   [[ "$(stat -c '%u:%g:%a:%h' "$STATE_FILE")" == '0:0:600:1' ]] || fail 'The persistent install-state permissions changed.'
+  if [[ -e "$UPGRADE_JOURNAL_FILE" || -L "$UPGRADE_JOURNAL_FILE" ]]; then
+    local journal_phase
+    journal_phase="$(node_target 'const fs=require("node:fs");const j=JSON.parse(fs.readFileSync("/target/.upgrade-journal.json","utf8"));if(j.schema!==1||typeof j.phase!=="string")process.exit(1);process.stdout.write(j.phase)')" || \
+      fail 'An invalid upgrade journal exists; no automatic service or data changes were attempted.'
+    if [[ "$journal_phase" == candidate_active_starting ]]; then
+      fail 'An upgrade stopped after candidate services could run business or external operations. Automatic rollback is blocked; inspect status and diagnose.'
+    fi
+    fail 'An upgrade was interrupted before acceptance. Inspect status and diagnose before running another operation.'
+  fi
   recorded_sha="$(node_target '
     const fs=require("node:fs"); const s=JSON.parse(fs.readFileSync("/target/install-state.json","utf8"));
-    const keys=["domain","manifest_sha256","phase","release_origin","schema","updated_at","version"].sort().join(",");
-    if(!s || typeof s!=="object" || Object.keys(s).sort().join(",")!==keys || s.schema!==1 ||
+    const base=["domain","manifest_sha256","phase","release_origin","schema","updated_at","version"].sort().join(",");
+    const withUpgrade=[...base.split(","),"upgrade"].sort().join(",");
+    const keys=Object.keys(s||{}).sort().join(",");
+    if(!s || typeof s!=="object" || (keys!==base && keys!==withUpgrade) || s.schema!==1 ||
       !/^[a-zA-Z0-9.-]{1,253}$/.test(s.domain) || !/^[a-f0-9]{64}$/.test(s.manifest_sha256) ||
       !/^[0-9A-Za-z.+-]{1,64}$/.test(s.version) || !["verified","secrets_ready","storage_ready","storage_volumes_ready","database_ready","roles_ready","migrated","identity_ready","api_ready","web_ready","caddy_started","https_ready","setup_token_issued"].includes(s.phase) ||
       typeof s.release_origin!=="string" || typeof s.updated_at!=="string") process.exit(1);
+    if(keys===withUpgrade && (!s.upgrade || typeof s.upgrade!=="object" || Array.isArray(s.upgrade) ||
+      Object.keys(s.upgrade).sort().join(",")!=="previous_manifest_sha256,previous_version,rollback_status" ||
+      !/^[0-9A-Za-z.+-]{1,64}$/.test(s.upgrade.previous_version) ||
+      !/^[a-f0-9]{64}$/.test(s.upgrade.previous_manifest_sha256) ||
+      !["blocked_after_candidate_start","blocked_after_acceptance"].includes(s.upgrade.rollback_status))) process.exit(1);
     process.stdout.write(s.manifest_sha256);
   ')" || fail 'The persisted install-state record is invalid; automatic initialization is stopped.'
   MANIFEST_SHA256="$(sha256sum "$RELEASE_DIR/release-manifest.json" | awk '{print $1}')"
@@ -487,10 +541,14 @@ state_value() {
 }
 
 load_release_image_digests() {
-  local image_references image_reference
+  load_release_image_digests_from "$RELEASE_DIR"
+}
+
+load_release_image_digests_from() {
+  local directory="$1" image_references image_reference
   local -a image_references_array
-  image_references="$(node_target '
-    const fs=require("node:fs"); const m=JSON.parse(fs.readFileSync("/target/release/release-manifest.json","utf8"));
+  image_references="$(docker run --rm --mount "type=bind,source=$directory,target=/release,readonly" --entrypoint node "$NODE_IMAGE" -e '
+    const fs=require("node:fs"); const m=JSON.parse(fs.readFileSync("/release/release-manifest.json","utf8"));
     const values=[m.images?.api?.reference,m.images?.web?.reference,m.images?.postgres?.reference,m.images?.caddy?.reference,m.images?.backup?.reference];
     if(values.some(v=>typeof v!=="string" || !/@sha256:[a-f0-9]{64}$/.test(v))) process.exit(1);
     process.stdout.write(values.join("\n"));
@@ -518,14 +576,39 @@ phase_rank() {
 }
 
 write_state() {
-  local phase="$1" directory="${2:-$TARGET_DIR}" now temporary
+  local phase="$1" directory="${2:-$TARGET_DIR}" now temporary serialized
   now="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   temporary="$directory/.install-state.$$.tmp"
-  printf '{"schema":1,"phase":"%s","domain":"%s","release_origin":"%s","version":"%s","manifest_sha256":"%s","updated_at":"%s"}\n' \
-    "$phase" "$SELECTED_DOMAIN" "$SELECTED_RELEASE_ORIGIN" "$SELECTED_VERSION" "$MANIFEST_SHA256" "$now" > "$temporary"
+  if [[ "$directory" == "$TARGET_DIR" && -f "$STATE_FILE" ]]; then
+    serialized="$(node_target '
+      const fs=require("node:fs");
+      const prior=JSON.parse(fs.readFileSync("/target/install-state.json","utf8"));
+      const [phase,domain,origin,version,sha,updated]=process.argv.slice(1);
+      const next={schema:1,phase,domain,release_origin:origin,version,manifest_sha256:sha,updated_at:updated};
+      if(prior.upgrade) next.upgrade=prior.upgrade;
+      process.stdout.write(JSON.stringify(next)+"\n");
+    ' "$phase" "$SELECTED_DOMAIN" "$SELECTED_RELEASE_ORIGIN" "$SELECTED_VERSION" "$MANIFEST_SHA256" "$now")" || \
+      fail 'Could not preserve the recorded upgrade state.'
+    printf '%s' "$serialized" > "$temporary"
+  else
+    printf '{"schema":1,"phase":"%s","domain":"%s","release_origin":"%s","version":"%s","manifest_sha256":"%s","updated_at":"%s"}\n' \
+      "$phase" "$SELECTED_DOMAIN" "$SELECTED_RELEASE_ORIGIN" "$SELECTED_VERSION" "$MANIFEST_SHA256" "$now" > "$temporary"
+  fi
   chmod 0600 "$temporary"
   chown 0:0 "$temporary"
   mv -f -- "$temporary" "$directory/install-state.json"
+}
+
+write_upgrade_state() {
+  local phase="$1" rollback_status="$2" previous_version="$3" previous_sha="$4" now temporary
+  now="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  temporary="$TARGET_DIR/.install-state.$$.tmp"
+  printf '{"schema":1,"phase":"%s","domain":"%s","release_origin":"%s","version":"%s","manifest_sha256":"%s","updated_at":"%s","upgrade":{"previous_version":"%s","previous_manifest_sha256":"%s","rollback_status":"%s"}}\n' \
+    "$phase" "$SELECTED_DOMAIN" "$SELECTED_RELEASE_ORIGIN" "$SELECTED_VERSION" "$MANIFEST_SHA256" "$now" \
+    "$previous_version" "$previous_sha" "$rollback_status" > "$temporary"
+  chmod 0600 "$temporary"
+  chown 0:0 "$temporary"
+  mv -f -- "$temporary" "$STATE_FILE"
 }
 
 compose() {
@@ -535,10 +618,26 @@ compose() {
     -u AIKAYUN_POSTGRES_ADMIN_PASSWORD_FILE -u AIKAYUN_API_DATABASE_PASSWORD_FILE -u AIKAYUN_MIGRATOR_DATABASE_PASSWORD_FILE \
     -u AIKAYUN_PAYMENT_CREDENTIAL_KEY_RING_FILE -u AIKAYUN_CODE_POOL_ENCRYPTION_KEY_RING_FILE -u AIKAYUN_DB_NAME \
     -u AIKAYUN_PRIVATE_SUBNET -u AIKAYUN_HTTP_BIND_ADDRESS -u AIKAYUN_HTTP_PORT -u AIKAYUN_HTTPS_BIND_ADDRESS \
-    -u AIKAYUN_HTTPS_PORT -u NUXT_PUBLIC_STORE_NAME -u NUXT_PUBLIC_STORE_LOGO_URL -u NUXT_PUBLIC_STORE_BRAND_COLOR \
+    -u AIKAYUN_HTTPS_PORT -u AIKAYUN_UPGRADE_PROBE_ONLY -u NUXT_PUBLIC_STORE_NAME -u NUXT_PUBLIC_STORE_LOGO_URL -u NUXT_PUBLIC_STORE_BRAND_COLOR \
     AIKAYUN_API_IMAGE="$SELECTED_API_IMAGE" AIKAYUN_WEB_IMAGE="$SELECTED_WEB_IMAGE" \
     AIKAYUN_POSTGRES_IMAGE="$SELECTED_POSTGRES_IMAGE" AIKAYUN_CADDY_IMAGE="$SELECTED_CADDY_IMAGE" \
     docker compose --project-name aikayun --file "$RELEASE_DIR/compose.yaml" --env-file "$TARGET_DIR/.env" "$@"
+}
+
+compose_with_release() {
+  local compose_file="$1" probe_only="$2"
+  shift 2
+  env \
+    -u AIKAYUN_API_IMAGE -u AIKAYUN_WEB_IMAGE -u AIKAYUN_POSTGRES_IMAGE -u AIKAYUN_CADDY_IMAGE \
+    -u AIKAYUN_PUBLIC_HOST -u AIKAYUN_LICENSE_TRUST_BUNDLE_FILE \
+    -u AIKAYUN_POSTGRES_ADMIN_PASSWORD_FILE -u AIKAYUN_API_DATABASE_PASSWORD_FILE -u AIKAYUN_MIGRATOR_DATABASE_PASSWORD_FILE \
+    -u AIKAYUN_PAYMENT_CREDENTIAL_KEY_RING_FILE -u AIKAYUN_CODE_POOL_ENCRYPTION_KEY_RING_FILE -u AIKAYUN_DB_NAME \
+    -u AIKAYUN_PRIVATE_SUBNET -u AIKAYUN_HTTP_BIND_ADDRESS -u AIKAYUN_HTTP_PORT -u AIKAYUN_HTTPS_BIND_ADDRESS \
+    -u AIKAYUN_HTTPS_PORT -u AIKAYUN_UPGRADE_PROBE_ONLY -u NUXT_PUBLIC_STORE_NAME -u NUXT_PUBLIC_STORE_LOGO_URL -u NUXT_PUBLIC_STORE_BRAND_COLOR \
+    AIKAYUN_API_IMAGE="$SELECTED_API_IMAGE" AIKAYUN_WEB_IMAGE="$SELECTED_WEB_IMAGE" \
+    AIKAYUN_POSTGRES_IMAGE="$SELECTED_POSTGRES_IMAGE" AIKAYUN_CADDY_IMAGE="$SELECTED_CADDY_IMAGE" \
+    AIKAYUN_UPGRADE_PROBE_ONLY="$probe_only" \
+    docker compose --project-name aikayun --file "$compose_file" --env-file "$TARGET_DIR/.env" "$@"
 }
 
 prepare_state_volume() {
@@ -855,9 +954,25 @@ show_status() {
     printf 'AiKayun deployment state: not installed\n'
     return 0
   fi
+  if [[ ! -e "$UPGRADE_JOURNAL_FILE" ]]; then
+    saved_bundle_verify
+  else
+    SELECTED_VERSION="$(state_value version)"
+    SELECTED_RELEASE_ORIGIN="$(state_value release_origin)"
+    SELECTED_DOMAIN="$(state_value domain)"
+    load_release_image_digests
+  fi
   node_target '
     const fs=require("node:fs"); const s=JSON.parse(fs.readFileSync("/target/install-state.json","utf8"));
     for(const k of ["phase","version","domain","release_origin","manifest_sha256","updated_at"]) console.log(`${k}: ${s[k]}`);
+    if(s.upgrade) {
+      console.log(`previous_version: ${s.upgrade.previous_version}`);
+      console.log(`rollback_status: ${s.upgrade.rollback_status}`);
+    }
+    try {
+      const j=JSON.parse(fs.readFileSync("/target/.upgrade-journal.json","utf8"));
+      console.log(`upgrade_journal: ${j.phase} (${j.from_version} -> ${j.to_version})`);
+    } catch (error) { if(error.code!=="ENOENT") process.exit(1); }
   ' || fail 'The saved deployment state is invalid.'
   if [[ -f "$TARGET_DIR/.env" ]]; then compose ps
   else printf 'Compose services: not started\n'; fi
@@ -868,6 +983,21 @@ diagnose() {
   docker_ready
   check_docker_local_engine
   if [[ ! -f "$STATE_FILE" ]]; then fail 'No saved deployment is available to diagnose.'; fi
+  if [[ -e "$UPGRADE_JOURNAL_FILE" || -L "$UPGRADE_JOURNAL_FILE" ]]; then
+    node_target '
+      const fs=require("node:fs");
+      const j=JSON.parse(fs.readFileSync("/target/.upgrade-journal.json","utf8"));
+      if(j.schema!==1 || typeof j.phase!=="string") process.exit(1);
+      console.log(`Interrupted upgrade: ${j.phase} (${j.from_version} -> ${j.to_version})`);
+      if(j.phase==="candidate_active_starting") {
+        console.log("Automatic rollback is blocked because candidate services may have processed business or external operations.");
+        console.log("Keep all database volumes, files, keys, and state. Inspect the running services before any manual recovery.");
+      } else {
+        console.log("Candidate services have not been accepted for public traffic. Resume the review before retrying any deployment operation.");
+      }
+    ' || fail 'The interrupted upgrade journal is invalid; data and services were left unchanged.'
+    return 0
+  fi
   saved_bundle_verify
   if [[ -f "$TARGET_DIR/.env" ]]; then compose ps
   else printf 'Compose configuration: not prepared\n'; fi
@@ -906,6 +1036,404 @@ setup_token_command() {
   fi
   compose exec -T api /nodejs/bin/node /app/dist/setup-token-cli.js issue
   write_state setup_token_issued
+}
+
+verify_upgrade_compatibility() {
+  local candidate_directory="$1"
+  docker run --rm \
+    --mount "type=bind,source=$RELEASE_DIR,target=/current,readonly" \
+    --mount "type=bind,source=$candidate_directory,target=/candidate,readonly" \
+    --entrypoint node "$NODE_IMAGE" -e '
+      const fs=require("node:fs");
+      const crypto=require("node:crypto");
+      const fail=code=>{ process.stderr.write(code+"\n"); process.exit(1); };
+      const read=(root,name)=>fs.readFileSync(`${root}/${name}`);
+      const manifest=root=>JSON.parse(read(root,"release-manifest.json").toString("utf8"));
+      let current,next;
+      try { current=manifest("/current"); next=manifest("/candidate"); } catch { fail("upgrade_manifest_invalid"); }
+      const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+      if(next.release_id===current.release_id || next.version===current.version) fail("upgrade_version_must_change");
+      if(next.database?.engine_major!==18 || current.database?.engine_major!==18 ||
+         next.database.migration_head!==current.database.migration_head ||
+         next.database.migration_checksums_sha256!==current.database.migration_checksums_sha256 ||
+         !next.database.readable_heads?.includes(current.database.migration_head) ||
+         !next.database.writable_heads?.includes(current.database.migration_head)) fail("upgrade_database_compatibility_mismatch");
+      if(!next.database.upgrade_from_releases?.includes(current.release_id)) fail("upgrade_not_allowed_by_signed_release");
+      if(!next.database.rollback_to_releases?.includes(current.release_id)) fail("upgrade_rollback_not_supported_by_signed_release");
+      const currentChecksums=read("/current","migration-checksums.json");
+      const nextChecksums=read("/candidate","migration-checksums.json");
+      const checksum=bytes=>crypto.createHash("sha256").update(bytes).digest("hex");
+      if(!currentChecksums.equals(nextChecksums) || checksum(currentChecksums)!==current.database.migration_checksums_sha256 ||
+         checksum(nextChecksums)!==next.database.migration_checksums_sha256) fail("upgrade_migration_checksums_mismatch");
+      const trustFields=["protocol_versions","trust_configuration_id","issuer","offline_root_kid","online_signer_kids","minimum_bundle_version"];
+      const trust=value=>Object.fromEntries(trustFields.map(key=>[key,value.license?.[key]]));
+      if(!same(trust(current),trust(next)) ||
+         !read("/current","license-trust-bundle.jws").equals(read("/candidate","license-trust-bundle.jws")) ||
+         !read("/current","license-offline-root.jwk.json").equals(read("/candidate","license-offline-root.jwk.json"))) {
+        fail("upgrade_license_trust_configuration_mismatch");
+      }
+      for(const name of ["postgres","caddy"]) {
+        if(current.images?.[name]?.reference!==next.images?.[name]?.reference) fail(`upgrade_${name}_image_change_not_supported`);
+      }
+      const staticFiles=["deploy/Caddyfile","deploy/bootstrap-production-db-roles.sh","deploy/prepare-state-volume.sh",
+        "backup-host-broker.sh","compose.restore-isolated.yaml"];
+      for(const name of staticFiles) if(!read("/current",name).equals(read("/candidate",name))) fail("upgrade_runtime_artifact_change_not_supported");
+      const oldCompose=read("/current","compose.yaml").toString("utf8");
+      const newCompose=read("/candidate","compose.yaml").toString("utf8");
+      const probeLine=/^[ \t]*AIKAYUN_UPGRADE_PROBE_ONLY: \$\{AIKAYUN_UPGRADE_PROBE_ONLY:-false\}[ \t]*\r?\n/gm;
+      if((newCompose.match(probeLine)||[]).length!==1) fail("upgrade_probe_support_missing");
+      const expectedOld=oldCompose.replace(probeLine,"");
+      const normalizedNew=newCompose.replaceAll(next.images.api.reference,current.images.api.reference)
+        .replaceAll(next.images.web.reference,current.images.web.reference).replace(probeLine,"");
+      if(expectedOld!==normalizedNew) fail("upgrade_compose_change_not_supported");
+      process.stdout.write(JSON.stringify({status:"compatible",from:current.release_id,to:next.release_id})+"\n");
+    ' || fail 'The signed release does not meet the first-stage upgrade and rollback compatibility policy.'
+}
+
+write_upgrade_journal() {
+  local phase="$1" now temporary
+  now="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  temporary="$TARGET_DIR/.upgrade-journal.$$.tmp"
+  printf '{"schema":1,"phase":"%s","from_version":"%s","from_manifest_sha256":"%s","to_version":"%s","to_manifest_sha256":"%s","updated_at":"%s"}\n' \
+    "$phase" "$CURRENT_RELEASE_VERSION" "$CURRENT_RELEASE_MANIFEST_SHA256" "$SELECTED_VERSION" "$MANIFEST_SHA256" "$now" > "$temporary"
+  chmod 0600 "$temporary"
+  chown 0:0 "$temporary"
+  mv -f -- "$temporary" "$UPGRADE_JOURNAL_FILE"
+}
+
+verify_upgrade_stopped_services() {
+  local service id state code ids
+  for service in api web caddy; do
+    ids="$(compose ps --all -q "$service")" || return 1
+    [[ -n "$ids" ]] || return 1
+    while IFS= read -r id; do
+      [[ -n "$id" ]] || continue
+      state="$(docker inspect --format '{{.State.Status}}|{{.State.ExitCode}}' "$id" 2>/dev/null)" || return 1
+      code="${state#*|}"
+      [[ "${state%%|*}" == exited && "$code" == 0 ]] || return 1
+    done <<< "$ids"
+  done
+}
+
+wait_healthy_with_release() {
+  local compose_file="$1" probe_only="$2" service="$3" limit="${4:-300}" id health attempt
+  for ((attempt=1; attempt<=limit; attempt++)); do
+    id="$(compose_with_release "$compose_file" "$probe_only" ps -q "$service" 2>/dev/null || true)"
+    if [[ -n "$id" ]]; then
+      health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$id" 2>/dev/null || true)"
+      [[ "$health" == healthy ]] && return 0
+      [[ "$health" == exited || "$health" == dead ]] && return 1
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+verify_running_program_image() {
+  local service="$1" expected="$2" id actual
+  id="$(compose ps -q "$service" 2>/dev/null)" || return 1
+  [[ -n "$id" ]] || return 1
+  actual="$(docker inspect --format '{{.Config.Image}}' "$id" 2>/dev/null)" || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+select_current_upgrade_release() {
+  SELECTED_VERSION="$CURRENT_RELEASE_VERSION"
+  SELECTED_RELEASE_ORIGIN="$(state_value release_origin)"
+  SELECTED_DOMAIN="$(state_value domain)"
+  MANIFEST_SHA256="$CURRENT_RELEASE_MANIFEST_SHA256"
+  SELECTED_API_IMAGE="$CURRENT_API_IMAGE"
+  SELECTED_WEB_IMAGE="$CURRENT_WEB_IMAGE"
+  SELECTED_POSTGRES_IMAGE="$CURRENT_POSTGRES_IMAGE"
+  SELECTED_CADDY_IMAGE="$CURRENT_CADDY_IMAGE"
+  SELECTED_BACKUP_RESTIC_IMAGE="$CURRENT_BACKUP_RESTIC_IMAGE"
+}
+
+select_candidate_upgrade_release() {
+  SELECTED_VERSION="$CANDIDATE_RELEASE_VERSION"
+  MANIFEST_SHA256="$CANDIDATE_RELEASE_MANIFEST_SHA256"
+  SELECTED_API_IMAGE="$CANDIDATE_API_IMAGE"
+  SELECTED_WEB_IMAGE="$CANDIDATE_WEB_IMAGE"
+  SELECTED_POSTGRES_IMAGE="$CANDIDATE_POSTGRES_IMAGE"
+  SELECTED_CADDY_IMAGE="$CANDIDATE_CADDY_IMAGE"
+  SELECTED_BACKUP_RESTIC_IMAGE="$CANDIDATE_BACKUP_RESTIC_IMAGE"
+}
+
+verify_previous_release() {
+  local expected_version="$1" expected_sha="$2" actual_sha actual_version
+  [[ -d "$PREVIOUS_RELEASE_DIR" && ! -L "$PREVIOUS_RELEASE_DIR" && \
+     "$(stat -c '%u:%g:%a' "$PREVIOUS_RELEASE_DIR")" == '0:0:755' && \
+     "$(realpath -e "$PREVIOUS_RELEASE_DIR")" == "$PREVIOUS_RELEASE_DIR" ]] || \
+    fail 'The saved previous release directory is missing or unsafe.'
+  actual_sha="$(sha256sum "$PREVIOUS_RELEASE_DIR/release-manifest.json" | awk '{print $1}')"
+  [[ "$actual_sha" == "$expected_sha" ]] || fail 'The saved previous release differs from its recorded manifest digest.'
+  actual_version="$(docker run --rm --mount "type=bind,source=$PREVIOUS_RELEASE_DIR,target=/release,readonly" \
+    --entrypoint node "$NODE_IMAGE" -e 'const fs=require("node:fs");const m=JSON.parse(fs.readFileSync("/release/release-manifest.json","utf8"));process.stdout.write(m.version)')" || \
+    fail 'The saved previous release manifest is invalid.'
+  [[ "$actual_version" == "$expected_version" ]] || fail 'The saved previous release version differs from its recorded version.'
+  docker run --rm --mount "type=bind,source=$PREVIOUS_RELEASE_DIR,target=/release,readonly" --entrypoint cosign "$COSIGN_IMAGE" \
+    verify-blob --bundle /release/release-manifest.cosign.bundle \
+    --certificate-identity "$RELEASE_CERT_IDENTITY" --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
+    /release/release-manifest.json >/dev/null || fail 'Cosign rejected the saved previous release.'
+  verify_release_artifacts_with_installer "$PREVIOUS_RELEASE_DIR" || fail 'Installer-owned verification rejected the saved previous release.'
+  docker run --rm --mount "type=bind,source=$PREVIOUS_RELEASE_DIR,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
+    /release/release-verifier.mjs /release/release-manifest.json /release/release-manifest.jws \
+    /release/release-signing-root.jwk.json >/dev/null || fail 'The saved previous release JWS signature is invalid.'
+  docker run --rm --mount "type=bind,source=$PREVIOUS_RELEASE_DIR,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
+    /release/verify-artifacts.mjs /release/release-manifest.json /release >/dev/null || \
+    fail 'A saved previous release artifact failed SHA-256 verification.'
+}
+
+assert_services_stopped_with_release() {
+  local compose_file="$1" probe_only="$2" service ids id state code
+  for service in api web caddy; do
+    ids="$(compose_with_release "$compose_file" "$probe_only" ps --all -q "$service")" || return 1
+    [[ -n "$ids" ]] || return 1
+    while IFS= read -r id; do
+      [[ -n "$id" ]] || continue
+      state="$(docker inspect --format '{{.State.Status}}|{{.State.ExitCode}}' "$id" 2>/dev/null)" || return 1
+      code="${state#*|}"
+      [[ "${state%%|*}" == exited && "$code" == 0 ]] || return 1
+    done <<< "$ids"
+  done
+}
+
+upgrade_install() {
+  local requested_version="$1" state_volume_label previous_info previous_version previous_sha
+  [[ ! -e "$UPGRADE_JOURNAL_FILE" && ! -L "$UPGRADE_JOURNAL_FILE" ]] || \
+    fail 'A prior upgrade was interrupted. Inspect status and diagnose before starting another upgrade.'
+  [[ ! -e "$UPGRADE_STAGING_DIR" && ! -L "$UPGRADE_STAGING_DIR" && \
+     ! -e "$UPGRADE_OLDER_RELEASE_DIR" && ! -L "$UPGRADE_OLDER_RELEASE_DIR" && \
+     ! -e "$UPGRADE_STATE_BACKUP" && ! -L "$UPGRADE_STATE_BACKUP" && \
+     ! -e "$UPGRADE_ENV_BACKUP" && ! -L "$UPGRADE_ENV_BACKUP" ]] || \
+    fail 'An unfinished upgrade staging artifact exists. Inspect it before retrying.'
+
+  saved_bundle_verify
+  verify_backup_launcher
+  [[ "$(state_value phase)" == setup_token_issued ]] || \
+    fail 'Upgrade requires a fully initialized installation with verified HTTPS and administrator setup.'
+  CURRENT_RELEASE_VERSION="$SELECTED_VERSION"
+  CURRENT_RELEASE_MANIFEST_SHA256="$MANIFEST_SHA256"
+  CURRENT_API_IMAGE="$SELECTED_API_IMAGE"
+  CURRENT_WEB_IMAGE="$SELECTED_WEB_IMAGE"
+  CURRENT_POSTGRES_IMAGE="$SELECTED_POSTGRES_IMAGE"
+  CURRENT_CADDY_IMAGE="$SELECTED_CADDY_IMAGE"
+  CURRENT_BACKUP_RESTIC_IMAGE="$SELECTED_BACKUP_RESTIC_IMAGE"
+  [[ "$requested_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+)(\.([0-9A-Za-z-]+))*)?$ ]] || \
+    fail 'Provide a canonical release version, such as the one published by the project.'
+  [[ "$requested_version" != "$CURRENT_RELEASE_VERSION" ]] || fail 'The requested version is already installed.'
+
+  prepare_secret_files 13
+  prepare_compose_volumes 13
+  state_volume_label="$(docker volume inspect aikayun_state --format '{{ index .Labels "com.aikayun.managed-by" }}')" || \
+    fail 'The persistent state volume is missing; upgrade stopped without recreating it.'
+  [[ "$state_volume_label" == aikayun-7-3 ]] || fail 'The persistent state volume ownership marker changed.'
+  compose config --quiet || fail 'The current Compose configuration is invalid.'
+  check_public_ports_available true
+  check_release_origin
+  compose exec -T api /nodejs/bin/node /app/dist/production-install-init.js verify >/dev/null || \
+    fail 'The current database identity or Pending Key binding is not verified; upgrade stopped.'
+
+  if [[ -e "$PREVIOUS_RELEASE_DIR" || -L "$PREVIOUS_RELEASE_DIR" ]]; then
+    previous_info="$(node_target '
+      const fs=require("node:fs");const s=JSON.parse(fs.readFileSync("/target/install-state.json","utf8"));
+      const u=s.upgrade;
+      if(!u || typeof u.previous_version!=="string" || !/^[a-f0-9]{64}$/.test(u.previous_manifest_sha256)) process.exit(1);
+      process.stdout.write(u.previous_version+"\n"+u.previous_manifest_sha256);
+    ')" || fail 'The existing previous release is not described by verified upgrade state.'
+    previous_version="${previous_info%%$'\n'*}"
+    previous_sha="${previous_info#*$'\n'}"
+    [[ -z "$UPGRADE_OLDER_RELEASE_DIR" || ! -e "$UPGRADE_OLDER_RELEASE_DIR" ]] || \
+      fail 'An older previous release is already staged; inspect the installation before retrying.'
+    verify_previous_release "$previous_version" "$previous_sha"
+  fi
+
+  WORK_DIR="$(mktemp -d /var/tmp/aikayun-install.XXXXXX)"
+  chmod 0700 "$WORK_DIR"
+  SELECTED_VERSION="$requested_version"
+  download_and_verify_release
+  load_release_image_digests_from "$WORK_DIR/release"
+  CANDIDATE_RELEASE_VERSION="$SELECTED_VERSION"
+  CANDIDATE_RELEASE_MANIFEST_SHA256="$MANIFEST_SHA256"
+  CANDIDATE_API_IMAGE="$SELECTED_API_IMAGE"
+  CANDIDATE_WEB_IMAGE="$SELECTED_WEB_IMAGE"
+  CANDIDATE_POSTGRES_IMAGE="$SELECTED_POSTGRES_IMAGE"
+  CANDIDATE_CADDY_IMAGE="$SELECTED_CADDY_IMAGE"
+  CANDIDATE_BACKUP_RESTIC_IMAGE="$SELECTED_BACKUP_RESTIC_IMAGE"
+
+  cp -a "$WORK_DIR/release" "$UPGRADE_STAGING_DIR"
+  chmod -R a+rX "$UPGRADE_STAGING_DIR"
+  chmod 0400 "$UPGRADE_STAGING_DIR/license-trust-bundle.jws"
+  chown 1000:1000 "$UPGRADE_STAGING_DIR/license-trust-bundle.jws"
+  UPGRADE_CANDIDATE_DIR="$UPGRADE_STAGING_DIR"
+  verify_release_artifacts_with_installer "$UPGRADE_STAGING_DIR" || fail 'The staged signed release failed installer-owned verification.'
+  docker run --rm --mount "type=bind,source=$UPGRADE_STAGING_DIR,target=/release,readonly" --entrypoint cosign "$COSIGN_IMAGE" \
+    verify-blob --bundle /release/release-manifest.cosign.bundle \
+    --certificate-identity "$RELEASE_CERT_IDENTITY" --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
+    /release/release-manifest.json >/dev/null || fail 'Cosign rejected the staged release manifest.'
+  docker run --rm --mount "type=bind,source=$UPGRADE_STAGING_DIR,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
+    /release/release-verifier.mjs /release/release-manifest.json /release/release-manifest.jws \
+    /release/release-signing-root.jwk.json >/dev/null || fail 'The staged release JWS signature is invalid.'
+  docker run --rm --mount "type=bind,source=$UPGRADE_STAGING_DIR,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
+    /release/verify-artifacts.mjs /release/release-manifest.json /release >/dev/null || \
+    fail 'A staged release artifact failed SHA-256 verification.'
+
+  SELECTED_VERSION="$CANDIDATE_RELEASE_VERSION"
+  MANIFEST_SHA256="$CANDIDATE_RELEASE_MANIFEST_SHA256"
+  SELECTED_API_IMAGE="$CANDIDATE_API_IMAGE"
+  SELECTED_WEB_IMAGE="$CANDIDATE_WEB_IMAGE"
+  SELECTED_POSTGRES_IMAGE="$CANDIDATE_POSTGRES_IMAGE"
+  SELECTED_CADDY_IMAGE="$CANDIDATE_CADDY_IMAGE"
+  SELECTED_BACKUP_RESTIC_IMAGE="$CANDIDATE_BACKUP_RESTIC_IMAGE"
+  verify_upgrade_compatibility "$UPGRADE_STAGING_DIR"
+  compose_with_release "$UPGRADE_STAGING_DIR/compose.yaml" false config --quiet || \
+    fail 'The candidate signed Compose configuration is invalid.'
+
+  cp -p "$STATE_FILE" "$UPGRADE_STATE_BACKUP"
+  cp -p "$TARGET_DIR/.env" "$UPGRADE_ENV_BACKUP"
+  chmod 0600 "$UPGRADE_STATE_BACKUP" "$UPGRADE_ENV_BACKUP"
+  chown 0:0 "$UPGRADE_STATE_BACKUP" "$UPGRADE_ENV_BACKUP"
+  write_upgrade_journal preacceptance_probe
+
+  select_current_upgrade_release
+  compose stop caddy || fail 'Could not stop the public Caddy service cleanly; no candidate service was started.'
+  compose stop web || fail 'Could not stop the current Web service cleanly; no candidate service was started.'
+  compose stop --timeout 30 api || fail 'The current API did not stop cleanly. No candidate service was started; inspect pending operations before retrying.'
+  verify_upgrade_stopped_services || fail 'A current service did not exit cleanly. Upgrade stopped to avoid overlapping business writers.'
+  UPGRADE_PRE_ACCEPTANCE=1
+
+  select_candidate_upgrade_release
+  compose_with_release "$UPGRADE_STAGING_DIR/compose.yaml" false run --rm --no-deps --entrypoint /nodejs/bin/node \
+    migrate /app/dist/db/upgrade-database-check-cli.js \
+    "$(docker run --rm --mount "type=bind,source=$UPGRADE_STAGING_DIR,target=/release,readonly" --entrypoint node "$NODE_IMAGE" -e \
+      'const fs=require("node:fs");process.stdout.write(JSON.parse(fs.readFileSync("/release/release-manifest.json","utf8")).database.migration_head)')" \
+    "$(docker run --rm --mount "type=bind,source=$UPGRADE_STAGING_DIR,target=/release,readonly" --entrypoint node "$NODE_IMAGE" -e \
+      'const fs=require("node:fs");process.stdout.write(JSON.parse(fs.readFileSync("/release/release-manifest.json","utf8")).database.migration_checksums_sha256)')" || \
+    fail 'The live PostgreSQL major version, applied migration registry, identity binding, or complete migration checksum does not match.'
+  compose_with_release "$UPGRADE_STAGING_DIR/compose.yaml" false run --rm --no-deps \
+    production-install-init verify >/dev/null || fail 'The candidate release could not verify the existing installation identity and Pending Key.'
+
+  write_upgrade_journal preacceptance_probe
+  compose_with_release "$UPGRADE_STAGING_DIR/compose.yaml" true up -d --force-recreate --no-deps api || \
+    fail 'The candidate API probe failed before public traffic; the prior program will be restored.'
+  wait_healthy_with_release "$UPGRADE_STAGING_DIR/compose.yaml" true api 300 || \
+    fail 'The candidate API did not become healthy during its no-worker probe; the prior program will be restored.'
+  compose_with_release "$UPGRADE_STAGING_DIR/compose.yaml" true up -d --force-recreate --no-deps web || \
+    fail 'The candidate Web probe failed before public traffic; the prior program will be restored.'
+  wait_healthy_with_release "$UPGRADE_STAGING_DIR/compose.yaml" true web 300 || \
+    fail 'The candidate Web did not become healthy during its no-worker probe; the prior program will be restored.'
+  compose_with_release "$UPGRADE_STAGING_DIR/compose.yaml" true stop api web || \
+    fail 'The candidate no-worker probe could not stop cleanly; the prior program will be restored.'
+  assert_services_stopped_with_release "$UPGRADE_STAGING_DIR/compose.yaml" true || \
+    fail 'A no-worker probe service did not stop cleanly; the prior program will be restored.'
+
+  write_upgrade_journal preacceptance_switch
+  if [[ -d "$PREVIOUS_RELEASE_DIR" ]]; then
+    mv -- "$PREVIOUS_RELEASE_DIR" "$UPGRADE_OLDER_RELEASE_DIR" || fail 'Could not stage the older verified release.'
+  fi
+  mv -- "$RELEASE_DIR" "$PREVIOUS_RELEASE_DIR" || fail 'Could not preserve the current signed release.'
+  mv -- "$UPGRADE_STAGING_DIR" "$RELEASE_DIR" || fail 'Could not install the verified signed release directory.'
+  UPGRADE_CANDIDATE_DIR="$RELEASE_DIR"
+  write_upgrade_env "$CANDIDATE_API_IMAGE" "$CANDIDATE_WEB_IMAGE"
+  SELECTED_RELEASE_ORIGIN="$(state_value release_origin)"
+  SELECTED_DOMAIN="$(state_value domain)"
+  select_candidate_upgrade_release
+  prepare_secret_files 13
+  compose config --quiet || fail 'The switched candidate Compose environment does not match the signed release and preserved secrets.'
+  install -m 0555 "$RELEASE_DIR/install.sh" "$TARGET_DIR/.aikayun.upgrade.$$.tmp"
+  chown 0:0 "$TARGET_DIR/.aikayun.upgrade.$$.tmp"
+  mv -f -- "$TARGET_DIR/.aikayun.upgrade.$$.tmp" "$TARGET_DIR/aikayun"
+  write_upgrade_journal candidate_active_starting
+  UPGRADE_PRE_ACCEPTANCE=0
+
+  compose up -d --force-recreate --no-deps api || \
+    fail 'The candidate API failed after workers could start. Automatic rollback is blocked; Caddy remains stopped and all data is retained.'
+  wait_healthy api 300 || fail 'The candidate API health check failed after workers could start. Automatic rollback is blocked; inspect before retrying.'
+  compose up -d --force-recreate --no-deps web || \
+    fail 'The candidate Web failed after the API became active. Automatic rollback is blocked; Caddy remains stopped and all data is retained.'
+  wait_healthy web 300 || fail 'The candidate Web health check failed after the API became active. Automatic rollback is blocked; inspect before retrying.'
+  compose run --rm --no-deps production-install-init verify >/dev/null || \
+    fail 'The running candidate could not verify the existing identity and Pending Key. Automatic rollback is blocked.'
+  verify_running_program_image api "$CANDIDATE_API_IMAGE" || \
+    fail 'The running API image does not match the signed candidate manifest. Automatic rollback is blocked.'
+  verify_running_program_image web "$CANDIDATE_WEB_IMAGE" || \
+    fail 'The running Web image does not match the signed candidate manifest. Automatic rollback is blocked.'
+  write_upgrade_state setup_token_issued blocked_after_candidate_start "$CURRENT_RELEASE_VERSION" "$CURRENT_RELEASE_MANIFEST_SHA256"
+  compose up -d --no-recreate --no-deps caddy || \
+    fail 'The candidate programs are healthy but Caddy could not be restored. Automatic rollback is blocked; inspect before retrying.'
+
+  probe_https || fail 'The candidate programs are running but the HTTPS acceptance probe failed. Automatic rollback is blocked; inspect status and diagnose.'
+  write_upgrade_state setup_token_issued blocked_after_acceptance "$CURRENT_RELEASE_VERSION" "$CURRENT_RELEASE_MANIFEST_SHA256"
+  [[ ! -e "$UPGRADE_OLDER_RELEASE_DIR" ]] || rm -rf -- "$UPGRADE_OLDER_RELEASE_DIR"
+  rm -f -- "$UPGRADE_JOURNAL_FILE" "$UPGRADE_STATE_BACKUP" "$UPGRADE_ENV_BACKUP"
+  UPGRADE_CANDIDATE_DIR=''
+  printf 'AiKayun upgraded from %s to %s. Previous release %s is retained; automatic rollback is blocked after candidate services could process business or external operations.\n' \
+    "$CURRENT_RELEASE_VERSION" "$CANDIDATE_RELEASE_VERSION" "$CURRENT_RELEASE_VERSION"
+}
+
+write_upgrade_env() {
+  local api_image="$1" web_image="$2" temporary="$TARGET_DIR/.env.upgrade.$$.tmp"
+  sed -e "s|^AIKAYUN_API_IMAGE=.*$|AIKAYUN_API_IMAGE=$api_image|" \
+      -e "s|^AIKAYUN_WEB_IMAGE=.*$|AIKAYUN_WEB_IMAGE=$web_image|" \
+    "$TARGET_DIR/.env" > "$temporary" || fail 'Could not prepare the signed program image update.'
+  [[ "$(grep -c '^AIKAYUN_API_IMAGE=' "$temporary")" == 1 && "$(grep -c '^AIKAYUN_WEB_IMAGE=' "$temporary")" == 1 ]] || {
+    rm -f -- "$temporary"
+    fail 'The persistent Compose file does not contain exactly one API and Web image entry.'
+  }
+  chmod 0600 "$temporary"
+  chown 0:0 "$temporary"
+  mv -f -- "$temporary" "$TARGET_DIR/.env"
+}
+
+rollback_upgrade_before_acceptance() {
+  local current_manifest_sha=''
+  printf 'AiKayun installer: restoring the prior program before public traffic was enabled.\n' >&2
+  if [[ -n "$UPGRADE_CANDIDATE_DIR" && -f "$UPGRADE_CANDIDATE_DIR/compose.yaml" ]]; then
+    compose_with_release "$UPGRADE_CANDIDATE_DIR/compose.yaml" true stop api web >/dev/null 2>&1 || true
+  fi
+
+  if [[ -d "$RELEASE_DIR" && ! -L "$RELEASE_DIR" && -f "$RELEASE_DIR/release-manifest.json" ]]; then
+    current_manifest_sha="$(sha256sum "$RELEASE_DIR/release-manifest.json" | awk '{print $1}')"
+  fi
+  if [[ "$current_manifest_sha" == "$MANIFEST_SHA256" && -d "$PREVIOUS_RELEASE_DIR" && ! -L "$PREVIOUS_RELEASE_DIR" ]]; then
+    [[ ! -e "$UPGRADE_STAGING_DIR" ]] || rm -rf -- "$UPGRADE_STAGING_DIR"
+    mv -- "$RELEASE_DIR" "$UPGRADE_STAGING_DIR" || return 1
+    mv -- "$PREVIOUS_RELEASE_DIR" "$RELEASE_DIR" || return 1
+  elif [[ ! -d "$RELEASE_DIR" && -d "$PREVIOUS_RELEASE_DIR" && ! -L "$PREVIOUS_RELEASE_DIR" ]]; then
+    mv -- "$PREVIOUS_RELEASE_DIR" "$RELEASE_DIR" || return 1
+  fi
+  if [[ -d "$UPGRADE_OLDER_RELEASE_DIR" && ! -L "$UPGRADE_OLDER_RELEASE_DIR" ]]; then
+    [[ ! -e "$PREVIOUS_RELEASE_DIR" ]] || return 1
+    mv -- "$UPGRADE_OLDER_RELEASE_DIR" "$PREVIOUS_RELEASE_DIR" || return 1
+  fi
+  if [[ -f "$UPGRADE_ENV_BACKUP" && ! -L "$UPGRADE_ENV_BACKUP" ]]; then
+    mv -f -- "$UPGRADE_ENV_BACKUP" "$TARGET_DIR/.env" || return 1
+  fi
+  if [[ -f "$UPGRADE_STATE_BACKUP" && ! -L "$UPGRADE_STATE_BACKUP" ]]; then
+    mv -f -- "$UPGRADE_STATE_BACKUP" "$STATE_FILE" || return 1
+  fi
+  [[ -d "$RELEASE_DIR" && ! -L "$RELEASE_DIR" ]] || return 1
+  install -m 0555 "$RELEASE_DIR/install.sh" "$TARGET_DIR/.aikayun.rollback.$$.tmp" || return 1
+  chown 0:0 "$TARGET_DIR/.aikayun.rollback.$$.tmp" || return 1
+  mv -f -- "$TARGET_DIR/.aikayun.rollback.$$.tmp" "$TARGET_DIR/aikayun" || return 1
+
+  SELECTED_VERSION="$(state_value version)" || return 1
+  SELECTED_RELEASE_ORIGIN="$(state_value release_origin)" || return 1
+  SELECTED_DOMAIN="$(state_value domain)" || return 1
+  MANIFEST_SHA256="$(sha256sum "$RELEASE_DIR/release-manifest.json" | awk '{print $1}')"
+  load_release_image_digests || return 1
+  compose config --quiet >/dev/null 2>&1 || return 1
+  compose up -d --force-recreate --no-deps api >/dev/null 2>&1 || return 1
+  wait_healthy api 300 || return 1
+  compose up -d --force-recreate --no-deps web >/dev/null 2>&1 || return 1
+  wait_healthy web 300 || return 1
+  compose up -d --no-recreate --no-deps caddy >/dev/null 2>&1 || return 1
+
+  [[ ! -e "$UPGRADE_STAGING_DIR" ]] || rm -rf -- "$UPGRADE_STAGING_DIR"
+  rm -f -- "$UPGRADE_JOURNAL_FILE" "$UPGRADE_STATE_BACKUP" "$UPGRADE_ENV_BACKUP"
+  UPGRADE_PRE_ACCEPTANCE=0
+  printf 'AiKayun installer: prior program restored; database, volumes, secrets, and identity were retained.\n' >&2
+  return 0
 }
 
 parse_install_options() {
@@ -957,6 +1485,15 @@ main() {
       require_host_commands
       find /var/tmp -maxdepth 1 -type d -name 'aikayun-install.*' -user 0 -mmin +1 -exec rm -rf -- {} + 2>/dev/null || true
       resume_install
+      ;;
+    upgrade)
+      [[ $# == 3 && "$2" == --version ]] || fail 'Usage: sudo /opt/aikayun/aikayun upgrade --version X.Y.Z'
+      local upgrade_version="$3"
+      require_root
+      begin_lock
+      host_preflight
+      find /var/tmp -maxdepth 1 -type d -name 'aikayun-install.*' -user 0 -mmin +1 -exec rm -rf -- {} + 2>/dev/null || true
+      upgrade_install "$upgrade_version"
       ;;
     status)
       (($# == 1)) || fail 'status does not accept options.'
