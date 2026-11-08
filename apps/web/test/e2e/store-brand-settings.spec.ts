@@ -22,7 +22,7 @@ test('admin settings persist and render in storefront SSR without changing admin
   try {
     await page.setViewportSize({ width: 390, height: 844 })
     await page.goto('/admin/storefront/brand')
-    await expect(page.getByRole('heading', { name: '店铺设置', exact: true })).toBeVisible()
+    await expect(page.locator('#admin-main').getByRole('heading', { name: '店铺设置', exact: true })).toBeVisible()
     await expect(page.locator('html')).toHaveAttribute('data-aikayun-area', 'admin')
     await expect(page.getByRole('link', { name: '店铺设置' })).toBeVisible()
 
