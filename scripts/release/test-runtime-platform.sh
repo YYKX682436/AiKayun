@@ -6,6 +6,10 @@ platform="${1:?Usage: test-runtime-platform.sh linux/amd64|linux/arm64 API_IMAGE
 api_image="${2:?API staging image is required}"
 web_image="${3:?Web staging image is required}"
 expected_migration_head="${4:?Expected signed migration head is required}"
+validation_postgres_image="${AIKAYUN_VALIDATION_POSTGRES_IMAGE:-docker.io/library/postgres@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395}"
+validation_caddy_image="${AIKAYUN_VALIDATION_CADDY_IMAGE:-docker.io/library/caddy@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee}"
+printf '%s\n' "$validation_postgres_image" | grep -Eq '^docker.io/library/postgres@sha256:[a-f0-9]{64}$' || { echo 'PostgreSQL validation image must be an official digest-pinned image.' >&2; exit 2; }
+printf '%s\n' "$validation_caddy_image" | grep -Eq '^docker.io/library/caddy@sha256:[a-f0-9]{64}$' || { echo 'Caddy validation image must be an official digest-pinned image.' >&2; exit 2; }
 case "$platform" in
   linux/amd64) network="172.30.240.0/24" ;;
   linux/arm64) network="172.30.241.0/24" ;;
@@ -48,8 +52,8 @@ chmod 0400 "$work"/*
 
 export AIKAYUN_API_IMAGE="$api_image"
 export AIKAYUN_WEB_IMAGE="$web_image"
-export AIKAYUN_POSTGRES_IMAGE='docker.io/library/postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873'
-export AIKAYUN_CADDY_IMAGE='docker.io/library/caddy@sha256:e70b164da81ef698b3ad19af799ea6086ce6d9e48ed4079eb9fe26f6fbf14ee5'
+export AIKAYUN_POSTGRES_IMAGE="$validation_postgres_image"
+export AIKAYUN_CADDY_IMAGE="$validation_caddy_image"
 export AIKAYUN_PUBLIC_HOST=localhost
 export AIKAYUN_PRIVATE_SUBNET="$network"
 export AIKAYUN_POSTGRES_ADMIN_PASSWORD_FILE="$work/postgres-admin-password"
