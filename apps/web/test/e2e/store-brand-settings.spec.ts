@@ -26,6 +26,8 @@ test('admin settings persist and render in storefront SSR without changing admin
     await expect(page.locator('html')).toHaveAttribute('data-aikayun-area', 'admin')
     await page.getByRole('button', { name: '打开侧边栏' }).click()
     await expect(page.getByRole('link', { name: '店铺设置' })).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.getByRole('link', { name: '店铺设置' })).toBeHidden()
 
     await page.getByLabel('店铺名称').fill('青屿数字商店')
     await page.getByLabel('店铺 Logo 地址').fill('/store-logo.svg')
