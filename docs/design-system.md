@@ -94,15 +94,15 @@ Nuxt UI 语义色映射在 `app.config.ts`：`primary → brand`、`secondary �
 - 浅色、深色和跟随系统由 Nuxt Color Mode 管理，默认 `preference` 是 `system`。明确选择的浅色或深色优先于系统设置；跟随系统时，系统偏好变化会立即更新 `value`。
 - 模式偏好由 Nuxt Color Mode 写入 `localStorage` 的 `aikayun-color-mode`。这是长期应用存储键；历史 `nuxt-color-mode` 与阶段②-1临时键 `aikayun-color-mode-r1` 不参与初始化，避免旧值覆盖新的系统默认。没有额外的主题状态或同步存储。
 - 模式切换使用 Nuxt UI `USelectMenu` 和 Nuxt Color Mode 的 `preference`；实际显示主题读取只读 `value`。选择器在客户端初始化后启用，SSR 提供稳定回退项。
-- 店铺品牌配置位于 `runtimeConfig.public`：`storeName`、`storeLogoUrl`、`storeBrandColor`。独立部署通过 `NUXT_PUBLIC_STORE_NAME`、`NUXT_PUBLIC_STORE_LOGO_URL`、`NUXT_PUBLIC_STORE_BRAND_COLOR` 设置，无需修改源码或重新构建应用镜像。
+- 店铺品牌首次配置从 `runtimeConfig.public` 读取：`storeName`、`storeLogoUrl`、`storeBrandColor`，独立部署可通过 `NUXT_PUBLIC_STORE_NAME`、`NUXT_PUBLIC_STORE_LOGO_URL`、`NUXT_PUBLIC_STORE_BRAND_COLOR` 设置。管理员保存后台“店铺设置”后，以 PostgreSQL 单实例 `storefront_brand_settings` 中的值为准；未保存时继续使用部署默认值。运行时 API 在 SSR 首屏读取已保存设置，并把安全的非敏感品牌字段传给前台，不从请求 Host 推断域名。
 - Logo 仅接受站内根路径或 HTTPS URL；无 Logo 时统一显示店铺名称首字。品牌色仅接受 `#RGB` 或 `#RRGGBB`；非法颜色回退为 AiKayun 默认蓝 `#2563EB`。Culori 将主色转换为 OKLCH 并裁切到 sRGB，在统一色阶生成逻辑中检查实际浅色和深色页面表面、`primary/10` 半透明底色、主按钮反白文字，以及聚焦轮廓。色阶以高于 WCAG AA 的余量生成；浏览器测试对普通品牌文字和按钮验证至少 4.5:1，对焦点轮廓验证至少 3:1。成功、信息、警告、错误色保持独立。
-- 商城前台的浏览器标题由 `app.vue` 的响应式 `titleTemplate` 使用当前 `storeName`；管理后台和登录页使用固定 AiKayun 产品名称。SSR 按当前请求路由和 `runtimeConfig.public` 输出首屏标题，客户端路由时同步更新。
+- 商城前台的浏览器标题由 `app.vue` 的响应式 `titleTemplate` 使用当前有效 `storeName`；管理后台和登录页使用固定 AiKayun 产品名称。SSR 首屏通过 Nuxt BFF 读取数据库已保存设置，并回退到 `runtimeConfig.public` 初始默认值；客户端应用状态随保存结果同步更新。
 - 浏览器 `theme-color` 由 `app.vue` 通过 Nuxt `useHead` 与 `useColorMode().value` 同步：浅色用 `#F8FAFC`，深色用 `#020617`；SSR 模式尚未解析时先输出浅色默认值，客户端解析后随实际显示模式更新，不另存模式状态。
 - 商城前台将生成的 `--ui-color-primary-*` 变量放在 `<html>` 根节点，页面导航切换时由 SSR/应用路由设置 `data-aikayun-area` 并更新根变量。管理后台及登录页不写入客户主色，沿用 AiKayun 蓝和中性色。
 - 根节点作用域使 UApp 中 Teleport 到 `body` 的菜单、弹窗和抽屉继承当前区域主题；不依赖可能被 Teleport 脱离的局部容器，也不在服务端模块间共享可变主题状态。
-- Color Mode 的早期 head 脚本在绘制前读取用户偏好并设置 `.light` / `.dark`；应用 SSR 不按未知系统状态分支渲染主题文案。品牌根变量由本次请求的 public runtimeConfig 计算并随首屏 HTML 输出。
-- Compose 默认值可直接运行 AiKayun 蓝色配置；`docs/deployment.md` 也提供紫色配置示例。新增品牌只需在目标部署设置三项环境变量并重启 web 容器；生产构建验证会在不重建应用镜像的条件下，以另一组启动环境变量启动同一份构建产物。
-- 当前没有后台可视化主题编辑器、主题数据库、配置 API、拖拽装修、主题市场或多租户/按域名主题解析。品牌配置仅在部署层维护。
+- Color Mode 的早期 head 脚本在绘制前读取用户偏好并设置 `.light` / `.dark`；应用 SSR 不按未知系统状态分支渲染主题文案。品牌根变量由本次请求读取的有效店铺设置计算并随首屏 HTML 输出。
+- Compose 默认值可直接运行 AiKayun 蓝色配置；`docs/deployment.md` 也提供紫色初始值示例。数据库保存店铺设置后，环境变量不覆盖已保存品牌，前台刷新会在 SSR 中读取数据库值；浏览器端的后台保存同时更新当前应用状态。
+- 当前为每个独立部署实例保存一份店铺品牌设置。后台保持 AiKayun 自身配色；商城前台在现有 `useStoreBrand()`、`BrandMark` 和 `createStorefrontThemeStyle()` 机制下读取商家品牌。此功能不包含多租户、按域名解析或拖拽装修。
 
 ## 新页面使用规范
 

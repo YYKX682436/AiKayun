@@ -264,6 +264,18 @@ export const StorefrontCustomerPolicySchema = Type.Object({
   updatedAt: Type.String({ format: 'date-time' }),
 }, { additionalProperties: false })
 
+export const StorefrontBrandSchema = Type.Object({
+  storeName: Type.String({ minLength: 1, maxLength: 80 }),
+  storeLogoUrl: Type.String({ maxLength: 2048 }),
+  storeBrandColor: Type.String({ pattern: '^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$' }),
+}, { additionalProperties: false })
+
+export const StorefrontBrandSettingsSchema = Type.Object({
+  brand: Type.Union([StorefrontBrandSchema, Type.Null()]),
+}, { additionalProperties: false })
+
+export const UpdateStorefrontBrandBodySchema = StorefrontBrandSchema
+
 export const UpdateStorefrontCustomerPolicyBodySchema = Type.Object({
   requireEmail: Type.Boolean(),
   requirePhone: Type.Boolean(),
@@ -3034,6 +3046,9 @@ export type AdminWalletList = Static<typeof AdminWalletListSchema>
 export type AdminWalletDetail = Static<typeof AdminWalletDetailSchema>
 export type AdminPaymentReconciliationResult = Static<typeof AdminPaymentReconciliationResultSchema>
 export type StorefrontCustomerPolicy = Static<typeof StorefrontCustomerPolicySchema>
+export type StorefrontBrand = Static<typeof StorefrontBrandSchema>
+export type StorefrontBrandSettings = Static<typeof StorefrontBrandSettingsSchema>
+export type UpdateStorefrontBrandBody = Static<typeof UpdateStorefrontBrandBodySchema>
 export type UpdateStorefrontCustomerPolicyBody = Static<typeof UpdateStorefrontCustomerPolicyBodySchema>
 export type ProductType = Static<typeof ProductTypeSchema>
 export type ProductStatus = Static<typeof ProductStatusSchema>

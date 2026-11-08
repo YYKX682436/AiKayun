@@ -62,6 +62,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     icon: 'i-lucide-user-round-cog',
     to: '/admin/storefront/customer-policy',
   },
+  {
+    label: '店铺设置',
+    icon: 'i-lucide-store',
+    to: '/admin/storefront/brand',
+  },
 ]]
 
 const unavailableModules = [

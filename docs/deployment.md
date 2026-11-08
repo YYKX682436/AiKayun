@@ -7,11 +7,11 @@
 1. 在目标 Linux 主机安装 Docker Engine 与 Compose 插件。
 2. 从受控渠道获取代码和锁文件。
 3. 复制 `.env.example` 为 `.env`，为 PostgreSQL 设置唯一高强度密码。
-4. 在 `.env` 中设置 `NUXT_PUBLIC_SITE_URL` 为商城公开的规范 HTTP(S) origin，并按需设置 `NUXT_PUBLIC_STORE_NAME`、`NUXT_PUBLIC_STORE_LOGO_URL` 和 `NUXT_PUBLIC_STORE_BRAND_COLOR`。该 origin 用于 canonical、OG 图片/地址和 sitemap，不从请求 Host 头推断。它们通过 Nuxt public runtimeConfig 在容器启动时读取。修改后仅需重新创建 web 容器，例如 `docker compose up -d --no-deps --force-recreate web`，无需重新构建镜像。
+4. 在 `.env` 中设置 `NUXT_PUBLIC_SITE_URL` 为商城公开的规范 HTTP(S) origin，并可设置 `NUXT_PUBLIC_STORE_NAME`、`NUXT_PUBLIC_STORE_LOGO_URL` 和 `NUXT_PUBLIC_STORE_BRAND_COLOR` 作为店主首次保存品牌前的初始默认值。该 origin 用于 canonical、OG 图片/地址和 sitemap，不从请求 Host 头推断。初始值通过 Nuxt public runtimeConfig 在容器启动时读取；后台保存的品牌设置以 PostgreSQL 为准，之后更改这些环境变量不会覆盖数据库值。
 5. 配置 DNS，将独立商城域名指向主机；放通 TCP 80 和 443。
 6. 将 `HTTP_BIND_ADDRESS=0.0.0.0` 明确设为公开入口，`SITE_ADDRESS` 设为域名，`PUBLIC_ORIGIN` 和 `NUXT_PUBLIC_SITE_URL` 都设为同一 `https://域名` origin，`COOKIE_SECURE=true`，并将 `HTTP_PORT=80`、`HTTPS_PORT=443`。Caddy 负责 TLS 终止；生产管理员会话必须使用 Secure Cookie。
 
-默认品牌配置为 `AiKayun 数字商城`、无 Logo、`#2563EB`。例如，独立部署为紫色品牌可使用：
+默认品牌初始值为 `AiKayun 数字商城`、无 Logo、`#2563EB`。例如，独立部署首次进入时显示紫色品牌可使用：
 
 ```dotenv
 NUXT_PUBLIC_STORE_NAME="青屿数字商店"

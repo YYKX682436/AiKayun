@@ -25,6 +25,7 @@ import { requireAdmin } from './auth/admin.js'
 import { registerInitialAdminSetupRoutes } from './auth/initial-admin.js'
 import { registerCustomerAuthRoutes } from './auth/customer.js'
 import { registerCustomerPolicyRoutes } from './auth/customer-policy.js'
+import { registerStoreBrandRoutes } from './auth/store-brand.js'
 import { registerAdminCustomerRoutes } from './customers/admin.js'
 import { hashPassword } from './auth/password.js'
 import { registerAdminProductRoutes } from './catalog/admin-products.js'
@@ -291,6 +292,7 @@ export async function createAppInternal(options: {
   await registerWithdrawalRoutes(app, db, config)
   registerPaymentRoutes(app, db, config, new ZpayEpayProvider(paymentProviderBaseUrl), gate)
   registerCustomerPolicyRoutes(app, db, config)
+  registerStoreBrandRoutes(app, db, config)
   registerAdminCustomerRoutes(app, db, config)
   const identityFactory = options.productIdentityFactory ?? defaultProductIdentityFactory
   registerAdminProductRoutes(app, db, config, identityFactory)

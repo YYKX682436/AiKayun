@@ -225,6 +225,14 @@ export interface StorefrontCustomerPolicyTable {
   updated_at: Generated<Date>
 }
 
+export interface StorefrontBrandSettingsTable {
+  singleton: Generated<boolean>
+  store_name: string | null
+  store_logo_url: string | null
+  store_brand_color: string | null
+  updated_at: Generated<Date>
+}
+
 export type PurchaseFormsStatus = 'preparing' | 'active' | 'paused'
 
 export type CustomerStatus = 'active' | 'disabled' | 'deleted'
@@ -1525,6 +1533,7 @@ export interface Database {
   product_media_variants: ProductMediaVariantsTable
   product_media_references: ProductMediaReferencesTable
   storefront_customer_policy: StorefrontCustomerPolicyTable
+  storefront_brand_settings: StorefrontBrandSettingsTable
   customers: CustomersTable
   customer_sessions: CustomerSessionsTable
   customer_management_audit: CustomerManagementAuditTable
