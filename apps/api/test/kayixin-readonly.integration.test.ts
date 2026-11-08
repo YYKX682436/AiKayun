@@ -89,6 +89,7 @@ beforeAll(async () => {
     '202611030002_license_pending_key_binding',
     '202611040001_operations_worker_health',
     '202611040002_file_check_results',
+    '202611090001_storefront_brand_settings',
   ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])

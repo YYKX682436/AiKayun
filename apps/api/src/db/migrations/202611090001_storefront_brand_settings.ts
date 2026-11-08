@@ -24,7 +24,6 @@ export const storefrontBrandSettingsMigration: Migration = {
         )
       )
     `).execute(db)
-    await sql`INSERT INTO storefront_brand_settings (singleton) VALUES (true)`.execute(db)
   },
   async down(db) {
     await sql`DROP TABLE storefront_brand_settings`.execute(db)

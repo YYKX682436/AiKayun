@@ -5,6 +5,7 @@ import { Pool } from 'pg'
 import cookie from '@fastify/cookie'
 import Fastify from 'fastify'
 import type { FastifyInstance } from 'fastify'
+import { failure } from '@aikayun/contracts'
 import type { Database } from '../src/db/types.js'
 import { storefrontBrandSettingsMigration } from '../src/db/migrations/202611090001_storefront_brand_settings.js'
 import { readConfig } from '../src/config.js'
@@ -76,6 +77,11 @@ describe.skipIf(!testDatabaseUrl)('single-instance storefront brand settings', (
 
     app = Fastify({ logger: false })
     await app.register(cookie)
+    app.setErrorHandler((error, request, reply) => reply.code(error.statusCode ?? 500).send(failure(
+      error.validation ? 'VALIDATION_ERROR' : 'INTERNAL_ERROR',
+      error.validation ? 'The request contains invalid data' : 'An unexpected error occurred',
+      request.id,
+    )))
     registerStoreBrandRoutes(app, db, readConfig({
       ...process.env,
       DATABASE_URL: testDatabaseUrl,
