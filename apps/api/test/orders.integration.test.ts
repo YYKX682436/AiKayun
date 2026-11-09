@@ -743,6 +743,7 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     const admin = await createAdmin()
     const customer = await createCustomer()
     const catalog = await createCatalog({ price: '1.20', mode: 'unlimited' })
+    await enableManual(catalog, admin)
     const firstOrderId = randomUUID()
     const secondOrderId = randomUUID()
     await db.transaction().execute(async (trx) => {
