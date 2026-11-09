@@ -168,8 +168,8 @@ test('blocks the admin page until login, then creates and ends a session', async
   await expect(page.getByRole('group', { name: '累计完成订单' })).toContainText(String(overview.completedOrders))
   await expect(page.getByRole('group', { name: '今日已确认订单付款' })).toContainText(formatCnyAmount(overview.todayConfirmedOrderPaymentAmount))
   await expect(page.getByText(/统计区间：.+北京时间/)).toBeVisible()
-  await expect(page.getByRole('link', { name: '查看订单' })).toHaveAttribute('href', '/admin/orders')
-  await expect(page.getByRole('link', { name: '运维中心' })).toHaveAttribute('href', '/admin/operations')
+  await expect(page.locator('#admin-main').getByRole('link', { name: '查看订单' })).toHaveAttribute('href', '/admin/orders')
+  await expect(page.locator('#admin-main').getByRole('link', { name: '运维中心' })).toHaveAttribute('href', '/admin/operations')
   expect(await page.evaluate(() => ({
     area: document.documentElement.dataset.aikayunArea,
     primary: getComputedStyle(document.documentElement).getPropertyValue('--ui-color-primary-600').trim(),
