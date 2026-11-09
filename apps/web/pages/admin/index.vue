@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { AdminSession, ApiSuccess } from '@aikayun/contracts'
+import type { AdminBusinessOverview, AdminSession, ApiSuccess } from '@aikayun/contracts'
 
 definePageMeta({ layout: 'admin', middleware: 'admin-auth' })
 useSeoMeta({ title: '管理概览' })
@@ -10,6 +10,67 @@ const { data: license, error: licenseError, refresh: refreshLicense } = await us
   allowedUntil: string | null
   retryable: boolean
 }>>('/api/v1/admin/license-status')
+const {
+  data: businessOverviewResponse,
+  error: businessOverviewError,
+  pending: businessOverviewPending,
+  refresh: refreshBusinessOverview,
+} = await useFetch<ApiSuccess<AdminBusinessOverview>>('/api/v1/admin/business-overview')
+const businessOverview = computed(() => businessOverviewResponse.value?.data)
+const businessMetrics = computed(() => {
+  const data = businessOverview.value
+  if (!data) return []
+  return [
+    { label: '今日新订单', value: data.todayNewOrders, icon: 'i-lucide-calendar-plus' },
+    { label: '待付款订单', value: data.pendingPaymentOrders, icon: 'i-lucide-clock-3' },
+    { label: '处理中订单', value: data.processingOrders, icon: 'i-lucide-loader-circle' },
+    { label: '累计完成订单', value: data.completedOrders, icon: 'i-lucide-circle-check' },
+  ]
+})
+const refreshingBusinessOverview = ref(false)
+const beijingTimeFormatter = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Asia/Shanghai',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23',
+})
+
+function formatBeijingDateTime(value: string): string {
+  const parts = beijingTimeFormatter.formatToParts(new Date(value))
+  const part = (type: Intl.DateTimeFormatPartTypes) => parts.find(item => item.type === type)?.value ?? ''
+  return `${part('year')}-${part('month')}-${part('day')} ${part('hour')}:${part('minute')}:${part('second')}`
+}
+
+function formatCnyAmount(value: string): string {
+  const [integer, fraction = '00'] = value.split('.')
+  const groupedInteger = (integer ?? '0').replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return `¥${groupedInteger}.${fraction.padEnd(2, '0')}`
+}
+
+const businessPeriodLabel = computed(() => {
+  const data = businessOverview.value
+  if (!data) return ''
+  return `统计区间：${formatBeijingDateTime(data.periodStart)} 至 ${formatBeijingDateTime(data.periodEnd)}（北京时间）`
+})
+const businessMeasuredAtLabel = computed(() => {
+  const data = businessOverview.value
+  return data ? `统计时间：${formatBeijingDateTime(data.measuredAt)}（北京时间）` : ''
+})
+
+async function refreshBusinessData() {
+  if (refreshingBusinessOverview.value) return
+  refreshingBusinessOverview.value = true
+  try {
+    await refreshBusinessOverview()
+  } finally {
+    refreshingBusinessOverview.value = false
+  }
+}
+
 const licenseStatus = computed(() => {
   switch (license.value?.data.status) {
     case 'active': return '正常'
@@ -187,28 +248,151 @@ async function logout() {
           aria-labelledby="business-data-title"
           class="mt-10 border-t border-default pt-8"
         >
-          <div>
-            <p class="text-sm font-medium text-muted">
-              店铺经营
-            </p>
-            <h2
-              id="business-data-title"
-              class="mt-1 text-xl font-semibold text-highlighted"
-            >
-              经营数据
-            </h2>
+          <div class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <p class="text-sm font-medium text-muted">
+                店铺经营
+              </p>
+              <h2
+                id="business-data-title"
+                class="mt-1 text-xl font-semibold text-highlighted"
+              >
+                经营数据
+              </h2>
+              <p class="mt-2 text-sm text-muted">
+                今日订单与付款按北京时间自然日统计。
+              </p>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <UButton
+                to="/admin/orders"
+                color="neutral"
+                variant="outline"
+                icon="i-lucide-receipt"
+                class="min-h-11"
+              >
+                查看订单
+              </UButton>
+              <UButton
+                to="/admin/operations"
+                color="neutral"
+                variant="outline"
+                icon="i-lucide-activity"
+                class="min-h-11"
+              >
+                运维中心
+              </UButton>
+              <UButton
+                color="neutral"
+                variant="outline"
+                icon="i-lucide-refresh-cw"
+                :loading="businessOverviewPending || refreshingBusinessOverview"
+                :disabled="businessOverviewPending || refreshingBusinessOverview"
+                class="min-h-11"
+                @click="refreshBusinessData"
+              >
+                刷新经营数据
+              </UButton>
+            </div>
           </div>
 
-          <div class="mt-4 rounded-xl border border-default bg-elevated">
-            <UEmpty
-              icon="i-lucide-chart-no-axes-combined"
-              title="经营数据尚未开放"
-              description="目前没有商品、订单或销售数据可供查看。相关数据接入后，概览会在这里展示。"
-              variant="naked"
-              size="lg"
-              class="min-h-56"
-            />
-          </div>
+          <UAlert
+            v-if="businessOverviewError"
+            class="mt-5"
+            color="error"
+            variant="soft"
+            title="经营数据暂时无法读取"
+            description="请检查连接后重试。"
+            role="alert"
+            aria-live="assertive"
+          />
+
+          <UCard
+            v-else-if="businessOverviewPending && !businessOverview"
+            class="mt-5"
+          >
+            <p
+              role="status"
+              class="text-sm text-muted"
+            >
+              正在读取经营数据…
+            </p>
+          </UCard>
+
+          <template v-else-if="businessOverview">
+            <p class="mt-4 text-xs text-muted">
+              {{ businessPeriodLabel }} · {{ businessMeasuredAtLabel }}
+            </p>
+            <div class="mt-4 grid grid-cols-1 gap-3 min-[360px]:grid-cols-2 xl:grid-cols-4">
+              <div
+                v-for="metric in businessMetrics"
+                :key="metric.label"
+                role="group"
+                :aria-label="metric.label"
+                class="min-w-0"
+              >
+                <UCard class="h-full">
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0">
+                      <p class="text-sm text-muted">
+                        {{ metric.label }}
+                      </p>
+                      <p class="mt-3 text-3xl font-semibold tabular-nums text-highlighted">
+                        {{ metric.value }}
+                      </p>
+                    </div>
+                    <UIcon
+                      :name="metric.icon"
+                      class="size-5 shrink-0 text-primary"
+                      aria-hidden="true"
+                    />
+                  </div>
+                </UCard>
+              </div>
+            </div>
+
+            <div
+              role="group"
+              aria-label="今日已确认订单付款"
+              class="mt-3"
+            >
+              <UCard>
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <p class="text-sm font-medium text-muted">
+                      今日已确认订单付款
+                    </p>
+                    <p class="mt-2 text-3xl font-semibold tabular-nums text-highlighted">
+                      {{ formatCnyAmount(businessOverview.todayConfirmedOrderPaymentAmount) }}
+                      <span class="text-base font-medium text-muted">CNY</span>
+                    </p>
+                  </div>
+                  <UBadge
+                    color="success"
+                    variant="soft"
+                    icon="i-lucide-circle-check"
+                    class="w-fit"
+                  >
+                    已确认
+                  </UBadge>
+                </div>
+                <p class="mt-3 text-xs leading-5 text-muted">
+                  按付款回执记录时间统计；仅含关联真实订单、支付成功、准时回执且没有开放对账案例的付款。包含外部支付、钱包现金和赠送余额，按回执原金额汇总，不扣退款；不代表净收入、现金实收或利润。
+                </p>
+              </UCard>
+            </div>
+          </template>
+
+          <UAlert
+            v-else
+            class="mt-5"
+            color="error"
+            variant="soft"
+            title="经营数据暂时无法读取"
+            description="请检查连接后重试。"
+            role="alert"
+            aria-live="assertive"
+          />
         </section>
       </main>
     </template>

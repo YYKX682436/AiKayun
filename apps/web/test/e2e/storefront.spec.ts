@@ -3,6 +3,11 @@ import { wcagContrast } from 'culori'
 
 const viewportWidths = [320, 390, 768, 1024, 1137, 1280, 1440]
 
+function formatCnyAmount(value: string): string {
+  const [integer, fraction = '00'] = value.split('.')
+  return `¥${(integer ?? '0').replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${fraction.padEnd(2, '0')}`
+}
+
 async function assertAdminVisuals(page: import('@playwright/test').Page, area: string, mode: 'light' | 'dark') {
   await expect.poll(() => page.locator('meta[name="theme-color"]').getAttribute('content')).toBe(mode === 'dark' ? '#020617' : '#f8fafc')
   const measurements = await page.evaluate(() => ({
@@ -37,7 +42,7 @@ async function assertAdminVisuals(page: import('@playwright/test').Page, area: s
 
 async function assertMobileAdminNavigation(page: import('@playwright/test').Page) {
   await page.setViewportSize({ width: 390, height: 844 })
-  await expect(page.getByRole('heading', { name: '经营数据尚未开放' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '经营数据' })).toBeVisible()
 
   const menuToggle = page.locator('[data-slot="toggle"]')
   await expect(menuToggle).toBeVisible()
@@ -55,7 +60,7 @@ async function assertMobileAdminNavigation(page: import('@playwright/test').Page
   await expect(drawer).toBeVisible()
   await expect(drawer).toHaveAttribute('aria-labelledby', /.+/)
   await expect(drawer.getByRole('link', { name: 'AiKayun' })).toBeVisible()
-  await expect(drawer.locator('[aria-disabled="true"]')).toHaveCount(1)
+  await expect(drawer.locator('[aria-disabled="true"]')).toHaveCount(0)
   await expect.poll(() => drawer.evaluate(element => element.contains(document.activeElement))).toBe(true)
   await page.keyboard.press('Escape')
   await expect(drawer).toBeHidden()
@@ -147,10 +152,62 @@ test('blocks the admin page until login, then creates and ends a session', async
   expect(page.url()).not.toContain('Only-For-E2E-Tests-2026!!')
   await expect(page.getByRole('heading', { name: '管理概览' })).toBeVisible()
   await expect(page.getByText('browser-test@example.com')).toBeVisible()
+  const overviewResponse = await page.request.get('/api/v1/admin/business-overview')
+  expect(overviewResponse.status()).toBe(200)
+  const baseResponse = await overviewResponse.json()
+  const overview = baseResponse.data as {
+    todayNewOrders: number
+    pendingPaymentOrders: number
+    processingOrders: number
+    completedOrders: number
+    todayConfirmedOrderPaymentAmount: string
+  }
+  await expect(page.getByRole('group', { name: '今日新订单' })).toContainText(String(overview.todayNewOrders))
+  await expect(page.getByRole('group', { name: '待付款订单' })).toContainText(String(overview.pendingPaymentOrders))
+  await expect(page.getByRole('group', { name: '处理中订单' })).toContainText(String(overview.processingOrders))
+  await expect(page.getByRole('group', { name: '累计完成订单' })).toContainText(String(overview.completedOrders))
+  await expect(page.getByRole('group', { name: '今日已确认订单付款' })).toContainText(formatCnyAmount(overview.todayConfirmedOrderPaymentAmount))
+  await expect(page.getByText(/统计区间：.+北京时间/)).toBeVisible()
+  await expect(page.getByRole('link', { name: '查看订单' })).toHaveAttribute('href', '/admin/orders')
+  await expect(page.getByRole('link', { name: '运维中心' })).toHaveAttribute('href', '/admin/operations')
   expect(await page.evaluate(() => ({
     area: document.documentElement.dataset.aikayunArea,
     primary: getComputedStyle(document.documentElement).getPropertyValue('--ui-color-primary-600').trim(),
   }))).toEqual({ area: 'admin', primary: '#2563eb' })
+
+  const zeroResponse = {
+    ...baseResponse,
+    data: {
+      ...baseResponse.data,
+      todayNewOrders: 0,
+      pendingPaymentOrders: 0,
+      processingOrders: 0,
+      completedOrders: 0,
+      todayConfirmedOrderPaymentAmount: '0.00',
+    },
+  }
+  const overviewRoute = '**/api/v1/admin/business-overview'
+  await page.route(overviewRoute, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(zeroResponse),
+  }))
+  await page.getByRole('button', { name: '刷新经营数据' }).click()
+  await expect(page.getByRole('group', { name: '今日新订单' })).toContainText('0')
+  await expect(page.getByRole('group', { name: '今日已确认订单付款' })).toContainText('¥0.00')
+  await page.unroute(overviewRoute)
+
+  await page.route(overviewRoute, route => route.fulfill({
+    status: 503,
+    contentType: 'application/json',
+    body: JSON.stringify({ error: { code: 'BUSINESS_OVERVIEW_UNAVAILABLE', message: '经营数据暂时无法读取，请稍后重试。' }, meta: { requestId: 'e2e' } }),
+  }))
+  await page.getByRole('button', { name: '刷新经营数据' }).click()
+  await expect(page.getByRole('alert')).toContainText('经营数据暂时无法读取')
+  await expect(page.getByRole('group', { name: '今日新订单' })).toHaveCount(0)
+  await page.unroute(overviewRoute)
+  await page.getByRole('button', { name: '刷新经营数据' }).click()
+  await expect(page.getByRole('group', { name: '今日新订单' })).toContainText(String(overview.todayNewOrders))
 
   for (const mode of ['light', 'dark'] as const) {
     await page.getByRole('button', { name: '显示模式' }).click()

@@ -54,6 +54,26 @@ export const AdminOverviewSchema = Type.Object({
   status: Type.Literal('ready'),
 })
 
+export const AdminBusinessOverviewSchema = Type.Object({
+  todayNewOrders: Type.Integer({ minimum: 0 }),
+  pendingPaymentOrders: Type.Integer({ minimum: 0 }),
+  processingOrders: Type.Integer({ minimum: 0 }),
+  completedOrders: Type.Integer({ minimum: 0 }),
+  todayConfirmedOrderPaymentAmount: Type.String({ pattern: '^(?:0|[1-9]\\d*)\\.\\d{2}$' }),
+  currency: Type.Literal('CNY'),
+  paymentRule: Type.Literal('succeeded_on_time_order_receipts_excluding_open_reconciliation'),
+  paymentTimeBasis: Type.Literal('payment_receipts.received_at'),
+  includedPaymentSources: Type.Array(Type.Union([
+    Type.Literal('external'),
+    Type.Literal('cash'),
+    Type.Literal('gift'),
+  ]), { minItems: 3, maxItems: 3 }),
+  refundsDeducted: Type.Literal(false),
+  periodStart: Type.String({ format: 'date-time' }),
+  periodEnd: Type.String({ format: 'date-time' }),
+  measuredAt: Type.String({ format: 'date-time' }),
+}, { additionalProperties: false })
+
 export const CustomerUsernameSchema = Type.String({
   minLength: 3,
   maxLength: 32,
@@ -3000,6 +3020,7 @@ export type Admin = Static<typeof AdminSchema>
 export type AdminSession = Static<typeof AdminSessionSchema>
 export type AdminLogout = Static<typeof AdminLogoutSchema>
 export type AdminOverview = Static<typeof AdminOverviewSchema>
+export type AdminBusinessOverview = Static<typeof AdminBusinessOverviewSchema>
 export type CustomerRegisterBody = Static<typeof CustomerRegisterBodySchema>
 export type CustomerLoginBody = Static<typeof CustomerLoginBodySchema>
 export type Customer = Static<typeof CustomerSchema>

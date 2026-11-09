@@ -74,9 +74,6 @@ const navigationItems: NavigationMenuItem[][] = [[
   },
 ]]
 
-const unavailableModules = [
-  { label: '经营数据', icon: 'i-lucide-chart-no-axes-column-increasing' },
-]
 </script>
 
 <template>
@@ -133,38 +130,6 @@ const unavailableModules = [
             highlight
             class="w-full"
           />
-
-          <section aria-labelledby="unavailable-modules-title">
-            <h2
-              id="unavailable-modules-title"
-              class="px-2.5 py-1.5 text-xs font-medium text-dimmed"
-            >
-              尚未开放
-            </h2>
-            <ul class="grid gap-1">
-              <li
-                v-for="module in unavailableModules"
-                :key="module.label"
-                aria-disabled="true"
-                class="flex min-h-10 min-w-0 items-center gap-2 rounded-md px-2.5 py-2 text-sm text-dimmed"
-              >
-                <UIcon
-                  :name="module.icon"
-                  class="size-4 shrink-0"
-                  aria-hidden="true"
-                />
-                <span class="min-w-0 flex-1 truncate">{{ module.label }}</span>
-                <UBadge
-                  color="neutral"
-                  variant="subtle"
-                  size="xs"
-                  class="shrink-0"
-                >
-                  未开放
-                </UBadge>
-              </li>
-            </ul>
-          </section>
         </div>
       </template>
 
