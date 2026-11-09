@@ -43,7 +43,7 @@ describe.skipIf(!testDatabaseUrl)('single-instance storefront featured products'
     await pool.query([
       'CREATE TABLE admin_users (id uuid PRIMARY KEY, email text NOT NULL, password_hash text NOT NULL, is_active boolean NOT NULL DEFAULT true, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());',
       'CREATE TABLE admin_sessions (id uuid PRIMARY KEY, admin_user_id uuid NOT NULL REFERENCES admin_users(id), token_hash text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz NOT NULL, revoked_at timestamptz);',
-      'CREATE TABLE products (id uuid PRIMARY KEY, name text NOT NULL, description text NOT NULL, product_type text NOT NULL, status text NOT NULL);',
+      'CREATE TABLE products (id uuid PRIMARY KEY, name text NOT NULL, description text NOT NULL, product_type text NOT NULL, status text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());',
       'CREATE TABLE product_variants (id uuid PRIMARY KEY, product_id uuid NOT NULL REFERENCES products(id), sale_price numeric(15, 2) NOT NULL, inventory_mode text, enabled boolean NOT NULL, retired_at timestamptz);',
       'CREATE TABLE product_option_groups (id uuid PRIMARY KEY, product_id uuid NOT NULL, enabled boolean NOT NULL);',
       'CREATE TABLE product_option_values (id uuid PRIMARY KEY, product_id uuid NOT NULL, option_group_id uuid NOT NULL, enabled boolean NOT NULL);',
