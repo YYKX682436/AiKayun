@@ -10,6 +10,10 @@ sudo /opt/aikayun/aikayun upgrade --version X.Y.Z
 
 运行前必须处于完整的 `setup_token_issued` 安装阶段。升级器会验证当前发行、客户命令文件、Compose 配置、秘密、数据库绑定和所有固定业务卷。授权中心发生变更的情况下，只允许使用与当前发行完全相同的信任配置和 Trust Bundle。
 
+## ⑧-2 首页推荐迁移边界
+
+首页推荐只新增 `storefront_featured_products` 表，不改写现有商品、SKU、订单或顾客记录。迁移仅向前应用。由于 ⑦-5C-1 升级器要求当前与候选发行的 schema head 和 checksum 完全相同，仍运行 ⑦-5C-1 命令的实例不能直接升级到包含这项迁移的发行；升级器会在停机前拒绝 schema 不同的候选版本。本阶段不扩展升级器，已有实例的跨 schema 升级须由后续阶段另行提供并验收。
+
 ## 首版升级条件
 
 新发行必须在签名清单 `database.upgrade_from_releases` 中列出当前 `release_id`，并在 `database.rollback_to_releases` 中明确声明支持回退到该发行。候选发行和当前发行还必须满足：

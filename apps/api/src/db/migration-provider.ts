@@ -65,6 +65,7 @@ import { licensePendingKeyBindingMigration } from './migrations/202611030002_lic
 import { operationsWorkerHealthMigration } from './migrations/202611040001_operations_worker_health.js'
 import { fileCheckResultsMigration } from './migrations/202611040002_file_check_results.js'
 import { storefrontBrandSettingsMigration } from './migrations/202611090001_storefront_brand_settings.js'
+import { storefrontFeaturedProductsMigration } from './migrations/202611090002_storefront_featured_products.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -131,6 +132,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202611040001_operations_worker_health': operationsWorkerHealthMigration,
       '202611040002_file_check_results': fileCheckResultsMigration,
       '202611090001_storefront_brand_settings': storefrontBrandSettingsMigration,
+      '202611090002_storefront_featured_products': storefrontFeaturedProductsMigration,
     }
     verifyMigrationChecksums(migrations)
     return migrations

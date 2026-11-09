@@ -60,6 +60,9 @@ const conflictMessages: Record<string, string> = {
   SPECIFICATION_GROUP_IN_USE: '规格组仍被历史 SKU 使用，不能移除。',
   SPECIFICATION_VALUE_IN_USE: '规格值仍被历史 SKU 使用，不能移除。',
   PRODUCT_LIFECYCLE_TRANSITION_INVALID: '当前商品状态不允许此生命周期操作，请重新读取状态。',
+  STOREFRONT_FEATURED_PRODUCT_NOT_ACTIVE: '只能新增正在销售的商品；已暂停或归档的既有推荐仍会保留。',
+  STOREFRONT_FEATURED_PRODUCT_NOT_FOUND: '所选商品已不存在，请刷新后重新选择。',
+  STOREFRONT_FEATURED_PRODUCTS_INVALID: '首页推荐最多可选择 8 件商品，且不能重复选择。',
 }
 
 function statusOf(error: unknown): number {

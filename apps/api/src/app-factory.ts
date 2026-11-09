@@ -48,6 +48,7 @@ import { registerAdminSupplierProductMappingRoutes } from './catalog/admin-suppl
 import { registerAdminApiFulfillmentRoutes } from './catalog/admin-api-fulfillment.js'
 import { registerProductMediaRoutes } from './media/admin.js'
 import { registerPublicProductRoutes } from './catalog/public-products.js'
+import { registerStorefrontFeaturedProductRoutes } from './catalog/storefront-featured-products.js'
 import { registerCustomerCartRoutes } from './commerce/customer-cart.js'
 import { registerCustomerPurchaseFormRoutes } from './commerce/customer-purchase-forms.js'
 import { registerOrderRoutes } from './commerce/orders.js'
@@ -313,5 +314,6 @@ export async function createAppInternal(options: {
   await registerAdminPrivateFileDeliveryRoutes(app, db, config)
   await registerProductMediaRoutes(app, db, config)
   registerPublicProductRoutes(app, db)
+  registerStorefrontFeaturedProductRoutes(app, db, config)
   return app
 }

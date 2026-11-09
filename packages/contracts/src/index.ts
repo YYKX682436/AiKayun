@@ -1049,6 +1049,26 @@ export const PublicProductPageSchema = Type.Object({
   totalPages: Type.Integer({ minimum: 0 }),
 }, { additionalProperties: false })
 
+export const StorefrontFeaturedProductSchema = Type.Object({
+  id: Type.String({ format: 'uuid' }),
+  name: Type.String({ minLength: 1, maxLength: 200 }),
+  productType: ProductTypeSchema,
+  status: ProductStatusSchema,
+  coverImage: Type.Union([ProductGalleryImageSchema, Type.Null()]),
+}, { additionalProperties: false })
+
+export const StorefrontFeaturedProductsSchema = Type.Object({
+  items: Type.Array(StorefrontFeaturedProductSchema, { maxItems: 8 }),
+}, { additionalProperties: false })
+
+export const UpdateStorefrontFeaturedProductsBodySchema = Type.Object({
+  productIds: Type.Array(Type.String({ format: 'uuid' }), { maxItems: 8, uniqueItems: true }),
+}, { additionalProperties: false })
+
+export const PublicStorefrontFeaturedProductsSchema = Type.Object({
+  products: Type.Array(PublicProductCardSchema, { maxItems: 8 }),
+}, { additionalProperties: false })
+
 export const PublicCategoryPathItemSchema = Type.Object({
   id: Type.String({ format: 'uuid' }),
   name: Type.String({ minLength: 1, maxLength: 120 }),
@@ -3128,6 +3148,10 @@ export type PublicProductSearchQuery = Static<typeof PublicProductSearchQuerySch
 export type PublicProductImage = Static<typeof PublicProductImageSchema>
 export type PublicProductCard = Static<typeof PublicProductCardSchema>
 export type PublicProductPage = Static<typeof PublicProductPageSchema>
+export type StorefrontFeaturedProduct = Static<typeof StorefrontFeaturedProductSchema>
+export type StorefrontFeaturedProducts = Static<typeof StorefrontFeaturedProductsSchema>
+export type UpdateStorefrontFeaturedProductsBody = Static<typeof UpdateStorefrontFeaturedProductsBodySchema>
+export type PublicStorefrontFeaturedProducts = Static<typeof PublicStorefrontFeaturedProductsSchema>
 export type PublicCategoryPathItem = Static<typeof PublicCategoryPathItemSchema>
 export type PublicCategory = Static<typeof PublicCategorySchema>
 export type PublicCategoriesResponse = Static<typeof PublicCategoriesResponseSchema>

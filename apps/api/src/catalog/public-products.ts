@@ -1,5 +1,5 @@
 import type { FastifyInstance, FastifyReply } from 'fastify'
-import { sql, type Kysely } from 'kysely'
+import { sql, type Kysely, type RawBuilder } from 'kysely'
 import {
   ApiErrorSchema,
   ApiSuccessSchemaOf,
@@ -246,31 +246,13 @@ function productWhere(query: PublicProductQuery, categoryIds: string[]) {
   return { error: false as const, where: sql`WHERE ${sql.join(predicates, sql` AND `)}` }
 }
 
-async function queryProductPage(
+async function selectPublicProductCardRows(
   db: KyselyDatabase<Database>,
-  query: PublicProductQuery,
-  categoryIds: string[] = [],
-): Promise<PublicProductPage> {
-  const page = query.page ?? 1
-  const pageSize = query.pageSize ?? defaultPageSize
-  const offset = (page - 1) * pageSize
-  const { where } = productWhere(query, categoryIds)
-  const totalResult = await sql<{ total: number }>`
-    SELECT count(*)::integer AS total FROM products AS product ${where}
-  `.execute(db)
-
-  let orderBy = sql`product.created_at DESC, product.id ASC`
-  if (query.sort === 'price_asc') orderBy = sql`catalog.min_sale_price ASC NULLS LAST, product.id ASC`
-  else if (query.sort === 'price_desc') orderBy = sql`catalog.min_sale_price DESC NULLS LAST, product.id ASC`
-  else if (query.sort === 'default' && query.categoryId) {
-    orderBy = sql`COALESCE((
-      SELECT min(assignment.sort_order)
-      FROM product_category_assignments AS assignment
-      WHERE assignment.product_id = product.id
-        AND assignment.category_id = ANY(${categoryIds}::uuid[])
-    ), 2147483647) ASC, product.created_at DESC, product.id ASC`
-  }
-
+  where: RawBuilder<unknown>,
+  orderBy: RawBuilder<unknown>,
+  limit: number,
+  offset: number,
+): Promise<PublicCardRow[]> {
   const rows = await sql<PublicCardRow>`
     WITH public_variants AS (
       SELECT variant.*
@@ -318,10 +300,13 @@ async function queryProductPage(
     ) AS cover ON TRUE
     ${where}
     ORDER BY ${orderBy}
-    LIMIT ${pageSize} OFFSET ${offset}
+    LIMIT ${limit} OFFSET ${offset}
   `.execute(db)
+  return rows.rows
+}
 
-  const items: PublicProductCard[] = rows.rows.map((row) => {
+function mapPublicProductCards(rows: PublicCardRow[]): PublicProductCard[] {
+  return rows.map((row) => {
     if ((row.min_sale_price === null) !== (row.max_sale_price === null)) {
       throw new Error('Public product list encountered an incomplete price range')
     }
@@ -353,7 +338,55 @@ async function queryProductPage(
       inventoryStatus,
     }
   })
-  return responsePage(items, totalResult.rows[0]?.total ?? 0, page, pageSize)
+}
+
+export async function loadPublicProductCardsByIdOrder(
+  db: KyselyDatabase<Database>,
+  productIds: string[],
+): Promise<PublicProductCard[]> {
+  if (!productIds.length) return []
+  const rows = await selectPublicProductCardRows(
+    db,
+    sql`WHERE product.status = 'active' AND product.id = ANY(${productIds}::uuid[])`,
+    sql`array_position(${productIds}::uuid[], product.id)`,
+    productIds.length,
+    0,
+  )
+  return mapPublicProductCards(rows)
+}
+
+async function queryProductPage(
+  db: KyselyDatabase<Database>,
+  query: PublicProductQuery,
+  categoryIds: string[] = [],
+): Promise<PublicProductPage> {
+  const page = query.page ?? 1
+  const pageSize = query.pageSize ?? defaultPageSize
+  const offset = (page - 1) * pageSize
+  const { where } = productWhere(query, categoryIds)
+  const totalResult = await sql<{ total: number }>`
+    SELECT count(*)::integer AS total FROM products AS product ${where}
+  `.execute(db)
+
+  let orderBy = sql`product.created_at DESC, product.id ASC`
+  if (query.sort === 'price_asc') orderBy = sql`catalog.min_sale_price ASC NULLS LAST, product.id ASC`
+  else if (query.sort === 'price_desc') orderBy = sql`catalog.min_sale_price DESC NULLS LAST, product.id ASC`
+  else if (query.sort === 'default' && query.categoryId) {
+    orderBy = sql`COALESCE((
+      SELECT min(assignment.sort_order)
+      FROM product_category_assignments AS assignment
+      WHERE assignment.product_id = product.id
+        AND assignment.category_id = ANY(${categoryIds}::uuid[])
+    ), 2147483647) ASC, product.created_at DESC, product.id ASC`
+  }
+
+  const rows = await selectPublicProductCardRows(db, where, orderBy, pageSize, offset)
+  return responsePage(
+    mapPublicProductCards(rows),
+    totalResult.rows[0]?.total ?? 0,
+    page,
+    pageSize,
+  )
 }
 
 async function loadPublicVariants(db: KyselyDatabase<Database>, productId: string) {

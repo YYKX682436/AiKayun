@@ -64,6 +64,6 @@ docker compose exec -e NODE_ENV=test -T api node dist/licensing/installation-ide
 
 ⑦-1B-3A 只增加身份文件格式、数据库 binding 和隔离开发/测试 CLI。该 CLI 在生产环境禁用，普通 API 启动不会自动生成身份；当前没有生产初始化入口，也没有把身份接入经营门禁。商城端中心客户端、经营授权和受控生产安装流程须以后续阶段单独验收，不能据此宣称已完成商用授权保护。详细边界见[商城安装身份与数据库绑定](./license-client-7-1b-3a.md)。
 
-升级时拉取目标提交，检查迁移说明，然后 `docker compose up -d --build`。数据库迁移按版本前进并由部署前的一次性服务执行。当前未承诺自动 schema 回滚或在线零停机升级；如应用回滚依赖不可逆迁移，应恢复经过验证的备份并部署兼容版本。
+升级时拉取目标提交，检查迁移说明，然后 `docker compose up -d --build`。数据库迁移按版本前进并由部署前的一次性服务执行。当前 ⑦-5C-1 升级器要求当前与目标 schema head/checksum 完全一致，因此已有实例不能直接升级到新增 schema 迁移的发行；详情见[升级边界](./upgrade-7-5c-1.md)。当前也未承诺自动 schema 回滚或在线零停机升级；如应用回滚依赖不可逆迁移，应恢复经过验证的备份并部署兼容版本。
 
 `docker compose down` 保留数据。只有明确要销毁本地/测试环境数据时才使用 `docker compose down -v`。不要在生产环境使用该命令。

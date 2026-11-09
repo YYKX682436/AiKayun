@@ -67,6 +67,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     icon: 'i-lucide-store',
     to: '/admin/storefront/brand',
   },
+  {
+    label: '首页推荐',
+    icon: 'i-lucide-star',
+    to: '/admin/storefront/featured',
+  },
 ]]
 
 const unavailableModules = [

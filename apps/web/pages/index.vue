@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { ApiSuccess, PublicProductPage } from '@aikayun/contracts'
+import type { ApiSuccess, PublicProductPage, PublicStorefrontFeaturedProducts } from '@aikayun/contracts'
 
 const route = useRoute()
 const siteUrl = usePublicSiteUrl()
@@ -26,6 +26,23 @@ const { data: fetchedData, error, status, refresh } = await useAsyncData(
   { default: () => null, deep: false, getCachedData: (key, nuxtApp) => nuxtApp.isHydrating ? nuxtApp.payload.data[key] : undefined },
 )
 
+const featuredDataKey = computed(() => `public-storefront-home-featured-${page.value}`)
+const { data: featuredData } = await useAsyncData(
+  featuredDataKey,
+  async (_nuxtApp, { signal }) => {
+    if (page.value !== 1) return null
+    try {
+      const response = await $fetch<ApiSuccess<PublicStorefrontFeaturedProducts>>('/api/v1/public/storefront/featured-products', { signal })
+      return response.data
+    } catch {
+      // Recommendations are optional: a failed request must not invent placeholder products.
+      return null
+    }
+  },
+  { default: () => null, deep: false, getCachedData: (key, nuxtApp) => nuxtApp.isHydrating ? nuxtApp.payload.data[key] : undefined },
+)
+const featuredProducts = computed(() => featuredData.value?.products ?? [])
+
 const data = computed(() => fetchedData.value?.page === page.value ? fetchedData.value : null)
 const products = computed(() => data.value?.items ?? [])
 const siteBrand = useStoreBrand()
@@ -44,6 +61,27 @@ useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
 <template>
   <main id="main-content">
     <UContainer class="py-6 sm:py-9">
+      <section
+        v-if="page === 1 && featuredProducts.length"
+        class="mb-8 sm:mb-10"
+        aria-labelledby="featured-products-title"
+      >
+        <div class="mb-4 flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <p class="text-sm font-medium text-primary">
+              店主精选
+            </p>
+            <h2
+              id="featured-products-title"
+              class="mt-1 text-xl font-semibold text-highlighted sm:text-2xl"
+            >
+              精选推荐
+            </h2>
+          </div>
+        </div>
+        <StorefrontProductGrid :products="featuredProducts" />
+      </section>
+
       <div class="mb-5 flex flex-wrap items-end justify-between gap-3 sm:mb-7">
         <div>
           <p class="text-sm font-medium text-muted">

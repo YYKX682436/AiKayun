@@ -233,6 +233,11 @@ export interface StorefrontBrandSettingsTable {
   updated_at: Generated<Date>
 }
 
+export interface StorefrontFeaturedProductsTable {
+  position: number
+  product_id: string
+}
+
 export type PurchaseFormsStatus = 'preparing' | 'active' | 'paused'
 
 export type CustomerStatus = 'active' | 'disabled' | 'deleted'
@@ -1534,6 +1539,7 @@ export interface Database {
   product_media_references: ProductMediaReferencesTable
   storefront_customer_policy: StorefrontCustomerPolicyTable
   storefront_brand_settings: StorefrontBrandSettingsTable
+  storefront_featured_products: StorefrontFeaturedProductsTable
   customers: CustomersTable
   customer_sessions: CustomerSessionsTable
   customer_management_audit: CustomerManagementAuditTable
