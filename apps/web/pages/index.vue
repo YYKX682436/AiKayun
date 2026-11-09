@@ -87,7 +87,10 @@ useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
           <p class="text-sm font-medium text-muted">
             店铺商品
           </p>
-          <h1 class="mt-1 text-2xl font-semibold text-highlighted sm:text-3xl">
+          <h1
+            id="all-products-title"
+            class="mt-1 text-2xl font-semibold text-highlighted sm:text-3xl"
+          >
             全部商品
           </h1>
         </div>
