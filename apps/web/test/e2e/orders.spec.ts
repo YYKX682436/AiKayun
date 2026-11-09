@@ -219,6 +219,38 @@ test('creates a zero-value order, completes actual private delivery, and cancels
   await page.getByRole('button', { name: '确认取消' }).click()
   await expect(page.getByText('已关闭', { exact: true })).toBeVisible()
 
+  const paidOrderId = paidOrderUrl.split('/').at(-1)!
+  await page.goto('/admin/orders')
+  await expect(page.getByRole('heading', { name: '订单管理' })).toBeVisible()
+  const orderSearch = page.getByRole('textbox', { name: '搜索完整订单 UUID 或顾客用户名' })
+  await orderSearch.fill(zeroOrderId)
+  const uuidSearchResponse = page.waitForResponse(response => {
+    const url = new URL(response.url())
+    return url.pathname === '/api/v1/admin/orders' && url.searchParams.get('search') === zeroOrderId
+  })
+  await page.getByRole('button', { name: '搜索', exact: true }).click()
+  expect((await uuidSearchResponse).status()).toBe(200)
+  await expect(page).toHaveURL(new RegExp(`/admin/orders\\?search=${zeroOrderId}`))
+  await expect(page.getByRole('heading', { name: zeroOrderId })).toBeVisible()
+  await page.reload()
+  await expect(page.getByRole('heading', { name: zeroOrderId })).toBeVisible()
+
+  await orderSearch.fill(username.toUpperCase())
+  await orderSearch.press('Enter')
+  await expect(page).toHaveURL(new RegExp(`/admin/orders\\?search=${username.toUpperCase()}`))
+  await expect(page.getByRole('heading', { name: zeroOrderId })).toBeVisible()
+  await expect(page.getByRole('heading', { name: paidOrderId })).toBeVisible()
+
+  await page.goBack()
+  await expect(page).toHaveURL(new RegExp(`/admin/orders\\?search=${zeroOrderId}`))
+  await expect(page.getByRole('heading', { name: zeroOrderId })).toBeVisible()
+  await page.getByRole('button', { name: '清空搜索' }).click()
+  await expect(page).toHaveURL('/admin/orders')
+  await expect(page.getByRole('heading', { name: zeroOrderId })).toBeVisible()
+  await orderSearch.fill('no-matching-customer')
+  await page.getByRole('button', { name: '搜索', exact: true }).click()
+  await expect(page.getByRole('status')).toContainText('没有找到符合条件的订单')
+
   await page.goto('/orders')
   await expect(page.getByRole('heading', { name: '我的订单' })).toBeVisible()
   await expect(page.getByRole('link', { name: '订单详情' })).toHaveCount(2)

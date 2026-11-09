@@ -2160,6 +2160,10 @@ export const AdminOrderListQuerySchema = Type.Object({
   page: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000 })),
   pageSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
   status: Type.Optional(Type.Union([OrderStatusSchema, Type.Literal('all')])),
+  search: Type.Optional(Type.Union([
+    Type.String({ format: 'uuid' }),
+    CustomerUsernameSchema,
+  ])),
 }, { additionalProperties: false })
 export const AdminOrderSummarySchema = Type.Intersect([
   OrderSummarySchema,

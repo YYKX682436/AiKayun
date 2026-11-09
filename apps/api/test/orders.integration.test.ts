@@ -736,6 +736,95 @@ afterAll(async () => {
 })
 
 describe('real order creation and lifecycle on PostgreSQL', () => {
+  it('searches admin orders by exact UUID or case-insensitive username with matching status and pagination', async () => {
+    const unauthorized = await inject({ method: 'GET', url: `/api/v1/admin/orders?search=${randomUUID()}` })
+    expect(unauthorized.statusCode).toBe(401)
+
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog({ price: '1.20', mode: 'unlimited' })
+    const firstOrderId = randomUUID()
+    const secondOrderId = randomUUID()
+    await db.transaction().execute(async (trx) => {
+      await insertDirectPurchaseOrder(trx, customer.id, catalog, firstOrderId)
+      await insertDirectPurchaseOrder(trx, customer.id, catalog, secondOrderId)
+    })
+
+    const usernameSearch = await inject({
+      method: 'GET', url: `/api/v1/admin/orders?search=${customer.username.toUpperCase()}&status=pending_payment`,
+      headers: { cookie: admin.cookie },
+    })
+    expect(usernameSearch.statusCode).toBe(200)
+    expect(usernameSearch.json().data).toMatchObject({
+      total: 2,
+      items: expect.arrayContaining([
+        expect.objectContaining({ id: firstOrderId, status: 'pending_payment', customerUsername: customer.username }),
+        expect.objectContaining({ id: secondOrderId, status: 'pending_payment', customerUsername: customer.username }),
+      ]),
+    })
+
+    const combinedMiss = await inject({
+      method: 'GET', url: `/api/v1/admin/orders?search=${customer.username}&status=processing`,
+      headers: { cookie: admin.cookie },
+    })
+    expect(combinedMiss.statusCode).toBe(200)
+    expect(combinedMiss.json().data).toMatchObject({ items: [], total: 0, totalPages: 0 })
+
+    const pagedFirst = await inject({
+      method: 'GET', url: `/api/v1/admin/orders?search=${customer.username}&page=1&pageSize=1`,
+      headers: { cookie: admin.cookie },
+    })
+    const pagedSecond = await inject({
+      method: 'GET', url: `/api/v1/admin/orders?search=${customer.username}&page=2&pageSize=1`,
+      headers: { cookie: admin.cookie },
+    })
+    expect(pagedFirst.statusCode).toBe(200)
+    expect(pagedSecond.statusCode).toBe(200)
+    expect(pagedFirst.json().data).toMatchObject({ total: 2, page: 1, pageSize: 1, totalPages: 2 })
+    expect(pagedSecond.json().data).toMatchObject({ total: 2, page: 2, pageSize: 1, totalPages: 2 })
+    expect(pagedFirst.json().data.items[0].id).not.toBe(pagedSecond.json().data.items[0].id)
+
+    const invalid = await inject({
+      method: 'GET', url: '/api/v1/admin/orders?search=not%20a%20username', headers: { cookie: admin.cookie },
+    })
+    expect(invalid.statusCode).toBe(400)
+
+    for (const id of [firstOrderId, secondOrderId]) {
+      const cancelled = await inject({
+        method: 'POST', url: `/api/v1/customer/orders/${id}/cancel`, headers: customerHeaders(customer),
+      })
+      expect(cancelled.statusCode).toBe(200)
+      expect(cancelled.json().data.status).toBe('closed')
+    }
+    const deleted = await inject({
+      method: 'DELETE', url: `/api/v1/admin/customers/${customer.id}`, headers: adminHeaders(admin),
+    })
+    expect(deleted.statusCode).toBe(200)
+    const anonymized = await inject({
+      method: 'GET', url: `/api/v1/admin/orders?search=${firstOrderId}`, headers: { cookie: admin.cookie },
+    })
+    expect(anonymized.statusCode).toBe(200)
+    expect(anonymized.json().data).toMatchObject({
+      total: 1,
+      items: [{ id: firstOrderId, customerUsername: null, ownerType: 'customer' }],
+    })
+
+    await db.updateTable('storefront_customer_policy').set({ guest_checkout_enabled: true }).execute()
+    const guest = await newGuestSession()
+    const guestQuote = await quote([{ skuId: catalog.skuId, quantity: 1 }], undefined, guest.cookie)
+    const guestOrder = await createOrder([{ skuId: catalog.skuId, quantity: 1 }], guestQuote.json().data.quoteToken, guest)
+    expect(guestOrder.statusCode).toBe(201)
+    const guestOrderId = guestOrder.json().data.order.id as string
+    const guestSearch = await inject({
+      method: 'GET', url: `/api/v1/admin/orders?search=${guestOrderId}`, headers: { cookie: admin.cookie },
+    })
+    expect(guestSearch.statusCode).toBe(200)
+    expect(guestSearch.json().data).toMatchObject({
+      total: 1,
+      items: [{ id: guestOrderId, ownerType: 'guest', customerId: null, customerUsername: null }],
+    })
+  })
+
   it('fails closed for a new order without release trust while preserving the signed-era replay and conflict', async () => {
     const admin = await createAdmin()
     const customer = await createCustomer()

@@ -163,11 +163,25 @@ test('blocks the admin page until login, then creates and ends a session', async
     todayConfirmedOrderPaymentAmount: string
   }
   await expect(page.getByRole('group', { name: '今日新订单' })).toContainText(String(overview.todayNewOrders))
-  await expect(page.getByRole('group', { name: '待付款订单' })).toContainText(String(overview.pendingPaymentOrders))
-  await expect(page.getByRole('group', { name: '处理中订单' })).toContainText(String(overview.processingOrders))
-  await expect(page.getByRole('group', { name: '累计完成订单' })).toContainText(String(overview.completedOrders))
+  await expect(page.getByRole('link', { name: '待付款订单' })).toContainText(String(overview.pendingPaymentOrders))
+  await expect(page.getByRole('link', { name: '处理中订单' })).toContainText(String(overview.processingOrders))
+  await expect(page.getByRole('link', { name: '累计完成订单' })).toContainText(String(overview.completedOrders))
   await expect(page.getByRole('group', { name: '今日已确认订单付款' })).toContainText(formatCnyAmount(overview.todayConfirmedOrderPaymentAmount))
   await expect(page.getByText(/统计区间：.+北京时间/)).toBeVisible()
+  const processingListResponse = page.waitForResponse(response => {
+    const url = new URL(response.url())
+    return url.pathname === '/api/v1/admin/orders' && url.searchParams.get('status') === 'processing'
+  })
+  await page.getByRole('link', { name: '处理中订单' }).click()
+  const processingList = await processingListResponse
+  expect(processingList.status()).toBe(200)
+  expect(page.url()).toContain('/admin/orders?status=processing')
+  await expect(page.getByRole('combobox', { name: '按订单状态筛选' })).toContainText('处理中')
+  const processingPage = (await processingList.json()).data as { items: Array<{ status: string }> }
+  expect(processingPage.items.every(order => order.status === 'processing')).toBe(true)
+  await page.goBack()
+  await expect(page).toHaveURL(/\/admin$/u)
+  await expect(page.getByRole('link', { name: '处理中订单' })).toContainText(String(overview.processingOrders))
   await expect(page.locator('#admin-main').getByRole('link', { name: '查看订单' })).toHaveAttribute('href', '/admin/orders')
   await expect(page.locator('#admin-main').getByRole('link', { name: '运维中心' })).toHaveAttribute('href', '/admin/operations')
   expect(await page.evaluate(() => ({

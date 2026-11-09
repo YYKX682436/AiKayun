@@ -5,15 +5,30 @@ definePageMeta({ layout: 'admin', middleware: 'admin-auth' })
 useSeoMeta({ title: '订单管理' })
 useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 
+const route = useRoute()
+const router = useRouter()
 const { request } = useAdminApi()
 const orders = ref<AdminOrderPage['items']>([])
 const total = ref(0)
 const totalPages = ref(0)
-const page = ref(1)
-const status = ref<'all' | 'pending_payment' | 'processing' | 'completed' | 'closed'>('all')
+const searchInput = ref(typeof route.query.search === 'string' ? route.query.search : '')
 const loading = ref(false)
 const errorMessage = ref('')
 let sequence = 0
+
+const validStatuses = ['all', 'pending_payment', 'processing', 'completed', 'closed'] as const
+type AdminOrderStatusFilter = typeof validStatuses[number]
+
+const page = computed(() => {
+  const value = Number(route.query.page)
+  return Number.isInteger(value) && value >= 1 && value <= 100_000 ? value : 1
+})
+const status = computed<AdminOrderStatusFilter>(() =>
+  typeof route.query.status === 'string' && validStatuses.includes(route.query.status as AdminOrderStatusFilter)
+    ? route.query.status as AdminOrderStatusFilter
+    : 'all',
+)
+const search = computed(() => typeof route.query.search === 'string' ? route.query.search : '')
 
 const statusOptions = [
   { label: '全部订单', value: 'all' },
@@ -45,8 +60,12 @@ async function loadOrders() {
   const currentSequence = ++sequence
   loading.value = true
   errorMessage.value = ''
+  orders.value = []
+  total.value = 0
+  totalPages.value = 0
   try {
     const query = new URLSearchParams({ page: String(page.value), pageSize: '20', status: status.value })
+    if (search.value) query.set('search', search.value)
     const result = await request<AdminOrderPage>(`/api/v1/admin/orders?${query}`)
     if (currentSequence !== sequence) return
     orders.value = result.items
@@ -60,15 +79,38 @@ async function loadOrders() {
   }
 }
 
-watch([page, status], () => { void loadOrders() }, { immediate: true })
-onBeforeUnmount(() => { sequence++ })
+function updateQuery(next: { search: string, status: AdminOrderStatusFilter, page: number }) {
+  const query: Record<string, string> = {}
+  if (next.search) query.search = next.search
+  if (next.status !== 'all') query.status = next.status
+  if (next.page > 1) query.page = String(next.page)
+  void router.push({ path: '/admin/orders', query })
+}
+
+function submitSearch() {
+  updateQuery({ search: searchInput.value.trim(), status: status.value, page: 1 })
+}
+
+function clearSearch() {
+  searchInput.value = ''
+  updateQuery({ search: '', status: status.value, page: 1 })
+}
 
 function setStatus(value: string) {
-  if (value === 'all' || value === 'pending_payment' || value === 'processing' || value === 'completed' || value === 'closed') {
-    status.value = value
-    page.value = 1
+  if (validStatuses.includes(value as AdminOrderStatusFilter)) {
+    updateQuery({ search: search.value, status: value as AdminOrderStatusFilter, page: 1 })
   }
 }
+
+function setPage(value: number) {
+  updateQuery({ search: search.value, status: status.value, page: value })
+}
+
+watch([page, status, search], () => { void loadOrders() }, { immediate: true, flush: 'sync' })
+watch(search, (value) => {
+  if (searchInput.value !== value) searchInput.value = value
+})
+onBeforeUnmount(() => { sequence++ })
 </script>
 
 <template>
@@ -85,7 +127,7 @@ function setStatus(value: string) {
         id="admin-main-content"
         class="mx-auto w-full max-w-[90rem] min-w-0 px-4 py-5 sm:px-6 lg:px-8"
       >
-        <header class="mb-6 flex flex-wrap items-end justify-between gap-4">
+        <header class="mb-6">
           <div>
             <p class="text-sm font-medium text-primary">
               订单与履约
@@ -97,18 +139,67 @@ function setStatus(value: string) {
               查看真实成交快照、顾客或游客归属、库存事件与人工数字交付记录。
             </p>
           </div>
-          <UFormField
-            label="订单状态"
-            class="w-full sm:w-48"
-          >
-            <USelect
-              :model-value="status"
-              :items="statusOptions"
-              class="w-full"
-              @update:model-value="setStatus(String($event))"
-            />
-          </UFormField>
         </header>
+
+        <UCard
+          :ui="{ body: 'p-4 sm:p-5' }"
+          class="mb-5 min-w-0"
+        >
+          <form
+            class="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,1fr)_12rem_auto] sm:items-end"
+            role="search"
+            @submit.prevent="submitSearch"
+          >
+            <UFormField
+              label="搜索订单"
+              name="orderSearch"
+              hint="完整订单 UUID 或顾客完整用户名"
+            >
+              <UInput
+                id="order-search"
+                v-model="searchInput"
+                class="w-full"
+                icon="i-lucide-search"
+                placeholder="输入订单 UUID 或用户名"
+                autocomplete="off"
+                aria-label="搜索完整订单 UUID 或顾客用户名"
+              />
+            </UFormField>
+            <UFormField
+              label="订单状态"
+              name="orderStatus"
+            >
+              <USelect
+                id="order-status-filter"
+                :model-value="status"
+                :items="statusOptions"
+                value-key="value"
+                class="w-full"
+                aria-label="按订单状态筛选"
+                @update:model-value="setStatus(String($event))"
+              />
+            </UFormField>
+            <div class="flex flex-wrap gap-2 sm:justify-end">
+              <UButton
+                type="submit"
+                icon="i-lucide-search"
+                class="min-h-11"
+              >
+                搜索
+              </UButton>
+              <UButton
+                v-if="search || searchInput"
+                type="button"
+                color="neutral"
+                variant="outline"
+                class="min-h-11"
+                @click="clearSearch"
+              >
+                清空搜索
+              </UButton>
+            </div>
+          </form>
+        </UCard>
 
         <UAlert
           v-if="errorMessage"
@@ -144,15 +235,17 @@ function setStatus(value: string) {
           />
         </div>
         <UAlert
-          v-else-if="!orders.length"
+          v-else-if="!loading && !errorMessage && !orders.length"
           color="neutral"
           variant="subtle"
           icon="i-lucide-receipt-text"
-          title="暂无订单"
-          description="真实订单会在顾客提交后显示在此处。"
+          title="没有找到符合条件的订单"
+          description="请检查搜索内容或调整订单状态。"
+          role="status"
+          aria-live="polite"
         />
         <section
-          v-else
+          v-else-if="orders.length"
           class="space-y-3"
           aria-label="后台订单列表"
           :aria-busy="loading"
@@ -205,7 +298,7 @@ function setStatus(value: string) {
               color="neutral"
               variant="outline"
               :disabled="loading || page <= 1"
-              @click="page--"
+              @click="setPage(page - 1)"
             >
               上一页
             </UButton>
@@ -214,7 +307,7 @@ function setStatus(value: string) {
               color="neutral"
               variant="outline"
               :disabled="loading || page >= totalPages"
-              @click="page++"
+              @click="setPage(page + 1)"
             >
               下一页
             </UButton>

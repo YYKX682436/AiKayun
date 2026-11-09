@@ -976,11 +976,21 @@ async function adminOrderPage(db: Kysely<Database>, query: {
   page?: number
   pageSize?: number
   status?: OrderStatus | 'all'
+  search?: string
 }): Promise<AdminOrderPage> {
   const page = query.page ?? 1
   const pageSize = query.pageSize ?? defaultPageSize
   const offset = (page - 1) * pageSize
-  let listQuery = db.selectFrom('orders as order')
+  const statusFilter = query.status && query.status !== 'all'
+    ? sql<boolean>`\"order\".status = ${query.status}`
+    : sql<boolean>`true`
+  const searchFilter = query.search
+    ? /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(query.search)
+      ? sql<boolean>`\"order\".id = ${query.search}::uuid`
+      : sql<boolean>`lower(customer.username) = lower(${query.search})`
+    : sql<boolean>`true`
+  const filters = sql<boolean>`(${statusFilter}) AND (${searchFilter})`
+  const listQuery = db.selectFrom('orders as order')
     .leftJoin('customers as customer', 'customer.id', 'order.customer_id')
     .select([
       'order.id', 'order.status', 'order.total_amount', 'order.currency', 'order.created_at',
@@ -990,11 +1000,11 @@ async function adminOrderPage(db: Kysely<Database>, query: {
         WHERE attempt.order_id = order.id AND attempt.status = 'succeeded'
           AND receipt.disposition = 'on_time'), 0)::text`.as('confirmed_amount'),
     ])
-  let countQuery = db.selectFrom('orders').select(({ fn }) => fn.countAll<number>().as('total'))
-  if (query.status && query.status !== 'all') {
-    listQuery = listQuery.where('order.status', '=', query.status)
-    countQuery = countQuery.where('status', '=', query.status)
-  }
+    .where(filters)
+  const countQuery = db.selectFrom('orders as order')
+    .leftJoin('customers as customer', 'customer.id', 'order.customer_id')
+    .select(({ fn }) => fn.countAll<number>().as('total'))
+    .where(filters)
   const [rows, count] = await Promise.all([
     listQuery.orderBy('order.created_at', 'desc').orderBy('order.id', 'desc').limit(pageSize).offset(offset).execute(),
     countQuery.executeTakeFirstOrThrow(),
@@ -1548,7 +1558,12 @@ export function registerOrderRoutes(app: FastifyInstance, db: Kysely<Database>, 
       response: { 200: ApiSuccessSchemaOf(AdminOrderPageSchema), 401: ApiErrorSchema },
     },
   }, async (request, reply) => {
-    const query = request.query as { page?: number; pageSize?: number; status?: 'pending_payment' | 'processing' | 'completed' | 'closed' | 'all' }
+    const query = request.query as {
+      page?: number
+      pageSize?: number
+      status?: 'pending_payment' | 'processing' | 'completed' | 'closed' | 'all'
+      search?: string
+    }
     const result = await adminOrderPage(db, query)
     reply.header('cache-control', 'no-store')
     return success(result, request.id)

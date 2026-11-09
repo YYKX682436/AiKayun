@@ -21,10 +21,10 @@ const businessMetrics = computed(() => {
   const data = businessOverview.value
   if (!data) return []
   return [
-    { label: '今日新订单', value: data.todayNewOrders, icon: 'i-lucide-calendar-plus' },
-    { label: '待付款订单', value: data.pendingPaymentOrders, icon: 'i-lucide-clock-3' },
-    { label: '处理中订单', value: data.processingOrders, icon: 'i-lucide-loader-circle' },
-    { label: '累计完成订单', value: data.completedOrders, icon: 'i-lucide-circle-check' },
+    { label: '今日新订单', value: data.todayNewOrders, icon: 'i-lucide-calendar-plus', to: undefined },
+    { label: '待付款订单', value: data.pendingPaymentOrders, icon: 'i-lucide-clock-3', to: '/admin/orders?status=pending_payment' },
+    { label: '处理中订单', value: data.processingOrders, icon: 'i-lucide-loader-circle', to: '/admin/orders?status=processing' },
+    { label: '累计完成订单', value: data.completedOrders, icon: 'i-lucide-circle-check', to: '/admin/orders?status=completed' },
   ]
 })
 const refreshingBusinessOverview = ref(false)
@@ -324,14 +324,16 @@ async function logout() {
               {{ businessPeriodLabel }} · {{ businessMeasuredAtLabel }}
             </p>
             <div class="mt-4 grid grid-cols-1 gap-3 min-[360px]:grid-cols-2 xl:grid-cols-4">
-              <div
+              <component
+                :is="metric.to ? 'NuxtLink' : 'div'"
                 v-for="metric in businessMetrics"
                 :key="metric.label"
-                role="group"
+                :to="metric.to"
+                :role="metric.to ? undefined : 'group'"
                 :aria-label="metric.label"
-                class="min-w-0"
+                class="block min-w-0 rounded-xl focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
               >
-                <UCard class="h-full">
+                <UCard class="h-full transition-shadow hover:shadow-md">
                   <div class="flex items-start justify-between gap-3">
                     <div class="min-w-0">
                       <p class="text-sm text-muted">
@@ -341,14 +343,23 @@ async function logout() {
                         {{ metric.value }}
                       </p>
                     </div>
-                    <UIcon
-                      :name="metric.icon"
-                      class="size-5 shrink-0 text-primary"
+                    <span
+                      class="flex shrink-0 items-center gap-2 text-primary"
                       aria-hidden="true"
-                    />
+                    >
+                      <UIcon
+                        :name="metric.icon"
+                        class="size-5"
+                      />
+                      <UIcon
+                        v-if="metric.to"
+                        name="i-lucide-arrow-up-right"
+                        class="size-4"
+                      />
+                    </span>
                   </div>
                 </UCard>
-              </div>
+              </component>
             </div>
 
             <div
