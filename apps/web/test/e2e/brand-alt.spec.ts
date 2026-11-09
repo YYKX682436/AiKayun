@@ -100,6 +100,28 @@ test('an alternate deployment applies its logo and purple primary, then isolates
     contentType: 'application/json',
     body: JSON.stringify({ data: { status: 'active', allowedUntil: null, retryable: false } }),
   }))
+  await page.route('**/api/v1/admin/business-overview', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      data: {
+        todayNewOrders: 0,
+        pendingPaymentOrders: 0,
+        processingOrders: 0,
+        completedOrders: 0,
+        todayConfirmedOrderPaymentAmount: '0.00',
+        currency: 'CNY',
+        paymentRule: 'succeeded_on_time_order_receipts_excluding_open_reconciliation',
+        paymentTimeBasis: 'payment_receipts.received_at',
+        includedPaymentSources: ['external', 'cash', 'gift'],
+        refundsDeducted: false,
+        periodStart: '2026-01-01T16:00:00.000Z',
+        periodEnd: '2026-01-02T16:00:00.000Z',
+        measuredAt: '2026-01-01T17:00:00.000Z',
+      },
+      meta: { requestId: 'brand-alt-test' },
+    }),
+  }))
   await expect(page.getByRole('button', { name: '安全登录' })).toBeEnabled({ timeout: 15_000 })
   await page.getByLabel('管理员邮箱').fill('theme-test@example.com')
   await page.getByLabel('密码').fill('theme-test-password')
