@@ -323,8 +323,8 @@ expect_rejected backup_cleanup_isolated_restore "$unsafe_run"
 unset -f backup_docker backup_docker_quick
 
 # Drive the broker's restore invocation with a different verified release.
-# Model Docker's inspect responses separately, including one deliberately
-# wrong container image, so success cannot come from just passing env values.
+# Start with an empty historical image cache; Docker rejects --pull never
+# starts until the exact image is ready. Inspect also models a wrong image.
 (
   old_release="$pin_root/historical-release"
   mkdir -p "$old_release"
@@ -339,9 +339,34 @@ unset -f backup_docker backup_docker_quick
   stat() {
     if [[ "$2" == '%u:%g:%a' ]]; then printf '0:0:700\n'
     elif [[ -d "$3" ]]; then printf '0:0:700:2\n'
+    elif [[ "$3" == */record ]]; then printf '0:0:600:1\n'
     else printf '0:0:644:1\n'; fi
   }
-  backup_restore_create_volumes() { return 0; }
+  declare -A prepared=() signatures=()
+  volume_creations=0
+  container_starts=0
+  rejected_pull=''
+  rejected_signature=''
+  verify_release_image_signature() {
+    [[ "$2" == backup_docker && ( "$1" == "$old_api" || "$1" == "$old_restic" ) &&
+       "$1" != "$rejected_signature" ]] || return 1
+    signatures["$1"]=yes
+  }
+  backup_docker() {
+    [[ "$1" == pull && "$#" == 2 ]] || return 1
+    case "$2" in
+      "$old_api"|"$old_restic") [[ "${signatures[$2]:-}" == yes ]] || return 1 ;;
+      "$old_postgres") ;;
+      *) return 1 ;;
+    esac
+    [[ "$2" != "$rejected_pull" ]] || return 1
+    prepared["$2"]=yes
+  }
+  backup_restore_create_volumes() {
+    ((volume_creations+=1))
+    [[ "${prepared[$old_api]:-}" == yes && "${prepared[$old_postgres]:-}" == yes &&
+       "${prepared[$old_restic]:-}" == yes ]]
+  }
   backup_restore_assert_volume() { return 0; }
   backup_restore_assert_network() { return 0; }
   backup_restore_assert_one_network() { return 0; }
@@ -351,12 +376,24 @@ unset -f backup_docker backup_docker_quick
   finished=false
   wrong_image=false
   backup_docker_compose() {
+    local start_image
     [[ "$2" == "$drill_project" && "$4" == "$old_release/compose.restore-isolated.yaml" ]] || return 1
     if [[ "$7" == config ]]; then
       grep -Fxq 'AIKAYUN_RESTORE_RELEASE_ID=aikayun-older' "$6" &&
         grep -Fxq "AIKAYUN_API_IMAGE=$old_api" "$6" &&
         grep -Fxq "AIKAYUN_POSTGRES_IMAGE=$old_postgres" "$6" &&
         grep -Fxq "AIKAYUN_BACKUP_RESTIC_IMAGE=$old_restic" "$6" || return 1
+    fi
+    if [[ "$7" == run || "$7" == up ]]; then
+      ((container_starts+=1))
+      [[ " $* " == *' --pull never '* ]] || return 1
+      case "${*: -1}" in
+        validate) start_image="$old_api" ;;
+        restore-source|restore-manifest) start_image="$old_restic" ;;
+        db|restore-secrets|restore-database|restore-readonly-role|restore-input-permissions) start_image="$old_postgres" ;;
+        *) return 1 ;;
+      esac
+      [[ "${prepared[$start_image]:-}" == yes ]] || return 1
     fi
     if [[ "${*: -1}" == validate ]]; then
       printf '{"operation":"restore-validation","status":"verified","runId":"%s","backupSetId":"%s","sourceSnapshotId":"%s","manifestSnapshotId":"%s","schemaHead":"fixture"}\n' \
@@ -366,6 +403,7 @@ unset -f backup_docker backup_docker_quick
   backup_docker_quick() {
     local number=0 service format image net
     case "$1" in
+      image) [[ "$2" == inspect && "${prepared[$3]:-}" == yes ]] ;;
       volume) return 1 ;;
       network) [[ "$2" == ls ]]; return ;;
       ps)
@@ -392,8 +430,25 @@ unset -f backup_docker backup_docker_quick
       *) return 1 ;;
     esac
   }
-  expect_ok backup_restore_run_compose "$clean_run" "$set_id" "$restore_source_id" "$restore_manifest_id" \
-    "$old_release" aikayun-older "$old_api" "$old_web" "$old_postgres" "$old_caddy" "$old_restic"
+  restore_args=("$clean_run" "$set_id" "$restore_source_id" "$restore_manifest_id"
+    "$old_release" aikayun-older "$old_api" "$old_web" "$old_postgres" "$old_caddy" "$old_restic")
+  rejected_pull="$old_postgres"
+  expect_rejected backup_restore_run_compose "${restore_args[@]}"
+  expect_ok backup_restore_load_record "$clean_run"
+  [[ "$BACKUP_RESTORE_STATUS" == failed && "$BACKUP_RESTORE_CODE" == RESTORE_IMAGE_PREPARATION_FAILED ]]
+  [[ "$volume_creations" == 0 && "$container_starts" == 0 && "${prepared[$old_api]:-}" == yes ]]
+
+  rejected_pull=''
+  rejected_signature="$old_restic"
+  expect_rejected backup_restore_run_compose "${restore_args[@]}"
+  expect_ok backup_restore_load_record "$clean_run"
+  [[ "$BACKUP_RESTORE_STATUS" == failed && "$BACKUP_RESTORE_CODE" == RESTORE_IMAGE_PREPARATION_FAILED ]]
+  [[ "$volume_creations" == 0 && "$container_starts" == 0 && -z "${prepared[$old_restic]:-}" ]]
+
+  rejected_signature=''
+  prepared=() signatures=()
+  expect_ok backup_restore_run_compose "${restore_args[@]}"
+  [[ "$volume_creations" == 1 && "$container_starts" == 8 && "${#prepared[@]}" == 3 ]]
   wrong_image=true
   expect_rejected backup_restore_assert_finished_project "$clean_run" "$drill_project" "$old_api" "$old_postgres" "$old_restic"
 )

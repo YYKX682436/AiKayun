@@ -440,6 +440,13 @@ download_and_verify_release() {
   diff -qr "$WORK_DIR/release" "$WORK_DIR/oci-release" >/dev/null || fail 'The signed HTTPS files differ from the digest-pinned OCI release bundle.'
 }
 
+verify_release_image_signature() {
+  local image="$1"; shift
+  "$@" run --rm --entrypoint cosign "$COSIGN_IMAGE" verify \
+    --certificate-identity "$RELEASE_CERT_IDENTITY" --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
+    "$image" >/dev/null
+}
+
 verify_release_image_references() {
   local directory="$1" image name manifest_references compose_references
   manifest_references="$(docker run --rm --mount "type=bind,source=$directory,target=/release,readonly" \
@@ -467,9 +474,7 @@ verify_release_image_references() {
     fi
     docker pull "$image" >/dev/null || fail "Could not pull the digest-pinned $name image."
     if [[ "$name" == api || "$name" == web || "$name" == backup ]]; then
-      docker run --rm --entrypoint cosign "$COSIGN_IMAGE" verify \
-        --certificate-identity "$RELEASE_CERT_IDENTITY" --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
-        "$image" >/dev/null || fail "Cosign rejected the $name image signature."
+      verify_release_image_signature "$image" docker || fail "Cosign rejected the $name image signature."
     fi
   done
   if grep -Eq '(^|[[:space:]])latest([[:space:]]|$)|^[[:space:]]*build:' "$directory/compose.yaml"; then

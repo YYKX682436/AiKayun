@@ -237,6 +237,18 @@ backup_restore_assert_finished_project() {
   while IFS= read -r expected_service; do [[ "$seen" == *"|$expected_service|"* ]] || return 1; done < <(backup_restore_expected_services)
 }
 
+backup_restore_prepare_image() {
+  local name="$1" image="$2"
+  [[ "$image" =~ ^[A-Za-z0-9][^[:space:]@]*@sha256:[a-f0-9]{64}$ ]] || return 1
+  # A local exact digest is already bound by the authenticated archive.
+  if backup_docker_quick image inspect "$image" >/dev/null 2>&1; then return 0; fi
+  # Verify newly fetched first-party images before they can enter the cache.
+  if [[ "$name" == api || "$name" == backup ]]; then
+    verify_release_image_signature "$image" backup_docker || return 1
+  fi
+  backup_docker pull "$image" >/dev/null
+}
+
 backup_restore_run_compose() {
   local run_id="$1" set_id="$2" source_id="$3" manifest_id="$4"
   local release_dir="$5" release_id="$6" api_image="$7" web_image="$8" postgres_image="$9" caddy_image="${10}" restic_image="${11}"
@@ -270,6 +282,13 @@ backup_restore_run_compose() {
     backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed RESTORE_TARGET_RESOURCE_CONFLICT
     return 1
   fi
+  if ! backup_restore_prepare_image api "$api_image" ||
+     ! backup_restore_prepare_image postgres "$postgres_image" ||
+     ! backup_restore_prepare_image backup "$restic_image"; then
+    backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed RESTORE_IMAGE_PREPARATION_FAILED
+    return 1
+  fi
+  backup_assert_held_lock || return 1
   step=RESTORE_VOLUME_PREPARATION_FAILED
   if ! backup_restore_create_volumes "$run_id" "$project"; then
     backup_restore_write_record "$run_id" "$project" "$set_id" "$source_id" "$manifest_id" failed "$step"
@@ -1203,9 +1222,14 @@ run_backup_host_broker() {
       "$BACKUP_RESTORE_SOURCE_ID" "$BACKUP_RESTORE_MANIFEST_ID" started RESTORE_ISOLATED_STARTING || \
       fail "Could not pin the verified snapshot pair. Run cleanup-isolated $run_id."
     if ! backup_restore_run_compose "$run_id" "$BACKUP_RESTORE_SET_ID" "$BACKUP_RESTORE_SOURCE_ID" "$BACKUP_RESTORE_MANIFEST_ID" "${BACKUP_RESTORE_RELEASE[@]}"; then
-      if backup_restore_load_record "$run_id" && [[ "$BACKUP_RESTORE_STATUS" != failed ]]; then
-        backup_restore_write_record "$run_id" "$BACKUP_RESTORE_PROJECT" "$BACKUP_RESTORE_SET_ID" \
-          "$BACKUP_RESTORE_SOURCE_ID" "$BACKUP_RESTORE_MANIFEST_ID" failed RESTORE_ISOLATED_FAILED || true
+      if backup_restore_load_record "$run_id"; then
+        if [[ "$BACKUP_RESTORE_CODE" == RESTORE_IMAGE_PREPARATION_FAILED ]]; then
+          fail "Could not prepare the digest-pinned historical restore images. No restore volumes or containers were created. Run cleanup-isolated $run_id to remove the record."
+        fi
+        if [[ "$BACKUP_RESTORE_STATUS" != failed ]]; then
+          backup_restore_write_record "$run_id" "$BACKUP_RESTORE_PROJECT" "$BACKUP_RESTORE_SET_ID" \
+            "$BACKUP_RESTORE_SOURCE_ID" "$BACKUP_RESTORE_MANIFEST_ID" failed RESTORE_ISOLATED_FAILED || true
+        fi
       fi
       fail "Isolated restore did not verify; partial resources remain stopped for inspection. Cleanup with: sudo /opt/aikayun/aikayun backup cleanup-isolated $run_id"
     fi
