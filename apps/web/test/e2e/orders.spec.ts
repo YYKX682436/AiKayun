@@ -156,6 +156,12 @@ test('creates a zero-value order, completes actual private delivery, and cancels
   const zeroOrderId = zeroOrderUrl.split('/').at(-1)!
   await expect(page.getByText('零元订单，等待商家交付')).toBeVisible()
   await expect(page.getByText('零元订单，无需付款')).toBeVisible()
+  const contact = page.locator('main header').getByRole('link', { name: '联系商家' })
+  await expect(contact).toHaveAttribute('href', '/support')
+  await contact.click()
+  await expect(page).toHaveURL('/support')
+  await page.goBack()
+  await expect(page).toHaveURL(zeroOrderUrl)
   await expect(page.getByRole('heading', { name: zeroName })).toBeVisible()
   await page.reload()
   await expect(page.getByText('零元订单，等待商家交付')).toBeVisible()

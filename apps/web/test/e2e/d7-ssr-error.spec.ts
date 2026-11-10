@@ -114,6 +114,36 @@ test('client navigation keeps retryable errors on the requested public route', a
   await resetApi()
 })
 
+test('support errors hide previously loaded contacts and can retry without leaving the page', async ({ page }) => {
+  const linkName = '打开SSR售后渠道（新窗口）'
+  try {
+    await page.goto('/')
+    await expect(page.locator('[data-storefront-ready="true"]')).toBeAttached()
+    const footerLink = page.locator('footer').getByRole('link', { name: '联系客服' })
+    await expect(footerLink).toHaveAttribute('href', '/support')
+    await failApi('/api/v1/public/storefront/support')
+    const unavailable = await html(page, '/support', 502)
+    expect(unavailable.response.headers()['cache-control']).toBe('no-store')
+    expect(unavailable.body).toContain('暂时无法读取客服联系方式')
+    expect(unavailable.body).not.toContain('店主暂未设置客服联系方式')
+    expect(unavailable.body).not.toContain('private database stack marker')
+    expect(unavailable.body).not.toContain('https://support.example.test/contact')
+
+    await footerLink.click()
+    await expect(page).toHaveURL('/support')
+    await expect(page.getByRole('alert')).toContainText('暂时无法读取客服联系方式')
+    await expect(page.getByRole('link', { name: linkName })).toHaveCount(0)
+    await expect(footerLink).toHaveCount(0)
+    await expect(page.getByText('店主暂未设置客服联系方式')).toHaveCount(0)
+    await resetApi()
+    await page.getByRole('button', { name: '重试' }).click()
+    await expect(page.getByRole('link', { name: linkName })).toHaveAttribute('href', 'https://support.example.test/contact')
+    await expect(footerLink).toHaveAttribute('href', '/support')
+  } finally {
+    await resetApi()
+  }
+})
+
 
 test('unauthenticated admin SSR redirect preserves only the requested path', async ({ request }) => {
   const sensitive = 'sensitive-callback-signature-marker'

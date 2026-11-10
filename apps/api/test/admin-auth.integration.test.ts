@@ -1098,7 +1098,7 @@ describe('Fastify API with PostgreSQL 18', () => {
       'purchase_form_audit_events', 'purchase_form_template_identities', 'purchase_form_template_versions', 'purchase_form_templates',
       'purchase_order_attachment_objects',
       'sku_purchase_form_overrides',
-      'storefront_brand_settings', 'storefront_customer_policy', 'storefront_featured_products',
+      'storefront_brand_settings', 'storefront_customer_policy', 'storefront_featured_products', 'storefront_support_settings',
       'supplier_api_delivery_events', 'supplier_api_delivery_operations',
       'supplier_api_operations_admin_audit', 'supplier_connection_audit_events', 'supplier_connection_credentials', 'supplier_connection_tests',
       'supplier_connection_versions', 'supplier_connections',

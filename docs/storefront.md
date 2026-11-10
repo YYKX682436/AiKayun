@@ -12,8 +12,15 @@
 | `/products/:id` | 使用永久商品 UUID 查看详情与规格 | `GET /api/v1/public/products/:id` |
 | sitemap | 当前可公开商品和分类 | `GET /api/v1/public/sitemap`、`/sitemap.xml`、`/sitemap-:page.xml` |
 | 分类导航 | 四级可见分类树 | `GET /api/v1/public/categories` |
+| `/support` | 查看店主发布的客服联系方式 | `GET /api/v1/public/storefront/support` |
 
 所有公开查询响应均为 `Cache-Control: no-store`。商品媒体仍通过 D5 的 `/api/v1/media/:id/{thumbnail,card,detail}.webp` 不可变 URL 长期缓存。Fastify 为公开端点应用独立 schema 和响应契约，包括 `PublicProductCard`、`PublicProductDetail`、`PublicCategory`、`PublicInventorySummary` 和分页结果；额外响应字段不向匿名访问者开放。
+
+## ⑧-5 店铺客服
+
+每个独立商城的管理员可在 `/admin/storefront/support` 保存最多三个公开渠道，列表顺序即展示顺序。后台读写使用 `GET` / `PUT /api/v1/admin/storefront/support`，保存时原子替换列表；保存空列表可取消公开。顾客可以从商城页脚（有配置时显示）或订单详情的“联系商家”打开 `/support`，无需登录即可查看。HTTPS 联系链接在新窗口打开；账号以纯文本显示并可复制。订单标识和凭据不会附加到联系方式中。
+
+公开页从 SSR 读取真实配置。空列表显示未设置提示，读取失败显示重试，且不展示此前的渠道。新增数据库迁移的升级限制见 [⑦-5C-1](./upgrade-7-5c-1.md)。
 
 ## 商品公开规则与字段边界
 

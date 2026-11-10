@@ -72,6 +72,11 @@ const navigationItems: NavigationMenuItem[][] = [[
     icon: 'i-lucide-star',
     to: '/admin/storefront/featured',
   },
+  {
+    label: '客服设置',
+    icon: 'i-lucide-headset',
+    to: '/admin/storefront/support',
+  },
 ]]
 
 </script>

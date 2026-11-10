@@ -545,13 +545,26 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                 创建于 {{ formatDate(order.createdAt) }}
               </p>
             </div>
-            <UBadge
-              :color="statusColor(order.status)"
-              variant="soft"
-              size="lg"
-            >
-              {{ statusLabel(order) }}
-            </UBadge>
+            <div class="flex flex-wrap items-center gap-2">
+              <UBadge
+                :color="statusColor(order.status)"
+                variant="soft"
+                size="lg"
+              >
+                {{ statusLabel(order) }}
+              </UBadge>
+              <NuxtLink
+                to="/support"
+                class="inline-flex min-h-11 items-center gap-2 rounded-lg px-3 text-sm font-medium text-primary hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              >
+                <UIcon
+                  name="i-lucide-headset"
+                  class="size-4"
+                  aria-hidden="true"
+                />
+                联系商家
+              </NuxtLink>
+            </div>
           </div>
 
           <div class="grid gap-3 border-t border-default pt-4 sm:grid-cols-3">

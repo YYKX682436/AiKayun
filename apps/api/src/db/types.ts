@@ -1,5 +1,5 @@
 import type { ColumnType, Generated } from 'kysely'
-import type { ProductRichContent } from '@aikayun/contracts'
+import type { ProductRichContent, StorefrontSupportChannel } from '@aikayun/contracts'
 
 export type ProductMediaReferenceSource = 'gallery' | 'rich_content'
 
@@ -236,6 +236,11 @@ export interface StorefrontBrandSettingsTable {
 export interface StorefrontFeaturedProductsTable {
   position: number
   product_id: string
+}
+
+export interface StorefrontSupportSettingsTable {
+  singleton: Generated<boolean>
+  channels: ColumnType<StorefrontSupportChannel[], string, string>
 }
 
 export type PurchaseFormsStatus = 'preparing' | 'active' | 'paused'
@@ -1540,6 +1545,7 @@ export interface Database {
   storefront_customer_policy: StorefrontCustomerPolicyTable
   storefront_brand_settings: StorefrontBrandSettingsTable
   storefront_featured_products: StorefrontFeaturedProductsTable
+  storefront_support_settings: StorefrontSupportSettingsTable
   customers: CustomersTable
   customer_sessions: CustomerSessionsTable
   customer_management_audit: CustomerManagementAuditTable

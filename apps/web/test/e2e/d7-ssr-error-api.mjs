@@ -73,6 +73,12 @@ const server = createServer(async (request, response) => {
     response.writeHead(200).end(JSON.stringify({ data: { categories: [category().category] } }))
     return
   }
+  if (url.pathname === '/api/v1/public/storefront/support') {
+    response.writeHead(200).end(JSON.stringify({ data: {
+      channels: [{ name: 'SSR售后渠道', type: 'https', content: 'https://support.example.test/contact' }],
+    } }))
+    return
+  }
   if (url.pathname === '/api/v1/public/products') {
     response.writeHead(200).end(JSON.stringify({ data: page(url) }))
     return

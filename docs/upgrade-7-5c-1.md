@@ -14,6 +14,10 @@ sudo /opt/aikayun/aikayun upgrade --version X.Y.Z
 
 首页推荐只新增 `storefront_featured_products` 表，不改写现有商品、SKU、订单或顾客记录。迁移仅向前应用。由于 ⑦-5C-1 升级器要求当前与候选发行的 schema head 和 checksum 完全相同，仍运行 ⑦-5C-1 命令的实例不能直接升级到包含这项迁移的发行；升级器会在停机前拒绝 schema 不同的候选版本。本阶段不扩展升级器，已有实例的跨 schema 升级须由后续阶段另行提供并验收。
 
+## ⑧-5 客服设置迁移边界
+
+`202611100001_storefront_support_settings` 只新增单实例客服配置表，初始无渠道，不改写已有店铺、顾客或订单记录。该迁移改变 schema head 和完整迁移校验清单，⑦-5C-1 仍会在停机前拒绝跨 schema 升级；本阶段未扩展升级器。
+
 ## 首版升级条件
 
 新发行必须在签名清单 `database.upgrade_from_releases` 中列出当前 `release_id`，并在 `database.rollback_to_releases` 中明确声明支持回退到该发行。候选发行和当前发行还必须满足：

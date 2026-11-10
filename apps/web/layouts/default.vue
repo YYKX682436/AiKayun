@@ -1,5 +1,6 @@
 <script setup lang="ts">
 const storeBrand = useStoreBrand()
+const { data: support, status: supportStatus } = useStorefrontSupport()
 const { data: categoriesResponse } = await usePublicCategories()
 const categories = computed(() => categoriesResponse.value?.data.categories ?? [])
 const storefrontReady = ref(false)
@@ -151,6 +152,13 @@ onMounted(() => {
             class="min-h-11 content-center rounded-lg px-2 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
           >
             订单查询
+          </NuxtLink>
+          <NuxtLink
+            v-if="supportStatus === 'success' && support?.channels.length"
+            to="/support"
+            class="min-h-11 content-center rounded-lg px-2 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+          >
+            联系客服
           </NuxtLink>
           <NuxtLink
             to="/admin/login"

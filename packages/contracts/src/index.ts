@@ -296,6 +296,28 @@ export const StorefrontBrandSettingsSchema = Type.Object({
 
 export const UpdateStorefrontBrandBodySchema = StorefrontBrandSchema
 
+export const storefrontSupportLimits = { channels: 3, name: 40, account: 200, https: 2048 } as const
+
+const storefrontSupportNameSchema = Type.String({ minLength: 1, maxLength: storefrontSupportLimits.name })
+const StorefrontSupportChannelSchema = Type.Union([
+  Type.Object({
+    name: storefrontSupportNameSchema,
+    type: Type.Literal('https'),
+    content: Type.String({ minLength: 1, maxLength: storefrontSupportLimits.https }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    name: storefrontSupportNameSchema,
+    type: Type.Literal('account'),
+    content: Type.String({ minLength: 1, maxLength: storefrontSupportLimits.account }),
+  }, { additionalProperties: false }),
+])
+
+export const StorefrontSupportSettingsSchema = Type.Object({
+  channels: Type.Array(StorefrontSupportChannelSchema, { maxItems: storefrontSupportLimits.channels }),
+}, { additionalProperties: false })
+
+export const UpdateStorefrontSupportBodySchema = StorefrontSupportSettingsSchema
+
 export const UpdateStorefrontCustomerPolicyBodySchema = Type.Object({
   requireEmail: Type.Boolean(),
   requirePhone: Type.Boolean(),
@@ -3094,6 +3116,9 @@ export type StorefrontCustomerPolicy = Static<typeof StorefrontCustomerPolicySch
 export type StorefrontBrand = Static<typeof StorefrontBrandSchema>
 export type StorefrontBrandSettings = Static<typeof StorefrontBrandSettingsSchema>
 export type UpdateStorefrontBrandBody = Static<typeof UpdateStorefrontBrandBodySchema>
+export type StorefrontSupportChannel = Static<typeof StorefrontSupportChannelSchema>
+export type StorefrontSupportSettings = Static<typeof StorefrontSupportSettingsSchema>
+export type UpdateStorefrontSupportBody = Static<typeof UpdateStorefrontSupportBodySchema>
 export type UpdateStorefrontCustomerPolicyBody = Static<typeof UpdateStorefrontCustomerPolicyBodySchema>
 export type ProductType = Static<typeof ProductTypeSchema>
 export type ProductStatus = Static<typeof ProductStatusSchema>
