@@ -1,5 +1,7 @@
 # ⑦-2 商业发行流程
 
+> 2026-11-10 内测发行更新：本页保留原阶段的历史方案与阻断记录。当前单人手动发行策略、镜像复扫结果和实际开通状态见[首轮内测交接](./first-beta-handoff.md)；私有仓库不再要求当前套餐不支持的 Required Reviewers、分支保护或 Tag Ruleset，其他授权、签名、扫描与安装器门禁仍保留。
+
 本目录和 `scripts/release/` 定义 ⑦-2 的发行接口。首个不可覆盖的候选版本是 `0.1.0-rc.1`，release ID 固定由版本派生为 `aikayun-0.1.0-rc.1`。部署配置只接受 API、Web、PostgreSQL、Caddy 的 OCI digest；Compose 不使用 `latest`，也不包含源码构建步骤。
 
 ## 发行制品

@@ -88,7 +88,7 @@ RUN test "$(dpkg-query -W -f='${Version}' util-linux)" = '2.41.5-0+deb13u1' \
   && install -D -m 0755 /usr/bin/flock /runtime-root/usr/bin/flock \
   && install -D -m 0644 /usr/share/doc/util-linux/copyright /runtime-root/usr/share/doc/util-linux/copyright
 
-FROM gcr.io/distroless/nodejs24-debian13:nonroot@sha256:b8cec4b2f2126ff7bd034ec9ac207ffb3272667dfdc48376e3b035d3270549ba AS runtime
+FROM gcr.io/distroless/nodejs24-debian13:nonroot@sha256:088a01637f22908632ba09018be2e0b516f2fa6f7869c191d29491139db43c78 AS runtime
 
 ARG AIKAYUN_RELEASE_ID=local-development
 ARG AIKAYUN_RELEASE_VERSION=0.0.0-dev

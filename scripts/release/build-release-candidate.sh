@@ -75,11 +75,8 @@ for name in AIKAYUN_RELEASE_SIGNING_KEY_PEM AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD
   AIKAYUN_PRODUCTION_LICENSE_ISSUER AIKAYUN_PRODUCTION_LICENSE_ROOT_KID \
   AIKAYUN_LICENSE_CENTER_SIGNER_KIDS AIKAYUN_RELEASE_ORIGIN AIKAYUN_RELEASE_PUBLISH_URL \
   AIKAYUN_RELEASE_PUBLISH_TOKEN AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN GH_TOKEN; do need "$name"; done
-need AIKAYUN_RELEASE_POLICY_READ_TOKEN
-
 [[ "$(gh api "/repos/${GITHUB_REPOSITORY}" --jq .visibility)" == private ]] || fail 'The source repository must remain private.'
-AIKAYUN_RELEASE_POLICY_READ_TOKEN="$AIKAYUN_RELEASE_POLICY_READ_TOKEN" \
-  "$source_root/scripts/release/check-github-protections.sh" >/dev/null
+"$source_root/scripts/release/check-release-policy.sh" >/dev/null
 [[ "$AIKAYUN_RELEASE_PUBLISH_TOKEN" != *$'\n'* && "$AIKAYUN_RELEASE_PUBLISH_TOKEN" != *$'\r'* ]] || \
   fail 'The release upload token must be a single-line bearer token.'
 printf '%s' "$AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64" | base64 --decode > "$work/trusted-license-config.json" || \
@@ -278,14 +275,14 @@ done
 
 for platform in linux/amd64 linux/arm64; do
   "$source_root/scripts/release/test-runtime-platform.sh" "$platform" "$api_staging_index_ref" "$web_staging_index_ref" \
-    '202611040002_file_check_results'
+    '202611100002_payment_expiry_and_refund_completion'
 done
 migration_path="$work/migration-checksums.json"
 container_id="$(docker create --platform linux/amd64 "$api_staging_index_ref")"
 docker cp "$container_id:/app/dist/db/migration-checksums.json" "$migration_path"
 docker rm "$container_id" >/dev/null
 migration_head="$(jq -er '.migration_head | select(test("^[0-9]{12}_[A-Za-z0-9_-]+$"))' "$migration_path")"
-[[ "$migration_head" == '202611040002_file_check_results' ]] || fail 'Release migration head differs from the reviewed matrix.'
+[[ "$migration_head" == '202611100002_payment_expiry_and_refund_completion' ]] || fail 'Release migration head differs from the reviewed matrix.'
 
 # The signed manifest schema stores platform hashes without the OCI prefix.
 # Keep the original prefixed variables for staging pulls and scan references.

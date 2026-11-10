@@ -9,7 +9,7 @@ on:
         default: 0.1.0-rc.1
         type: string
       confirmation:
-        description: Type PUBLISH-<version> after reviewing the source and protected release settings
+        description: Type PUBLISH-<version> after reviewing the source commit and release settings
         required: true
         type: string
       upgrade_from_releases:
@@ -33,7 +33,7 @@ concurrency:
 jobs:
   validate:
     name: Validate source and frozen authorization center
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'YYKX682436' && github.triggering_actor == 'YYKX682436'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
@@ -62,6 +62,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Verify manual release policy and source commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release/check-release-policy.sh
       - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996
         with:
           version: 10.29.3
@@ -127,11 +131,9 @@ jobs:
   publish:
     name: Build, sign and publish immutable candidate
     needs: validate
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'YYKX682436' && github.triggering_actor == 'YYKX682436'
     runs-on: ubuntu-24.04
     timeout-minutes: 240
-    environment:
-      name: aikayun-release
     permissions:
       contents: write
       packages: write
@@ -140,6 +142,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
+      - name: Verify manual release policy before loading signing credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release/check-release-policy.sh
       - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996
         with:
           version: 10.29.3
@@ -170,7 +176,6 @@ jobs:
           AIKAYUN_RELEASE_ORIGIN: ${{ vars.AIKAYUN_RELEASE_ORIGIN }}
           AIKAYUN_RELEASE_PUBLISH_URL: ${{ vars.AIKAYUN_RELEASE_PUBLISH_URL }}
           AIKAYUN_RELEASE_PUBLISH_TOKEN: ${{ secrets.AIKAYUN_RELEASE_PUBLISH_TOKEN }}
-          AIKAYUN_RELEASE_POLICY_READ_TOKEN: ${{ secrets.AIKAYUN_RELEASE_POLICY_READ_TOKEN }}
           AIKAYUN_RELEASE_VERSION: ${{ inputs.version }}
           AIKAYUN_RELEASE_CONFIRMATION: ${{ inputs.confirmation }}
           AIKAYUN_UPGRADE_FROM_RELEASES: ${{ inputs.upgrade_from_releases }}
