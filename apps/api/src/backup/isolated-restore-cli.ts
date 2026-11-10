@@ -222,7 +222,7 @@ async function verifyPrivateFiles(db: Kysely<Database>, root: string): Promise<n
     .where('status', '=', 'available').orderBy('id').execute()
   for (const object of objects) {
     if (!object.size_bytes || !object.sha256 || !digest.test(object.sha256)) throw new Error('RESTORE_PRIVATE_FILE_METADATA_INVALID')
-    const file = await storage.openVerified(object.id, { sizeBytes: object.size_bytes, sha256: object.sha256 }, { readOnly: true })
+    const file = await storage.openVerified(object.id, { sizeBytes: object.size_bytes, sha256: object.sha256 })
     await file.handle.close()
   }
   return objects.length

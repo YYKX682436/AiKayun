@@ -557,6 +557,72 @@ describe('private-file delivery on real PostgreSQL and filesystem', () => {
       .where('content_sha256', '=', delivery.content_sha256).execute())).toHaveLength(1)
   }, 30_000)
 
+  it('keeps the file available through temporary worker and download read failures', async () => {
+    const admin = await createAdmin()
+    const customer = await createCustomer()
+    const catalog = await createCatalog('0.00', 'unlimited')
+    const bytes = Buffer.from('available after the descriptor limit clears\n')
+    const saved = await saveFile(catalog, admin, 'transient-read.txt', bytes)
+    expect((await setReadiness(catalog, admin, saved.configurationRevision, true)).statusCode).toBe(200)
+    const created = await order(catalog, customer, 1)
+    expect(created.statusCode).toBe(201)
+    const orderId = created.json().data.order.id as string
+    const itemId = created.json().data.order.items[0].id as string
+    const version = await db.selectFrom('product_variant_fulfillment_versions')
+      .select('private_file_object_id').where('id', '=', saved.currentVersion.id).executeTakeFirstOrThrow()
+    const objectId = version.private_file_object_id!
+    const assertStillAvailable = async () => {
+      expect((await db.selectFrom('private_file_objects').select('status')
+        .where('id', '=', objectId).executeTakeFirstOrThrow()).status).toBe('available')
+      expect((await db.selectFrom('product_variant_fulfillment').select('automatic_delivery_ready')
+        .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).automatic_delivery_ready).toBe(true)
+    }
+    // Inject errno below both read methods' error handling, for this object only.
+    const prototype = PrivateFileStorage.prototype as unknown as { inspectObjectDirectory(id: string): Promise<string> }
+    const inspect = prototype.inspectObjectDirectory
+    let failOnce = true
+    const fault = vi.spyOn(prototype, 'inspectObjectDirectory').mockImplementation(async function (this: PrivateFileStorage, id: string) {
+      if (id === objectId && failOnce) {
+        failOnce = false
+        throw Object.assign(new Error('fixture descriptor exhaustion'), { code: 'EMFILE' })
+      }
+      return inspect.call(this, id)
+    })
+    let stop: (() => Promise<void>) | undefined
+    try {
+      const inspected = await inject({ method: 'GET',
+        url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/private-files`,
+        headers: { cookie: admin.cookie } })
+      expect(inspected.statusCode).toBe(200)
+      expect(inspected.json().data).toMatchObject({ integrityStatus: 'unknown', automaticDeliveryReady: true })
+      await assertStillAvailable()
+      failOnce = true
+      stop = startDigitalDeliveryWorker(db, config, app.log)
+      await waitForFailure(itemId, 'FILE_DELIVERY_OBJECT_UNAVAILABLE')
+      const failed = await db.selectFrom('order_item_fulfillment_attempts').select('retry_after')
+        .where('order_item_id', '=', itemId).where('status', '=', 'failed').executeTakeFirstOrThrow()
+      expect(failed.retry_after).not.toBeNull()
+      await assertStillAvailable()
+      await waitForCompletion(orderId, itemId)
+      const delivery = await db.selectFrom('order_item_fulfillment_deliveries as row')
+        .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'row.fulfillment_attempt_id')
+        .select('row.id').where('attempt.order_item_id', '=', itemId).where('attempt.status', '=', 'succeeded').executeTakeFirstOrThrow()
+      const download = () => inject({ method: 'GET', url: `/api/v1/customer/orders/${orderId}/items/${itemId}/deliveries/${delivery.id}/file`,
+        headers: { cookie: customer.cookie } })
+      failOnce = true
+      const failedDownload = await download()
+      expect(failedDownload.statusCode).toBe(503)
+      expect(failedDownload.json().error.code).toBe('PRIVATE_FILE_READ_UNAVAILABLE')
+      await assertStillAvailable()
+      const recovered = await download()
+      expect(recovered.statusCode).toBe(200)
+      expect(recovered.rawPayload).toEqual(bytes)
+    } finally {
+      fault.mockRestore()
+      await stop?.()
+    }
+  }, 30_000)
+
   it('rejects damaged content and blocks pending payment and reconciliation cases from delivery and download', async () => {
     const admin = await createAdmin()
     const customer = await createCustomer()

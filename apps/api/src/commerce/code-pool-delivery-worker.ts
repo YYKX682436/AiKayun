@@ -5,7 +5,7 @@ import { sql, type Kysely, type Transaction } from 'kysely'
 import type { AppConfig } from '../config.js'
 import type { Database } from '../db/types.js'
 import { settleAmount } from '@aikayun/money'
-import { PrivateFileError, PrivateFileStorage } from '../media/private-file-storage.js'
+import { PrivateFileStorage, privateFileObjectFailure } from '../media/private-file-storage.js'
 import {
   CodePoolDecryptionError,
   CodePoolKeyUnavailableError,
@@ -547,12 +547,6 @@ async function attemptFixedDelivery(
   }
 }
 
-function errno(error: unknown): string | undefined {
-  return error && typeof error === 'object' && 'code' in error
-    ? String((error as NodeJS.ErrnoException).code)
-    : undefined
-}
-
 async function attemptFileDelivery(
   db: Kysely<Database>, config: AppConfig, orderId: string, itemId: string,
 ): Promise<'delivered' | 'failed' | 'skipped'> {
@@ -581,10 +575,12 @@ async function attemptFileDelivery(
       fileFailure = 'FILE_DELIVERY_DATA_INCONSISTENT'
     } else if (version.object_status !== 'available') {
       fileFailure = 'FILE_DELIVERY_OBJECT_UNAVAILABLE'
-      await db.updateTable('product_variant_fulfillment').set({ automatic_delivery_ready: false })
-        .where('product_variant_id', '=', bound.product_variant_id).where('method', '=', 'file')
-        .where('current_content_version_id', '=', version.version_id)
-        .where('automatic_delivery_ready', '=', true).execute()
+      if (version.object_status === 'missing' || version.object_status === 'corrupt') {
+        await db.updateTable('product_variant_fulfillment').set({ automatic_delivery_ready: false })
+          .where('product_variant_id', '=', bound.product_variant_id).where('method', '=', 'file')
+          .where('current_content_version_id', '=', version.version_id)
+          .where('automatic_delivery_ready', '=', true).execute()
+      }
     } else {
       try {
         opened = await storage.openVerified(version.object_id, {
@@ -592,17 +588,16 @@ async function attemptFileDelivery(
           sha256: version.sha256.trim(),
         })
       } catch (error) {
-        const unavailable = error instanceof PrivateFileError
-          ? error.code === 'PRIVATE_FILE_UNAVAILABLE'
-          : ['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'ELOOP'].includes(errno(error) ?? '')
-        fileFailure = unavailable ? 'FILE_DELIVERY_OBJECT_UNAVAILABLE' : 'FILE_DELIVERY_INTEGRITY_FAILED'
-        const nextStatus = unavailable ? 'missing' : 'corrupt'
-        await db.updateTable('product_variant_fulfillment').set({ automatic_delivery_ready: false })
-          .where('product_variant_id', '=', bound.product_variant_id).where('method', '=', 'file')
-          .where('current_content_version_id', '=', version.version_id)
-          .where('automatic_delivery_ready', '=', true).execute()
-        await db.updateTable('private_file_objects').set({ status: nextStatus })
-          .where('id', '=', version.object_id).where('status', '=', 'available').execute()
+        const failure = privateFileObjectFailure(error)
+        fileFailure = failure === 'corrupt' ? 'FILE_DELIVERY_INTEGRITY_FAILED' : 'FILE_DELIVERY_OBJECT_UNAVAILABLE'
+        if (failure) {
+          await db.updateTable('product_variant_fulfillment').set({ automatic_delivery_ready: false })
+            .where('product_variant_id', '=', bound.product_variant_id).where('method', '=', 'file')
+            .where('current_content_version_id', '=', version.version_id)
+            .where('automatic_delivery_ready', '=', true).execute()
+          await db.updateTable('private_file_objects').set({ status: failure })
+            .where('id', '=', version.object_id).where('status', '=', 'available').execute()
+        }
       }
     }
 

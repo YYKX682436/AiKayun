@@ -39,6 +39,13 @@ export class PrivateFileError extends Error {
   }
 }
 
+/** Only proven object failures may change stored availability. */
+export function privateFileObjectFailure(error: unknown): 'missing' | 'corrupt' | undefined {
+  if (!(error instanceof PrivateFileError)) return undefined
+  if (error.code === 'PRIVATE_FILE_UNAVAILABLE') return 'missing'
+  if (error.code === 'PRIVATE_FILE_INTEGRITY_FAILED') return 'corrupt'
+}
+
 export interface PrivateFileObjectMetadata {
   id: string
   mediaType: string
@@ -86,6 +93,18 @@ function errnoCode(error: unknown): string | undefined {
   return error && typeof error === 'object' && 'code' in error
     ? String((error as NodeJS.ErrnoException).code)
     : undefined
+}
+
+function unavailableObject(): PrivateFileError {
+  return new PrivateFileError('PRIVATE_FILE_UNAVAILABLE', '文件暂不可用，请稍后重试。', 410)
+}
+
+function objectReadError(error: unknown): unknown {
+  if (error instanceof PrivateFileError) return error
+  const code = errnoCode(error)
+  if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP') return unavailableObject()
+  if (code) return new PrivateFileError('PRIVATE_FILE_READ_UNAVAILABLE', '暂时无法读取文件，请稍后重试。', 503)
+  return error
 }
 
 async function syncDirectory(path: string): Promise<void> {
@@ -196,7 +215,7 @@ export class PrivateFileStorage {
   // Audit reads must not create directories or chmod existing storage.
   private async inspectRoot(): Promise<string> {
     const info = await lstat(this.root)
-    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Private file storage root is invalid')
+    if (!info.isDirectory() || info.isSymbolicLink()) throw unavailableObject()
     this.canonicalRoot = await realpath(this.root)
     return this.canonicalRoot
   }
@@ -208,9 +227,9 @@ export class PrivateFileStorage {
     const shard = resolve(objects, id.slice(0, 2))
     for (const directory of [objects, shard]) {
       const info = await lstat(directory)
-      if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Private file object directory is invalid')
+      if (!info.isDirectory() || info.isSymbolicLink()) throw unavailableObject()
       const canonical = resolve(await realpath(directory))
-      if (!insideRoot(root, canonical) || canonical !== directory) throw new Error('Private file object directory escaped its root')
+      if (!insideRoot(root, canonical) || canonical !== directory) throw unavailableObject()
     }
     return shard
   }
@@ -236,11 +255,11 @@ export class PrivateFileStorage {
   async assertObjectAvailable(id: string, expected: { sizeBytes: number }): Promise<void> {
     let handle: Awaited<ReturnType<typeof open>> | undefined
     try {
-      await this.ensureObjectDirectory(id)
+      await this.inspectObjectDirectory(id)
       const path = this.objectPath(id)
       const info = await lstat(path)
       if (!info.isFile() || info.isSymbolicLink()) {
-        throw new PrivateFileError('PRIVATE_FILE_UNAVAILABLE', '文件暂不可用，请稍后重试。', 410)
+        throw unavailableObject()
       }
       if (info.size !== expected.sizeBytes) {
         throw new PrivateFileError('PRIVATE_FILE_INTEGRITY_FAILED', '文件完整性校验失败。', 410)
@@ -250,15 +269,14 @@ export class PrivateFileStorage {
       const resolvedPath = await realpath(path)
       if (!openedInfo.isFile() || !insideRoot(this.canonicalRoot!, resolvedPath)
         || resolve(resolvedPath) !== resolve(path) || openedInfo.dev !== info.dev || openedInfo.ino !== info.ino) {
-        throw new PrivateFileError('PRIVATE_FILE_UNAVAILABLE', '文件暂不可用，请稍后重试。', 410)
+        throw unavailableObject()
       }
       const finalInfo = await handle.stat()
       if (finalInfo.size !== expected.sizeBytes || finalInfo.dev !== openedInfo.dev || finalInfo.ino !== openedInfo.ino) {
         throw new PrivateFileError('PRIVATE_FILE_INTEGRITY_FAILED', '文件完整性校验失败。', 410)
       }
     } catch (error) {
-      if (error instanceof PrivateFileError) throw error
-      throw new PrivateFileError('PRIVATE_FILE_UNAVAILABLE', '文件暂不可用，请稍后重试。', 410)
+      throw objectReadError(error)
     } finally {
       await handle?.close().catch(() => undefined)
     }
@@ -369,14 +387,14 @@ export class PrivateFileStorage {
     }
   }
 
-  async openVerified(id: string, expected: { sizeBytes: number; sha256: string }, options: { readOnly?: boolean } = {}) {
+  async openVerified(id: string, expected: { sizeBytes: number; sha256: string }) {
     let handle: Awaited<ReturnType<typeof open>> | undefined
     try {
-      const shard = await (options.readOnly ? this.inspectObjectDirectory(id) : this.ensureObjectDirectory(id))
+      const shard = await this.inspectObjectDirectory(id)
       const path = this.objectPath(id)
       const info = await lstat(path)
       if (!info.isFile() || info.isSymbolicLink()) {
-        throw new PrivateFileError('PRIVATE_FILE_UNAVAILABLE', '文件暂不可用，请稍后重试。', 410)
+        throw unavailableObject()
       }
       if (info.size !== expected.sizeBytes) {
         throw new PrivateFileError('PRIVATE_FILE_INTEGRITY_FAILED', '文件完整性校验失败。', 410)
@@ -387,7 +405,7 @@ export class PrivateFileStorage {
       if (!openedInfo.isFile() || openedInfo.size !== expected.sizeBytes
         || !insideRoot(this.canonicalRoot!, resolvedPath) || resolve(resolvedPath) !== resolve(path)
         || openedInfo.dev !== info.dev || openedInfo.ino !== info.ino) {
-        throw new PrivateFileError('PRIVATE_FILE_UNAVAILABLE', '文件暂不可用，请稍后重试。', 410)
+        throw unavailableObject()
       }
       const hash = createHash('sha256')
       const buffer = Buffer.allocUnsafe(1024 * 1024)
@@ -408,8 +426,7 @@ export class PrivateFileStorage {
       return { handle, info: finalInfo, path, shard }
     } catch (error) {
       await handle?.close().catch(() => undefined)
-      if (error instanceof PrivateFileError) throw error
-      throw new PrivateFileError('PRIVATE_FILE_UNAVAILABLE', '文件暂不可用，请稍后重试。', 410)
+      throw objectReadError(error)
     }
   }
 

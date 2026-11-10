@@ -9,7 +9,7 @@ import {
 import { optionalCustomer, requireCustomer } from '../auth/customer.js'
 import type { AppConfig } from '../config.js'
 import type { Database } from '../db/types.js'
-import { PrivateFileError, PrivateFileStorage } from '../media/private-file-storage.js'
+import { PrivateFileError, PrivateFileStorage, privateFileObjectFailure } from '../media/private-file-storage.js'
 import { assertCustomerSession, assertGuestSession, guestSessionCookie } from './orders.js'
 
 interface AuthorizedDownload {
@@ -182,14 +182,15 @@ async function download(
         sizeBytes: record.size_bytes!, sha256: record.sha256!.trim(),
       })
     } catch (error) {
-      const integrity = error instanceof PrivateFileError && error.code === 'PRIVATE_FILE_INTEGRITY_FAILED'
-      await db.updateTable('product_variant_fulfillment').set({ automatic_delivery_ready: false })
-        .where('method', '=', 'file').where('current_content_version_id', '=', record.version_id!)
-        .where('automatic_delivery_ready', '=', true).execute().catch(() => undefined)
-      await db.updateTable('private_file_objects').set({ status: integrity ? 'corrupt' : 'missing' })
-        .where('id', '=', record.object_id!).where('status', '=', 'available').execute().catch(() => undefined)
-      if (error instanceof PrivateFileError) throw error
-      throw new PrivateFileError('PRIVATE_FILE_UNAVAILABLE', '文件暂不可用，请稍后重试。', 410)
+      const failure = privateFileObjectFailure(error)
+      if (failure) {
+        await db.updateTable('product_variant_fulfillment').set({ automatic_delivery_ready: false })
+          .where('method', '=', 'file').where('current_content_version_id', '=', record.version_id!)
+          .where('automatic_delivery_ready', '=', true).execute().catch(() => undefined)
+        await db.updateTable('private_file_objects').set({ status: failure })
+          .where('id', '=', record.object_id!).where('status', '=', 'available').execute().catch(() => undefined)
+      }
+      throw error
     }
 
     reply.header('cache-control', 'private, no-store, max-age=0')

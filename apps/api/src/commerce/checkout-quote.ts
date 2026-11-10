@@ -15,7 +15,7 @@ import {
 } from '@aikayun/money'
 import type { AppConfig } from '../config.js'
 import type { Database, ProductInventoryMode, ProductStatus, ProductType } from '../db/types.js'
-import { PrivateFileError, PrivateFileStorage } from '../media/private-file-storage.js'
+import { PrivateFileStorage, privateFileObjectFailure } from '../media/private-file-storage.js'
 import { variantOptionCombinationValid } from '../catalog/public-products.js'
 import type { PurchaseDraftOwner } from './purchase-forms.js'
 import { normalizePurchaseLineRequests, resolvePurchaseLinesInTransaction,
@@ -320,20 +320,19 @@ export async function quoteCheckoutItems(
       && row.private_file_object_id
       && row.private_file_status === 'available'
       && row.private_file_size_bytes !== null
-    let nextStatus: 'missing' | 'corrupt' | undefined
+    let nextStatus: ReturnType<typeof privateFileObjectFailure> = row.private_file_status === 'corrupt' || row.private_file_status === 'missing'
+      ? row.private_file_status : undefined
     if (versionIsAvailable) {
       try {
         await privateFileStorage.assertObjectAvailable(row.private_file_object_id!, {
           sizeBytes: row.private_file_size_bytes!,
         })
+        continue
       } catch (error) {
-        nextStatus = error instanceof PrivateFileError && error.code === 'PRIVATE_FILE_INTEGRITY_FAILED'
-          ? 'corrupt'
-          : 'missing'
+        nextStatus = privateFileObjectFailure(error)
       }
-    } else {
-      nextStatus = row.private_file_status === 'corrupt' ? 'corrupt' : 'missing'
     }
+    row.automatic_delivery_ready = false
     if (nextStatus) {
       if (row.fulfillment_version_id) {
         await db.updateTable('product_variant_fulfillment').set({ automatic_delivery_ready: false })
@@ -346,7 +345,6 @@ export async function quoteCheckoutItems(
           .where('id', '=', row.private_file_object_id).where('status', '=', 'available').execute()
       }
       row.private_file_status = nextStatus
-      row.automatic_delivery_ready = false
     }
   }
 

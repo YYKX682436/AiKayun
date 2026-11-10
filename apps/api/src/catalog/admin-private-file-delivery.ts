@@ -33,6 +33,7 @@ import {
   PRIVATE_FILE_MAX_UPLOAD_BYTES,
   PRIVATE_FILE_STAGE_TTL_MS,
   PrivateFileError,
+  privateFileObjectFailure,
   PrivateFileStorage,
   newPrivateFileId,
   normalizeDisplayFilename,
@@ -174,18 +175,12 @@ async function inspectObject(
     const opened = await storage.openVerified(row.id, { sizeBytes: row.size_bytes, sha256: row.sha256.trim() })
     await opened.handle.close()
   } catch (error) {
-    status = error instanceof PrivateFileError && error.code === 'PRIVATE_FILE_INTEGRITY_FAILED'
-      ? 'corrupt'
-      : error instanceof PrivateFileError && error.code === 'PRIVATE_FILE_UNAVAILABLE'
-        ? 'missing'
-        : 'unknown'
+    status = privateFileObjectFailure(error) ?? 'unknown'
   }
+  if (currentSale) await pauseBrokenCurrentSale(db, currentSale.skuId, currentSale.versionId, status)
   if (status !== 'unknown') {
     const nextState = status === 'verified' ? 'available' : status
     if (row.status !== nextState) {
-      if (status !== 'verified' && currentSale) {
-        await pauseBrokenCurrentSale(db, currentSale.skuId, currentSale.versionId, status)
-      }
       await db.updateTable('private_file_objects').set({ status: nextState })
         .where('id', '=', row.id).where('status', 'in', ['available', 'missing', 'corrupt']).execute()
     }
@@ -194,7 +189,7 @@ async function inspectObject(
 }
 
 async function pauseBrokenCurrentSale(db: Db, skuId: string, versionId: string, integrity: PrivateFileIntegrityStatus): Promise<void> {
-  if (integrity === 'verified') return
+  if (integrity !== 'missing' && integrity !== 'corrupt') return
   await db.updateTable('product_variant_fulfillment').set({ automatic_delivery_ready: false })
     .where('product_variant_id', '=', skuId).where('method', '=', 'file')
     .where('current_content_version_id', '=', versionId).where('automatic_delivery_ready', '=', true).execute()
@@ -232,7 +227,6 @@ async function loadFileConfig(
     integrityStatus = row.id === preverifiedObjectId && row.status === 'available'
       ? 'verified'
       : await inspectObject(db, storage, row, { skuId: row.sku_id, versionId: row.version_id })
-    await pauseBrokenCurrentSale(db, row.sku_id, row.version_id, integrityStatus)
     currentVersion = {
       id: row.version_id,
       versionNumber: row.version_number,
@@ -249,7 +243,8 @@ async function loadFileConfig(
     skuId: row.sku_id,
     productType: row.product_type,
     method: row.method as PrivateFileConfig['method'],
-    automaticDeliveryReady: row.method === 'file' && row.automatic_delivery_ready && integrityStatus === 'verified',
+    automaticDeliveryReady: row.method === 'file' && row.automatic_delivery_ready
+      && integrityStatus !== 'missing' && integrityStatus !== 'corrupt',
     configurationRevision: row.configuration_revision,
     updatedAt: row.updated_at?.toISOString() ?? null,
     integrityStatus,
@@ -265,7 +260,7 @@ async function verifyObject(storage: PrivateFileStorage, row: FileObjectRow, exp
   try {
     return await storage.openVerified(row.id, { sizeBytes: row.size_bytes, sha256: row.sha256.trim() })
   } catch (error) {
-    if (error instanceof PrivateFileError) {
+    if (error instanceof PrivateFileError && privateFileObjectFailure(error)) {
       throw new PrivateFileAdminError(409, error.code, error.message)
     }
     throw error
@@ -385,7 +380,6 @@ export async function registerAdminPrivateFileDeliveryRoutes(
           return reply.code(404).send(failure('PRIVATE_FILE_VERSION_NOT_FOUND', '找不到此 SKU 的文件版本。', request.id))
         }
         const integrityStatus = await inspectObject(db, storage, row, { skuId: row.sku_id, versionId: row.version_id! })
-        await pauseBrokenCurrentSale(db, row.sku_id, row.version_id, integrityStatus)
         reply.header('cache-control', 'private, no-store')
         const result: PrivateFileVersion = {
           id: row.version_id,
@@ -657,9 +651,9 @@ export async function registerAdminPrivateFileDeliveryRoutes(
               sha256: candidate.sha256.trim(),
             })
           } catch (error) {
-            if (error instanceof PrivateFileError) {
-              const nextStatus = error.code === 'PRIVATE_FILE_INTEGRITY_FAILED' ? 'corrupt' : 'missing'
-              await pauseBrokenCurrentSale(db, candidate.sku_id, candidate.version_id, 'corrupt').catch(() => undefined)
+            const nextStatus = privateFileObjectFailure(error)
+            if (nextStatus) {
+              await pauseBrokenCurrentSale(db, candidate.sku_id, candidate.version_id, nextStatus).catch(() => undefined)
               await db.updateTable('private_file_objects').set({ status: nextStatus })
                 .where('id', '=', candidate.id).where('status', '=', 'available').execute().catch(() => undefined)
             }

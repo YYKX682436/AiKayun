@@ -1,6 +1,6 @@
 import type { Kysely } from 'kysely'
 import type { Database, PrivateFileObjectStatus } from '../db/types.js'
-import { PRIVATE_FILE_STAGE_TTL_MS, PrivateFileError, PrivateFileStorage } from './private-file-storage.js'
+import { PRIVATE_FILE_STAGE_TTL_MS, PrivateFileStorage, privateFileObjectFailure } from './private-file-storage.js'
 
 export interface PrivateFileReconciliationReport {
   mode: 'check' | 'repair'
@@ -14,12 +14,6 @@ export interface PrivateFileReconciliationReport {
   repairedObjects: number
   removedOrphans: number
   needsAttention: boolean
-}
-
-function errno(error: unknown): string | undefined {
-  return error && typeof error === 'object' && 'code' in error
-    ? String((error as NodeJS.ErrnoException).code)
-    : undefined
 }
 
 export async function reconcilePrivateFiles(
@@ -48,13 +42,11 @@ export async function reconcilePrivateFiles(
     let actual: 'verified' | 'missing' | 'corrupt' | 'unknown' = 'unknown'
     if (row.size_bytes !== null && row.sha256 && row.media_type) {
       try {
-        const opened = await storage.openVerified(row.id, { sizeBytes: row.size_bytes, sha256: row.sha256.trim() }, { readOnly: !repair })
+        const opened = await storage.openVerified(row.id, { sizeBytes: row.size_bytes, sha256: row.sha256.trim() })
         await opened.handle.close()
         actual = 'verified'
       } catch (error) {
-        actual = error instanceof PrivateFileError
-          ? error.code === 'PRIVATE_FILE_INTEGRITY_FAILED' ? 'corrupt' : 'missing'
-          : ['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'ELOOP'].includes(errno(error) ?? '') ? 'missing' : 'unknown'
+        actual = privateFileObjectFailure(error) ?? 'unknown'
       }
     }
     if (actual === 'verified') report.verifiedObjects += 1
@@ -69,23 +61,18 @@ export async function reconcilePrivateFiles(
 
     if (actual !== 'unknown') {
       const next: PrivateFileObjectStatus = actual === 'verified' ? 'available' : actual
-      if (row.status !== next) {
-        report.needsAttention = true
-        if (repair) {
-          if (next !== 'available') {
-            await db.updateTable('product_variant_fulfillment').set({ automatic_delivery_ready: false })
-              .where('product_variant_id', '=', row.product_variant_id).where('method', '=', 'file')
-              .where('current_content_version_id', '=', row.version_id).where('automatic_delivery_ready', '=', true).execute()
-          }
-          await db.updateTable('private_file_objects').set({ status: next })
-            .where('id', '=', row.id).where('status', 'in', ['available', 'missing', 'corrupt']).execute()
-          report.repairedObjects += 1
-        }
-      }
       if (repair && next !== 'available') {
         await db.updateTable('product_variant_fulfillment').set({ automatic_delivery_ready: false })
           .where('product_variant_id', '=', row.product_variant_id).where('method', '=', 'file')
           .where('current_content_version_id', '=', row.version_id).where('automatic_delivery_ready', '=', true).execute()
+      }
+      if (row.status !== next) {
+        report.needsAttention = true
+        if (repair) {
+          await db.updateTable('private_file_objects').set({ status: next })
+            .where('id', '=', row.id).where('status', 'in', ['available', 'missing', 'corrupt']).execute()
+          report.repairedObjects += 1
+        }
       }
     } else {
       report.needsAttention = true
