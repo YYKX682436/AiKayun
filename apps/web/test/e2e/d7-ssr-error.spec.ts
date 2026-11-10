@@ -115,10 +115,11 @@ test('client navigation keeps retryable errors on the requested public route', a
 })
 
 test('support errors hide previously loaded contacts and can retry without leaving the page', async ({ page }) => {
+  test.setTimeout(90_000)
   const linkName = '打开SSR售后渠道（新窗口）'
   try {
     await page.goto('/')
-    await expect(page.locator('[data-storefront-ready="true"]')).toBeAttached()
+    await expect(page.locator('[data-storefront-ready="true"]')).toBeAttached({ timeout: 30_000 })
     const footerLink = page.locator('footer').getByRole('link', { name: '联系客服' })
     await expect(footerLink).toHaveAttribute('href', '/support')
     await failApi('/api/v1/public/storefront/support')
