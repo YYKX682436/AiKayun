@@ -997,7 +997,7 @@ async function adminOrderPage(db: Kysely<Database>, query: {
       'order.unpaid_expires_at', 'order.customer_id', 'customer.username as customer_username',
       sql<string>`COALESCE((SELECT sum(receipt.amount) FROM payment_receipts AS receipt
         JOIN payment_attempts AS attempt ON attempt.id = receipt.payment_attempt_id
-        WHERE attempt.order_id = order.id AND attempt.status = 'succeeded'
+        WHERE attempt.order_id = ${sql.ref('order.id')} AND attempt.status = 'succeeded'
           AND receipt.disposition = 'on_time'), 0)::text`.as('confirmed_amount'),
     ])
     .where(filters)
