@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  application:
+    name: Application checks
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -70,22 +71,33 @@ jobs:
       - name: Type check
         run: pnpm typecheck
       - name: Unit and PostgreSQL integration tests
+        # Includes the three frozen-center interop/persistence files with the
+        # pinned checkout above; the standalone script would repeat them.
         run: pnpm test
-      - name: Frozen license-center HTTPS Challenge and activation interoperability
-        env:
-          LICENSE_CENTER_READ_TOKEN: ${{ secrets.LICENSE_CENTER_READ_TOKEN }}
-        run: scripts/test-license-center-interop.sh
       - name: Install Chromium
-        run: pnpm --filter @aikayun/web exec playwright install --with-deps chromium
+        timeout-minutes: 9
+        env:
+          PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT: "60000"
+        run: |
+          for attempt in 1 2; do
+            echo "Chromium installation attempt $attempt/2"
+            if timeout --kill-after=10s 4m pnpm --filter @aikayun/web exec playwright install --with-deps chromium; then
+              exit 0
+            else
+              install_status=$?
+            fi
+            if [ "$attempt" -eq 2 ]; then
+              exit "$install_status"
+            fi
+            echo "::warning::Chromium installation attempt $attempt exited with $install_status; retrying in 5 seconds."
+            sleep 5
+          done
       - name: Production build
         run: pnpm build
       - name: Verify release scan gate, sanitized reports and OCI bundle extraction
         run: |
           scripts/release/test-scan-gate.sh
           scripts/release/test-bundle-extraction.sh
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
-      - name: Run controlled Linux installer command-flow regression
-        run: scripts/install/test-ai-kayun-installer.sh
       - name: Browser E2E against real PostgreSQL
         run: PLAYWRIGHT_USE_PRODUCTION_SERVER=true pnpm e2e
       - name: Verify production runtime branding
@@ -156,3 +168,46 @@ jobs:
       - name: Remove frozen test checkout
         if: always()
         run: rm -rf "$RUNNER_TEMP/aikayun-license-center-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+
+  installer:
+    name: Installer (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996
+        with:
+          version: 10.29.3
+          run_install: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run controlled Linux installer command-flow regression
+        env:
+          AIKAYUN_TEST_ONLY_PLATFORM: linux/${{ matrix.arch }}
+        run: scripts/install/test-ai-kayun-installer.sh
+
+  verify:
+    needs: [application, installer]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require all CI jobs to pass
+        env:
+          APPLICATION_RESULT: ${{ needs.application.result }}
+          INSTALLER_RESULT: ${{ needs.installer.result }}
+        run: |
+          printf 'Application: %s\nInstaller matrix: %s\n' "$APPLICATION_RESULT" "$INSTALLER_RESULT"
+          test "$APPLICATION_RESULT" = success
+          test "$INSTALLER_RESULT" = success
