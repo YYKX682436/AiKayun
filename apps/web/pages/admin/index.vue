@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { AdminBusinessOverview, AdminSession, ApiSuccess } from '@aikayun/contracts'
+import { NuxtLink } from '#components'
 
 definePageMeta({ layout: 'admin', middleware: 'admin-auth' })
 useSeoMeta({ title: '管理概览' })
@@ -325,7 +326,7 @@ async function logout() {
             </p>
             <div class="mt-4 grid grid-cols-1 gap-3 min-[360px]:grid-cols-2 xl:grid-cols-4">
               <component
-                :is="metric.to ? 'NuxtLink' : 'div'"
+                :is="metric.to ? NuxtLink : 'div'"
                 v-for="metric in businessMetrics"
                 :key="metric.label"
                 :to="metric.to"

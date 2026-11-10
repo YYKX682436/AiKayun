@@ -221,7 +221,7 @@ test('creates a zero-value order, completes actual private delivery, and cancels
 
   const paidOrderId = paidOrderUrl.split('/').at(-1)!
   await page.goto('/admin/orders')
-  await expect(page.getByRole('heading', { name: '订单管理' })).toBeVisible()
+  await expect(page.locator('#admin-main-content').getByRole('heading', { name: '订单管理', exact: true })).toBeVisible()
   const orderSearch = page.getByRole('textbox', { name: '搜索完整订单 UUID 或顾客用户名' })
   await orderSearch.fill(zeroOrderId)
   const uuidSearchResponse = page.waitForResponse(response => {
