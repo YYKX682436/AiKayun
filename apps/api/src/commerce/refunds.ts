@@ -275,6 +275,16 @@ function isUsableReceipt(receipt: RefundSource): boolean {
     && ['on_time', 'late'].includes(receipt.disposition)
 }
 
+function assertFullRemainingRefund(order: RefundOrder, amount: string, receipts: RefundSource[]): void {
+  if (order.status === 'completed') return
+  const remaining = receipts.filter(receipt => isUsableReceipt(receipt)
+    && (order.customer_id !== null || receipt.source_bucket === 'external'))
+    .reduce((sum, receipt) => sum + cents(receipt.amount) - cents(receipt.refunded_amount), 0n)
+  if (cents(amount) < remaining) {
+    throw new RefundError(409, 'REFUND_FULL_REMAINING_REQUIRED', '未完成订单只能退还全部剩余可退款金额。')
+  }
+}
+
 function allocateRefundSources(
   receipts: RefundSource[], amount: string, customerOwned: boolean,
 ): Array<{ receipt: RefundSource; amount: string; destination: 'cash_balance' | 'gift_balance' | 'original_source' }> {
@@ -349,7 +359,7 @@ async function setRefundStatus(
 }
 
 async function loadRefundSummary(db: Db, orderId: string, includeAudit: boolean): Promise<CustomerOrderRefunds | AdminOrderRefunds> {
-  const order = await db.selectFrom('orders').select(['id', 'customer_id']).where('id', '=', orderId).executeTakeFirst()
+  const order = await db.selectFrom('orders').select(['id', 'customer_id', 'status']).where('id', '=', orderId).executeTakeFirst()
   if (!order) throw new RefundError(404, 'ORDER_NOT_FOUND', '订单不存在。')
 
   const totals = await sql<{
@@ -536,7 +546,8 @@ async function loadRefundSummary(db: Db, orderId: string, includeAudit: boolean)
     refundedAmount: normalizeWalletAmount(totals.refunded_amount),
     refundReservedAmount: normalizeWalletAmount(totals.reserved_amount),
     activeRequestAmount: amountFromCents(activeRequestAmount),
-    canRequest: payoutMode !== 'unavailable' && blockedReason === null && cents(refundableAmount) > 0n,
+    canRequest: payoutMode !== 'unavailable' && blockedReason === null && cents(refundableAmount) > 0n
+      && (order.status === 'completed' || activeRequestAmount === 0n),
     blockedReason,
     items,
   }
@@ -583,6 +594,7 @@ async function customerCreateRefund(
     }
     await assertRefundNotBlocked(trx, order.id)
     const receipts = await lockRefundSourceReceipts(trx, orderId)
+    assertFullRemainingRefund(order, amount, receipts)
     const sourceAvailable = receipts.filter(receipt => isUsableReceipt(receipt)
       && (order.customer_id !== null || receipt.source_bucket === 'external'))
       .reduce((total, receipt) => total + cents(receipt.amount) - cents(receipt.refund_reserved_amount) - cents(receipt.refunded_amount), 0n)
@@ -629,6 +641,7 @@ async function adminApproveRefund(
     if (refund.status !== 'requested') throw new RefundError(409, 'REFUND_STATUS_CHANGED', '此退款申请已审核或已处理，请刷新后再操作。')
     await assertRefundNotBlocked(trx, orderId)
     const receipts = await lockRefundSourceReceipts(trx, orderId)
+    assertFullRemainingRefund(context.order, refund.amount, receipts)
     const splits = allocateRefundSources(receipts, refund.amount, context.order.customer_id !== null)
     await trx.updateTable('order_refunds').set({
       status: 'approved', reviewed_by_admin_id: adminId,

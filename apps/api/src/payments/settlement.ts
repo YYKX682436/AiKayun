@@ -3,6 +3,7 @@ import { settleAmount } from '@aikayun/money'
 import type { Kysely, Transaction } from 'kysely'
 import { sql } from 'kysely'
 import type { AppConfig } from '../config.js'
+import { lockPaymentAttempt, paymentAttemptHasNoFundsEvidence } from './attempts.js'
 import type {
   Database,
   PaymentAttemptStatus,
@@ -165,40 +166,8 @@ export async function recordCallbackObservation(
   db: Kysely<Database>, attemptId: string, observation: CallbackObservation, disposition: string,
 ): Promise<string> {
   return await db.transaction().execute(async (trx) => {
-    const attempt = await trx.selectFrom('payment_attempts').select(['id', 'order_id', 'wallet_hold_operation_id', 'status'])
-      .where('id', '=', attemptId).executeTakeFirst()
+    const attempt = await lockPaymentAttempt(trx, attemptId)
     if (!attempt) throw new PaymentServiceError(404, 'PAYMENT_ATTEMPT_NOT_FOUND', '支付尝试不存在。')
-    // Plain orders use order -> attempt. Combo orders use customer -> order ->
-    // wallet -> attempt; top-ups use customer -> wallet -> attempt. A common
-    // customer/account prefix prevents receipt-settlement cycles across both.
-    if (attempt.order_id) {
-      if (attempt.wallet_hold_operation_id) {
-        const orderOwner = await trx.selectFrom('orders').select('customer_id')
-          .where('id', '=', attempt.order_id).executeTakeFirst()
-        if (orderOwner?.customer_id) {
-          await trx.selectFrom('customers').select('id').where('id', '=', orderOwner.customer_id)
-            .forUpdate().executeTakeFirst()
-        }
-      }
-      await trx.selectFrom('orders').select('id').where('id', '=', attempt.order_id).forUpdate().executeTakeFirst()
-      if (attempt.wallet_hold_operation_id) {
-        const orderOwner = await trx.selectFrom('orders').select('customer_id')
-          .where('id', '=', attempt.order_id).executeTakeFirstOrThrow()
-        if (orderOwner.customer_id) {
-          await trx.selectFrom('wallet_accounts').select('customer_id')
-            .where('customer_id', '=', orderOwner.customer_id).forUpdate().executeTakeFirst()
-        }
-      }
-    } else {
-      const topupCustomer = await trx.selectFrom('payment_attempts').select('topup_customer_id')
-        .where('id', '=', attemptId).executeTakeFirstOrThrow()
-      if (topupCustomer.topup_customer_id) {
-        await trx.selectFrom('customers').select('id').where('id', '=', topupCustomer.topup_customer_id).forUpdate().executeTakeFirst()
-        await trx.selectFrom('wallet_accounts').select('customer_id')
-          .where('customer_id', '=', topupCustomer.topup_customer_id).forUpdate().executeTakeFirst()
-      }
-    }
-    await trx.selectFrom('payment_attempts').select('id').where('id', '=', attemptId).forUpdate().executeTakeFirst()
     const inserted = await trx.insertInto('payment_provider_events').values({
       id: randomUUID(),
       payment_attempt_id: attemptId,
@@ -356,15 +325,10 @@ function providerEventMatchesQuery(
 }
 
 async function writeVerifiedReceipt(
-  trx: Transaction<Database>, attempt: PaymentAttemptSnapshot,
+  trx: Transaction<Database>, attempt: PaymentAttemptSnapshot, provider: string,
   result: PaymentQueryResult, queryEventId: string,
   callback: CallbackObservation | undefined, resolverAdminId?: string,
 ): Promise<{ settlement: SettlementWriteResult; reconciliationOpen: boolean; resolutionMade: boolean }> {
-  const lockedAttempt = await trx.selectFrom('payment_attempts').select(['id', 'status', 'amount', 'provider'])
-    .where('id', '=', attempt.id).forUpdate().executeTakeFirst()
-  if (!lockedAttempt || !lockedAttempt.provider) {
-    return { settlement: { receiptDisposition: null, duplicate: false, conflict: true }, reconciliationOpen: true, resolutionMade: false }
-  }
   const callbackEvents = await trx.selectFrom('payment_provider_events')
     .select(['id', 'provider_transaction_id', 'reported_amount', 'payload'])
     .where('payment_attempt_id', '=', attempt.id).where('source', '=', 'callback')
@@ -383,10 +347,10 @@ async function writeVerifiedReceipt(
     .where('payment_attempt_id', '=', attempt.id).where('source_bucket', '=', 'external')
     .executeTakeFirst()
 
-  await sql`SELECT pg_advisory_xact_lock(hashtextextended(${'payment-receipt:' + lockedAttempt.provider + ':' + result.providerOrderId}, 0))`.execute(trx)
+  await sql`SELECT pg_advisory_xact_lock(hashtextextended(${'payment-receipt:' + provider + ':' + result.providerOrderId}, 0))`.execute(trx)
   const globalReceipt = await trx.selectFrom('payment_receipts')
     .select(['payment_attempt_id', 'provider_transaction_id', 'amount', 'disposition'])
-    .where('provider', '=', lockedAttempt.provider).where('provider_transaction_id', '=', result.providerOrderId!)
+    .where('provider', '=', provider).where('provider_transaction_id', '=', result.providerOrderId!)
     .executeTakeFirst()
   const globalCollision = Boolean(globalReceipt && globalReceipt.payment_attempt_id !== attempt.id)
   const receiptConflict = Boolean(existingReceipt && (existingReceipt.provider_transaction_id !== result.providerOrderId
@@ -430,7 +394,7 @@ async function writeVerifiedReceipt(
       id: randomUUID(),
       payment_attempt_id: attempt.id,
       source_bucket: 'external',
-      provider: lockedAttempt.provider,
+      provider,
       provider_transaction_id: result.providerOrderId!,
       wallet_operation_id: null,
       wallet_line_no: null,
@@ -444,7 +408,7 @@ async function writeVerifiedReceipt(
     } else {
       const collision = await trx.selectFrom('payment_receipts')
         .select(['payment_attempt_id', 'provider_transaction_id', 'amount', 'disposition'])
-        .where('provider', '=', lockedAttempt.provider).where('provider_transaction_id', '=', result.providerOrderId!)
+        .where('provider', '=', provider).where('provider_transaction_id', '=', result.providerOrderId!)
         .executeTakeFirst()
       settlement = {
         receiptDisposition: collision?.payment_attempt_id === attempt.id ? collision.disposition : null,
@@ -463,7 +427,7 @@ async function writeVerifiedReceipt(
       callbackEventId: callbackEvents[0]?.id ?? null,
       queryEventId,
     })
-  } else if (settlement.receiptDisposition === 'late') {
+  } else if (settlement.receiptDisposition === 'late' && attempt.orderId && !settlement.duplicate) {
     await insertOpenReconciliationCase(trx, {
       paymentAttemptId: attempt.id,
       reason: 'late_confirmed_payment',
@@ -500,6 +464,8 @@ async function writeVerifiedReceipt(
             .where('id', '=', attempt.orderId).where('status', '=', 'pending_payment')
             .where(sql<boolean>`NOT order_has_unresolved_payment_attempts(${attempt.orderId}::uuid)`).execute()
         }
+      } else if (settlement.receiptDisposition === 'late' && attempt.topupCustomerId) {
+        await sql`SELECT credit_payment_top_up(${attempt.id}::uuid)`.execute(trx)
       }
       resolutionMade = true
       hasOpenCase = undefined
@@ -519,30 +485,10 @@ export async function processProviderQuery(
 ): Promise<RefreshAttemptResult> {
   const identityVerified = queryMatchesAttempt(attempt, credentials, result)
   const persisted = await db.transaction().execute(async (trx) => {
-    if (attempt.orderId) {
-      if (attempt.walletHoldOperationId) {
-        const orderOwner = await trx.selectFrom('orders').select('customer_id')
-          .where('id', '=', attempt.orderId).executeTakeFirst()
-        if (orderOwner?.customer_id) {
-          await trx.selectFrom('customers').select('id').where('id', '=', orderOwner.customer_id)
-            .forUpdate().executeTakeFirst()
-        }
-      }
-      await trx.selectFrom('orders').select('id').where('id', '=', attempt.orderId).forUpdate().executeTakeFirst()
-      if (attempt.walletHoldOperationId) {
-        const orderOwner = await trx.selectFrom('orders').select('customer_id')
-          .where('id', '=', attempt.orderId).executeTakeFirstOrThrow()
-        if (orderOwner.customer_id) {
-          await trx.selectFrom('wallet_accounts').select('customer_id')
-            .where('customer_id', '=', orderOwner.customer_id).forUpdate().executeTakeFirst()
-        }
-      }
-    } else if (attempt.topupCustomerId) {
-      await trx.selectFrom('customers').select('id').where('id', '=', attempt.topupCustomerId).forUpdate().executeTakeFirst()
-      await trx.selectFrom('wallet_accounts').select('customer_id')
-        .where('customer_id', '=', attempt.topupCustomerId).forUpdate().executeTakeFirst()
+    const lockedAttempt = await lockPaymentAttempt(trx, attempt.id)
+    if (!lockedAttempt?.provider) {
+      throw new PaymentServiceError(404, 'PAYMENT_ATTEMPT_NOT_FOUND', '支付尝试不存在。')
     }
-    await trx.selectFrom('payment_attempts').select('id').where('id', '=', attempt.id).forUpdate().executeTakeFirst()
     const inserted = await trx.insertInto('payment_provider_events').values({
       id: randomUUID(), payment_attempt_id: attempt.id, source: 'query', event_sha256: result.eventSha256,
       verification: identityVerified ? 'verified' : 'unverified',
@@ -580,26 +526,20 @@ export async function processProviderQuery(
       }
       const openCase = await trx.selectFrom('payment_provider_reconciliation_cases').select('id')
         .where('payment_attempt_id', '=', attempt.id).where('state', '=', 'open').executeTakeFirst()
-      const receipt = await trx.selectFrom('payment_receipts').select('id')
-        .where('payment_attempt_id', '=', attempt.id).executeTakeFirst()
-      if (identityVerified && result.status === 'failed' && !callback && !receipt && !openCase) {
-        await trx.updateTable('payment_attempts').set({ status: 'failed' })
-          .where('id', '=', attempt.id).where('status', 'in', ['created', 'pending']).execute()
+      if (identityVerified && result.status === 'failed' && !callback && !openCase) {
+        await trx.updateTable('payment_attempts as attempt').set({ status: 'failed' })
+          .where('attempt.id', '=', attempt.id).where('attempt.status', 'in', ['created', 'pending'])
+          .where(paymentAttemptHasNoFundsEvidence).execute()
       }
       return { settlement: null, reconciliationOpen: Boolean(openCase), resolutionMade: false }
     }
-    const resultWrite = await writeVerifiedReceipt(trx, attempt, result, queryEvent.id, callback, resolverAdminId)
-    if (callback) {
-      // The signed callback event was durably recorded before the network query.
-      // Its immutable disposition remains pending_confirmation; the query and case
-      // rows record the later adjudication without rewriting historic evidence.
-    }
-    return resultWrite
+    return await writeVerifiedReceipt(trx, attempt, lockedAttempt.provider, result, queryEvent.id, callback, resolverAdminId)
   })
 
   if (!identityVerified) return { kind: 'unknown', attempt, providerStatus: result.status, verification: 'unverified' }
-  if (persisted.reconciliationOpen || persisted.settlement?.conflict
-    || persisted.settlement?.receiptDisposition && persisted.settlement.receiptDisposition !== 'on_time') {
+  const disposition = persisted.settlement?.receiptDisposition
+  const acceptableReceipt = disposition === 'on_time' || disposition === 'late' && attempt.topupCustomerId !== null
+  if (persisted.reconciliationOpen || persisted.settlement && (persisted.settlement.conflict || !acceptableReceipt)) {
     return { kind: 'reconciliation_required', attempt, providerStatus: result.status, verification: 'verified', resolutionMade: persisted.resolutionMade }
   }
   if (result.status === 'paid') return { kind: 'confirmed', attempt, providerStatus: result.status, verification: 'verified', resolutionMade: persisted.resolutionMade }
@@ -623,16 +563,18 @@ export async function refreshPaymentAttempt(
 ): Promise<RefreshAttemptResult> {
   const attempt = await loadPaymentAttemptSnapshot(db, attemptId)
   if (!attempt) throw new PaymentServiceError(404, 'PAYMENT_ATTEMPT_NOT_FOUND', '支付尝试不存在。')
-  const openCase = attempt.status === 'reconciliation_required'
+  const openCase = ['succeeded', 'late_succeeded', 'reconciliation_required'].includes(attempt.status)
     ? await db.selectFrom('payment_provider_reconciliation_cases').select('id')
       .where('payment_attempt_id', '=', attempt.id).where('state', '=', 'open').executeTakeFirst()
     : undefined
-  if (attempt.status !== 'created' && attempt.status !== 'pending' && !openCase) {
+  if (!['created', 'pending', 'expired'].includes(attempt.status) && !openCase) {
+    const confirmed = attempt.status === 'succeeded'
+      || (attempt.status === 'late_succeeded' && attempt.topupCustomerId !== null)
     return {
-      kind: attempt.status === 'succeeded' ? 'confirmed' : 'reconciliation_required',
+      kind: confirmed ? 'confirmed' : 'reconciliation_required',
       attempt,
-      providerStatus: attempt.status === 'succeeded' ? 'paid' : 'unknown',
-      verification: attempt.status === 'succeeded' ? 'verified' : 'unverified',
+      providerStatus: confirmed ? 'paid' : 'unknown',
+      verification: confirmed ? 'verified' : 'unverified',
     }
   }
   if (!provider.supportsStatusQuery) {
@@ -722,7 +664,8 @@ export async function handleProviderCallback(
   const priorReceipt = await db.selectFrom('payment_receipts').select(['provider_transaction_id', 'amount', 'disposition'])
     .where('payment_attempt_id', '=', attempt.id).where('source_bucket', '=', 'external').executeTakeFirst()
   if (priorReceipt && priorReceipt.provider_transaction_id === observation.providerOrderId
-    && priorReceipt.amount === observation.amount && priorReceipt.disposition === 'on_time'
+    && priorReceipt.amount === observation.amount
+    && (priorReceipt.disposition === 'on_time' || (priorReceipt.disposition === 'late' && attempt.topupCustomerId !== null))
     && observation.merchantOrderNo === attempt.merchantOrderNo
     && observation.merchantId === credentials.merchantId && observation.paymentMethod === attempt.paymentMethod) {
     return 'accepted'

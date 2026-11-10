@@ -179,6 +179,9 @@ async function runRefundAction(
       method: 'POST', body: { ...body, idempotencyKey: await refundIdempotencyKey(scope, body) },
     })
     refunds.value = result.refunds
+    if (result.refunds.refundStatus === 'refunded' && ['pending_payment', 'processing'].includes(data.value?.order.status ?? '')) {
+      await loadOrder()
+    }
     successMessage.value = result.repeated ? '已读取这项相同操作的最新结果。' : successText
   } catch (error) {
     errorMessage.value = error instanceof AdminApiError || error instanceof Error
@@ -901,6 +904,12 @@ onBeforeUnmount(() => { sequence++ })
                   v-if="refund.status === 'requested'"
                   class="mt-3 grid gap-3 rounded-lg border border-primary/25 bg-primary/5 p-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end"
                 >
+                  <p
+                    v-if="data.order.status !== 'completed'"
+                    class="text-sm text-muted sm:col-span-2"
+                  >
+                    未完成订单只能审核通过退还全部剩余金额的申请。
+                  </p>
                   <UFormField label="拒绝原因">
                     <UTextarea
                       v-model="rejectionDrafts[refund.id]"

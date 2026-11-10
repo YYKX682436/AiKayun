@@ -217,7 +217,41 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     await page.getByRole('button', { name: '创建充值支付' }).click()
     await expect(page.getByRole('alert')).toContainText('店铺经营状态暂时无法确认')
     await page.unroute('**/api/v1/customer/wallet/top-ups', topUpUnavailable)
-    await page.getByRole('button', { name: '创建充值支付' }).click()
+
+    const topUpPath = /\/api\/v1\/customer\/wallet\/top-ups(?:\?.*)?$/u
+    const createTopUpButton = page.getByRole('button', { name: '创建充值支付' })
+    const storedTopUpKeys = () => page.evaluate(() => Object.keys(sessionStorage)
+      .filter(key => key.startsWith('aikayun-wallet-topup-v1:')).map(key => sessionStorage.getItem(key)))
+    let acceptedTopUpId = ''
+    let lostRequestKey = ''
+    const loseResponse = async (route: import('@playwright/test').Route) => {
+      if (route.request().method() !== 'POST') return await route.fallback()
+      lostRequestKey = route.request().postDataJSON().idempotencyKey as string
+      const accepted = await route.fetch({ headers: { ...route.request().headers(), 'x-forwarded-for': testIp } })
+      acceptedTopUpId = (await accepted.json()).data.items[0].id as string
+      await route.abort('failed')
+    }
+    await page.route(topUpPath, loseResponse)
+    await createTopUpButton.click()
+    await expect.poll(() => acceptedTopUpId).not.toBe('')
+    await expect(createTopUpButton).toBeEnabled()
+    expect(await storedTopUpKeys()).toEqual([lostRequestKey])
+    await page.unroute(topUpPath, loseResponse)
+
+    const failListRefresh = (route: import('@playwright/test').Route) => route.request().method() === 'GET'
+      ? topUpUnavailable(route) : route.fallback()
+    await page.route(topUpPath, failListRefresh)
+    const replayResponse = page.waitForResponse(response => response.url().endsWith('/wallet/top-ups') && response.request().method() === 'POST')
+    const failedList = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/wallet/top-ups') && response.request().method() === 'GET')
+    await createTopUpButton.click()
+    const replay = await replayResponse
+    expect(replay.status()).toBe(200)
+    expect(replay.request().postDataJSON().idempotencyKey).toBe(lostRequestKey)
+    expect((await replay.json()).data.items).toMatchObject([{ id: acceptedTopUpId }])
+    expect((await failedList).status()).toBe(503)
+    expect(await storedTopUpKeys()).toEqual([])
+    await page.unroute(topUpPath, failListRefresh)
+    await page.reload()
     await expect(page.getByRole('heading', { name: '充值处理中' })).toBeVisible()
     await expect(page.getByAltText('钱包充值支付二维码')).toBeVisible()
     const walletFixturePort = process.env.ZPAY_FIXTURE_PORT ?? '3099'
@@ -246,6 +280,15 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     await page.reload()
     await expect(page.getByText('可用现金', { exact: true })).toBeVisible()
     await expect(page.getByText('¥2.00', { exact: true }).first()).toBeVisible()
+    await page.getByLabel('充值金额').fill('2.00')
+    const nextTopUp = page.waitForResponse(response => response.url().endsWith('/wallet/top-ups') && response.request().method() === 'POST')
+    await createTopUpButton.click()
+    const next = await nextTopUp
+    expect(next.status()).toBe(201)
+    expect(next.request().postDataJSON().idempotencyKey).not.toBe(lostRequestKey)
+    const nextItems = (await next.json()).data.items
+    expect(nextItems).toMatchObject([{ amount: '2.00', status: 'pending' }, { id: acceptedTopUpId, status: 'succeeded' }])
+    expect(nextItems[0].id).not.toBe(acceptedTopUpId)
 
     await page.goto('/cart')
     await page.getByRole('button', { name: '清空购物车' }).click()
@@ -364,6 +407,8 @@ test('customer requests a full refund and an administrator approves it without c
     expect(await callbackResponse.text()).toBe('success')
     await page.getByRole('button', { name: '刷新支付状态' }).click()
     await expect(page.getByText('等待商家交付').first()).toBeVisible()
+    await expect(page.getByLabel('申请退款金额')).toHaveValue('5.00')
+    await expect(page.getByLabel('申请退款金额')).not.toBeEditable()
 
     await page.goto(`/admin/orders/${orderId}`)
     await expect(page.getByRole('heading', { name: '退款与订单售后' })).toBeVisible()

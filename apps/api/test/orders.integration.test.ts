@@ -3000,12 +3000,12 @@ describe('per-SKU encrypted code-pool fulfillment on PostgreSQL', () => {
       .where('product_variant_id', '=', catalog.skuId).where('state', '=', 'delivered').execute()).toHaveLength(3)
   })
 
-  it('commits a real payment receipt while delivery retries, then retains delivered codes after refund', async () => {
+  it('commits a real payment receipt while delivery retries, then releases only reserved codes on refund', async () => {
     const admin = await createAdmin()
     const customer = await createCustomer()
     const catalog = await createCatalog({ price: '2.50', mode: 'quantity', stock: 0 })
     expect((await setCodePoolReadiness(catalog, admin, false)).statusCode).toBe(200)
-    expect((await importCodePool(catalog, admin, 'PAID-DELIVERY-CODE')).statusCode).toBe(201)
+    expect((await importCodePool(catalog, admin, 'PAID-DELIVERY-CODE\nREFUND-RESERVED-CODE')).statusCode).toBe(201)
     expect((await setCodePoolReadiness(catalog, admin, true)).statusCode).toBe(200)
     const items = [{ skuId: catalog.skuId, quantity: 1 }]
     const currentQuote = await quote(items, customer)
@@ -3020,20 +3020,25 @@ describe('per-SKU encrypted code-pool fulfillment on PostgreSQL', () => {
     expect(beforePayment.json().data.items[0].deliveries).toEqual([])
     expect(JSON.stringify(beforePayment.json())).not.toContain('PAID-DELIVERY-CODE')
 
-    const attemptId = randomUUID()
-    const receiptId = randomUUID()
-    await db.insertInto('payment_attempts').values({
-      id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: orderId,
-      topup_customer_id: null, source: 'external', amount: '2.50', status: 'created', provider: 'integration',
-      provider_payment_id: `confirmed-${attemptId}`, wallet_operation_id: null, wallet_hold_operation_id: null,
-      requested_wallet_amount: null, expires_at: new Date(Date.now() + 60 * 60_000), completed_at: null,
-    }).execute()
-    await db.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
-    await db.insertInto('payment_receipts').values({
-      id: receiptId, payment_attempt_id: attemptId, source_bucket: 'external', provider: 'integration',
-      provider_transaction_id: `confirmed-receipt-${receiptId}`, wallet_operation_id: null,
-      wallet_line_no: null, amount: '2.50',
-    }).execute()
+    async function settleOrder(targetOrderId: string) {
+      const attemptId = randomUUID()
+      const receiptId = randomUUID()
+      await db.insertInto('payment_attempts').values({
+        id: attemptId, idempotency_key: randomUUID(), request_sha256: digest, order_id: targetOrderId,
+        topup_customer_id: null, source: 'external', amount: '2.50', status: 'created', provider: 'integration',
+        provider_payment_id: `confirmed-${attemptId}`, wallet_operation_id: null, wallet_hold_operation_id: null,
+        requested_wallet_amount: null, expires_at: new Date(Date.now() + 60 * 60_000), completed_at: null,
+      }).execute()
+      await db.updateTable('payment_attempts').set({ status: 'pending' }).where('id', '=', attemptId).execute()
+      await db.insertInto('payment_receipts').values({
+        id: receiptId, payment_attempt_id: attemptId, source_bucket: 'external', provider: 'integration',
+        provider_transaction_id: `confirmed-receipt-${receiptId}`, wallet_operation_id: null,
+        wallet_line_no: null, amount: '2.50',
+      }).execute()
+      return { attemptId, receiptId }
+    }
+
+    const { attemptId, receiptId } = await settleOrder(orderId)
     const stopWithoutKey = startCodePoolDeliveryWorker(db, { ...appConfig, codePoolEncryptionKeyRing: null }, app.log)
     await db.updateTable('payment_attempts').set({ status: 'succeeded' }).where('id', '=', attemptId).execute()
     await waitForCodePoolOrder(orderId, itemId, 0)
@@ -3051,13 +3056,24 @@ describe('per-SKU encrypted code-pool fulfillment on PostgreSQL', () => {
     const stopWithKey = startCodePoolDeliveryWorker(db, appConfig, app.log)
     await waitForCodePoolOrder(orderId, itemId, 1)
     await stopWithKey()
-    expect((await db.selectFrom('code_pool_entries').select('state')
-      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).state).toBe('delivered')
     await refundExistingReceipt(orderId, receiptId, '2.50')
-    expect((await db.selectFrom('code_pool_entries').select('state')
-      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).state).toBe('delivered')
+    const secondQuote = await quote(items, customer)
+    const second = await createOrder(items, secondQuote.json().data.quoteToken, customer)
+    expect(second.statusCode).toBe(201)
+    const secondOrderId = second.json().data.order.id as string
+    const { receiptId: secondReceiptId } = await settleOrder(secondOrderId)
+    const states = async () => (await db.selectFrom('code_pool_entries').select('state')
+      .where('product_variant_id', '=', catalog.skuId).orderBy('state').execute()).map(entry => entry.state)
+    expect(await states()).toEqual(['delivered', 'reserved'])
+    await refundExistingReceipt(secondOrderId, secondReceiptId, '2.50')
+    expect(await db.selectFrom('orders').select('status').where('id', '=', secondOrderId).executeTakeFirstOrThrow())
+      .toEqual({ status: 'closed' })
+    expect(await states()).toEqual(['available', 'delivered'])
     expect((await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
-      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow())).toEqual({ stocked: 0, reserved: 0 })
+      .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow())).toEqual({ stocked: 1, reserved: 0 })
+    expect((await sql<{ consistent: boolean }>`
+      SELECT assert_code_pool_inventory_consistency(${catalog.skuId}::uuid) AS consistent
+    `.execute(db)).rows[0]?.consistent).toBe(true)
   })
 })
 
@@ -3621,8 +3637,7 @@ describe('purchase limit acceptance on PostgreSQL', () => {
     const orderId = created.json().data.order.id as string
     await settleAndRefundExternally(orderId, '1.25')
     expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
-      .toBe('processing')
-    await db.updateTable('orders').set({ status: 'closed' }).where('id', '=', orderId).execute()
+      .toBe('closed')
     expect((await sql<{ counts: boolean }>`SELECT order_counts_as_purchase(${orderId}::uuid) AS counts`.execute(db)).rows[0]?.counts)
       .toBe(true)
 

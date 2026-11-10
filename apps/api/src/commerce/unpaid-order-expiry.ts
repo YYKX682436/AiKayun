@@ -3,14 +3,14 @@ import type { Kysely } from 'kysely'
 import type { Database } from '../db/types.js'
 import { expireDueUnpaidOrders } from './orders.js'
 import { createWorkerObserver } from '../ops/worker-health.js'
+import { expireDuePaymentAttempts } from '../payments/attempts.js'
 
 const pollIntervalMs = 60_000
 const batchSize = 100
 
 /**
- * One in-process runner per API instance. PostgreSQL row locks plus
- * SKIP LOCKED distribute work across instances; the first run after startup
- * recovers anything that expired while the service was down.
+ * One runner per API instance. Payment expiry locks one payment context at a
+ * time; SKIP LOCKED distributes order closure across instances.
  */
 export function startUnpaidOrderExpiryWorker(
   db: Kysely<Database>,
@@ -33,7 +33,11 @@ export function startUnpaidOrderExpiryWorker(
       let closedCount = 0
       try {
         while (!stopped) {
-          const closed = await expireDueUnpaidOrders(db, new Date(), batchSize)
+          if (await expireDuePaymentAttempts(db, batchSize) < batchSize) break
+        }
+        const now = new Date()
+        while (!stopped) {
+          const closed = await expireDueUnpaidOrders(db, now, batchSize)
           closedCount += closed
           if (closed < batchSize) break
         }

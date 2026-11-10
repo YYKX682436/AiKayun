@@ -86,8 +86,14 @@ const channels = computed(() => channelsResponse.value?.data.items ?? [])
 const selectedChannel = computed(() => channels.value.find(channel => channel.id === selectedChannelId.value) ?? null)
 const loading = computed(() => walletPending.value || ledgerPending.value || topUpsPending.value || withdrawalsPending.value)
 const hasPageError = computed(() => walletError.value || ledgerError.value || topUpsError.value || withdrawalsError.value)
-const latestActiveTopUp = computed(() => topUps.value?.items.find(item => ['created', 'pending', 'reconciliation_required'].includes(item.status)) ?? null)
-const activeQrAction = computed(() => latestActiveTopUp.value?.action?.type === 'qr_code' ? latestActiveTopUp.value.action.value : '')
+const pendingTopUp = computed(() => topUps.value?.items.find(item => ['created', 'pending', 'reconciliation_required'].includes(item.status)) ?? null)
+const topUpWindowEnded = ref(false)
+const latestActiveTopUp = computed(() => {
+  const topUp = pendingTopUp.value
+  return topUp && (!topUpWindowEnded.value || topUp.reconciliationOpen || topUp.status === 'reconciliation_required') ? topUp : null
+})
+const activeTopUpAction = computed(() => topUpWindowEnded.value ? null : latestActiveTopUp.value?.action)
+const activeQrAction = computed(() => activeTopUpAction.value?.type === 'qr_code' ? activeTopUpAction.value.value : '')
 const availableWithdrawalMethods = computed(() => withdrawalPolicy.value?.methods ?? [])
 const withdrawalAmountValid = computed(() => {
   const value = withdrawalAmountInput.value.trim()
@@ -128,10 +134,9 @@ function formatDate(value: string): string {
 
 function topUpStatusLabel(value: CustomerTopUpPage['items'][number]): string {
   if (value.reconciliationOpen || value.status === 'reconciliation_required') return '异常核对中'
-  if (value.status === 'succeeded') return '已到账'
-  if (value.status === 'late_succeeded') return '迟到收款待核对'
+  if (value.status === 'succeeded' || value.status === 'late_succeeded') return '已到账'
   if (value.status === 'failed') return '支付失败'
-  if (value.status === 'expired') return '已过期'
+  if (value.status === 'expired' || (value.id === pendingTopUp.value?.id && topUpWindowEnded.value)) return '付款窗口已结束'
   if (value.status === 'cancelled') return '已取消'
   return value.providerState === 'unknown' || value.providerState === 'requesting' ? '结果确认中' : '待支付'
 }
@@ -157,9 +162,8 @@ function topUpStorageKey(): string {
   return `aikayun-wallet-topup-v1:${identity.value}:${amountInput.value.trim()}:${selectedChannelId.value}:${selectedPaymentMethod.value}`
 }
 
-function getTopUpIdempotencyKey(): string {
+function getTopUpIdempotencyKey(key: string): string {
   if (!import.meta.client) throw new Error('请在浏览器中发起充值。')
-  const key = topUpStorageKey()
   try {
     const existing = sessionStorage.getItem(key)
     if (existing && /^[0-9a-f-]{36}$/iu.test(existing)) return existing
@@ -188,19 +192,20 @@ async function createTopUp() {
   topUpLicenseError.value = ''
   successMessage.value = ''
   const identityAtStart = identity.value
+  const storageKey = topUpStorageKey()
   try {
-    const amount = amountInput.value.includes('.')
-      ? amountInput.value.padEnd(amountInput.value.indexOf('.') + 3, '0')
-      : `${amountInput.value}.00`
+    const input = amountInput.value.trim()
+    const amount = input.includes('.') ? input.padEnd(input.indexOf('.') + 3, '0') : `${input}.00`
     await customerApi.request<CustomerTopUpPage>('/api/v1/customer/wallet/top-ups', {
       method: 'POST',
       body: {
-        idempotencyKey: getTopUpIdempotencyKey(),
+        idempotencyKey: getTopUpIdempotencyKey(storageKey),
         amount,
         channelId: selectedChannelId.value,
         paymentMethod: selectedPaymentMethod.value,
       },
     })
+    try { sessionStorage.removeItem(storageKey) } catch { /* The server remains authoritative if session storage becomes unavailable. */ }
     if (identityAtStart !== identity.value) return
     successMessage.value = '充值请求已记录。余额只会在服务端确认到账后增加。'
     await Promise.all([refreshWallet(), refreshTopUps(), refreshLedger()])
@@ -386,6 +391,16 @@ watch(channels, (items) => {
 
 watch(availableWithdrawalMethods, (items) => {
   if (!items.includes(withdrawalMethod.value) && items[0]) withdrawalMethod.value = items[0]
+}, { immediate: true })
+
+watch([clientMounted, () => pendingTopUp.value?.expiresAt], ([mounted, expiresAt], _, onCleanup) => {
+  if (!mounted) return
+  const remaining = expiresAt ? Date.parse(expiresAt) - Date.now() : 0
+  topUpWindowEnded.value = Boolean(expiresAt && remaining <= 0)
+  if (remaining > 0) {
+    const timer = setTimeout(() => { topUpWindowEnded.value = true }, remaining)
+    onCleanup(() => clearTimeout(timer))
+  }
 }, { immediate: true })
 
 watch(activeQrAction, async (value) => {
@@ -1076,7 +1091,7 @@ watch(activeQrAction, async (value) => {
               </UBadge>
             </div>
             <figure
-              v-if="latestActiveTopUp.action?.type === 'qr_code' && qrDataUrl"
+              v-if="activeTopUpAction?.type === 'qr_code' && qrDataUrl"
               class="mx-auto mt-4 grid w-full max-w-64 justify-items-center gap-2 rounded-xl border border-default bg-default p-4"
             >
               <img
@@ -1098,8 +1113,8 @@ watch(activeQrAction, async (value) => {
               {{ qrError }}
             </p>
             <a
-              v-if="latestActiveTopUp.action?.type === 'redirect'"
-              :href="latestActiveTopUp.action.url"
+              v-if="activeTopUpAction?.type === 'redirect'"
+              :href="activeTopUpAction.url"
               target="_blank"
               rel="noopener noreferrer"
               class="mt-4 inline-flex min-h-11 items-center justify-center rounded-lg bg-primary px-4 py-2 text-sm font-medium text-inverted hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
@@ -1201,13 +1216,13 @@ watch(activeQrAction, async (value) => {
                 </div>
                 <div class="flex flex-wrap items-center gap-2">
                   <UBadge
-                    :color="item.status === 'succeeded' ? 'success' : item.reconciliationOpen || item.status === 'reconciliation_required' ? 'warning' : 'neutral'"
+                    :color="item.reconciliationOpen || item.status === 'reconciliation_required' ? 'warning' : ['succeeded', 'late_succeeded'].includes(item.status) ? 'success' : 'neutral'"
                     variant="soft"
                   >
                     {{ topUpStatusLabel(item) }}
                   </UBadge>
                   <UButton
-                    v-if="['created', 'pending', 'reconciliation_required'].includes(item.status)"
+                    v-if="['created', 'pending', 'expired', 'reconciliation_required'].includes(item.status)"
                     color="neutral"
                     variant="outline"
                     size="sm"

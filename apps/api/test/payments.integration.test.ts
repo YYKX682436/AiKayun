@@ -12,6 +12,8 @@ import { createDatabase } from '../src/db/pool.js'
 import type { Database } from '../src/db/types.js'
 import { createZpaySignature } from '../src/payments/zpay-epay.js'
 import { expireDueUnpaidOrders } from '../src/commerce/orders.js'
+import { startUnpaidOrderExpiryWorker } from '../src/commerce/unpaid-order-expiry.js'
+import { expireDuePaymentAttempts } from '../src/payments/attempts.js'
 import { startZpayHttpFixture } from './fixtures/zpay-http-server.js'
 import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
 import { createSignedBusinessLicense } from './fixtures/signed-business-license.js'
@@ -40,6 +42,7 @@ let admin: { id: string; cookie: string; csrfCookie: string; csrfToken: string }
 let channelId: string
 let licensePool: Pool
 let licenseFixture: Awaited<ReturnType<typeof createSignedBusinessLicense>>
+let legacy: Awaited<ReturnType<typeof seedPreUpgradePayments>>
 
 type Customer = { id: string; cookie: string; csrfCookie: string; csrfToken: string }
 type Owner = Customer | { id: string; cookie: string; csrfCookie: string; csrfToken: string; guest: true }
@@ -246,6 +249,93 @@ async function createWalletTopUp(owner: Customer, options: {
   return { response, attemptId }
 }
 
+async function makePaymentDue(attemptId: string, orderId?: string) {
+  // Advance only the fixture deadlines. Settlement and release run with all triggers enabled.
+  await db.transaction().execute(async (trx) => {
+    await sql`SET CONSTRAINTS ALL IMMEDIATE`.execute(trx)
+    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_guard`.execute(trx)
+    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+    await sql`UPDATE payment_attempts SET created_at = clock_timestamp() - interval '1 minute',
+      expires_at = clock_timestamp() - interval '2 seconds' WHERE id = ${attemptId}::uuid`.execute(trx)
+    await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_deadline_r1`.execute(trx)
+    await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_guard`.execute(trx)
+    if (orderId) {
+      await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(trx)
+      await trx.updateTable('orders').set({ unpaid_expires_at: new Date(Date.now() - 2_000) }).where('id', '=', orderId).execute()
+      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(trx)
+    }
+  })
+}
+
+async function orderInventory(orderId: string) {
+  return await db.selectFrom('product_variant_quantity_inventory as inventory')
+    .innerJoin('order_inventory_reservations as reservation', 'reservation.product_variant_id', 'inventory.product_variant_id')
+    .innerJoin('order_items as item', 'item.id', 'reservation.order_item_id')
+    .select(['inventory.stocked', 'inventory.reserved', sql<number>`(SELECT count(*)::int FROM order_inventory_events AS event
+      WHERE event.reservation_id = reservation.id AND event.action = 'release')`.as('releases')])
+    .where('item.order_id', '=', orderId).executeTakeFirstOrThrow()
+}
+
+async function seedPreUpgradePayments() {
+  await db.updateTable('storefront_customer_policy').set({ wallet_top_up_enabled: true }).where('singleton', '=', true).execute()
+  const topUps = []
+  for (const state of ['resolved', 'open'] as const) {
+    const customer = await createCustomer()
+    const topUp = await createWalletTopUp(customer, { amount: '9.00' })
+    expect(topUp.response.statusCode).toBe(201)
+    await makePaymentDue(topUp.attemptId)
+    const callback = fixture.setPaid(fixture.orders().at(-1)!.merchantOrderNo)
+    expect((await inject({ method: 'GET', url: callbackUrl(callback) })).body).toBe('success')
+    const query = await db.selectFrom('payment_provider_events').selectAll()
+      .where('payment_attempt_id', '=', topUp.attemptId).where('source', '=', 'query').executeTakeFirstOrThrow()
+    const caseId = randomUUID()
+    await db.insertInto('payment_provider_reconciliation_cases').values({
+      id: caseId, payment_attempt_id: topUp.attemptId, reason: 'late_confirmed_payment', opening_query_event_id: query.id,
+    }).execute()
+    if (state === 'resolved') {
+      await db.updateTable('payment_provider_reconciliation_cases').set({
+        state, resolved_at: new Date(), resolved_by_admin_id: admin.id,
+        resolution_query_event_sha256: query.event_sha256, resolution_provider_transaction_id: query.provider_transaction_id,
+        resolution_payment_method: 'alipay', resolution_confirmed_amount: query.reported_amount,
+        resolution_currency: 'CNY', resolution_payload: query.payload,
+      }).where('id', '=', caseId).execute()
+    }
+    expect(await db.selectFrom('wallet_ledger_entries').select('id').where('payment_attempt_id', '=', topUp.attemptId).execute()).toEqual([])
+    topUps.push({ customer, attemptId: topUp.attemptId, state })
+  }
+
+  const customer = await createCustomer()
+  const orders = []
+  for (const refundedAmount of ['5.00', '2.00']) {
+    const orderId = await createOrder(customer, undefined, { amount: '5.00', quantityStock: 1 })
+    const payment = await createPayment(orderId, customer)
+    expect(payment.statusCode).toBe(201)
+    const attemptId = payment.json().data.attempt.id as string
+    expect((await inject({ method: 'GET', url: callbackUrl(fixture.setPaid(fixture.orders().at(-1)!.merchantOrderNo)) })).body).toBe('success')
+    const receipt = await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', attemptId).executeTakeFirstOrThrow()
+    const refundId = randomUUID()
+    const allocationId = randomUUID()
+    await db.transaction().execute(async (trx) => {
+      await trx.insertInto('order_refunds').values({
+        id: refundId, order_id: orderId, idempotency_key: randomUUID(), request_sha256: digest,
+        amount: refundedAmount, reason: '升级前的退款记录',
+      }).execute()
+      await trx.updateTable('order_refunds').set({ status: 'approved', reviewed_by_admin_id: admin.id }).where('id', '=', refundId).execute()
+      await trx.insertInto('order_refund_allocations').values({
+        id: allocationId, refund_id: refundId, source_payment_receipt_id: receipt.id, operation_id: randomUUID(),
+        request_sha256: digest, destination: 'cash_balance', amount: refundedAmount,
+      }).execute()
+      await trx.updateTable('order_refunds').set({ status: 'processing' }).where('id', '=', refundId).execute()
+      await trx.updateTable('order_refund_allocations').set({ status: 'succeeded' }).where('id', '=', allocationId).execute()
+      await trx.updateTable('order_refunds').set({ status: 'succeeded' }).where('id', '=', refundId).execute()
+    })
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status).toBe('processing')
+    expect(await orderInventory(orderId)).toEqual({ stocked: 1, reserved: 1, releases: 0 })
+    orders.push({ customer, orderId, refundId, refundedAmount })
+  }
+  return { topUps, orders }
+}
+
 async function creditGiftFixture(owner: Customer, amount: string): Promise<void> {
   const operationId = randomUUID()
   await db.transaction().execute(async (trx) => {
@@ -289,8 +379,8 @@ function callbackUrl(parameters: Record<string, string>): string {
   return `/api/v1/payments/callback/zpay?${new URLSearchParams(parameters).toString()}`
 }
 
-function signedConflictingCallback(merchantOrderNo: string): Record<string, string> {
-  const callback = fixture.setPaid(merchantOrderNo, { amount: '100.00' })
+function signedConflictingCallback(merchantOrderNo: string, amount = '100.00'): Record<string, string> {
+  const callback = fixture.setPaid(merchantOrderNo, { amount })
   callback.money = '90.00'
   return resignCallback(callback)
 }
@@ -324,10 +414,8 @@ beforeAll(async () => {
   await sql`DROP SCHEMA public CASCADE`.execute(db)
   await sql`CREATE SCHEMA public`.execute(db)
   const migrator = new Migrator({ db, provider: new AppMigrationProvider() })
-  const migrated = await migrator.migrateToLatest()
-  if (migrated.error) throw migrated.error
-  const repeated = await migrator.migrateToLatest()
-  if (repeated.error) throw repeated.error
+  const previous = await migrator.migrateTo('202611100001_storefront_support_settings')
+  if (previous.error) throw previous.error
   const centerCheckout = process.env.LICENSE_CENTER_CHECKOUT
   if (!centerCheckout) throw new Error('Payment integration tests require the frozen LICENSE_CENTER_CHECKOUT')
   licensePool = new Pool({ connectionString: testDatabaseUrl, max: 8 })
@@ -355,6 +443,12 @@ beforeAll(async () => {
 
   admin = await createAdmin()
   channelId = await createPaymentChannel()
+  legacy = await seedPreUpgradePayments()
+  const migrated = await migrator.migrateToLatest()
+  if (migrated.error) throw migrated.error
+  const repeated = await migrator.migrateToLatest()
+  if (repeated.error) throw repeated.error
+  expect(repeated.results).toEqual([])
 }, 120_000)
 
 afterAll(async () => {
@@ -368,6 +462,61 @@ afterAll(async () => {
 })
 
 describe('online payment settlement through a real local HTTP provider and PostgreSQL', () => {
+  it('backfills eligible historical money and stock once, then credits the old open case after resolution', async () => {
+    for (const { customer, attemptId, state } of legacy.topUps) {
+      const credit = () => db.selectFrom('wallet_ledger_entries').select(['bucket', 'action', 'amount'])
+        .where('payment_attempt_id', '=', attemptId).execute()
+      const expectedCredit = [{ bucket: 'cash', action: 'credit_available', amount: '9.00' }]
+      expect(await credit()).toEqual(state === 'resolved' ? expectedCredit : [])
+      if (state === 'open') {
+        await db.updateTable('payment_attempt_provider_state').set({ last_query_at: null }).where('payment_attempt_id', '=', attemptId).execute()
+        const resolved = await inject({ method: 'POST',
+          url: `/api/v1/admin/wallets/${customer.id}/top-ups/${attemptId}/reconcile`, headers: adminHeaders() })
+        expect(resolved.statusCode).toBe(200)
+        expect(resolved.json().data).toMatchObject({ state: 'resolved', message: expect.stringContaining('已入账') })
+      }
+      await sql`SELECT credit_payment_top_up(${attemptId}::uuid)`.execute(db)
+      expect(await credit()).toEqual(expectedCredit)
+      const page = await inject({ method: 'GET', url: '/api/v1/customer/wallet/top-ups', headers: customerHeaders(customer, false) })
+      expect(page.json().data.items).toMatchObject([{ id: attemptId, status: 'late_succeeded', receiptDisposition: 'late', reconciliationOpen: false }])
+      await expectWalletMatchesLedger(customer.id)
+    }
+
+    for (const { orderId, refundedAmount } of legacy.orders) {
+      const closed = refundedAmount === '5.00'
+      const expectedInventory = { stocked: 1, reserved: closed ? 0 : 1, releases: closed ? 1 : 0 }
+      expect(await orderInventory(orderId)).toEqual(expectedInventory)
+      expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
+        .toBe(closed ? 'closed' : 'processing')
+      await sql`SELECT close_expired_order_when_settled(${orderId}::uuid)`.execute(db)
+      expect(await orderInventory(orderId)).toEqual(expectedInventory)
+    }
+  })
+
+  it('rejects new or unreviewed partial refunds on unfinished orders and lets historical partial payouts be topped up', async () => {
+    const { orderId, customer, refundId } = legacy.orders.find(order => order.refundedAmount === '2.00')!
+    const requestRefund = (amount: string) => inject({ method: 'POST', url: `/api/v1/customer/orders/${orderId}/refunds`,
+      headers: customerHeaders(customer), payload: { idempotencyKey: randomUUID(), amount, reason: '退回未完成订单余款' } })
+    const reviewRefund = (id: string, action: 'approve' | 'reject') => inject({ method: 'POST',
+      url: `/api/v1/admin/orders/${orderId}/refunds/${id}/${action}`, headers: adminHeaders(),
+      payload: { idempotencyKey: randomUUID(), ...(action === 'reject' ? { reason: '请申请剩余全部金额' } : {}) } })
+    expect((await requestRefund('1.00')).json().error.code).toBe('REFUND_FULL_REMAINING_REQUIRED')
+    const oldRequestId = randomUUID()
+    await db.insertInto('order_refunds').values({ id: oldRequestId, order_id: orderId, idempotency_key: randomUUID(),
+      request_sha256: digest, amount: '1.00', reason: '旧版待审部分退款' }).execute()
+    expect((await reviewRefund(oldRequestId, 'approve')).json().error.code).toBe('REFUND_FULL_REMAINING_REQUIRED')
+    expect((await reviewRefund(oldRequestId, 'reject')).statusCode).toBe(200)
+    const remaining = await requestRefund('3.00')
+    expect(remaining.statusCode).toBe(201)
+    const request = remaining.json().data.refunds.items.find((item: { status: string }) => item.status === 'requested')
+    expect(request.amount).toBe('3.00')
+    const approved = await reviewRefund(request.id, 'approve')
+    expect(approved.statusCode).toBe(200)
+    expect(approved.json().data.refunds.items).toContainEqual(expect.objectContaining({ id: refundId, amount: '2.00', status: 'succeeded' }))
+    expect(await orderInventory(orderId)).toEqual({ stocked: 1, reserved: 0, releases: 1 })
+    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status).toBe('closed')
+  })
+
   it('rejects signed test injection when the actual PostgreSQL database is not isolated', async () => {
     const otherUrl = new URL(testDatabaseUrl)
     otherUrl.pathname = '/postgres'
@@ -418,6 +567,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
   })
 
   it('uses server-owned order facts and reuses an active attempt on repeated clicks', async () => {
+    const createCountBefore = fixture.stats().creates
     const customer = await createCustomer()
     const orderId = await createOrder(customer)
     await changeOrderCatalogSale(orderId, '9.00')
@@ -440,7 +590,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
     expect(attempts).toHaveLength(1)
     expect(attempts[0]!.amount).toBe('5.00')
     expect(attempts[0]!.status).toBe('pending')
-    expect(fixture.stats().creates).toBe(1)
+    expect(fixture.stats().creates).toBe(createCountBefore + 1)
     const encryptedSecret = await db.selectFrom('payment_attempt_secrets').select('ciphertext')
       .where('payment_attempt_id', '=', attempts[0]!.id).executeTakeFirstOrThrow()
     expect(encryptedSecret.ciphertext.toString('utf8')).not.toContain(merchantKey)
@@ -689,31 +839,25 @@ describe('online payment settlement through a real local HTTP provider and Postg
 
   it('does not let timeout or cancellation win while a signed paid callback awaits its provider query', async () => {
     const customer = await createCustomer()
+    await creditGiftFixture(customer, '2.00')
     const orderId = await createOrder(customer, `回调查单间超时并发-${randomUUID().slice(0, 8)}`, {
       amount: '100.00', quantityStock: 1,
     })
-    const created = await createPayment(orderId, customer)
+    const created = await createPayment(orderId, customer, { walletAmount: '2.00' })
     const attemptId = created.json().data.attempt.id as string
-    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
-    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_guard`.execute(db)
-    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_deadline_r1`.execute(db)
-    try {
-      await db.updateTable('orders').set({ unpaid_expires_at: new Date(Date.now() - 2_000) })
-        .where('id', '=', orderId).execute()
-      await sql`UPDATE payment_attempts SET created_at = clock_timestamp() - interval '1 minute',
-        expires_at = clock_timestamp() - interval '2 seconds' WHERE id = ${attemptId}::uuid`.execute(db)
-    } finally {
-      await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_deadline_r1`.execute(db)
-      await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_guard`.execute(db)
-      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
-    }
+    await makePaymentDue(attemptId, orderId)
 
-    const callback = signedConflictingCallback(fixture.orders().at(-1)!.merchantOrderNo)
+    const callback = signedConflictingCallback(fixture.orders().at(-1)!.merchantOrderNo, '98.00')
     const gate = fixture.pauseNextQueryResponse()
     const callbackRequest = fetch(`${api2BaseUrl}${callbackUrl(callback)}`)
     try {
       await gate.entered
+      await expireDuePaymentAttempts(db, 100)
       await expireDueUnpaidOrders(db)
+      expect(await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow())
+        .toEqual({ status: 'pending' })
+      expect(await db.selectFrom('wallet_accounts').select('gift_frozen').where('customer_id', '=', customer.id).executeTakeFirstOrThrow())
+        .toEqual({ gift_frozen: '2.00' })
       const cancel = await inject({
         method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer),
       })
@@ -735,7 +879,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
       .select(['inventory.reserved', sql<string>`(SELECT COALESCE(string_agg(event.action, ',' ORDER BY event.created_at), '')
         FROM order_inventory_events AS event WHERE event.reservation_id = reservation.id)`.as('actions')])
       .where('item.order_id', '=', orderId).executeTakeFirstOrThrow()
-    expect(receipt).toEqual({ amount: '100.00', disposition: 'late' })
+    expect(receipt).toEqual({ amount: '98.00', disposition: 'late' })
     expect(reconciliation.state).toBe('open')
     expect((await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow()).status)
       .toBe('late_succeeded')
@@ -1223,6 +1367,33 @@ describe('online payment settlement through a real local HTTP provider and Postg
       .rejects.toThrow()
   })
 
+  it('lets a customer start the same top-up after expiry and credits the old payment once after a query', async () => {
+    const customer = await createCustomer()
+    const original = await createWalletTopUp(customer, { amount: '10.00' })
+    expect(original.response.statusCode).toBe(201)
+    const merchantNo = fixture.orders().at(-1)!.merchantOrderNo
+    await makePaymentDue(original.attemptId)
+    const list = () => inject({ method: 'GET', url: '/api/v1/customer/wallet/top-ups', headers: customerHeaders(customer, false) })
+    expect((await list()).json().data.items[0]).toMatchObject({ id: original.attemptId, action: null })
+    const next = await createWalletTopUp(customer, { amount: '10.00' })
+    expect(next.response.statusCode).toBe(201)
+    expect(next.attemptId).not.toBe(original.attemptId)
+    expect((await list()).json().data.items).toContainEqual(expect.objectContaining({ id: original.attemptId, status: 'expired', action: null }))
+
+    const callback = fixture.setPaid(merchantNo)
+    const checked = await inject({ method: 'POST', url: `/api/v1/customer/wallet/top-ups/${original.attemptId}/refresh`,
+      headers: customerHeaders(customer) })
+    expect(checked.statusCode).toBe(200)
+    expect(checked.json().data.items).toContainEqual(expect.objectContaining({ id: original.attemptId,
+      status: 'late_succeeded', receiptDisposition: 'late', reconciliationOpen: false, action: null }))
+    expect((await inject({ method: 'GET', url: callbackUrl(callback) })).body).toBe('success')
+    expect(await db.selectFrom('wallet_ledger_entries').select(['bucket', 'action', 'amount'])
+      .where('payment_attempt_id', '=', original.attemptId).execute())
+      .toEqual([{ bucket: 'cash', action: 'credit_available', amount: '10.00' }])
+    expect(await db.selectFrom('payment_receipts').select('id').where('payment_attempt_id', '=', original.attemptId).execute()).toHaveLength(1)
+    await expectWalletMatchesLedger(customer.id)
+  })
+
   it('refuses top-ups outside merchant limits and does not credit amount mismatches', async () => {
     await db.updateTable('storefront_customer_policy').set({
       wallet_top_up_enabled: true, wallet_top_up_min_amount: '5.00', wallet_top_up_max_amount: '20.00',
@@ -1380,7 +1551,37 @@ describe('online payment settlement through a real local HTTP provider and Postg
     const customer = await createCustomer()
     await creditGiftFixture(customer, '4.00')
     const rejectedOrder = await createOrder(customer, `__reject__combo-${randomUUID().slice(0, 8)}`, { amount: '10.00' })
-    const rejected = await createPayment(rejectedOrder, customer, { walletAmount: '4.00' })
+    const createGate = fixture.pauseNextCreateResponse()
+    const create = createPayment(rejectedOrder, customer, { walletAmount: '4.00' })
+    let refresh: ReturnType<typeof inject> | undefined
+    try {
+      await createGate.entered
+      let unlockWallet!: () => void
+      let walletLocked!: () => void
+      const released = new Promise<void>(resolve => { unlockWallet = resolve })
+      const locked = new Promise<void>(resolve => { walletLocked = resolve })
+      const blocker = db.transaction().execute(async (trx) => {
+        await trx.selectFrom('wallet_accounts').select('customer_id').where('customer_id', '=', customer.id).forUpdate().executeTakeFirstOrThrow()
+        walletLocked()
+        await released
+      })
+      try {
+        await locked
+        refresh = inject({ method: 'POST', url: `/api/v1/orders/${rejectedOrder}/payment/refresh`, headers: customerHeaders(customer) })
+        await waitForPgLockWaits(1, 'from "wallet_accounts"')
+        createGate.release()
+        await waitForPgLockWaits(1, 'from "customers"')
+      } finally {
+        unlockWallet()
+        await blocker
+      }
+    } finally {
+      createGate.release()
+      await create
+      await refresh
+    }
+    expect((await refresh)?.statusCode).toBe(200)
+    const rejected = await create
     expect(rejected.statusCode).toBe(201)
     expect(rejected.json().data.attempt.status).toBe('failed')
     expect((await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
@@ -1517,63 +1718,51 @@ describe('online payment settlement through a real local HTTP provider and Postg
     await expectWalletMatchesLedger(customer.id)
   })
 
-  it('closes an expired combo order on late receipt and releases its held wallet funds exactly once', async () => {
+  it('releases both abandoned combo holds and stock before a late payment can be confirmed', async () => {
     const customer = await createCustomer()
+    const funded = await createWalletTopUp(customer, { amount: '3.00' })
+    expect(funded.response.statusCode).toBe(201)
+    expect((await inject({ method: 'GET', url: callbackUrl(fixture.setPaid(fixture.orders().at(-1)!.merchantOrderNo)) })).body).toBe('success')
     await creditGiftFixture(customer, '2.00')
-    const orderId = await createOrder(customer, `组合付款迟到收款-${randomUUID().slice(0, 8)}`, { amount: '10.00', quantityStock: 1 })
-    const created = await createPayment(orderId, customer, { walletAmount: '2.00' })
+    const orderId = await createOrder(customer, undefined, { amount: '10.00', quantityStock: 1 })
+    const created = await createPayment(orderId, customer, { walletAmount: '5.00' })
     expect(created.statusCode).toBe(201)
     const attemptId = created.json().data.attempt.id as string
-    const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no')
-      .where('id', '=', attemptId).executeTakeFirstOrThrow()).merchant_order_no!
-    const callback = fixture.setPaid(merchantNo)
+    const { merchant_order_no: merchantNo, wallet_hold_operation_id: holdId } = await db.selectFrom('payment_attempts')
+      .select(['merchant_order_no', 'wallet_hold_operation_id']).where('id', '=', attemptId).executeTakeFirstOrThrow()
+    await makePaymentDue(attemptId, orderId)
 
-    await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
-    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_guard`.execute(db)
-    await sql`ALTER TABLE payment_attempts DISABLE TRIGGER payment_attempts_deadline_r1`.execute(db)
+    const stopWorker = startUnpaidOrderExpiryWorker(db, app.log)
     try {
-      await db.updateTable('orders').set({ unpaid_expires_at: new Date(Date.now() - 2_000) }).where('id', '=', orderId).execute()
-      await sql`UPDATE payment_attempts SET created_at = clock_timestamp() - interval '1 minute',
-        expires_at = clock_timestamp() - interval '2 seconds' WHERE id = ${attemptId}::uuid`.execute(db)
+      await expect.poll(() => orderInventory(orderId)).toEqual({ stocked: 1, reserved: 0, releases: 1 })
     } finally {
-      await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_deadline_r1`.execute(db)
-      await sql`ALTER TABLE payment_attempts ENABLE TRIGGER payment_attempts_guard`.execute(db)
-      await sql`ALTER TABLE orders ENABLE TRIGGER orders_guard_update`.execute(db)
+      await stopWorker()
     }
+    expect(await db.selectFrom('payment_attempts').select('status').where('id', '=', attemptId).executeTakeFirstOrThrow())
+      .toEqual({ status: 'expired' })
+    expect(await db.selectFrom('wallet_accounts').select(['cash_available', 'cash_frozen', 'gift_available', 'gift_frozen'])
+      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow())
+      .toEqual({ cash_available: '3.00', cash_frozen: '0.00', gift_available: '2.00', gift_frozen: '0.00' })
 
-    await expireDueUnpaidOrders(db)
-    const callbackResult = await inject({ method: 'GET', url: callbackUrl(callback) })
-    expect(callbackResult.statusCode).toBe(200)
-    expect((await db.selectFrom('payment_receipts').select('disposition')
-      .where('payment_attempt_id', '=', attemptId).executeTakeFirstOrThrow()).disposition).toBe('late')
-    expect((await db.selectFrom('payment_attempts').select('status')
-      .where('id', '=', attemptId).executeTakeFirstOrThrow()).status).toBe('late_succeeded')
-    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
-      .toBe('pending_payment')
-    expect((await db.selectFrom('wallet_accounts').select(['gift_available', 'gift_frozen'])
-      .where('customer_id', '=', customer.id).executeTakeFirstOrThrow())).toEqual({ gift_available: '2.00', gift_frozen: '0.00' })
-    const holdId = (await db.selectFrom('payment_attempts').select('wallet_hold_operation_id')
-      .where('id', '=', attemptId).executeTakeFirstOrThrow()).wallet_hold_operation_id!
-    expect(await db.selectFrom('wallet_operations').select('id')
-      .where('operation_type', '=', 'order_payment_release').where('resolves_operation_id', '=', holdId).execute())
-      .toHaveLength(1)
+    const callback = fixture.setPaid(merchantNo!)
+    const [queried, notified] = await Promise.all([
+      inject({ method: 'POST', url: `/api/v1/orders/${orderId}/payment/refresh`, headers: customerHeaders(customer) }),
+      fetch(`${api2BaseUrl}${callbackUrl(callback)}`),
+      expireDuePaymentAttempts(db, 100),
+    ])
+    expect(queried.statusCode).toBe(200)
+    expect([200, 503]).toContain(notified.status)
+    expect(await db.selectFrom('payment_receipts').select('disposition').where('payment_attempt_id', '=', attemptId).execute())
+      .toEqual([{ disposition: 'late' }])
+    expect(await db.selectFrom('payment_provider_reconciliation_cases').select('reason')
+      .where('payment_attempt_id', '=', attemptId).where('state', '=', 'open').execute())
+      .toEqual([{ reason: 'late_confirmed_payment' }])
+    expect(await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow())
+      .toEqual({ status: 'closed' })
+    expect(await db.selectFrom('wallet_operations').select('operation_type').where('resolves_operation_id', '=', holdId).execute())
+      .toEqual([{ operation_type: 'order_payment_release' }])
+    expect(await orderInventory(orderId)).toEqual({ stocked: 1, reserved: 0, releases: 1 })
     await expectWalletMatchesLedger(customer.id)
-
-    await db.updateTable('payment_attempt_provider_state').set({ last_query_at: new Date(Date.now() - 11_000) })
-      .where('payment_attempt_id', '=', attemptId).execute()
-    const reconciled = await inject({
-      method: 'POST', url: `/api/v1/admin/orders/${orderId}/payments/${attemptId}/reconcile`, headers: adminHeaders(),
-    })
-    expect(reconciled.statusCode).toBe(200)
-    expect(reconciled.json().data.state).toBe('resolved')
-    expect(await expireDueUnpaidOrders(db)).toBe(0)
-    expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
-      .toBe('pending_payment')
-    const inventory = await db.selectFrom('product_variant_quantity_inventory as inventory')
-      .innerJoin('order_inventory_reservations as reservation', 'reservation.product_variant_id', 'inventory.product_variant_id')
-      .innerJoin('order_items as item', 'item.id', 'reservation.order_item_id')
-      .select('inventory.reserved').where('item.order_id', '=', orderId).executeTakeFirstOrThrow()
-    expect(inventory.reserved).toBe(1)
   })
 
   it('returns a single cash, gift or external order receipt to the correct wallet bucket', async () => {
@@ -1593,7 +1782,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
         await creditGiftFixture(customer, '5.00')
       }
 
-      const orderId = await createOrder(customer, `单来源退款-${source}-${randomUUID().slice(0, 8)}`, { amount: '5.00' })
+      const orderId = await createOrder(customer, `单来源退款-${source}-${randomUUID().slice(0, 8)}`, { amount: '5.00', quantityStock: 1 })
       const payment = await createPayment(orderId, customer, source === 'external' ? {} : { walletAmount: '5.00' })
       expect(payment.statusCode).toBe(201)
       if (source === 'external') {
@@ -1619,7 +1808,8 @@ describe('online payment settlement through a real local HTTP provider and Postg
         sourceBucket: source, destination: source === 'gift' ? 'gift_balance' : 'cash_balance', amount: '5.00', status: 'succeeded',
       }])
       expect((await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).status)
-        .toBe('processing')
+        .toBe('closed')
+      expect(await orderInventory(orderId)).toEqual({ stocked: 1, reserved: 0, releases: 1 })
       const refundLines = await db.selectFrom('wallet_ledger_entries')
         .innerJoin('order_refund_allocations', 'order_refund_allocations.id', 'wallet_ledger_entries.refund_allocation_id')
         .select(['wallet_ledger_entries.bucket', 'wallet_ledger_entries.action', 'wallet_ledger_entries.amount'])
@@ -1853,7 +2043,7 @@ describe('online payment settlement through a real local HTTP provider and Postg
 
   it('uses manual original-source refund records for guests and never credits an arbitrary wallet', async () => {
     const guest = await createGuestSession()
-    const orderId = await createOrder(guest, `游客人工退款-${randomUUID().slice(0, 8)}`, { amount: '8.00' })
+    const orderId = await createOrder(guest, `游客人工退款-${randomUUID().slice(0, 8)}`, { amount: '8.00', quantityStock: 1 })
     const payment = await createPayment(orderId, guest)
     expect(payment.statusCode).toBe(201)
     const attemptId = payment.json().data.attempt.id as string
@@ -1946,6 +2136,8 @@ describe('online payment settlement through a real local HTTP provider and Postg
     expect(await db.selectFrom('payment_receipts').select(['refunded_amount', 'refund_reserved_amount']).where('id', '=', receipt.id)
       .executeTakeFirstOrThrow()).toEqual({ refunded_amount: '0.00', refund_reserved_amount: '8.00' })
 
+    expect(await orderInventory(orderId)).toEqual({ stocked: 1, reserved: 1, releases: 0 })
+
     const failed = await inject({
       method: 'POST', url: resolvePath, headers: {
         origin: testOrigin, cookie: `${admin.cookie}; ${admin.csrfCookie}`, 'x-csrf-token': admin.csrfToken,
@@ -1989,6 +2181,8 @@ describe('online payment settlement through a real local HTTP provider and Postg
     })
     expect(confirmed.statusCode).toBe(200)
     expect(confirmed.json().data.refunds).toMatchObject({ refundStatus: 'refunded', refundedAmount: '8.00' })
+    expect(await db.selectFrom('orders').select('status').where('id', '=', orderId).executeTakeFirstOrThrow()).toEqual({ status: 'closed' })
+    expect(await orderInventory(orderId)).toEqual({ stocked: 1, reserved: 0, releases: 1 })
     const finalAllocations = confirmed.json().data.refunds.items[0].allocations
     expect(finalAllocations.map((item: { status: string }) => item.status).sort()).toEqual(['released', 'succeeded'])
     expect(finalAllocations.flatMap((item: { manualAttempts: Array<{ status: string }> }) => item.manualAttempts)

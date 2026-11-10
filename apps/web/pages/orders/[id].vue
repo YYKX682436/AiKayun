@@ -55,7 +55,9 @@ const refundStatusNames: Record<CustomerOrderRefunds['refundStatus'], string> = 
   refunded: '已全额退款',
 }
 
+const fullRefundRequired = computed(() => order.value?.status !== 'completed')
 const refundRequestAmount = computed(() => {
+  if (fullRefundRequired.value) return refunds.value?.refundableAmount ?? ''
   const value = refundAmountInput.value.trim()
   if (!/^\d+(?:\.\d{1,2})?$/u.test(value)) return ''
   const normalized = value.includes('.') ? value.padEnd(value.indexOf('.') + 3, '0') : `${value}.00`
@@ -659,6 +661,16 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
               </UButton>
             </template>
           </div>
+          <UButton
+            v-if="order.status === 'closed' && payment?.attempt?.status === 'expired'"
+            color="neutral"
+            variant="outline"
+            icon="i-lucide-refresh-cw"
+            :loading="refreshingPayment"
+            @click="refreshPayment"
+          >
+            查询付款结果
+          </UButton>
         </header>
 
         <section
@@ -682,7 +694,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
               </p>
             </div>
             <UButton
-              v-if="hasActiveAttempt"
+              v-if="hasActiveAttempt || payment.attempt?.status === 'expired'"
               color="neutral"
               variant="outline"
               icon="i-lucide-refresh-cw"
@@ -1059,7 +1071,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
             variant="subtle"
             icon="i-lucide-shield-alert"
             :title="refunds.blockedReason === 'payment_reconciliation_required' ? '收款凭证待核对' : refunds.blockedReason === 'payment_unresolved' ? '订单存在未决支付' : '暂无可退款实收凭证'"
-            description="支付状态或服务商对账处理完成后，系统会重新计算可退款金额。退款不会改变已交付记录或订单履约状态。"
+            description="支付状态或服务商对账处理完成后，系统会重新计算可退款金额。已交付内容会保留。"
           />
 
           <UAlert
@@ -1088,16 +1100,18 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
           >
             <UFormField
               label="申请金额"
-              :description="`最多 ¥${refunds.refundableAmount}`"
+              :description="fullRefundRequired ? '未完成订单须退还全部剩余可退款金额。' : `最多 ¥${refunds.refundableAmount}`"
             >
               <UInput
-                v-model="refundAmountInput"
+                :model-value="fullRefundRequired ? refunds.refundableAmount : refundAmountInput"
+                :readonly="fullRefundRequired"
                 type="text"
                 inputmode="decimal"
                 autocomplete="off"
                 maxlength="19"
                 aria-label="申请退款金额"
                 class="w-full"
+                @update:model-value="refundAmountInput = $event"
               />
             </UFormField>
             <UFormField label="退款原因">
@@ -1122,7 +1136,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
           </form>
 
           <p class="mt-3 text-xs leading-5 text-muted">
-            审核中的金额会先预留，审核通过后按真实收款来源逐笔退款。退款不会删除成交记录、清除已交付内容、恢复已消费库存或重置限购统计。
+            审核通过后按实际收款来源退款。未完成订单全额退款后会关闭，已交付内容和已消费库存会保留。
           </p>
 
           <ol

@@ -117,6 +117,14 @@ export async function startZpayHttpFixture(options: FixtureOptions = {}): Promis
     release(): void
   } | null = null
 
+  async function waitForCreateResponse() {
+    const gate = nextCreateResponseGate
+    if (!gate) return
+    nextCreateResponseGate = null
+    gate.signalEntered()
+    await gate.waitForRelease
+  }
+
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? '/', 'http://127.0.0.1')
@@ -210,6 +218,7 @@ export async function startZpayHttpFixture(options: FixtureOptions = {}): Promis
           return
         }
         if ((payload.name ?? '').startsWith('__reject__')) {
+          await waitForCreateResponse()
           sendJson(response, 200, { code: 0, msg: 'fixture rejection' })
           return
         }
@@ -233,12 +242,7 @@ export async function startZpayHttpFixture(options: FixtureOptions = {}): Promis
           paidAt: null,
         }
         ordersByMerchantNo.set(merchantOrderNo, order)
-        const createResponseGate = nextCreateResponseGate
-        if (createResponseGate) {
-          nextCreateResponseGate = null
-          createResponseGate.signalEntered()
-          await createResponseGate.waitForRelease
-        }
+        await waitForCreateResponse()
         sendJson(response, 200, {
           code: 1,
           trade_no: order.providerOrderId,

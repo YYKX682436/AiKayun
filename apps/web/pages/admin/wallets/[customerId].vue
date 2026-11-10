@@ -30,10 +30,9 @@ function ledgerAction(item: CustomerWalletLedgerEntry) {
 
 function topUpStatus(item: CustomerTopUp) {
   if (item.reconciliationOpen || item.status === 'reconciliation_required') return '异常核对中'
-  if (item.status === 'succeeded') return '已到账'
-  if (item.status === 'late_succeeded') return '迟到收款待处理'
+  if (item.status === 'succeeded' || item.status === 'late_succeeded') return '已到账'
   if (item.status === 'failed') return '支付失败'
-  if (item.status === 'expired') return '已过期'
+  if (item.status === 'expired') return '付款窗口已结束'
   if (item.status === 'cancelled') return '已取消'
   if (item.providerState === 'unknown' || item.providerState === 'requesting') return '结果确认中'
   return '待支付'

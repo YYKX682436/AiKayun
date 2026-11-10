@@ -67,6 +67,7 @@ import { fileCheckResultsMigration } from './migrations/202611040002_file_check_
 import { storefrontBrandSettingsMigration } from './migrations/202611090001_storefront_brand_settings.js'
 import { storefrontFeaturedProductsMigration } from './migrations/202611090002_storefront_featured_products.js'
 import { storefrontSupportSettingsMigration } from './migrations/202611100001_storefront_support_settings.js'
+import { paymentExpiryAndRefundCompletionMigration } from './migrations/202611100002_payment_expiry_and_refund_completion.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -135,6 +136,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202611090001_storefront_brand_settings': storefrontBrandSettingsMigration,
       '202611090002_storefront_featured_products': storefrontFeaturedProductsMigration,
       '202611100001_storefront_support_settings': storefrontSupportSettingsMigration,
+      '202611100002_payment_expiry_and_refund_completion': paymentExpiryAndRefundCompletionMigration,
     }
     verifyMigrationChecksums(migrations)
     return migrations

@@ -42,6 +42,7 @@ import { decryptPaymentConfig, encryptPaymentConfig, parsePaymentConfig, seriali
 import { registerPaymentChannelRoutes } from './channels.js'
 import { recordWalletOrderPayment } from '../finance/wallet.js'
 import type { PaymentProviderAdapter } from './provider.js'
+import { expirePaymentAttempt, lockPaymentAttempt, paymentAttemptHasNoFundsEvidence } from './attempts.js'
 import { PaymentServiceError, handleProviderCallback, loadPaymentAttemptSnapshot, refreshPaymentAttempt, resolvePaymentReconciliation } from './settlement.js'
 
 const providerName = 'epay:zpayz.cn'
@@ -252,7 +253,8 @@ async function buildCustomerPaymentView(
       providerState: attemptSnapshot?.providerState ?? null,
       paymentMethod: attemptSnapshot?.paymentMethod ?? null,
       channelName: attemptSnapshot?.channelName ?? null,
-      action: payable && activeAttempt?.providerState === 'ready' ? activeAttempt.action : null,
+      action: payable && activeAttempt?.providerState === 'ready' && activeAttempt.expiresAt > now
+        ? activeAttempt.action : null,
       expiresAt: attemptRow.expires_at?.toISOString() ?? null,
       completedAt: attemptRow.completed_at?.toISOString() ?? null,
       errorCode: attemptSnapshot?.lastErrorCode ?? null,
@@ -630,8 +632,7 @@ async function recordProviderCreateResult(
   db: Kysely<Database>, attemptId: string, result: Awaited<ReturnType<PaymentProviderAdapter['create']>>,
 ): Promise<void> {
   await db.transaction().execute(async (trx) => {
-    const attempt = await trx.selectFrom('payment_attempts').select(['id', 'status'])
-      .where('id', '=', attemptId).forUpdate().executeTakeFirst()
+    const attempt = await lockPaymentAttempt(trx, attemptId)
     if (!attempt || !['created', 'pending'].includes(attempt.status)) return
     const state = await trx.selectFrom('payment_attempt_provider_state').selectAll()
       .where('payment_attempt_id', '=', attemptId).forUpdate().executeTakeFirstOrThrow()
@@ -648,8 +649,8 @@ async function recordProviderCreateResult(
     if (result.kind === 'rejected') {
       await trx.updateTable('payment_attempt_provider_state').set({ state: 'failed', last_error_code: result.code })
         .where('payment_attempt_id', '=', attemptId).execute()
-      await trx.updateTable('payment_attempts').set({ status: 'failed' })
-        .where('id', '=', attemptId).where('status', 'in', ['created', 'pending']).execute()
+      await trx.updateTable('payment_attempts as attempt').set({ status: 'failed' })
+        .where('attempt.id', '=', attemptId).where(paymentAttemptHasNoFundsEvidence).execute()
       return
     }
     await trx.updateTable('payment_attempt_provider_state').set({
@@ -788,6 +789,7 @@ async function buildTopUpPage(db: Kysely<Database>, customerId: string, page: nu
       'provider_state.state as provider_state', 'provider_state.action as action',
       'receipt.provider_transaction_id as provider_transaction_id', 'receipt.amount as receipt_amount',
       'receipt.disposition as receipt_disposition',
+      sql<boolean>`attempt.expires_at > clock_timestamp()`.as('payment_window_open'),
       sql<boolean>`EXISTS (SELECT 1 FROM payment_provider_reconciliation_cases AS reconciliation
         WHERE reconciliation.payment_attempt_id = attempt.id AND reconciliation.state = 'open')`.as('reconciliation_open'),
       sql<string[]>`COALESCE((SELECT array_agg(DISTINCT reconciliation.reason ORDER BY reconciliation.reason)
@@ -806,7 +808,8 @@ async function buildTopUpPage(db: Kysely<Database>, customerId: string, page: nu
       providerState: row.provider_state,
       paymentMethod: row.payment_method,
       channelName: row.channel_name,
-      action: ['created', 'pending'].includes(row.status) && row.provider_state === 'ready'
+      action: row.payment_window_open && !row.reconciliation_open
+        && ['created', 'pending'].includes(row.status) && row.provider_state === 'ready'
         ? row.action as PaymentAction | null : null,
       providerTransactionId: row.provider_transaction_id,
       receiptAmount: row.receipt_amount === null ? null : settleAmount(row.receipt_amount),
@@ -870,8 +873,12 @@ async function createTopUpAttempt(
     }
     const active = await trx.selectFrom('payment_attempts').select('id')
       .where('topup_customer_id', '=', customer.id).where('status', 'in', ['created', 'pending', 'reconciliation_required'])
-      .orderBy('created_at', 'desc').orderBy('id', 'desc').executeTakeFirst()
-    if (active) throw new PaymentRouteError(409, 'TOP_UP_IN_PROGRESS', '已有充值尚未确认，请先恢复或核对该记录。')
+      .orderBy('created_at', 'desc').orderBy('id', 'desc').execute()
+    for (const attempt of active) {
+      if (!await expirePaymentAttempt(trx, attempt.id)) {
+        throw new PaymentRouteError(409, 'TOP_UP_IN_PROGRESS', '已有充值尚未确认，请先恢复或核对该记录。')
+      }
+    }
 
     const channel = await trx.selectFrom('payment_channels').selectAll()
       .where('id', '=', body.channelId).forShare().executeTakeFirst()
@@ -995,7 +1002,7 @@ export function registerPaymentRoutes(
     preHandler: [optionalCustomerAuth, customerCsrf],
     config: { rateLimit: { max: 12, timeWindow: '1 minute' } },
     schema: {
-      tags: ['payments'], summary: 'Confirm the provider status for the active payment attempt with a rate-limited server query',
+      tags: ['payments'], summary: 'Confirm the latest unresolved online payment with a rate-limited server query',
       params: PaymentOrderIdParamsSchema,
       response: { 200: ApiSuccessSchemaOf(CustomerOrderPaymentSchema), 401: ApiErrorSchema, 403: ApiErrorSchema, 404: ApiErrorSchema, 409: ApiErrorSchema, 429: ApiErrorSchema, 503: ApiErrorSchema },
     },
@@ -1005,7 +1012,8 @@ export function registerPaymentRoutes(
       const owner = ownerFor(request)
       await db.transaction().execute(async (trx) => { await loadOwnedOrder(trx, params.id, request, owner) })
       const attempt = await db.selectFrom('payment_attempts').select('id')
-        .where('order_id', '=', params.id).where('status', 'in', ['created', 'pending', 'reconciliation_required'])
+        .where('order_id', '=', params.id).where('payment_channel_id', 'is not', null)
+        .where('status', 'in', ['created', 'pending', 'expired', 'reconciliation_required'])
         .orderBy('created_at', 'desc').orderBy('id', 'desc').executeTakeFirst()
       if (attempt) await refreshPaymentAttempt(db, config, provider, attempt.id)
       const view = await buildCustomerPaymentView(db, request, params.id, owner)
@@ -1213,7 +1221,7 @@ export function registerPaymentRoutes(
         state,
         providerStatus: result.kind === 'throttled' ? null : result.providerStatus,
         message: state === 'resolved'
-          ? '服务商最新认证结果与充值凭证一致，充值已按原记录核对。'
+          ? '服务商最新认证结果与充值凭证一致，充值已入账。'
           : state === 'throttled' ? '查单频率受限，请稍后重试。'
             : '最新服务商结果尚不足以解除异常；充值仍未入账，原始证据已保留。',
       }, request.id)
