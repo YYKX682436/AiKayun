@@ -34,6 +34,7 @@ type ApiErrorBody = { error?: { code?: string; message?: string; currentQuote?: 
 type RequestOptions = Parameters<typeof $fetch>[1]
 const customerIdentityLockName = 'aikayun:customer-identity:v1'
 const customerIdentityRevisionKey = 'aikayun-customer-identity-revision-v1'
+const customerPasswordPath = '/api/v1/customer/password'
 
 function statusOf(error: unknown): number {
   return Number((error as { statusCode?: number; response?: { status?: number } } | null)?.statusCode
@@ -105,7 +106,8 @@ export function useCustomerApi() {
   }
 
   function requiresCurrentSessionProbe(path: string): boolean {
-    return path.includes('/api/v1/customer/cart')
+    return path === customerPasswordPath
+      || path.includes('/api/v1/customer/cart')
       || path.startsWith('/api/v1/storefront/purchase-drafts')
       || path.includes('/api/v1/customer/orders')
       || path === '/api/v1/checkout/quote'
@@ -217,18 +219,21 @@ export function useCustomerApi() {
     }
   }
 
-  async function verifyCurrentSession(path: string): Promise<void> {
+  async function verifyCurrentSession(path: string, expectedId = session.value?.customer.id ?? null): Promise<CustomerSession | null | undefined> {
     verifyIdentityRevision(path)
     if (!requiresCurrentSessionProbe(path)) return
     const current = await $fetch<ApiSuccess<CustomerSession | null>>('/api/customer/session')
     const actualId = current.data?.customer.id ?? null
-    const expectedId = session.value?.customer.id ?? null
     if (actualId !== expectedId) {
       const revision = readIdentityRevision()
       invalidateForExternalIdentityChange(revision.ok ? revision.value : identityRevision.value)
-      void refreshSession(true)
-      throw new CustomerApiError(0, 'STALE_IDENTITY', '服务端登录身份已变化，请重新同步购物车。')
+      if (path === customerPasswordPath) commitSession(current.data)
+      else void refreshSession(true)
+      throw new CustomerApiError(0, 'STALE_IDENTITY', path === customerPasswordPath
+        ? '登录状态已变化，请确认当前账户后重试。'
+        : '服务端登录身份已变化，请重新同步购物车。')
     }
+    return current.data
   }
 
   async function withIdentityMutationLock<T>(action: () => Promise<T>): Promise<T> {
@@ -509,10 +514,29 @@ export function useCustomerApi() {
   }
 
   async function changePassword(body: ChangeCustomerPasswordBody): Promise<CustomerPasswordChanged> {
-    const identityAtStart = identityVersion.value
-    const result = await request<CustomerPasswordChanged>('/api/v1/customer/password', { method: 'PUT', body })
-    if (identityAtStart === identityVersion.value && session.value) session.value = { ...session.value, expiresAt: result.expiresAt }
-    return result
+    if (import.meta.client && !navigator.locks) {
+      throw new CustomerApiError(0, 'CROSS_TAB_SYNC_UNAVAILABLE', '当前浏览器不支持安全的跨标签账户同步。')
+    }
+    const expectedId = session.value?.customer.id ?? null
+    authMutationVersion.value += 1
+    authMutationPending.value += 1
+    let stale = false
+    try {
+      return await queueAuthMutation(() => withIdentityMutationLock(async () => {
+        const current = await verifyCurrentSession(customerPasswordPath, expectedId)
+        if (!current) throw new CustomerApiError(0, 'STALE_IDENTITY', '登录状态已变化，请确认当前账户后重试。')
+        const result = await requestDuringIdentityMutation<CustomerPasswordChanged>(customerPasswordPath, { method: 'PUT', body })
+        // A queued mutation cannot change the cookie until this lock is released.
+        commitSession({ ...current, expiresAt: result.expiresAt }, true, true)
+        return result
+      }))
+    } catch (error) {
+      stale = error instanceof CustomerApiError && error.code === 'STALE_IDENTITY'
+      throw error
+    } finally {
+      authMutationPending.value -= 1
+      if (stale && !sessionResolved.value) await refreshSession(true)
+    }
   }
 
   async function getPolicy(): Promise<StorefrontCustomerPolicy> {

@@ -125,6 +125,95 @@ test('customer can register, edit their account, change password, refresh, log i
   expect(runtimeErrors).toEqual([])
 })
 
+for (const first of ['password', 'login'] as const) {
+  test(`password change and account switch serialize when ${first} starts first`, async ({ page, context }) => {
+    const passwordPath = '/api/v1/customer/password'
+    const loginPath = '/api/v1/customer/auth/login'
+    const a = `browser-${randomUUID().slice(0, 8)}`
+    const b = `browser-${randomUUID().slice(0, 8)}`
+    const register = async (username: string) => {
+      await page.goto('/register')
+      await expect(page.locator('[data-customer-register-ready="true"]')).toBeAttached()
+      await page.getByLabel('用户名').fill(username)
+      await page.getByLabel('密码', { exact: true }).fill(initialPassword)
+      await page.getByLabel('确认密码').fill(initialPassword)
+      await page.getByLabel('邮箱').fill(`${username}@example.test`)
+      await page.getByRole('button', { name: '创建账户' }).click()
+      await expect(page).toHaveURL(/\/account$/u)
+      await expect(page.getByRole('link', { name: new RegExp(username) })).toBeVisible()
+    }
+    await register(b)
+    await page.getByRole('button', { name: '退出登录' }).click()
+    await expect(page).toHaveURL('/')
+    await register(a)
+    const loginTab = await context.newPage()
+    if (first === 'login') {
+      // Reproduce a cookie change with no local identity revision to rely on.
+      await loginTab.addInitScript(() => {
+        const revisionKey = 'aikayun-customer-identity-revision-v1'
+        const setItem = Storage.prototype.setItem
+        Storage.prototype.setItem = function (key, value) {
+          if (key !== revisionKey) setItem.call(this, key, value)
+        }
+        const postMessage = BroadcastChannel.prototype.postMessage
+        BroadcastChannel.prototype.postMessage = function (message) {
+          if (this.name !== revisionKey) postMessage.call(this, message)
+        }
+      })
+    }
+    await loginTab.goto('/login')
+    await expect(loginTab.locator('[data-customer-login-ready="true"]')).toBeAttached()
+    await loginTab.getByLabel('用户名').fill(b)
+    await loginTab.locator('input[autocomplete="current-password"]').fill(initialPassword)
+    await page.locator('input[autocomplete="current-password"]').fill(initialPassword)
+    await page.locator('input[autocomplete="new-password"]').nth(0).fill(changedPassword)
+    await page.locator('input[autocomplete="new-password"]').nth(1).fill(changedPassword)
+
+    const responseReady = Promise.withResolvers<number>()
+    const release = Promise.withResolvers<void>()
+    const passwordButton = page.getByRole('button', { name: '更新密码' })
+    const loginButton = loginTab.getByRole('button', { name: '登录', exact: true })
+    const [firstTab, firstPath, firstButton, secondButton] = first === 'password'
+      ? [page, passwordPath, passwordButton, loginButton] : [loginTab, loginPath, loginButton, passwordButton]
+    let passwordRequests = 0
+    let loginRequests = 0
+    page.on('request', request => { if (new URL(request.url()).pathname === passwordPath) passwordRequests++ })
+    loginTab.on('request', request => { if (new URL(request.url()).pathname === loginPath) loginRequests++ })
+    await firstTab.route(`**${firstPath}`, async route => {
+      const response = await route.fetch()
+      responseReady.resolve(response.status())
+      await release.promise
+      await route.fulfill({ response })
+    })
+    try {
+      await firstButton.click()
+      expect(await responseReady.promise).toBe(200)
+      await secondButton.click()
+      await expect.poll(() => page.evaluate(async () => (await navigator.locks.query()).pending?.some(lock =>
+        lock.name === 'aikayun:customer-identity:v1' && lock.mode === 'exclusive'))).toBe(true)
+      expect(first === 'password' ? loginRequests : passwordRequests).toBe(0)
+    } finally {
+      release.resolve()
+    }
+    if (first === 'password') {
+      await expect(page.getByRole('region', { name: '修改密码' }).getByRole('status')).toContainText('密码已更新')
+      expect(passwordRequests).toBe(1)
+    } else {
+      await expect(page.getByRole('region', { name: '修改密码' }).getByRole('alert')).toContainText('登录状态已变化')
+      expect(passwordRequests).toBe(0)
+    }
+    await expect(loginTab).toHaveURL(/\/account$/u)
+    for (const tab of [page, loginTab]) {
+      await expect(tab.getByRole('link', { name: new RegExp(b) })).toBeVisible()
+      await expect(tab.getByRole('main').getByText(b, { exact: true })).toBeVisible()
+      await expect(tab.getByLabel('邮箱')).toHaveValue(`${b}@example.test`)
+    }
+    const browserSession = await page.request.get('/api/v1/customer/session')
+    expect(browserSession.status()).toBe(200)
+    expect((await browserSession.json()).data.customer.username).toBe(b)
+  })
+}
+
 test('administrator updates real customer and guest policy without opening purchase routes', async ({ page }) => {
   const response = await page.goto('/admin/login')
   expect(response?.status()).toBe(200)

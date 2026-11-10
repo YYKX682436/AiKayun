@@ -11,7 +11,10 @@ const { data: profileResponse, error: profileLoadError } = await useFetch<ApiSuc
   '/api/v1/customer/profile',
   { key: profileKey },
 )
-const profile = ref<CustomerProfile | null>(profileResponse.value?.data ?? null)
+const profile = computed(() => {
+  const current = profileResponse.value?.data
+  return current?.id === customerApi.session.value?.customer.id ? current ?? null : null
+})
 const profileError = ref(profileLoadError.value ? '暂时无法读取账户资料，请刷新页面重试。' : '')
 const profileMessage = ref('')
 const passwordError = ref('')
@@ -29,8 +32,10 @@ const profileBusy = ref(false)
 const passwordBusy = ref(false)
 const logoutBusy = ref(false)
 const clientReady = ref(false)
-email.value = profile.value?.email ?? ''
-phone.value = profile.value?.phone ?? ''
+watch(profile, (current) => {
+  email.value = current?.email ?? ''
+  phone.value = current?.phone ?? ''
+}, { immediate: true })
 
 onMounted(() => { clientReady.value = true })
 
@@ -40,13 +45,12 @@ async function saveProfile() {
   profileError.value = ''
   profileMessage.value = ''
   try {
-    profile.value = await customerApi.updateProfile({
+    const updated = await customerApi.updateProfile({
       email: email.value.trim() || null,
       phone: phone.value.trim() || null,
     })
-    if (profileResponse.value) profileResponse.value.data = profile.value
-    email.value = profile.value.email ?? ''
-    phone.value = profile.value.phone ?? ''
+    if (updated.id !== customerApi.session.value?.customer.id) return
+    if (profileResponse.value) profileResponse.value = { ...profileResponse.value, data: updated }
     profileMessage.value = '账户资料已保存。联系方式变更后需要重新验证。'
   } catch (error) {
     profileError.value = error instanceof CustomerApiError ? error.message : '暂时无法保存资料，请稍后重试。'
