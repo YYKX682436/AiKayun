@@ -1,11 +1,11 @@
-# 首轮内测使用交接（2026-11-10）
+# 首轮内测使用交接（2026-11-11）
 
 **当前状态：尚未开放内测。** `https://aikayun.aiove.top` 已在腾讯云 DNSPod 配置 `aikayun` A 记录到 `103.212.187.244`，没有 AAAA 记录；但服务器尚无商城服务监听 80/443，HTTPS 请求连接被拒绝。`https://aikayun.aiove.top/admin/login` 也不能登录。现在不要把网址发给内测用户。
 
 ## 已确认的环境
 
 - 原 MyShop 服务器已可通过本机 `ssh myshop-prod` 登录。系统为 Ubuntu x86_64，Docker/Compose 可用；根分区约 21 GiB、`/data` 盘约 49 GiB 可用，内存 3.8 GiB。Docker 无容器和卷，80/443 无监听，UFW 已放通 80/443。SSH 命令已追加到项目 `AGENTS.md`，私钥仍只在本机 `~/.ssh/`。
-- 商城本机完整代码为 `02f355185fd97934d3541b0481daccb657d64238`，包含 `d7b2bb171f6061a6935fcaf0ca1162945b0b2a8a` 后的五个修复提交；当前本机 `main` 比远端领先 6 个提交。未将远端旧版当作安装版本。
+- 商城当前 `main` 已推送发行策略调整和此前本机审查修复，发行策略提交为 `b7c968413532cf65227604c18130b780716d4090`；部署仍须使用届时通过同一提交 CI 的正式签名版本，不能从远端旧提交或普通源码构建直接安装。
 - 独立授权中心源码在 `/Users/muchen/Documents/ChatGPT/AiKayun-License`，私有仓库为 `https://github.com/YYKX682436/AiKayun-License`。目前未发现生产中心服务、生产签名根、有效生产 Trust Bundle 或已创建的本次许可证；因此没有授权状态或到期时间可交付。现有受控生产管理方式是该仓库 `docs/admin-cli.md` 所述本机 CLI，**没有授权管理网页**，且在生产中心配置完成前不能用它发放本次授权。
 
 ## 上线阻断与下一步
