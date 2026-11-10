@@ -141,9 +141,9 @@ export async function advanceMaintenanceJournal(directory: string, expected: Mai
   return next
 }
 
-/** Retire a verified completed maintenance record without overwriting history.
- * The caller must hold the deployment lock and independently verify the actual
- * deployment and restored service/role states before invoking this function. */
+/** Retire a completed maintenance record under the deployment lock.
+ * Completion records service restoration at the time of maintenance; the
+ * publication record separately determines whether the backup succeeded. */
 export async function archiveCompletedMaintenanceJournal(
   directory: string, expected: MaintenanceJournal, assertLock: () => Promise<void>,
 ): Promise<void> {

@@ -14,6 +14,8 @@ import type { ReadonlyTrustBundleInspection } from '../licensing/trust/trust-bun
 
 type KeyReferences = Awaited<ReturnType<typeof readBackupKeyReferences>>
 type PublicationRecord = { schema: 2; set: string; state: 'uploading' | 'verified'; source_snapshot: string; manifest_snapshot?: string }
+type InspectTrustStore = (directory: string) => Promise<ReadonlyTrustBundleInspection>
+type AuthenticateManifest = (manifest: DirectBackupManifest, sourceSnapshot: string) => Promise<InspectTrustStore | void>
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const digest = /^[a-f0-9]{64}$/
 const setTag = (set: string) => `aikayun-set-${set}`
@@ -153,6 +155,7 @@ async function verifyDirectPair(input: {
   repository: LocalResticRepository; databaseDump: { size: number; sha256: string }; assertLock(): Promise<void>
   inspectTrustStoreReadOnly(directory: string): Promise<ReadonlyTrustBundleInspection>; signal?: AbortSignal
   allowCandidate?: boolean; expectedManifest?: DirectBackupManifest
+  assertAuthenticatedManifest?: AuthenticateManifest
 }): Promise<DirectBackupManifest> {
   await input.assertLock()
   const records = await input.repository.snapshotMetadata(input.set) as unknown
@@ -186,9 +189,10 @@ async function verifyDirectPair(input: {
       parsed.database_dump.size !== input.databaseDump.size || parsed.database_dump.sha256 !== input.databaseDump.sha256 ||
       parsed.status !== 'candidate') throw new Error('BACKUP_SNAPSHOT_PAIR_INVALID')
   if (input.expectedManifest && JSON.stringify(parsed) !== JSON.stringify(input.expectedManifest)) throw new Error('BACKUP_PUBLICATION_CHECK_FAILED')
+  const inspectTrustStore = await input.assertAuthenticatedManifest?.(parsed, input.sourceSnapshot)
   const evidence = await verifyDirectSourceSnapshot({ repo: input.repository, set: input.set, snapshot: input.sourceSnapshot,
     scratch: input.scratchDirectory, databaseDump: parsed.database_dump, database: metadataFor(parsed), keys: keysFor(parsed),
-    appUid: 1000, appGid: 1000, inspectTrustStoreReadOnly: input.inspectTrustStoreReadOnly,
+    appUid: 1000, appGid: 1000, inspectTrustStoreReadOnly: inspectTrustStore ?? input.inspectTrustStoreReadOnly,
     assertLock: input.assertLock, ...(input.signal ? { signal: input.signal } : {}) })
   if (evidence.identityFileSha256 !== parsed.instance_identity_sha256) throw new Error('BACKUP_STATE_IDENTITY_MISMATCH')
   assertTrustBundleManifestMatch(evidence.trustBundle, parsed.trust_bundle)
@@ -262,7 +266,7 @@ export async function verifyDirectPublishedSet(input: {
   backupSetId: string; publicationDirectory: string; manifestDirectory: string; scratchDirectory: string
   repository: LocalResticRepository; assertLock(): Promise<void>; assertSecureStorage(): Promise<void>
   inspectTrustStoreReadOnly(directory: string): Promise<ReadonlyTrustBundleInspection>; signal?: AbortSignal
-  assertAuthenticatedManifest?(manifest: DirectBackupManifest): Promise<void>
+  assertAuthenticatedManifest?: AuthenticateManifest
 }): Promise<{ snapshotId: string; sourceSnapshotId: string; status: 'verified'; manifest: DirectBackupManifest }> {
   await input.assertLock(); await input.assertSecureStorage()
   if (within(input.scratchDirectory, input.manifestDirectory) || within(input.manifestDirectory, input.scratchDirectory) ||
@@ -301,8 +305,8 @@ export async function verifyDirectPublishedSet(input: {
   const manifest = await verifyDirectPair({ set: input.backupSetId, sourceSnapshot: record.source_snapshot, manifestSnapshot: record.manifest_snapshot,
     manifestDirectory: path, scratchDirectory: input.scratchDirectory, repository: input.repository, databaseDump: parsed.database_dump,
     assertLock: input.assertLock, inspectTrustStoreReadOnly: input.inspectTrustStoreReadOnly,
-    ...(input.signal ? { signal: input.signal } : {}), allowCandidate: true })
-  if (input.assertAuthenticatedManifest) await input.assertAuthenticatedManifest(manifest)
+    ...(input.signal ? { signal: input.signal } : {}), allowCandidate: true,
+    ...(input.assertAuthenticatedManifest ? { assertAuthenticatedManifest: input.assertAuthenticatedManifest } : {}) })
   return { snapshotId: record.manifest_snapshot, sourceSnapshotId: record.source_snapshot, status: 'verified', manifest }
 }
 

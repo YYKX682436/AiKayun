@@ -78,6 +78,7 @@ expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" ls --json
 expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" ls --json --recursive "$(printf 'a%.0s' {1..64})" /sources/state
 expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" ls --json --recursive "$(printf 'a%.0s' {1..64})" /sources/caddy-data
 expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" ls --json --recursive "$(printf 'a%.0s' {1..64})" /sources/caddy-config
+expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" ls --json --recursive "$(printf 'a%.0s' {1..64})" /sources/deployment/release
 expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" ls --json "$(printf 'a%.0s' {1..64})" /sources/state/license-pending/license-pending-aes-256-gcm.json
 expect_ok backup_validate_restic_command "${restic_command_prefix[@]}" dump "$(printf 'a%.0s' {1..64})" /sources/state/identity/current/identity.json
 expect_rejected backup_validate_restic_command "${restic_command_prefix[@]}" ls --json "$(printf 'a%.0s' {1..64})" /sources/state/private/customer.bin
@@ -320,6 +321,82 @@ chmod 0600 "$pin_root/restores/$unsafe_run/foreign.txt"
 expect_rejected backup_cleanup_isolated_restore "$unsafe_run"
 [[ -f "$pin_root/restores/$unsafe_run/foreign.txt" ]]
 unset -f backup_docker backup_docker_quick
+
+# Drive the broker's restore invocation with a different verified release.
+# Model Docker's inspect responses separately, including one deliberately
+# wrong container image, so success cannot come from just passing env values.
+(
+  old_release="$pin_root/historical-release"
+  mkdir -p "$old_release"
+  cp "$root/scripts/release/compose.restore-isolated.yaml" "$old_release/"
+  chmod 0644 "$old_release/compose.restore-isolated.yaml"
+  old_api="${SELECTED_API_IMAGE%@*}@sha256:$(printf '1%.0s' {1..64})"
+  old_web="${SELECTED_WEB_IMAGE%@*}@sha256:$(printf '2%.0s' {1..64})"
+  old_postgres="${SELECTED_POSTGRES_IMAGE%@*}@sha256:$(printf '3%.0s' {1..64})"
+  old_caddy="${SELECTED_CADDY_IMAGE%@*}@sha256:$(printf '4%.0s' {1..64})"
+  old_restic="${SELECTED_BACKUP_RESTIC_IMAGE%@*}@sha256:$(printf '5%.0s' {1..64})"
+  mkdir -m 0700 -p "$pin_root/restores/$clean_run"
+  stat() {
+    if [[ "$2" == '%u:%g:%a' ]]; then printf '0:0:700\n'
+    elif [[ -d "$3" ]]; then printf '0:0:700:2\n'
+    else printf '0:0:644:1\n'; fi
+  }
+  backup_restore_create_volumes() { return 0; }
+  backup_restore_assert_volume() { return 0; }
+  backup_restore_assert_network() { return 0; }
+  backup_restore_assert_one_network() { return 0; }
+  mapfile -t services_under_test < <(backup_restore_expected_services)
+  drill_project="$(backup_restore_project_name "$clean_run")"
+  drill_network="${drill_project}_restore"
+  finished=false
+  wrong_image=false
+  backup_docker_compose() {
+    [[ "$2" == "$drill_project" && "$4" == "$old_release/compose.restore-isolated.yaml" ]] || return 1
+    if [[ "$7" == config ]]; then
+      grep -Fxq 'AIKAYUN_RESTORE_RELEASE_ID=aikayun-older' "$6" &&
+        grep -Fxq "AIKAYUN_API_IMAGE=$old_api" "$6" &&
+        grep -Fxq "AIKAYUN_POSTGRES_IMAGE=$old_postgres" "$6" &&
+        grep -Fxq "AIKAYUN_BACKUP_RESTIC_IMAGE=$old_restic" "$6" || return 1
+    fi
+    if [[ "${*: -1}" == validate ]]; then
+      printf '{"operation":"restore-validation","status":"verified","runId":"%s","backupSetId":"%s","sourceSnapshotId":"%s","manifestSnapshotId":"%s","schemaHead":"fixture"}\n' \
+        "$clean_run" "$set_id" "$restore_source_id" "$restore_manifest_id"
+    elif [[ "$7" == stop ]]; then finished=true; fi
+  }
+  backup_docker_quick() {
+    local number=0 service format image net
+    case "$1" in
+      volume) return 1 ;;
+      network) [[ "$2" == ls ]]; return ;;
+      ps)
+        case "${*: -1}" in
+          *service=validate) for service in "${services_under_test[@]}"; do ((number+=1)); [[ "$service" != validate ]] || printf '%064d\n' "$number"; done ;;
+          *service=db) for service in "${services_under_test[@]}"; do ((number+=1)); [[ "$service" != db ]] || printf '%064d\n' "$number"; done ;;
+          *) if "$finished"; then for service in "${services_under_test[@]}"; do ((number+=1)); printf '%064d\n' "$number"; done; fi ;;
+        esac ;;
+      inspect)
+        format="$5"; number=$((10#$6)); service="${services_under_test[number-1]}"
+        case "$service" in
+          validate) image="$old_api"; net="$drill_network" ;;
+          db|restore-database|restore-readonly-role) image="$old_postgres"; net="$drill_network" ;;
+          restore-source|restore-manifest) image="$old_restic"; net=none ;;
+          *) image="$old_postgres"; net=none ;;
+        esac
+        if "$wrong_image" && [[ "$service" == db ]]; then image="$SELECTED_POSTGRES_IMAGE"; fi
+        case "$format" in
+          *Config.User*) printf '%s|1000:1000|/nodejs/bin/node|["/app/dist/backup/isolated-restore-cli.js"]|%s|true|["ALL"]|%s|validate|%s' "$image" "$net" "$drill_project" "$clean_run" ;;
+          '{{.State.Status}}') printf exited ;;
+          '{{json .HostConfig.PortBindings}}') printf null ;;
+          *) printf '%s|%s|%s|%s|%s|exited|null' "$clean_run" "$drill_project" "$service" "$image" "$net" ;;
+        esac ;;
+      *) return 1 ;;
+    esac
+  }
+  expect_ok backup_restore_run_compose "$clean_run" "$set_id" "$restore_source_id" "$restore_manifest_id" \
+    "$old_release" aikayun-older "$old_api" "$old_web" "$old_postgres" "$old_caddy" "$old_restic"
+  wrong_image=true
+  expect_rejected backup_restore_assert_finished_project "$clean_run" "$drill_project" "$old_api" "$old_postgres" "$old_restic"
+)
 
 # A PostgreSQL dump lock heartbeat can arrive while Restic is streaming. The
 # broker must answer that bounded RPC without cancelling or consuming the

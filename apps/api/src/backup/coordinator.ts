@@ -32,8 +32,11 @@ export async function recoverMaintenance(directory: string, adapter: QuiesceAdap
   await adapter.assertLock()
   let journal = await readMaintenanceJournal(directory)
   if (!journal) throw new Error('Maintenance journal is missing')
+  if (journal.phase === 'complete') {
+    await archiveCompletedMaintenanceJournal(directory, journal, () => adapter.assertLock())
+    return
+  }
   await adapter.assertDeployment(journal.deployment)
-  if (journal.phase === 'complete') { await assertOriginal(journal, adapter); return }
   await adapter.assertRestorationSafe()
   // Inspect every original identity before any restoration. Original stopped
   // containers or NOLOGIN roles may not have become enabled independently.
@@ -112,9 +115,6 @@ export async function quiesceAndCapture<T, R>(directory: string, snapshot: Snaps
   await adapter.assertDeployment(snapshot.deployment)
   const previous = await readMaintenanceJournal(directory)
   if (previous?.phase === 'complete') {
-    await adapter.assertDeployment(previous.deployment)
-    if (previous.deployment !== snapshot.deployment) throw new Error('Previous maintenance deployment changed')
-    await assertOriginal(previous, adapter)
     await archiveCompletedMaintenanceJournal(directory, previous, () => adapter.assertLock())
   }
   let journal = await createMaintenanceJournal(directory, snapshot)
@@ -162,5 +162,7 @@ export async function quiesceAndCapture<T, R>(directory: string, snapshot: Snaps
       completed.deployment !== snapshot.deployment) throw new Error('Maintenance completion uncertain')
   await assertOriginal(completed, adapter)
   await adapter.assertLock()
-  return publish(staged, completed)
+  const result = await publish(staged, completed)
+  await archiveCompletedMaintenanceJournal(directory, completed, () => adapter.assertLock())
+  return result
 }

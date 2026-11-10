@@ -1,6 +1,6 @@
 import type { DockerPgFenceConfiguration } from './docker-pg-fence.js'
 import { recoverMaintenance, type QuiesceAdapter } from './coordinator.js'
-import { readMaintenanceJournal } from './journal.js'
+import { archiveCompletedMaintenanceJournal, readMaintenanceJournal } from './journal.js'
 
 /** Internal only: proves exact recorded container identities and absence of
  * detached backup helpers before restoring their original running/login state.
@@ -11,7 +11,12 @@ export async function recoverValidatedMaintenance(input: {
 }) {
   await input.adapter.assertLock()
   const journal = await readMaintenanceJournal(input.journalDirectory)
-  if (!journal || journal.deployment !== input.deployment) throw new Error('BACKUP_MAINTENANCE_UNVERIFIED')
+  if (!journal) throw new Error('BACKUP_MAINTENANCE_UNVERIFIED')
+  if (journal.phase === 'complete') {
+    await archiveCompletedMaintenanceJournal(input.journalDirectory, journal, () => input.adapter.assertLock())
+    return { backupSetId: journal.backupSetId, state: 'restoration_recorded' as const }
+  }
+  if (journal.deployment !== input.deployment) throw new Error('BACKUP_MAINTENANCE_UNVERIFIED')
   await input.adapter.assertDeployment(input.deployment)
   const recorded = journal.services.map(item => `${item.name}:${item.containerId}`).sort()
   const actual = input.managed.map(item => `${item.service}:${item.id}`).sort()

@@ -47,6 +47,19 @@ describe('maintenance-only recovery', () => {
     await expect(recoverValidatedMaintenance(input())).rejects.toThrow('unidentified helper')
     expect(services.get(api)).toBe('stopped'); expect(roles.get('aikayun_app')).toBe(false)
   })
+  it('archives a completed journal without inspecting the replaced deployment or containers', async () => {
+    const journal = await stoppedJournal()
+    const restoring = await advanceMaintenanceJournal(directory, journal, 'restoring')
+    await advanceMaintenanceJournal(directory, restoring, 'complete')
+    const checkDeployment = vi.spyOn(adapter, 'assertDeployment')
+    const checkContainer = vi.spyOn(adapter, 'containerState')
+    await expect(recoverValidatedMaintenance({ ...input(), deployment: 'd'.repeat(64), managed: [] }))
+      .resolves.toEqual({ backupSetId: journal.backupSetId, state: 'restoration_recorded' })
+    expect(await readMaintenanceJournal(directory)).toBeNull()
+    expect(checkDeployment).not.toHaveBeenCalled()
+    expect(checkContainer).not.toHaveBeenCalled()
+    expect(helpers).not.toHaveBeenCalled()
+  })
   it('refuses prepared or partially stopped states that cannot arise from the recorded order', async () => {
     const record = await createMaintenanceJournal(directory, { deployment: fingerprint, backupSetId: randomUUID(),
       services: [{ name: 'api', containerId: api, running: true }, { name: 'web', containerId: web, running: true }],

@@ -607,9 +607,14 @@ describe.skipIf(!fixture)('real PostgreSQL 18 direct source capture and paired R
     expect(restoredDigests).toEqual(rowDigests)
     const containers = (await docker(['ps', '-aq', '--filter', `label=com.docker.compose.project=${restoreProject}`])).split('\n').filter(Boolean)
     expect(containers).toHaveLength(8)
+    const restoreImages = [apiImage, process.env.AIKAYUN_FIXTURE_POSTGRES_IMAGE!, resticRuntimeImage]
+    const imageIds = await Promise.all(restoreImages.map(ref => docker(['image', 'inspect', '--format', '{{.Id}}', ref])))
     for (const id of containers) {
-      const details = await docker(['inspect', '--format', '{{index .Config.Labels "com.docker.compose.service"}}|{{.State.Status}}|{{json .HostConfig.PortBindings}}', id])
-      const [service, state, portBindings] = details.split('|')
+      const details = await docker(['inspect', '--format', '{{index .Config.Labels "com.docker.compose.service"}}|{{.State.Status}}|{{json .HostConfig.PortBindings}}|{{.Config.Image}}|{{.Image}}', id])
+      const [service, state, portBindings, reference, imageId] = details.split('|')
+      const expected = service === 'validate' ? 0 : service === 'restore-source' || service === 'restore-manifest' ? 2 : 1
+      expect(reference).toBe(restoreImages[expected])
+      expect(imageId).toBe(imageIds[expected])
       expect(state).toBe(service === 'db' ? 'running' : 'exited')
       expect(portBindings === 'null' || portBindings === '{}').toBe(true)
     }

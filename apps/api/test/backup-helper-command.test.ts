@@ -34,7 +34,7 @@ describe('internal helper command protocol', () => {
       authorization: 'unknown', disk: 'unknown', externalReconciliation: 'required', blockingReason: 'target-identity-unverified',
       readiness: 'blocked', automaticRestore: 'blocked' })
     expect(JSON.stringify(report)).not.toContain('marker')
-    expect(mocked.inspect).toHaveBeenCalledWith({ mode: 'restore-isolated', set }, signal)
+    expect(mocked.inspect).toHaveBeenCalledWith({ mode: 'restore-plan', set }, signal)
   })
   it.each([
     ['source database unavailable', 'BACKUP_DATABASE_TARGET_UNVERIFIED'],

@@ -239,6 +239,21 @@ node_target() {
     --entrypoint node "$NODE_IMAGE" -e "$1" "${@:2}"
 }
 
+verify_local_release_cosign() {
+  docker run --rm --mount "type=bind,source=$1,target=/release,readonly" --entrypoint cosign "$COSIGN_IMAGE" \
+    verify-blob --bundle /release/release-manifest.cosign.bundle \
+    --certificate-identity "$RELEASE_CERT_IDENTITY" --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
+    /release/release-manifest.json >/dev/null
+}
+
+# Only use the artifact verifier and JWS root after installer-owned checks
+# authenticate their bytes against the Cosign-authenticated manifest.
+verify_authenticated_release_jws() {
+  docker run --rm --mount "type=bind,source=$1,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
+    /release/release-verifier.mjs /release/release-manifest.json /release/release-manifest.jws \
+    /release/release-signing-root.jwk.json >/dev/null
+}
+
 verify_release_artifacts_with_installer() {
   local directory="$1"
   docker run --rm --mount "type=bind,source=$directory,target=/release,readonly" \
@@ -514,15 +529,10 @@ saved_bundle_verify() {
   ')" || fail 'The persisted install-state record is invalid; automatic initialization is stopped.'
   MANIFEST_SHA256="$(sha256sum "$RELEASE_DIR/release-manifest.json" | awk '{print $1}')"
   [[ "$MANIFEST_SHA256" == "$recorded_sha" ]] || fail 'The stored release manifest differs from the recorded verified digest.'
-  docker run --rm --mount "type=bind,source=$RELEASE_DIR,target=/release,readonly" --entrypoint cosign "$COSIGN_IMAGE" \
-    verify-blob --bundle /release/release-manifest.cosign.bundle \
-    --certificate-identity "$RELEASE_CERT_IDENTITY" --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
-    /release/release-manifest.json >/dev/null || fail 'The stored release manifest Cosign signature is invalid.'
+  verify_local_release_cosign "$RELEASE_DIR" || fail 'The stored release manifest Cosign signature is invalid.'
   verify_release_artifacts_with_installer "$RELEASE_DIR" || \
     fail 'Installer-owned verification rejected a stored release artifact before any downloaded verifier could run.'
-  docker run --rm --mount "type=bind,source=$RELEASE_DIR,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
-    /release/release-verifier.mjs /release/release-manifest.json /release/release-manifest.jws \
-    /release/release-signing-root.jwk.json >/dev/null || fail 'The stored release JWS signature is invalid.'
+  verify_authenticated_release_jws "$RELEASE_DIR" || fail 'The stored release JWS signature is invalid.'
   docker run --rm --mount "type=bind,source=$RELEASE_DIR,target=/release,readonly" --entrypoint node "$NODE_IMAGE" \
     /release/verify-artifacts.mjs /release/release-manifest.json /release >/dev/null || fail 'A stored release artifact failed SHA-256 verification.'
   SELECTED_VERSION="$(state_value version)"

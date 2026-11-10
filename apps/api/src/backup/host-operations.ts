@@ -170,13 +170,25 @@ function responsePromise(request: Pending): Promise<string | number> {
   return new Promise((resolve, reject) => { request.resolve = resolve; request.reject = reject })
 }
 
-export async function hostOperation(action: 'assert-lock' | 'verify-deployment', value?: string): Promise<void> {
-  if (action === 'verify-deployment' && (!value || !/^[a-f0-9]{64}$/.test(value))) throw new Error('BACKUP_HOST_ARGUMENT_INVALID')
+async function requestHostOperation(action: string, args: string[]): Promise<string | number> {
   const request = makePending('result', 4096)
   const pending = responsePromise(request)
-  await send(['REQ', String(request.id), action, ...(value ? [encode(value)] : [])])
-  const result = await pending
+  await send(['REQ', String(request.id), action, ...args.map(encode)])
+  return pending
+}
+
+export async function hostOperation(action: 'assert-lock' | 'verify-deployment', value?: string): Promise<void> {
+  if (action === 'verify-deployment' && (!value || !/^[a-f0-9]{64}$/.test(value))) throw new Error('BACKUP_HOST_ARGUMENT_INVALID')
+  const result = await requestHostOperation(action, value ? [value] : [])
   if (result !== '') throw new Error('BACKUP_HOST_PROTOCOL_INVALID')
+}
+
+export async function verifyHostBackupRelease(sourceSnapshot: string, manifest: import('./manifest.js').DirectBackupManifest): Promise<unknown> {
+  const result = await requestHostOperation('verify-backup-release', [sourceSnapshot, manifest.release_id,
+    manifest.images.api, manifest.images.web, manifest.images.postgres, manifest.images.caddy,
+    manifest.database.schema_head, manifest.database.migration_checksums_sha256])
+  if (typeof result !== 'string') throw new Error('BACKUP_HOST_PROTOCOL_INVALID')
+  return JSON.parse(result) as unknown
 }
 
 export async function hostDockerExec(args: string[], options: { maxBuffer?: number; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<string> {

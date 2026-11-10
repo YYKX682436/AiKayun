@@ -7,7 +7,6 @@ import { UnsafeMaintenanceRecoveryError } from './maintenance-errors.js'
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const digest = /^[a-f0-9]{64}$/
 export type HelperCommand = { mode: 'create' } | { mode: 'recover-maintenance' } | { mode: 'initialize-repository' } |
-  { mode: 'restore-plan'; set: string } |
   { mode: 'restore-prepare'; set: string } | FixedInspectionCommand
 
 /** No paths, credentials, endpoints, executable names or environment flags are accepted. */
@@ -55,7 +54,7 @@ export async function runInternalHelper(command: HelperCommand, signal: AbortSig
     if (signal.aborted || !uuid.test(result.backupSetId) || result.state !== 'restoration_recorded') throw new Error('BACKUP_COMMAND_INCOMPLETE')
     return { operation: 'recover-maintenance' as const, backupSetId: result.backupSetId, state: 'restoration_recorded' as const }
   }
-  const inspection = command.mode === 'restore-prepare' || command.mode === 'restore-plan'
+  const inspection = command.mode === 'restore-prepare'
     ? { mode: 'restore-isolated' as const, set: command.set }
     : command
   let result: Awaited<ReturnType<typeof runFixedProductionInspection>>

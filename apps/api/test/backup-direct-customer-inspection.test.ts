@@ -26,7 +26,7 @@ describe('direct backup pair listing', () => {
       manifestDirectory: (value: string) => join(root, 'staging', value),
       inspectTrustStoreReadOnly: async () => ({ status: 'uninitialized' as const, bundleVersion: null, artifactSha256: null, stateDigest: null,
         revokedKeyCount: 0, retiredKeyCount: 0 }),
-      assertBackupRelease: async () => {}, assertBackupMetadata: async () => {} }
+      assertAuthenticatedManifest: async () => {} }
     const result = await listDirectCustomerBackups(config, { limit: 10 })
     expect(result.items).toEqual([{ backupSetId: set, status: 'not_checked' }])
     expect(result.untrackedSnapshots).toBe(0)
@@ -45,7 +45,7 @@ describe('direct backup pair listing', () => {
     const result = await listDirectCustomerBackups({ publicationDirectory, scratchDirectory, repository, assertLock: async () => {},
       manifestDirectory: value => join(root, 'staging', value), assertSecureStorage: async () => {}, inspectTrustStoreReadOnly: async () => ({
         status: 'uninitialized', bundleVersion: null, artifactSha256: null, stateDigest: null, revokedKeyCount: 0, retiredKeyCount: 0 }),
-      assertBackupRelease: async () => {}, assertBackupMetadata: async () => {} }, { limit: 10 })
+      assertAuthenticatedManifest: async () => {} }, { limit: 10 })
     expect(result.items).toEqual([{ backupSetId: set, status: 'needs_attention' }])
     expect(result.untrackedSnapshots).toBe(1)
   })
@@ -60,7 +60,7 @@ describe('direct backup pair listing', () => {
     await expect(listDirectCustomerBackups({ publicationDirectory, scratchDirectory, repository, assertLock: async () => {},
       manifestDirectory: value => join(root, 'staging', value), assertSecureStorage: async () => {},
       inspectTrustStoreReadOnly: async () => ({ status: 'uninitialized' as const, bundleVersion: null, artifactSha256: null,
-        stateDigest: null, revokedKeyCount: 0, retiredKeyCount: 0 }), assertBackupRelease: async () => {}, assertBackupMetadata: async () => {} },
+        stateDigest: null, revokedKeyCount: 0, retiredKeyCount: 0 }), assertAuthenticatedManifest: async () => {} },
     { limit: 10 })).rejects.toThrow('RESTIC_SNAPSHOTS_FAILED')
   })
 })

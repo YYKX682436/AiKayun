@@ -4,7 +4,6 @@ import { isAbsolute, resolve } from 'node:path'
 import { UnsafeMaintenanceRecoveryError } from './maintenance-errors.js'
 import { readDirectPublicationRecord, verifyDirectPublishedSet } from './direct-publish-set.js'
 import { LocalResticRepository, privateDirectory } from './restic-local.js'
-import type { DirectBackupManifest, BackupManifest } from './manifest.js'
 import type { ReadonlyTrustBundleInspection } from '../licensing/trust/trust-bundle-store.js'
 
 const setPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
@@ -33,8 +32,7 @@ export interface DirectCustomerBackupInspectionConfig {
   assertSecureStorage(): Promise<void>
   assertLock(): Promise<void>
   inspectTrustStoreReadOnly(directory: string): Promise<ReadonlyTrustBundleInspection>
-  assertBackupRelease(releaseId: string, images: BackupManifest['images']): Promise<void>
-  assertBackupMetadata(manifest: DirectBackupManifest): Promise<void>
+  assertAuthenticatedManifest: NonNullable<Parameters<typeof verifyDirectPublishedSet>[0]['assertAuthenticatedManifest']>
   signal?: AbortSignal
 }
 
@@ -51,7 +49,7 @@ export type DirectCustomerBackupStatus = {
 export async function inspectDirectCustomerBackup(config: DirectCustomerBackupInspectionConfig, set: string,
   includeRestoreEvidence = false): Promise<DirectCustomerBackupStatus> {
   if (!setPattern.test(set) || typeof config.manifestDirectory !== 'function' || typeof config.assertLock !== 'function' ||
-      typeof config.assertSecureStorage !== 'function' || typeof config.assertBackupRelease !== 'function' || typeof config.assertBackupMetadata !== 'function') {
+      typeof config.assertSecureStorage !== 'function' || typeof config.assertAuthenticatedManifest !== 'function') {
     throw new Error('BACKUP_INSPECTION_ARGUMENT_INVALID')
   }
   try {
@@ -60,10 +58,7 @@ export async function inspectDirectCustomerBackup(config: DirectCustomerBackupIn
       manifestDirectory: config.manifestDirectory(set), scratchDirectory: config.scratchDirectory,
       repository: config.repository, assertLock: config.assertLock, assertSecureStorage: config.assertSecureStorage,
       inspectTrustStoreReadOnly: config.inspectTrustStoreReadOnly, ...(config.signal ? { signal: config.signal } : {}),
-      async assertAuthenticatedManifest(manifest) {
-        await config.assertBackupRelease(manifest.release_id, manifest.images)
-        await config.assertBackupMetadata(manifest)
-      } })
+      assertAuthenticatedManifest: config.assertAuthenticatedManifest })
     await config.assertLock()
     if (result.status !== 'verified' || result.manifest.backup_set_id !== set) {
       return { backupSetId: set, status: 'needs_attention', createdAt: null, releaseId: null }

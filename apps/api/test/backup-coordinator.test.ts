@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, realpath, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createMaintenanceJournal, advanceMaintenanceJournal, readMaintenanceJournal } from '../src/backup/journal.js'
@@ -54,7 +54,8 @@ describe('backup writer coordinator with simulated adapter', () => {
     })
     expect(result).toBe('fixture result')
     expect(f.events).toEqual(['stop', 'aikayun_app:false', 'check-writers', 'check-writers', 'aikayun_app:true', 'start'])
-    expect((await readMaintenanceJournal(directory))?.phase).toBe('complete')
+    expect(await readMaintenanceJournal(directory)).toBeNull()
+    expect(JSON.parse(await readFile(join(directory, `backup-maintenance-${f.input.backupSetId}.complete.json`), 'utf8'))).toMatchObject({ phase: 'complete' })
     expect(f.containers.get('c'.repeat(64))).toBe('stopped')
     expect(f.roles.get('aikayun_migrator')).toBe(false)
   })
@@ -140,19 +141,30 @@ describe('backup writer coordinator with simulated adapter', () => {
     expect(f.events).not.toContain('start')
     expect(f.events).not.toContain('aikayun_app:true')
   })
-  it('archives only a verified completed maintenance record before a second backup', async () => {
+  it('uses a fresh snapshot after a successful backup and same-version container rebuild', async () => {
     const f = fixture()
     await quiesceAndCapture(directory, f.input, f.adapter, async () => 'first')
+    f.containers.delete(f.input.services[0]!.containerId)
+    const rebuilt = 'd'.repeat(64)
+    f.containers.set(rebuilt, 'running')
+    const second = { ...f.input, backupSetId: randomUUID(), services: [{ name: 'api', containerId: rebuilt, running: true }] }
+    expect(await quiesceAndCapture(directory, second, f.adapter, async () => 'second')).toBe('second')
+    expect(f.containers.get(rebuilt)).toBe('running')
+    expect(await readMaintenanceJournal(directory)).toBeNull()
+  })
+  it('leaves publication failures failed and retires their completed maintenance after a deployment change', async () => {
+    const f = fixture()
+    await expect(captureAndPublish(directory, f.input, f.adapter, async () => 'staged', async () => {
+      throw new Error('publication failed')
+    })).rejects.toThrow('publication failed')
     const completed = await readMaintenanceJournal(directory)
     expect(completed?.phase).toBe('complete')
-    f.containers.set('b'.repeat(64), 'stopped')
-    await expect(quiesceAndCapture(directory, { ...f.input, backupSetId: randomUUID() }, f.adapter, async () => 'unsafe'))
-      .rejects.toThrow('Original container state changed')
-    expect(await readMaintenanceJournal(directory)).toEqual(completed)
-    f.containers.set('b'.repeat(64), 'running')
-    const second = randomUUID()
-    expect(await quiesceAndCapture(directory, { ...f.input, backupSetId: second }, f.adapter, async () => 'second')).toBe('second')
-    expect((await readMaintenanceJournal(directory))?.backupSetId).toBe(second)
+    const next = fixture()
+    const deployment = 'e'.repeat(64)
+    next.adapter.assertDeployment = async expected => { expect(expected).toBe(deployment) }
+    expect(await quiesceAndCapture(directory, { ...next.input, deployment }, next.adapter, async () => 'new release')).toBe('new release')
+    expect(JSON.parse(await readFile(join(directory, `backup-maintenance-${f.input.backupSetId}.complete.json`), 'utf8'))).toEqual(completed)
+    expect(await readMaintenanceJournal(directory)).toBeNull()
   })
   it('publishes only after the writer fence, restoration and complete journal verification', async () => {
     const f = fixture()
