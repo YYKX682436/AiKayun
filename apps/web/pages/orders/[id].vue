@@ -20,6 +20,7 @@ const refundError = ref('')
 const confirmCancel = ref(false)
 const errorMessage = ref('')
 const mounted = ref(false)
+const paymentWindowEnded = ref(false)
 const selectedChannelId = ref('')
 const selectedPaymentMethod = ref<ExternalPaymentMethod>('alipay')
 const selectedPaymentMode = ref<'external' | 'wallet' | 'hybrid'>('external')
@@ -44,8 +45,9 @@ const canCancel = computed(() => order.value?.status === 'pending_payment' && !h
 const automaticDeliveryPending = computed(() => order.value?.items.some(item =>
   ['code_pool', 'fixed_content', 'link', 'file', 'api'].includes(item.fulfillmentMethod) && item.fulfilledQuantity < item.quantity) ?? false)
 const selectedChannel = computed(() => payment.value?.channels.find(channel => channel.id === selectedChannelId.value) ?? null)
-const qrAction = computed(() => payment.value?.attempt?.action?.type === 'qr_code'
-  ? payment.value.attempt.action.value
+const paymentAction = computed(() => paymentWindowEnded.value ? null : payment.value?.attempt?.action)
+const qrAction = computed(() => paymentAction.value?.type === 'qr_code'
+  ? paymentAction.value.value
   : '')
 
 const refundStatusNames: Record<CustomerOrderRefunds['refundStatus'], string> = {
@@ -406,10 +408,11 @@ async function refreshPayment() {
   const orderAtStart = orderId.value
   const identityAtStart = customerApi.identityVersion.value
   try {
-    payment.value = await customerApi.request<CustomerOrderPayment>(`/api/v1/orders/${orderAtStart}/payment/refresh`, {
+    const result = await customerApi.request<CustomerOrderPayment>(`/api/v1/orders/${orderAtStart}/payment/refresh`, {
       method: 'POST',
     })
     if (orderAtStart !== orderId.value || identityAtStart !== customerApi.identityVersion.value) return
+    payment.value = result
     await loadOrder()
   } catch (error) {
     if (orderAtStart !== orderId.value || identityAtStart !== customerApi.identityVersion.value) return
@@ -418,6 +421,17 @@ async function refreshPayment() {
     refreshingPayment.value = false
   }
 }
+
+watch([mounted, orderId, () => payment.value?.attempt?.id, () => payment.value?.attempt?.expiresAt],
+  ([isMounted, , , expiresAt], _, onCleanup) => {
+    if (!isMounted) return
+    const remaining = expiresAt ? Date.parse(expiresAt) - Date.now() : 0
+    paymentWindowEnded.value = Boolean(expiresAt && remaining <= 0)
+    if (remaining > 0) {
+      const timer = window.setTimeout(() => { paymentWindowEnded.value = true }, remaining)
+      onCleanup(() => window.clearTimeout(timer))
+    }
+  }, { immediate: true })
 
 watch(qrAction, async (value) => {
   const currentSequence = ++qrSequence
@@ -605,7 +619,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
           </div>
 
           <UAlert
-            v-if="order.status === 'pending_payment' && order.totalAmount !== '0.00'"
+            v-if="order.status === 'pending_payment' && order.totalAmount !== '0.00' && !(hasActiveAttempt && paymentWindowEnded)"
             color="warning"
             variant="subtle"
             icon="i-lucide-clock-3"
@@ -725,6 +739,17 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
             description="系统已保留服务商凭证，订单不会自动进入履约。请联系商家核对实际收款。"
           />
 
+          <UAlert
+            v-else-if="hasActiveAttempt && paymentWindowEnded"
+            class="mt-4"
+            color="warning"
+            variant="subtle"
+            icon="i-lucide-clock-3"
+            title="本次付款窗口已结束"
+            description="如果已付款，请刷新支付状态核实到账结果。"
+            role="status"
+          />
+
           <template v-else-if="hasActiveAttempt && payment.attempt">
             <div class="mt-4 rounded-xl border border-default p-4">
               <div class="flex flex-wrap items-start justify-between gap-3">
@@ -755,7 +780,7 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
               </div>
 
               <figure
-                v-if="payment.attempt.action?.type === 'qr_code' && qrDataUrl"
+                v-if="qrAction && qrDataUrl"
                 class="mx-auto mt-4 grid w-full max-w-64 justify-items-center gap-2 rounded-xl border border-default bg-default p-4"
               >
                 <img
@@ -777,8 +802,8 @@ watch(() => selectedChannel.value?.paymentMethods, (methods) => {
                 {{ qrError }}
               </p>
               <a
-                v-if="payment.attempt.action?.type === 'redirect'"
-                :href="payment.attempt.action.url"
+                v-if="paymentAction?.type === 'redirect'"
+                :href="paymentAction.url"
                 target="_blank"
                 rel="noopener noreferrer"
                 class="mt-4 inline-flex min-h-11 items-center justify-center rounded-lg bg-primary px-4 py-2 text-sm font-medium text-inverted hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"

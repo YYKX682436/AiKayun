@@ -95,6 +95,7 @@ async function noHorizontalOverflow(page: Page, width: number): Promise<void> {
 test('creates a channel in the admin UI and confirms real payment evidence in a customer order', async ({ page }) => {
   test.setTimeout(180_000)
   page.setDefaultTimeout(10_000)
+  await page.clock.install()
   const unique = randomUUID().slice(0, 8)
   const channelName = `浏览器支付通道-${unique}`
   const productName = `浏览器在线支付-${unique}`
@@ -157,6 +158,40 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     for (const width of [320, 390, 768, 1440]) await noHorizontalOverflow(page, width)
     await page.setViewportSize({ width: 1280, height: 900 })
 
+    const paymentPath = `/api/v1/orders/${orderId}/payment`
+    const attempt = (await (await page.request.get(paymentPath)).json()).data.attempt
+    expect(attempt.status).toBe('pending')
+    const expiresAt = Date.parse(attempt.expiresAt)
+    const paymentQr = page.getByAltText('本次订单的支付二维码')
+    const paymentLink = page.getByRole('link', { name: '打开支付页面' })
+    const checkPayment = page.getByRole('button', { name: '刷新支付状态' })
+    const expectWindowToEnd = async () => {
+      await expect(page.getByText('待支付', { exact: true })).toBeVisible()
+      const remaining = expiresAt - await page.evaluate(() => Date.now())
+      expect(remaining).toBeGreaterThan(0)
+      await page.clock.fastForward(remaining + 1)
+      await expect(page.getByRole('status').filter({ hasText: '本次付款窗口已结束' })).toBeVisible()
+      await expect(paymentQr).toHaveCount(0)
+      await expect(paymentLink).toHaveCount(0)
+      await expect(page.getByText('待支付', { exact: true })).toHaveCount(0)
+      await expect(checkPayment).toBeEnabled()
+    }
+    await expectWindowToEnd()
+
+    // Use the same pending server attempt to exercise the other payment action.
+    const paymentUrl = new URL(paymentPath, page.url()).href
+    await page.route(paymentUrl, async (route) => {
+      const response = await route.fetch()
+      const json = await response.json()
+      json.data.attempt.action = { type: 'redirect', url: attempt.action.value }
+      await route.fulfill({ response, json })
+    })
+    await page.clock.setSystemTime(Date.now())
+    await page.reload()
+    await expect(paymentLink).toBeVisible()
+    await expectWindowToEnd()
+    await page.unroute(paymentUrl)
+
     const fixturePort = process.env.ZPAY_FIXTURE_PORT ?? '3099'
     const fixtureBaseUrl = `http://127.0.0.1:${fixturePort}`
     const fixtureOrdersResponse = await page.request.get(`${fixtureBaseUrl}/__fixture/orders`)
@@ -173,9 +208,13 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     expect(callbackResponse.status()).toBe(200)
     expect(await callbackResponse.text()).toBe('success')
 
-    await page.getByRole('button', { name: '刷新支付状态' }).click()
+    const checkedPayment = page.waitForResponse(response => response.url().endsWith(`${paymentPath}/refresh`)
+      && response.request().method() === 'POST')
+    await checkPayment.click()
+    expect((await checkedPayment).status()).toBe(200)
     await expect(page.getByText('服务端已确认付款').first()).toBeVisible()
     await expect(page.getByText('等待商家交付').first()).toBeVisible()
+    await page.clock.setSystemTime(Date.now())
 
     await page.goto(`/admin/orders/${orderId}`)
     await expect(page.getByRole('heading', { name: '在线支付与收款凭证' })).toBeVisible()
