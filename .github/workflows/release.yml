@@ -98,7 +98,7 @@ jobs:
           docker run --rm --network host -e PGPASSWORD=ci-test-password \
             postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873 \
             psql -h 127.0.0.1 -U aikayun -d postgres -v ON_ERROR_STOP=1 \
-            -c "CREATE ROLE license LOGIN CREATEDB PASSWORD 'license-test-only'" \
+            -c "CREATE ROLE license LOGIN SUPERUSER PASSWORD 'license-test-only'" \
             -c 'CREATE DATABASE license_center_test OWNER license'
       - name: Check out the exact authorization-center source pinned for this release
         env:
