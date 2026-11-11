@@ -213,7 +213,7 @@ for platform in linux/amd64 linux/arm64; do
     sbom_path="$work/sbom/${image_name}-${platform//\//-}.cdx.json"
     docker pull --platform "$platform" "$image_ref"
     docker save --output "$tar_path" "$image_ref"
-    docker run --rm -v "$work:/work" "$syft_image" \
+    docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$work:/work" "$syft_image" \
       "docker-archive:/work/$(basename "$tar_path")" -o "cyclonedx-json=/work/sbom/$(basename "$sbom_path")"
     # Do not ship the experimental helper before its complete image/license
     # evidence chain is integrated into the signed release workflow.
