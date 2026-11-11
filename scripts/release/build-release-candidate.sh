@@ -28,6 +28,7 @@ staging_tag="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
 work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/aikayun-release-${version//[^A-Za-z0-9.-]/_}.XXXXXX")"
 scan_report_dir="${RUNNER_TEMP:-/tmp}/aikayun-release-scan-reports-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+export BUILDX_CONFIG="${BUILDX_CONFIG:-${DOCKER_CONFIG:-$HOME/.docker}/buildx}"
 export DOCKER_CONFIG="$work/docker-config"
 export AIKAYUN_GO_LICENSE_CACHE_DIR="$work/go-license-cache"
 release_key_file="$work/release-signing-key.pem"
@@ -142,6 +143,8 @@ for repository in "$api_repository" "$web_repository" "$backup_repository" "$bun
   fi
 done
 pnpm audit --audit-level high
+builder_driver="$(docker buildx inspect --bootstrap | awk '$1 == "Driver:" { print $2; exit }')"
+[[ "$builder_driver" == docker-container ]] || fail 'Release requires the Actions multi-platform Buildx builder.'
 
 # A build failure after this append-only reservation consumes the version.
 git -C "$source_root" config user.name 'github-actions[bot]'

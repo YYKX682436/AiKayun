@@ -6,7 +6,6 @@ on:
       version:
         description: Immutable OCI-compatible SemVer release version
         required: true
-        default: 0.1.0-rc.1
         type: string
       confirmation:
         description: Type PUBLISH-<version> after reviewing the source commit and release settings
