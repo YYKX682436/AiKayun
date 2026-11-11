@@ -140,7 +140,7 @@ for repository in "$api_repository" "$web_repository" "$backup_repository" "$bun
   fi
 done
 pnpm audit --audit-level high
-builder_driver="$(docker buildx inspect --bootstrap | awk '$1 == "Driver:" { print $2; exit }')"
+builder_driver="$(docker buildx inspect --bootstrap | awk '$1 == "Driver:" { print $2 }')"
 [[ "$builder_driver" == docker-container ]] || fail 'Release requires the Actions multi-platform Buildx builder.'
 
 # A build failure after this append-only reservation consumes the version.
