@@ -164,7 +164,6 @@ jobs:
       - name: Build, verify, sign and publish release artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-          AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN: ${{ secrets.AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN }}
           AIKAYUN_RELEASE_SIGNING_KEY_PEM: ${{ secrets.AIKAYUN_RELEASE_SIGNING_KEY_PEM }}
           AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD: ${{ secrets.AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD }}
           AIKAYUN_RELEASE_PUBLIC_KEY_JWK: ${{ vars.AIKAYUN_RELEASE_PUBLIC_KEY_JWK }}

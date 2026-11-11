@@ -36,7 +36,7 @@ cleanup() {
   status=$?
   unset AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD AIKAYUN_RELEASE_SIGNING_KEY_PEM \
     AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 AIKAYUN_TRUSTED_LICENSE_BUNDLE_BASE64 \
-    AIKAYUN_RELEASE_PUBLISH_TOKEN AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN
+    AIKAYUN_RELEASE_PUBLISH_TOKEN
   unset GH_TOKEN
   if [[ "$registry_logged_in" == 1 ]]; then docker logout ghcr.io >/dev/null 2>&1 || true; fi
   rm -f "$release_key_file"
@@ -74,7 +74,7 @@ for name in AIKAYUN_RELEASE_SIGNING_KEY_PEM AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD
   AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 AIKAYUN_TRUSTED_LICENSE_BUNDLE_BASE64 \
   AIKAYUN_PRODUCTION_LICENSE_ISSUER AIKAYUN_PRODUCTION_LICENSE_ROOT_KID \
   AIKAYUN_LICENSE_CENTER_SIGNER_KIDS AIKAYUN_RELEASE_ORIGIN AIKAYUN_RELEASE_PUBLISH_URL \
-  AIKAYUN_RELEASE_PUBLISH_TOKEN AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN GH_TOKEN; do need "$name"; done
+  AIKAYUN_RELEASE_PUBLISH_TOKEN GH_TOKEN; do need "$name"; done
 [[ "$(gh api "/repos/${GITHUB_REPOSITORY}" --jq .visibility)" == private ]] || fail 'The source repository must remain private.'
 "$source_root/scripts/release/check-release-policy.sh" >/dev/null
 [[ "$AIKAYUN_RELEASE_PUBLISH_TOKEN" != *$'\n'* && "$AIKAYUN_RELEASE_PUBLISH_TOKEN" != *$'\r'* ]] || \
@@ -130,8 +130,8 @@ printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --pass
 registry_logged_in=1
 owner_type="$(gh api "/users/${GITHUB_REPOSITORY_OWNER}" --jq .type)"
 for package in aikayun-staging-api aikayun-staging-web aikayun-staging-backup-restic aikayun-staging-release-bundle; do
-  if [[ "$owner_type" == Organization ]]; then path="/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}/visibility"; else path="/user/packages/container/${package}/visibility"; fi
-  visibility="$(GH_TOKEN="$AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN" gh api "$path" --jq .visibility)"
+  if [[ "$owner_type" == Organization ]]; then path="/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}"; else path="/user/packages/container/${package}"; fi
+  visibility="$(gh api "$path" --jq .visibility)"
   [[ "$visibility" == private ]] || fail "The required staging package must already exist and remain private: $package"
 done
 for repository in "$api_repository" "$web_repository" "$backup_repository" "$bundle_repository"; do
@@ -361,11 +361,19 @@ cosign sign --yes "$web_index_ref" >/dev/null
 cosign sign --yes "$backup_index_ref" >/dev/null
 cosign sign --yes "${bundle_repository}@${bundle_digest}" >/dev/null
 
-for package in aikayun-api aikayun-web aikayun-backup-restic aikayun-release-bundle; do
-  if [[ "$owner_type" == Organization ]]; then path="/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}/visibility"; else path="/user/packages/container/${package}/visibility"; fi
-  visibility="$(GH_TOKEN="$AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN" gh api --method PATCH "$path" -f visibility=public --jq .visibility)"
-  [[ "$visibility" == public ]] || fail "GHCR package is not anonymously readable: $package"
+printf 'Signed release packages are ready. Set these four GHCR packages to Public in GitHub package settings; waiting up to one hour.\n'
+all_public=0
+for attempt in $(seq 1 240); do
+  all_public=1
+  for package in aikayun-api aikayun-web aikayun-backup-restic aikayun-release-bundle; do
+    if [[ "$owner_type" == Organization ]]; then path="/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}"; else path="/user/packages/container/${package}"; fi
+    visibility="$(gh api "$path" --jq .visibility)"
+    if [[ "$visibility" != public ]]; then all_public=0; break; fi
+  done
+  [[ "$all_public" == 1 ]] && break
+  sleep 15
 done
+[[ "$all_public" == 1 ]] || fail 'Signed GHCR release packages were not made public within one hour.'
 
 docker logout ghcr.io >/dev/null
 registry_logged_in=0
@@ -396,7 +404,7 @@ while IFS= read -r artifact; do
   curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --max-redirs 0 \
     "${download_base}${artifact}" --output "$customer_download/$artifact"
 done < <(jq -r '.artifacts[].name' "$customer_download/release-manifest.json")
-env -u GH_TOKEN -u GITHUB_TOKEN -u AIKAYUN_GHCR_PACKAGE_ADMIN_TOKEN cosign verify-blob \
+env -u GH_TOKEN -u GITHUB_TOKEN cosign verify-blob \
   --bundle "$customer_download/release-manifest.cosign.bundle" \
   --certificate-identity "$release_identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
