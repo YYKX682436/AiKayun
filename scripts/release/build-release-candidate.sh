@@ -9,7 +9,7 @@ release_id="aikayun-${version}"
 center_commit="$(tr -d '\n' < "$source_root/scripts/release/license-center-release-commit.txt")"
 node_base='node:24.22.0-trixie-slim@sha256:a6155384446670e9719bdc4fd0ebe4d4b29fb32a8d6aa523da3547a6cfbcf22c'
 postgres_image='docker.io/library/postgres@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395'
-caddy_image='docker.io/library/caddy@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee'
+caddy_image='docker.io/library/caddy@sha256:78bd35025c7ba85961dd149ae670315129954e77abe2383ac47c89106b35ade9'
 syft_image='anchore/syft@sha256:825cad3a952c87676a6d07e9a3bb05ac9c401d598360070e970aa46d54c1727e'
 trivy_image='aquasec/trivy@sha256:33f816d414b9d582d25bb737ffa4a632ae34e222f7ec1b50252cef0ce2266006'
 skopeo_image='quay.io/skopeo/stable@sha256:87a0dd8d9a093c87681706a2cb8ae51757af8c12340f04ab024c85badc6dcc07'
@@ -35,8 +35,7 @@ registry_logged_in=0
 cleanup() {
   status=$?
   unset AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD AIKAYUN_RELEASE_SIGNING_KEY_PEM \
-    AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 AIKAYUN_TRUSTED_LICENSE_BUNDLE_BASE64 \
-    AIKAYUN_RELEASE_PUBLISH_TOKEN
+    AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 AIKAYUN_TRUSTED_LICENSE_BUNDLE_BASE64
   unset GH_TOKEN
   if [[ "$registry_logged_in" == 1 ]]; then docker logout ghcr.io >/dev/null 2>&1 || true; fi
   rm -f "$release_key_file"
@@ -73,12 +72,9 @@ mkdir -m 0700 "$DOCKER_CONFIG"
 for name in AIKAYUN_RELEASE_SIGNING_KEY_PEM AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD AIKAYUN_RELEASE_PUBLIC_KEY_JWK \
   AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 AIKAYUN_TRUSTED_LICENSE_BUNDLE_BASE64 \
   AIKAYUN_PRODUCTION_LICENSE_ISSUER AIKAYUN_PRODUCTION_LICENSE_ROOT_KID \
-  AIKAYUN_LICENSE_CENTER_SIGNER_KIDS AIKAYUN_RELEASE_ORIGIN AIKAYUN_RELEASE_PUBLISH_URL \
-  AIKAYUN_RELEASE_PUBLISH_TOKEN GH_TOKEN; do need "$name"; done
+  AIKAYUN_LICENSE_CENTER_SIGNER_KIDS AIKAYUN_RELEASE_ORIGIN GH_TOKEN; do need "$name"; done
 [[ "$(gh api "/repos/${GITHUB_REPOSITORY}" --jq .visibility)" == public ]] || fail 'The source repository must be public.'
 "$source_root/scripts/release/check-release-policy.sh" >/dev/null
-[[ "$AIKAYUN_RELEASE_PUBLISH_TOKEN" != *$'\n'* && "$AIKAYUN_RELEASE_PUBLISH_TOKEN" != *$'\r'* ]] || \
-  fail 'The release upload token must be a single-line bearer token.'
 printf '%s' "$AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64" | base64 --decode > "$work/trusted-license-config.json" || \
   fail 'The production authorization config is not valid base64.'
 chmod 0600 "$work/trusted-license-config.json"
@@ -388,9 +384,7 @@ docker run --rm -v "$release_dir:/release:ro" --entrypoint node "$node_base" \
 docker run --rm -v "$release_dir:/release:ro" --entrypoint node "$node_base" \
   /release/verify-artifacts.mjs /release/release-manifest.json /release > "$work/independent-artifact-verification.json"
 
-AIKAYUN_RELEASE_ORIGIN="$AIKAYUN_RELEASE_ORIGIN" AIKAYUN_RELEASE_PUBLISH_URL="$AIKAYUN_RELEASE_PUBLISH_URL" \
-AIKAYUN_RELEASE_PUBLISH_TOKEN="$AIKAYUN_RELEASE_PUBLISH_TOKEN" \
-  node "$source_root/scripts/release/publish-static-release.mjs" "$release_dir" "$version" > "$work/static-publish.json"
+node "$source_root/scripts/release/publish-static-release.mjs" "$release_dir" "$version" > "$work/static-publish.json"
 customer_download="$work/customer-linux-download"
 mkdir -p "$customer_download"
 download_base="${AIKAYUN_RELEASE_ORIGIN%/}/releases/${version}/"

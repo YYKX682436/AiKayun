@@ -482,7 +482,7 @@ if [[ "$url" == https://store.customer.com/api/v1/setup/status ]]; then
   exit 7
 fi
 if [[ "$url" == https://downloads.customer.com/.well-known/aikayun-release.json ]]; then
-  printf '{"schema":1,"product":"aikayun","release_base_url":"https://downloads.customer.com/releases/","registry":"ghcr.io/yykx682436","publish_protocol":"http-put-if-none-match-v1"}\n' > "$output"
+  printf '{"schema":1,"product":"aikayun","release_base_url":"https://downloads.customer.com/releases/","registry":"ghcr.io/yykx682436","publish_protocol":"github-pages-branch-v1"}\n' > "$output"
   exit 0
 fi
 if [[ "$AIKAYUN_TEST_SCENARIO" == release-download-failure && "$url" == */release-index.json ]]; then exit 8; fi

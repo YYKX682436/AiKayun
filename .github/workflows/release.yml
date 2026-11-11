@@ -136,6 +136,7 @@ jobs:
     timeout-minutes: 240
     permissions:
       contents: write
+      pages: write
       packages: write
       id-token: write
     steps:
@@ -173,8 +174,6 @@ jobs:
           AIKAYUN_PRODUCTION_LICENSE_ROOT_KID: ${{ vars.AIKAYUN_PRODUCTION_LICENSE_ROOT_KID }}
           AIKAYUN_LICENSE_CENTER_SIGNER_KIDS: ${{ vars.AIKAYUN_LICENSE_CENTER_SIGNER_KIDS }}
           AIKAYUN_RELEASE_ORIGIN: ${{ vars.AIKAYUN_RELEASE_ORIGIN }}
-          AIKAYUN_RELEASE_PUBLISH_URL: ${{ vars.AIKAYUN_RELEASE_PUBLISH_URL }}
-          AIKAYUN_RELEASE_PUBLISH_TOKEN: ${{ secrets.AIKAYUN_RELEASE_PUBLISH_TOKEN }}
           AIKAYUN_RELEASE_VERSION: ${{ inputs.version }}
           AIKAYUN_RELEASE_CONFIRMATION: ${{ inputs.confirmation }}
           AIKAYUN_UPGRADE_FROM_RELEASES: ${{ inputs.upgrade_from_releases }}

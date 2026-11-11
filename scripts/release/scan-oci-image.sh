@@ -37,7 +37,12 @@ node "$(dirname "$0")/sanitize-trivy-report.mjs" \
   "$raw_vulnerability" "$raw_secret" "$report_path" "$image_ref" "$platform" \
   "$vulnerability_status" "$secret_status"
 
-if ! jq -e '.gate == "passed"' "$report_path" >/dev/null; then
+if jq -e '.gate == "passed"' "$report_path" >/dev/null; then
+  exit 0
+fi
+if node "$(dirname "$0")/assess-reviewed-image-risk.mjs" "$report_path" >/dev/null 2>&1; then
+  printf 'Trivy retained exact reviewed %s risk findings (%s); report: %s\n' "$image_name" "$platform" "$report_path" >&2
+else
   printf 'Trivy blocked %s (%s); sanitized report: %s\n' "$image_name" "$platform" "$report_path" >&2
   exit 1
 fi

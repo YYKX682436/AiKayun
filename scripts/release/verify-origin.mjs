@@ -20,7 +20,7 @@ const fields = ['schema', 'product', 'release_base_url', 'registry', 'publish_pr
 if (!marker || typeof marker !== 'object' || Array.isArray(marker) ||
     Object.keys(marker).sort().join(',') !== [...fields].sort().join(',') || marker.schema !== 1 ||
     marker.product !== 'aikayun' || marker.release_base_url !== `${origin}/releases/` ||
-    marker.registry !== 'ghcr.io/yykx682436' || marker.publish_protocol !== 'http-put-if-none-match-v1') {
+    marker.registry !== 'ghcr.io/yykx682436' || marker.publish_protocol !== 'github-pages-branch-v1') {
   throw new Error('Release origin marker does not match the immutable AiKayun release protocol')
 }
 process.stdout.write(`${JSON.stringify({ origin, marker: 'verified', protocol: marker.publish_protocol })}\n`)

@@ -373,7 +373,7 @@ assert_origin_marker() {
     const fs=require("node:fs"); const v=JSON.parse(fs.readFileSync("/work/marker.json","utf8")); const origin=process.argv[1];
     const keys=["product","publish_protocol","registry","release_base_url","schema"].sort().join(",");
     if(!v || typeof v!=="object" || Object.keys(v).sort().join(",")!==keys || v.schema!==1 || v.product!=="aikayun" ||
-      v.release_base_url!==origin+"/releases/" || v.registry!=="ghcr.io/yykx682436" || v.publish_protocol!=="http-put-if-none-match-v1") process.exit(1);
+      v.release_base_url!==origin+"/releases/" || v.registry!=="ghcr.io/yykx682436" || v.publish_protocol!=="github-pages-branch-v1") process.exit(1);
   ' "$SELECTED_RELEASE_ORIGIN" || fail 'The release marker does not match the AiKayun signed release protocol.'
 }
 
