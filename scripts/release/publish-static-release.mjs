@@ -91,13 +91,30 @@ if (!built) throw new Error('Timed out waiting for the GitHub Pages release buil
 
 for (const { key, digest, size } of expected) {
   const relativeKey = key.split(sep).map(encodeURIComponent).join('/')
-  const response = await fetch(`${origin}/releases/${version}/${relativeKey}`, {
-    redirect: 'error', signal: AbortSignal.timeout(120_000), headers: { accept: '*/*' },
-  })
-  if (!response.ok) throw new Error(`Anonymous HTTPS read-back failed for ${key}: HTTP ${response.status}`)
-  const received = Buffer.from(await response.arrayBuffer())
-  if (received.length !== size || createHash('sha256').update(received).digest('hex') !== digest) {
-    throw new Error(`Anonymous HTTPS read-back digest mismatch for ${key}`)
+  let verified = false
+  let lastFailure = 'not available'
+  for (let attempt = 0; attempt < 120; attempt++) {
+    let response
+    try {
+      response = await fetch(`${origin}/releases/${version}/${relativeKey}`, {
+        redirect: 'error', signal: AbortSignal.timeout(15_000), headers: { accept: '*/*', 'cache-control': 'no-cache' },
+      })
+    } catch (error) {
+      lastFailure = String(error)
+      await new Promise(resolve => setTimeout(resolve, 5000))
+      continue
+    }
+    if (response.ok) {
+      const received = Buffer.from(await response.arrayBuffer())
+      if (received.length !== size || createHash('sha256').update(received).digest('hex') !== digest) {
+        throw new Error(`Anonymous HTTPS read-back digest mismatch for ${key}`)
+      }
+      verified = true
+      break
+    }
+    lastFailure = `HTTP ${response.status}`
+    await new Promise(resolve => setTimeout(resolve, 5000))
   }
+  if (!verified) throw new Error(`Anonymous HTTPS read-back failed for ${key}: ${lastFailure}`)
 }
 process.stdout.write(`${JSON.stringify({ version, published_files: files.length, pages_commit: commit.sha, anonymous_readback: 'verified' })}\n`)
