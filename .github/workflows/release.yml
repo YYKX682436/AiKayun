@@ -115,7 +115,7 @@ jobs:
           test "$(git -C "$center_dir" rev-parse HEAD)" = "$center_commit"
           printf 'LICENSE_CENTER_CHECKOUT=%s\n' "$center_dir" >> "$GITHUB_ENV"
           (cd "$center_dir" && npm ci)
-          (cd "$center_dir" && npm run typecheck && npm run build && npm run build:release && npm test && npm run test:integration && npm audit --omit=dev --audit-level=high)
+          (cd "$center_dir" && npm run build && npm run build:release && npm run typecheck && npm test && npm run test:integration && npm audit --omit=dev --audit-level=high)
       - name: Block high and critical marketplace dependency advisories
         run: pnpm audit --audit-level high
       - name: Verify the complete AiKayun application and PostgreSQL integration suite
