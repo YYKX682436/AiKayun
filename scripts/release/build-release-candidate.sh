@@ -28,8 +28,6 @@ staging_tag="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
 work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/aikayun-release-${version//[^A-Za-z0-9.-]/_}.XXXXXX")"
 scan_report_dir="${RUNNER_TEMP:-/tmp}/aikayun-release-scan-reports-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-export BUILDX_CONFIG="${BUILDX_CONFIG:-${DOCKER_CONFIG:-$HOME/.docker}/buildx}"
-export DOCKER_CONFIG="$work/docker-config"
 export AIKAYUN_GO_LICENSE_CACHE_DIR="$work/go-license-cache"
 release_key_file="$work/release-signing-key.pem"
 registry_logged_in=0
@@ -69,7 +67,6 @@ node --input-type=module -e '
 [[ "${GITHUB_REPOSITORY,,}" == 'yykx682436/aikayun' ]] || fail 'Unexpected GitHub source repository.'
 [[ ! -e "$scan_report_dir" ]] || fail 'A scan-report directory for this workflow attempt already exists.'
 mkdir -m 0700 "$scan_report_dir"
-mkdir -m 0700 "$DOCKER_CONFIG"
 for name in AIKAYUN_RELEASE_SIGNING_KEY_PEM AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD AIKAYUN_RELEASE_PUBLIC_KEY_JWK \
   AIKAYUN_TRUSTED_LICENSE_CONFIG_BASE64 AIKAYUN_TRUSTED_LICENSE_BUNDLE_BASE64 \
   AIKAYUN_PRODUCTION_LICENSE_ISSUER AIKAYUN_PRODUCTION_LICENSE_ROOT_KID \
