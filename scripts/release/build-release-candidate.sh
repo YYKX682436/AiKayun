@@ -75,7 +75,7 @@ for name in AIKAYUN_RELEASE_SIGNING_KEY_PEM AIKAYUN_RELEASE_SIGNING_KEY_PASSWORD
   AIKAYUN_PRODUCTION_LICENSE_ISSUER AIKAYUN_PRODUCTION_LICENSE_ROOT_KID \
   AIKAYUN_LICENSE_CENTER_SIGNER_KIDS AIKAYUN_RELEASE_ORIGIN AIKAYUN_RELEASE_PUBLISH_URL \
   AIKAYUN_RELEASE_PUBLISH_TOKEN GH_TOKEN; do need "$name"; done
-[[ "$(gh api "/repos/${GITHUB_REPOSITORY}" --jq .visibility)" == private ]] || fail 'The source repository must remain private.'
+[[ "$(gh api "/repos/${GITHUB_REPOSITORY}" --jq .visibility)" == public ]] || fail 'The source repository must be public.'
 "$source_root/scripts/release/check-release-policy.sh" >/dev/null
 [[ "$AIKAYUN_RELEASE_PUBLISH_TOKEN" != *$'\n'* && "$AIKAYUN_RELEASE_PUBLISH_TOKEN" != *$'\r'* ]] || \
   fail 'The release upload token must be a single-line bearer token.'

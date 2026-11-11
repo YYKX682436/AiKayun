@@ -14,9 +14,9 @@ repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 [[ "${GITHUB_SHA:-}" =~ ^[a-f0-9]{40}$ ]] || fail 'Release source commit is invalid.'
 
 repository="$(gh api "/repos/${repo}")" || fail 'Could not read release repository settings.'
-[[ "$(jq -r '.private' <<<"$repository")" == true &&
+[[ "$(jq -r '.visibility' <<<"$repository")" == public &&
    "$(jq -r '.default_branch' <<<"$repository")" == main ]] || \
-  fail 'Release repository must remain private with main as its default branch.'
+  fail 'Release repository must be public with main as its default branch.'
 current_main="$(gh api "/repos/${repo}/git/ref/heads/main" --jq .object.sha)" || \
   fail 'Could not read the current main commit.'
 [[ "$current_main" == "$GITHUB_SHA" ]] || fail 'Main moved after the release workflow was dispatched.'
