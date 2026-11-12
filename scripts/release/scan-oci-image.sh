@@ -18,15 +18,15 @@ arch="${platform#linux/}"
 report_path="$report_dir/${image_name}-${arch}.json"
 raw_vulnerability="${work_dir}/${image_name}-${arch}-vulnerability.raw.json"
 raw_secret="${work_dir}/${image_name}-${arch}-secret.raw.json"
-mkdir -p "$report_dir"
+mkdir -p "$report_dir" "$work_dir/trivy-cache" "$work_dir/tmp"
 
 set +e
-docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/work/trivy-cache -v "$work_dir:/work" "$trivy_image" \
+docker run --rm --user "$(id -u):$(id -g)" -e TMPDIR=/work/tmp -e TRIVY_CACHE_DIR=/work/trivy-cache -v "$work_dir:/work" "$trivy_image" \
   image --input "/work/$(basename "$archive_path")" --scanners vuln --severity HIGH,CRITICAL \
   --exit-code 0 --format json --output "/work/$(basename "$raw_vulnerability")" \
   >/dev/null 2>"$work_dir/${image_name}-${arch}-vulnerability.stderr"
 vulnerability_status=$?
-docker run --rm --user "$(id -u):$(id -g)" -e TRIVY_CACHE_DIR=/work/trivy-cache -v "$work_dir:/work" "$trivy_image" \
+docker run --rm --user "$(id -u):$(id -g)" -e TMPDIR=/work/tmp -e TRIVY_CACHE_DIR=/work/trivy-cache -v "$work_dir:/work" "$trivy_image" \
   image --input "/work/$(basename "$archive_path")" --scanners secret \
   --exit-code 0 --format json --output "/work/$(basename "$raw_secret")" \
   >/dev/null 2>"$work_dir/${image_name}-${arch}-secret.stderr"

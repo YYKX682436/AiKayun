@@ -150,7 +150,7 @@ git -C "$source_root" tag -a "$release_tag" -m "AiKayun ${version} immutable rel
 git -C "$source_root" push origin "refs/tags/${release_tag}"
 
 build_time="$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')"
-mkdir -p "$work/support" "$work/sbom" "$work/notices" "$work/inspection" "$work/trivy-cache"
+mkdir -p "$work/support" "$work/sbom" "$work/notices" "$work/inspection" "$work/trivy-cache" "$work/tmp"
 
 build_args=(--build-arg "AIKAYUN_RELEASE_ID=${release_id}" --build-arg "AIKAYUN_RELEASE_VERSION=${version}" \
   --build-arg "AIKAYUN_SOURCE_COMMIT=${GITHUB_SHA}")
@@ -213,7 +213,7 @@ for platform in linux/amd64 linux/arm64; do
     sbom_path="$work/sbom/${image_name}-${platform//\//-}.cdx.json"
     docker pull --platform "$platform" "$image_ref"
     docker save --output "$tar_path" "$image_ref"
-    docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$work:/work" "$syft_image" \
+    docker run --rm --user "$(id -u):$(id -g)" -e HOME=/work -e TMPDIR=/work/tmp -v "$work:/work" "$syft_image" \
       "docker-archive:/work/$(basename "$tar_path")" -o "cyclonedx-json=/work/sbom/$(basename "$sbom_path")"
     # Do not ship the experimental helper before its complete image/license
     # evidence chain is integrated into the signed release workflow.
