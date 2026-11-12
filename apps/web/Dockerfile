@@ -1,4 +1,4 @@
-FROM node:24.22.0-trixie-slim@sha256:a6155384446670e9719bdc4fd0ebe4d4b29fb32a8d6aa523da3547a6cfbcf22c AS build
+FROM --platform=$BUILDPLATFORM node:24.22.0-trixie-slim@sha256:a6155384446670e9719bdc4fd0ebe4d4b29fb32a8d6aa523da3547a6cfbcf22c AS build
 
 ARG AIKAYUN_RELEASE_ID=local-development
 ARG AIKAYUN_RELEASE_VERSION=0.0.0-dev
@@ -18,7 +18,7 @@ COPY packages/money packages/money
 COPY apps/web apps/web
 RUN pnpm --filter @aikayun/contracts build \
   && pnpm --filter @aikayun/money build \
-  && ROLLDOWN_WORKER_THREADS=2 RAYON_NUM_THREADS=2 pnpm --filter @aikayun/web build \
+  && pnpm --filter @aikayun/web build \
   && node scripts/release/prune-node-modules.mjs apps/web/.output/server/node_modules \
   && find apps/web/.output/server/node_modules -type f -name '*.ts' -delete \
   && find apps/web/.output -type f \( -name '*.map' -o -name '*.d.ts' -o -iname 'README*' -o -iname 'CHANGELOG*' -o -iname 'CONTRIBUTING*' \) -delete \
