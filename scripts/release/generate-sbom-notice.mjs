@@ -29,13 +29,25 @@ const pinnedGoLicenseAssets = new Map([
     path: join(scriptDirectory, 'upstream-notices', 'caddy-v2.11.7-LICENSE'),
     source: 'https://github.com/caddyserver/caddy', commit: '72dd0fb067f6d7826c7f79907670ba4a713bfe37',
     sha256: 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30',
-    description: 'MIT; exact Caddy v2.11.7 LICENSE is embedded below.',
+    description: 'Apache-2.0; exact Caddy v2.11.7 LICENSE is embedded below.',
   }],
   ['github.com/caddyserver/caddy/v2@v2.11.7', {
     path: join(scriptDirectory, 'upstream-notices', 'caddy-v2.11.7-LICENSE'),
     source: 'https://github.com/caddyserver/caddy', commit: '72dd0fb067f6d7826c7f79907670ba4a713bfe37',
     sha256: 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30',
-    description: 'MIT; exact Caddy v2.11.7 LICENSE is embedded below.',
+    description: 'Apache-2.0; exact Caddy v2.11.7 LICENSE is embedded below.',
+  }],
+  ['caddy@v0.0.0-20261104230511-0d98caea58f7', {
+    path: join(scriptDirectory, 'upstream-notices', 'caddy-v2.11.7-LICENSE'),
+    source: 'https://github.com/caddyserver/caddy', commit: '0d98caea58f794f88e709b1bef2880996a471bca',
+    sha256: 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30',
+    description: 'Apache-2.0; exact Caddy v2.11.9 LICENSE is embedded below.',
+  }],
+  ['github.com/caddyserver/caddy/v2@v2.11.9', {
+    path: join(scriptDirectory, 'upstream-notices', 'caddy-v2.11.7-LICENSE'),
+    source: 'https://github.com/caddyserver/caddy', commit: '0d98caea58f794f88e709b1bef2880996a471bca',
+    sha256: 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30',
+    description: 'Apache-2.0; exact Caddy v2.11.9 LICENSE is embedded below.',
   }],
   ['github.com/cloudflare/circl@v1.6.5', {
     path: join(scriptDirectory, 'upstream-notices', 'cloudflare-circl-v1.6.5-LICENSE'),
@@ -178,8 +190,9 @@ async function goModuleLicenseAtPurl(purl) {
     const archive = join(temporaryRoot, 'module.zip')
     try {
       await execFile('curl', ['--fail', '--silent', '--show-error', '--location', '--proto', '=https',
-        '--tlsv1.2', '--max-time', '30', '--max-filesize', '33554432', '--output', archive,
-        `https://proxy.golang.org/${proxyPath}`], { timeout: 35_000, maxBuffer: 1024 * 1024 })
+        '--tlsv1.2', '--retry', '2', '--retry-all-errors', '--retry-delay', '1',
+        '--max-time', '30', '--max-filesize', '33554432', '--output', archive,
+        `https://proxy.golang.org/${proxyPath}`], { timeout: 100_000, maxBuffer: 1024 * 1024 })
       const listing = await execFile('unzip', ['-Z1', archive], { timeout: 10_000, maxBuffer: 1024 * 1024 })
       const licensePaths = listing.stdout.split(/\r?\n/).filter(path => {
         if (!path || path.endsWith('/') || path.split('/').some(part => part === '..')) return false

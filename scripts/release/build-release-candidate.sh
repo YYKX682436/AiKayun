@@ -258,7 +258,7 @@ for platform in linux/amd64 linux/arm64; do
       cmp -s "$backup_binary_from_image" "$evidence_root/restic" || fail 'The scanned backup image binary differs from its license evidence build.'
       docker pull "$go_toolchain_image" >/dev/null
       node "$source_root/scripts/release/prepare-backup-reader-notice.mjs" "$sbom_path" "$evidence_root" \
-        "$system_notice_root" "$image_ref" "$arch" "$work/notices/NOTICE-image-backup-${platform//\//-}.txt"
+        "$system_notice_root" "${backup_repository}@${child}" "$arch" "$work/notices/NOTICE-image-backup-${platform//\//-}.txt"
     else
       node "$source_root/scripts/release/generate-sbom-notice.mjs" "$sbom_path" \
         "$work/notices/NOTICE-image-${image_name}-${platform//\//-}.txt" "$image_ref" "$system_notice_root"
