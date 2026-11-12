@@ -149,7 +149,7 @@ try {
   ], { timeout: 3 * 60 * 1000, maxBuffer: 1024 * 1024, encoding: 'utf8',
     env: { PATH: isolatedPath, AIKAYUN_GO_LICENSE_CACHE_DIR: cacheDirectory } })
   const noticeInfo = await regular(noticePath, 32 * 1024 * 1024, root)
-  if (noticeInfo.uid !== root || (noticeInfo.mode & 0o777) !== 0o644) throw new Error('BACKUP_NOTICE_OUTPUT_INVALID')
+  if (noticeInfo.uid !== root || ![0o600, 0o644].includes(noticeInfo.mode & 0o777)) throw new Error('BACKUP_NOTICE_OUTPUT_INVALID')
   const noticeBytes = await readFile(noticePath)
   const scanNoticePath = join(scanInput, 'NOTICE.txt')
   await writeFile(scanNoticePath, noticeBytes, { flag: 'wx', mode: 0o600 })
