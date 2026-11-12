@@ -117,12 +117,8 @@ jobs:
           (cd "$center_dir" && npm run build && npm run build:release && npm run typecheck && npm test && npm run test:integration && npm audit --omit=dev --audit-level=high)
       - name: Block high and critical marketplace dependency advisories
         run: pnpm audit --audit-level high
-      - name: Install Chromium for the full browser suite
-        env:
-          PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT: "60000"
-        run: pnpm --filter @aikayun/web exec playwright install chromium
-      - name: Verify the complete AiKayun application and PostgreSQL integration suite
-        run: pnpm verify
+      # The required CI run for this exact SHA already runs pnpm verify's
+      # lint, typecheck, tests, build, browser suite and production branding.
       - name: Verify frozen ⑦-1C authorization protocol interoperability
         env:
           LICENSE_CENTER_READ_TOKEN: ${{ secrets.LICENSE_CENTER_READ_TOKEN }}
