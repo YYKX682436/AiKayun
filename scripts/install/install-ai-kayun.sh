@@ -473,7 +473,7 @@ verify_release_image_references() {
       grep -Fqx "    image: $image" "$directory/compose.yaml" || fail "Compose does not use the signed $name image digest."
     fi
     docker pull "$image" >/dev/null || fail "Could not pull the digest-pinned $name image."
-    if [[ "$name" == api || "$name" == web || "$name" == backup ]]; then
+    if [[ "$name" == api || "$name" == web || "$name" == postgres || "$name" == backup ]]; then
       verify_release_image_signature "$image" docker || fail "Cosign rejected the $name image signature."
     fi
   done
@@ -576,7 +576,7 @@ load_release_image_digests_from() {
   SELECTED_CADDY_IMAGE="${image_references_array[3]}"
   SELECTED_BACKUP_RESTIC_IMAGE="${image_references_array[4]}"
   for image_reference in "${image_references_array[@]}"; do
-    [[ "$image_reference" =~ ^(ghcr\.io/yykx682436/aikayun-(api|web|backup-restic)|docker\.io/library/(postgres|caddy))@sha256:[a-f0-9]{64}$ ]] || \
+    [[ "$image_reference" =~ ^(ghcr\.io/yykx682436/aikayun-(api|web|postgres|backup-restic)|docker\.io/library/caddy)@sha256:[a-f0-9]{64}$ ]] || \
       fail 'A signed image reference does not use its canonical repository and immutable digest.'
   done
 }

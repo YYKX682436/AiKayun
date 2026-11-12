@@ -16,7 +16,7 @@ const platformDigests = { 'linux/amd64': hex('1'), 'linux/arm64': hex('2') }
 const imageReferences = {
   api: 'ghcr.io/yykx682436/aikayun-api',
   web: 'ghcr.io/yykx682436/aikayun-web',
-  postgres: 'docker.io/library/postgres',
+  postgres: 'ghcr.io/yykx682436/aikayun-postgres',
   caddy: 'docker.io/library/caddy',
   backup: 'ghcr.io/yykx682436/aikayun-backup-restic',
 }
@@ -187,7 +187,7 @@ test('release bundle assembly pins images and includes the signed host backup br
   await mkdir(support)
   const api = `ghcr.io/yykx682436/aikayun-api@sha256:${hex('a')}`
   const web = `ghcr.io/yykx682436/aikayun-web@sha256:${hex('b')}`
-  const postgres = `docker.io/library/postgres@sha256:${hex('c')}`
+  const postgres = `ghcr.io/yykx682436/aikayun-postgres@sha256:${hex('c')}`
   const caddy = `docker.io/library/caddy@sha256:${hex('d')}`
   const version = '1.2.3-rc.1'
   const metadataPath = join(directory, 'metadata.json')

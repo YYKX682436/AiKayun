@@ -25,7 +25,7 @@ for image in api web postgres caddy backup; do
       .scanner_errors == [] and .high_critical_count == 0 and .secret_finding_count == 0' "$report" >/dev/null; then
       continue
     fi
-    if node "$(dirname "$0")/assess-reviewed-image-risk.mjs" "$report" >/dev/null 2>&1; then
+    if node "$(dirname "$0")/assess-reviewed-image-risk.mjs" "$report" "$image" >/dev/null 2>&1; then
       continue
     fi
     echo "Trivy gate did not pass for ${image}-${arch}; no final release tag was copied." >&2

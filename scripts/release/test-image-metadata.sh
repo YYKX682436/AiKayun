@@ -18,7 +18,7 @@ AIKAYUN_LICENSE_CENTER_SIGNER_KIDS='["BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
 a=$(printf 'a%.0s' {1..64}); b=$(printf 'b%.0s' {1..64})
 api_index_ref="ghcr.io/yykx682436/aikayun-api@sha256:$a"
 web_index_ref="ghcr.io/yykx682436/aikayun-web@sha256:$a"
-postgres_image="docker.io/library/postgres@sha256:$a"
+postgres_image="ghcr.io/yykx682436/aikayun-postgres@sha256:$a"
 caddy_image="docker.io/library/caddy@sha256:$a"
 backup_index_ref="ghcr.io/yykx682436/aikayun-backup-restic@sha256:$a"
 for image in api web postgres caddy backup; do printf -v "${image}_amd64" 'sha256:%s' "$a"; printf -v "${image}_arm64" 'sha256:%s' "$b"; done

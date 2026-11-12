@@ -25,7 +25,7 @@ try {
  const fake='a'.repeat(64), fakeImage=repo=>({reference:`${repo}@sha256:${fake}`,platform_digests:{'linux/amd64':fake,'linux/arm64':fake},sbom_sha256:{'linux/amd64':fake,'linux/arm64':fake}})
  const metadata={version:'1.2.3',built_at:'2026-11-05T00:00:00.000Z',source_commit:'c'.repeat(40),distribution_origin:'https://release.vendor.com',license_center_signer_kids:['B'.repeat(43)],images:{
   api:{reference:`ghcr.io/yykx682436/aikayun-api@${arm.index_digest}`,platform_digests:{'linux/amd64':amd.platform_manifest_digest.slice(7),'linux/arm64':arm.platform_manifest_digest.slice(7)},sbom_sha256:{'linux/amd64':amd.sbom_sha256,'linux/arm64':arm.sbom_sha256}},
-  web:fakeImage('ghcr.io/yykx682436/aikayun-web'),postgres:fakeImage('docker.io/library/postgres'),caddy:fakeImage('docker.io/library/caddy')}}
+  web:fakeImage('ghcr.io/yykx682436/aikayun-web'),postgres:fakeImage('ghcr.io/yykx682436/aikayun-postgres'),caddy:fakeImage('docker.io/library/caddy')}}
  const migrations=join(work,'migrations.json'), config=join(work,'config.json')
  await writeJson(migrations,{migration_head:'202611040002_file_check_results'})
  await writeJson(config,{trust_configuration_id:'11111111-1111-4111-8111-111111111111',expected_center_issuer:'https://license.vendor.com',offline_root:{kid:'A'.repeat(43)},minimum_bundle_version:'1'})

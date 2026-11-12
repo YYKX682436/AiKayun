@@ -14,7 +14,7 @@ const imageNames = ['api', 'web', 'postgres', 'caddy', 'backup']
 const imageRepositories = {
   api: 'ghcr.io/yykx682436/aikayun-api',
   web: 'ghcr.io/yykx682436/aikayun-web',
-  postgres: 'docker.io/library/postgres',
+  postgres: 'ghcr.io/yykx682436/aikayun-postgres',
   caddy: 'docker.io/library/caddy',
   backup: 'ghcr.io/yykx682436/aikayun-backup-restic',
 }

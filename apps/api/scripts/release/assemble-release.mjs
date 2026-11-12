@@ -23,7 +23,7 @@ const imageMarkers = {
 }
 for (const [name, marker] of Object.entries(imageMarkers)) {
   const reference = metadata.images[name].reference
-  const repository = name === 'api' || name === 'web'
+  const repository = name === 'api' || name === 'web' || name === 'postgres'
     ? `ghcr.io/yykx682436/aikayun-${name}`
     : `docker.io/library/${name}`
   const prefix = `${repository}@sha256:`

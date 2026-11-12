@@ -8,7 +8,8 @@ source_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 release_id="aikayun-${version}"
 center_commit="$(tr -d '\n' < "$source_root/scripts/release/license-center-release-commit.txt")"
 node_base='node:24.22.0-trixie-slim@sha256:a6155384446670e9719bdc4fd0ebe4d4b29fb32a8d6aa523da3547a6cfbcf22c'
-postgres_image='docker.io/library/postgres@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395'
+postgres_staging_image='ghcr.io/yykx682436/aikayun-staging-api@sha256:b36f0783117de373b3ce8db84fc2187cee285c2af80fbca5f230f1b9eda3c192'
+postgres_image='ghcr.io/yykx682436/aikayun-postgres@sha256:b36f0783117de373b3ce8db84fc2187cee285c2af80fbca5f230f1b9eda3c192'
 caddy_image='docker.io/library/caddy@sha256:78bd35025c7ba85961dd149ae670315129954e77abe2383ac47c89106b35ade9'
 syft_image='anchore/syft@sha256:825cad3a952c87676a6d07e9a3bb05ac9c401d598360070e970aa46d54c1727e'
 trivy_image='aquasec/trivy@sha256:33f816d414b9d582d25bb737ffa4a632ae34e222f7ec1b50252cef0ce2266006'
@@ -18,6 +19,7 @@ owner="${GITHUB_REPOSITORY_OWNER,,}"
 release_tag="v${version}"
 api_repository="ghcr.io/${owner}/aikayun-api"
 web_repository="ghcr.io/${owner}/aikayun-web"
+postgres_repository="ghcr.io/${owner}/aikayun-postgres"
 backup_repository="ghcr.io/${owner}/aikayun-backup-restic"
 bundle_repository="ghcr.io/${owner}/aikayun-release-bundle"
 staging_api_repository="ghcr.io/${owner}/aikayun-staging-api"
@@ -179,7 +181,7 @@ backup_index_ref="${backup_repository}@${backup_index_digest}"
 docker buildx imagetools inspect --raw "$api_staging_index_ref" > "$work/api-index.json"
 docker buildx imagetools inspect --raw "$web_staging_index_ref" > "$work/web-index.json"
 docker buildx imagetools inspect --raw "$backup_staging_index_ref" > "$work/backup-index.json"
-docker buildx imagetools inspect --raw "$postgres_image" > "$work/postgres-index.json"
+docker buildx imagetools inspect --raw "$postgres_staging_image" > "$work/postgres-index.json"
 docker buildx imagetools inspect --raw "$caddy_image" > "$work/caddy-index.json"
 
 digest_for() {
@@ -201,8 +203,8 @@ for platform in linux/amd64 linux/arm64; do
       api:arm64) repository="$staging_api_repository"; child="$api_arm64" ;;
       web:amd64) repository="$staging_web_repository"; child="$web_amd64" ;;
       web:arm64) repository="$staging_web_repository"; child="$web_arm64" ;;
-      postgres:amd64) repository='docker.io/library/postgres'; child="$postgres_amd64" ;;
-      postgres:arm64) repository='docker.io/library/postgres'; child="$postgres_arm64" ;;
+      postgres:amd64) repository="$staging_api_repository"; child="$postgres_amd64" ;;
+      postgres:arm64) repository="$staging_api_repository"; child="$postgres_arm64" ;;
       caddy:amd64) repository='docker.io/library/caddy'; child="$caddy_amd64" ;;
       caddy:arm64) repository='docker.io/library/caddy'; child="$caddy_arm64" ;;
       backup:amd64) repository="$staging_backup_repository"; child="$backup_amd64" ;;
@@ -270,7 +272,8 @@ for platform in linux/amd64 linux/arm64; do
 done
 
 for platform in linux/amd64 linux/arm64; do
-  "$source_root/scripts/release/test-runtime-platform.sh" "$platform" "$api_staging_index_ref" "$web_staging_index_ref" \
+  AIKAYUN_VALIDATION_POSTGRES_IMAGE="$postgres_staging_image" \
+    "$source_root/scripts/release/test-runtime-platform.sh" "$platform" "$api_staging_index_ref" "$web_staging_index_ref" \
     '202611100002_payment_expiry_and_refund_completion'
 done
 migration_path="$work/migration-checksums.json"
@@ -345,23 +348,27 @@ api_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.s
   "$api_staging_index_ref" "$api_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
 web_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.sh" \
   "$web_staging_index_ref" "$web_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
+postgres_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.sh" \
+  "$postgres_staging_image" "$postgres_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
 backup_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.sh" \
   "$backup_staging_index_ref" "$backup_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
 bundle_promoted_digest="$("$source_root/scripts/release/promote-scanned-oci-image.sh" \
   "$bundle_staging_ref" "$bundle_repository" "$version" "$scan_report_dir" "$work" "$skopeo_image")"
 [[ "$api_promoted_digest" == "$api_index_digest" && "$web_promoted_digest" == "$web_index_digest" && \
+  "$postgres_promoted_digest" == "${postgres_image##*@}" && \
   "$backup_promoted_digest" == "$backup_index_digest" && \
   "$bundle_promoted_digest" == "$bundle_digest" ]] || fail 'OCI promotion did not preserve the verified staging digests.'
 cosign sign --yes "$api_index_ref" >/dev/null
 cosign sign --yes "$web_index_ref" >/dev/null
+cosign sign --yes "$postgres_image" >/dev/null
 cosign sign --yes "$backup_index_ref" >/dev/null
 cosign sign --yes "${bundle_repository}@${bundle_digest}" >/dev/null
 
-printf 'Signed release packages are ready. Set these four GHCR packages to Public in GitHub package settings; waiting up to one hour.\n'
+printf 'Signed release packages are ready. Set the five GHCR packages to Public in GitHub package settings; waiting up to one hour.\n'
 all_public=0
 for attempt in $(seq 1 240); do
   all_public=1
-  for package in aikayun-api aikayun-web aikayun-backup-restic aikayun-release-bundle; do
+  for package in aikayun-api aikayun-web aikayun-postgres aikayun-backup-restic aikayun-release-bundle; do
     if [[ "$owner_type" == Organization ]]; then path="/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}"; else path="/user/packages/container/${package}"; fi
     visibility="$(gh api "$path" --jq .visibility)"
     if [[ "$visibility" != public ]]; then all_public=0; break; fi
@@ -373,8 +380,8 @@ done
 
 docker logout ghcr.io >/dev/null
 registry_logged_in=0
-for image in "$api_index_ref" "$web_index_ref" "$backup_index_ref" "${bundle_repository}@${bundle_digest}"; do docker pull "$image" >/dev/null; done
-for image in "$api_index_ref" "$web_index_ref" "$backup_index_ref" "${bundle_repository}@${bundle_digest}"; do
+for image in "$api_index_ref" "$web_index_ref" "$postgres_image" "$backup_index_ref" "${bundle_repository}@${bundle_digest}"; do docker pull "$image" >/dev/null; done
+for image in "$api_index_ref" "$web_index_ref" "$postgres_image" "$backup_index_ref" "${bundle_repository}@${bundle_digest}"; do
   cosign verify --certificate-identity "$release_identity" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com "$image" >/dev/null
 done

@@ -278,6 +278,7 @@ if [[ "$1" == run ]]; then
     [[ "$joined" == *' --certificate-identity https://github.com/YYKX682436/AiKayun/.github/workflows/release.yml@refs/heads/main '* ]] || exit 1
     [[ "$joined" == *' --certificate-oidc-issuer https://token.actions.githubusercontent.com '* ]] || exit 1
     event controlled_cosign_identity
+    [[ "$joined" != *'ghcr.io/yykx682436/aikayun-postgres@sha256:'* ]] || event controlled_postgres_cosign_identity
     exit 0
   fi
   if [[ "$entrypoint" == node || "$entrypoint" == /nodejs/bin/node ]]; then
@@ -680,6 +681,7 @@ else
   ! grep -Fq 'https_probe_workdir_missing' "$EVENT_LOG"
   assert_no_secret_leak "$first_install_log"
 fi
+grep -Fq 'controlled_postgres_cosign_identity' "$EVENT_LOG"
 identity_hash="$(sha256sum "$FAKE_STATE/identity/"* | sha256sum | awk '{print $1}')"
 secrets_hash="$(sha256sum "$TARGET_DIR/secrets/"* | sha256sum | awk '{print $1}')"
 

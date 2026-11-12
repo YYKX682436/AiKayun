@@ -8,7 +8,10 @@ web_image="${3:?Web staging image is required}"
 expected_migration_head="${4:?Expected signed migration head is required}"
 validation_postgres_image="${AIKAYUN_VALIDATION_POSTGRES_IMAGE:-docker.io/library/postgres@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395}"
 validation_caddy_image="${AIKAYUN_VALIDATION_CADDY_IMAGE:-docker.io/library/caddy@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee}"
-printf '%s\n' "$validation_postgres_image" | grep -Eq '^docker.io/library/postgres@sha256:[a-f0-9]{64}$' || { echo 'PostgreSQL validation image must be an official digest-pinned image.' >&2; exit 2; }
+case "$validation_postgres_image" in
+  ghcr.io/yykx682436/aikayun-staging-api@sha256:b36f0783117de373b3ce8db84fc2187cee285c2af80fbca5f230f1b9eda3c192) ;;
+  *) printf '%s\n' "$validation_postgres_image" | grep -Eq '^docker.io/library/postgres@sha256:[a-f0-9]{64}$' || { echo 'PostgreSQL validation image must be an approved digest-pinned image.' >&2; exit 2; } ;;
+esac
 printf '%s\n' "$validation_caddy_image" | grep -Eq '^docker.io/library/caddy@sha256:[a-f0-9]{64}$' || { echo 'Caddy validation image must be an official digest-pinned image.' >&2; exit 2; }
 case "$platform" in
   linux/amd64) network="172.30.240.0/24" ;;
