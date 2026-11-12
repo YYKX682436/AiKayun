@@ -13,7 +13,7 @@ import { renderResticLicenses } from './restic-license-format.mjs'
 import { writeOfflineGoCache } from './offline-notice-cache.mjs'
 class Reject extends Error {}
 const digest = b => createHash('sha256').update(b).digest('hex')
-const expectedBinary = { arm64:'26c5b4d898ef5ea434d638fcbab616c319761dbd71ffe0d3585b37a9af62a2e1', amd64:'2f516a8aebbc0510806a501a88efdca5f199e52f9c6b720f044157a25684d84e' }
+const expectedBinary = { arm64:'2afe80670531f7cc4eb7f445fe6edfe70faa691a679be4a0d78df088a72d24b6', amd64:'42c087e671a774f637b522aa89f8fe60f2fa5ea17187c185255f0a862d36060f' }
 const trivy = 'aquasec/trivy@sha256:33f816d414b9d582d25bb737ffa4a632ae34e222f7ec1b50252cef0ce2266006'
 async function read(path,limit=16*1024*1024) {
   const s=await lstat(path); if(!s.isFile()||s.isSymbolicLink()||s.nlink!==1||s.size<=0||s.size>limit) throw new Reject('Invalid artifact')
@@ -49,7 +49,7 @@ async function main() {
   if(!Buffer.from(`${JSON.stringify(binding)}\n`).equals(bindingBytes)||!Buffer.from(`${JSON.stringify(scan)}\n`).equals(scanBytes)) throw new Reject('Noncanonical evidence encoding')
   const image=manifest.images.api
   if(binding.schema!=='aikayun.restic-release-evidence.v1'||binding.arch!==arch||binding.binary_sha256!==expectedBinary[arch]||
-     binding.license_manifest_sha256!=='1798e78a9b8d8d24bd901c8c9bccdce77bf14d98215f2a708beeb6f320dae63b'||
+     binding.license_manifest_sha256!=='92f0c44844b7e9e16956e00f7c5c9a5805ac7ab55d2febe048b5d6c5ecba6be2'||
      binding.generator_sha256!=='df92640564e96418a53e9b3bd2495943476cc7006a8d31b9dd8ed798b3b104b6'||
      binding.syft_image!=='anchore/syft@sha256:825cad3a952c87676a6d07e9a3bb05ac9c401d598360070e970aa46d54c1727e'||
      !/^sha256:[a-f0-9]{64}$/.test(binding.local_image_id)||

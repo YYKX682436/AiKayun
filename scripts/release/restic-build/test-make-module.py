@@ -23,10 +23,10 @@ with tempfile.TemporaryDirectory(prefix='aikayun-restic-module-test-') as tmp:
                                str(mod_lock), str(sum_lock), str(output)], capture_output=True)
 
     assert run(upstream, mod, sums, work / 'good').returncode == 0
-    result = work / 'good/github.com/restic/restic/@v/v0.19.1-aikayun.2.zip'
+    result = work / 'good/github.com/restic/restic/@v/v0.19.1-aikayun.3.zip'
     with ZipFile(upstream) as original, ZipFile(result) as patched:
         old_prefix = 'github.com/restic/restic@v0.19.1/'
-        new_prefix = 'github.com/restic/restic@v0.19.1-aikayun.2/'
+        new_prefix = 'github.com/restic/restic@v0.19.1-aikayun.3/'
         old_files = {name[len(old_prefix):]: original.read(name) for name in original.namelist() if not name.endswith('/')}
         new_files = {name[len(new_prefix):]: patched.read(name) for name in patched.namelist() if not name.endswith('/')}
         assert old_files.keys() == new_files.keys()
@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory(prefix='aikayun-restic-module-test-') as tmp:
         assert new_files['go.mod'] == mod.read_bytes()
         assert new_files['go.sum'] == sums.read_bytes()
         assert new_files['internal/global/global.go'] == old_files['internal/global/global.go'].replace(
-            b'const Version = "0.19.1"', b'const Version = "0.19.1-aikayun.2"')
+            b'const Version = "0.19.1"', b'const Version = "0.19.1-aikayun.3"')
 
     bad_mod = work / 'bad.mod'
     bad_mod.write_bytes(mod.read_bytes() + b'\n')

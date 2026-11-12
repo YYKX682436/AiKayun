@@ -296,7 +296,7 @@ database and requires its canonical module zip SHA-256
 `7d434c06bee279cc0378a23e91e369de8baef9addb64cf968b388ef4bb75ef34` and source
 commit `6aa3a516ce654808a1f28f9fa21e9b7c8e6e90bf`. The locked `go.mod` and
 `go.sum` upgrade dependencies from that release. The generated private module
-`v0.19.1-aikayun.2` also changes the version constant so that the executable
+`v0.19.1-aikayun.3` also changes the version constant so that the executable
 identifies the patch; it does not represent an upstream restic release.
 
 The module zip, dependency locks, Go 1.27.3 toolchain image, resulting Go module

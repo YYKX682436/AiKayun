@@ -18,8 +18,8 @@ from pathlib import Path
 
 REPOSITORY = 'ghcr.io/yykx682436/aikayun-staging-api'
 SHA = re.compile(r'^sha256:[a-f0-9]{64}$')
-HASHES = {'arm64': '26c5b4d898ef5ea434d638fcbab616c319761dbd71ffe0d3585b37a9af62a2e1',
-          'amd64': '2f516a8aebbc0510806a501a88efdca5f199e52f9c6b720f044157a25684d84e'}
+HASHES = {'arm64': '2afe80670531f7cc4eb7f445fe6edfe70faa691a679be4a0d78df088a72d24b6',
+          'amd64': '42c087e671a774f637b522aa89f8fe60f2fa5ea17187c185255f0a862d36060f'}
 TARGET = 'usr/bin/restic'
 PARENTS = ('usr', 'usr/bin')
 MAX_TAR = 2 * 1024 * 1024 * 1024

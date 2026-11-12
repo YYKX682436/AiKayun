@@ -11,12 +11,12 @@ RUN go mod download -json github.com/restic/restic@v0.19.1 > /tmp/upstream.json 
 RUN test "$TARGETOS" = linux && { test "$TARGETARCH" = amd64 || test "$TARGETARCH" = arm64; } \
   && GOPROXY=file:///proxy,https://proxy.golang.org GONOSUMDB=github.com/restic/restic \
      GOOS="$TARGETOS" GOARCH="$TARGETARCH" CGO_ENABLED=0 \
-     go install -trimpath -tags=disable_grpc_modules -ldflags='-s -w' github.com/restic/restic/cmd/restic@v0.19.1-aikayun.2 \
-  && (cd /go/pkg/mod/github.com/restic/restic@v0.19.1-aikayun.2 && go mod verify) \
+     go install -trimpath -tags=disable_grpc_modules -ldflags='-s -w' github.com/restic/restic/cmd/restic@v0.19.1-aikayun.3 \
+  && (cd /go/pkg/mod/github.com/restic/restic@v0.19.1-aikayun.3 && go mod verify) \
   && if test "$TARGETARCH" = "$(go env GOHOSTARCH)"; then binary=/go/bin/restic; else binary="/go/bin/${TARGETOS}_${TARGETARCH}/restic"; fi \
   && mkdir /out && cp "$binary" /out/restic \
   && go version -m /out/restic > /out/buildinfo \
-  && grep -F 'mod' /out/buildinfo | grep -F 'github.com/restic/restic' | grep -F 'v0.19.1-aikayun.2' | grep -F 'h1:ggpCj/YgpsldS+98NxKjYkSCT0d6F+pUnuSJDAlU65g=' \
+  && grep -F 'mod' /out/buildinfo | grep -F 'github.com/restic/restic' | grep -F 'v0.19.1-aikayun.3' | grep -F 'h1:nG3bsvusX28+p0A8fkwIgBWKgkbBJO/Etl95a8zWiOM=' \
   && grep -Fx "$(printf '\tbuild\tGOARCH=%s' "$TARGETARCH")" /out/buildinfo \
   && grep -Fx '/out/restic: go1.27.3' /out/buildinfo
 

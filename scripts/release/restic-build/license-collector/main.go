@@ -101,8 +101,8 @@ func purlIdentity(purl string) (string, string, error) {
 func collect(binary, sbomPath, cacheRoot, goRoot, arch string) (result, error) {
 	var out result
 	expectedBinary := map[string]string{
-		"arm64": "26c5b4d898ef5ea434d638fcbab616c319761dbd71ffe0d3585b37a9af62a2e1",
-		"amd64": "2f516a8aebbc0510806a501a88efdca5f199e52f9c6b720f044157a25684d84e",
+		"arm64": "2afe80670531f7cc4eb7f445fe6edfe70faa691a679be4a0d78df088a72d24b6",
+		"amd64": "42c087e671a774f637b522aa89f8fe60f2fa5ea17187c185255f0a862d36060f",
 	}[arch]
 	stat, err := os.Stat(binary)
 	if expectedBinary == "" || err != nil || !stat.Mode().IsRegular() || stat.Size() <= 0 || stat.Size() > 128<<20 {
@@ -120,7 +120,7 @@ func collect(binary, sbomPath, cacheRoot, goRoot, arch string) (result, error) {
 	if err != nil {
 		return out, errors.New("cannot read binary build information")
 	}
-	if bi.GoVersion != "go1.27.3" || bi.Main.Path != "github.com/restic/restic" || bi.Main.Version != "v0.19.1-aikayun.2" || bi.Main.Sum != "h1:ggpCj/YgpsldS+98NxKjYkSCT0d6F+pUnuSJDAlU65g=" || bi.Main.Replace != nil {
+	if bi.GoVersion != "go1.27.3" || bi.Main.Path != "github.com/restic/restic" || bi.Main.Version != "v0.19.1-aikayun.3" || bi.Main.Sum != "h1:nG3bsvusX28+p0A8fkwIgBWKgkbBJO/Etl95a8zWiOM=" || bi.Main.Replace != nil {
 		return out, errors.New("unexpected toolchain or main module")
 	}
 	goos, goarch := "", ""

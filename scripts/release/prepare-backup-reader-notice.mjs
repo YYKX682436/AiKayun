@@ -10,8 +10,8 @@ const execFile = promisify(execFileCallback)
 const goImage = 'golang@sha256:c65ecfe613b539ac74c62a4c3b2c27e8f8a6076384c8f27e8a3c0f3be17cc385'
 const trivyImage = 'aquasec/trivy@sha256:33f816d414b9d582d25bb737ffa4a632ae34e222f7ec1b50252cef0ce2266006'
 const expectedBinarySha256 = {
-  amd64: '2f516a8aebbc0510806a501a88efdca5f199e52f9c6b720f044157a25684d84e',
-  arm64: '26c5b4d898ef5ea434d638fcbab616c319761dbd71ffe0d3585b37a9af62a2e1',
+  amd64: '42c087e671a774f637b522aa89f8fe60f2fa5ea17187c185255f0a862d36060f',
+  arm64: '2afe80670531f7cc4eb7f445fe6edfe70faa691a679be4a0d78df088a72d24b6',
 }
 const expectedCaCopyrightSha256 = 'e85e1bcad3a915dc7e6f41412bc5bdeba275cadd817896ea0451f2140a93967c'
 const sha256 = data => createHash('sha256').update(data).digest('hex')

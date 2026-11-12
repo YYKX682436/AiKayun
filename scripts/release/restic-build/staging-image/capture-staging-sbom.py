@@ -95,7 +95,7 @@ def validate_sbom(data, binary_sha, binary_sha1):
         locations = [p.get('value') for p in props if re.fullmatch(r'syft:location:\d+:path', str(p.get('name', '')))]
         if not locations or any(p != '/usr/bin/restic' for p in locations):
             raise staging.Reject('Go component is outside the restic binary')
-    if ('github.com/restic/restic', 'v0.19.1-aikayun.2') not in seen or ('stdlib', 'go1.27.3') not in seen:
+    if ('github.com/restic/restic', 'v0.19.1-aikayun.3') not in seen or ('stdlib', 'go1.27.3') not in seen:
         raise staging.Reject('SBOM restic module or Go standard library is missing')
 
 

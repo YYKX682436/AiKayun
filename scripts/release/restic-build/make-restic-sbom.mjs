@@ -7,10 +7,10 @@ import { fileURLToPath } from 'node:url'
 
 class Reject extends Error {}
 const hashes = {
-  arm64: '26c5b4d898ef5ea434d638fcbab616c319761dbd71ffe0d3585b37a9af62a2e1',
-  amd64: '2f516a8aebbc0510806a501a88efdca5f199e52f9c6b720f044157a25684d84e',
+  arm64: '2afe80670531f7cc4eb7f445fe6edfe70faa691a679be4a0d78df088a72d24b6',
+  amd64: '42c087e671a774f637b522aa89f8fe60f2fa5ea17187c185255f0a862d36060f',
 }
-const manifestHash = '1798e78a9b8d8d24bd901c8c9bccdce77bf14d98215f2a708beeb6f320dae63b'
+const manifestHash = '92f0c44844b7e9e16956e00f7c5c9a5805ac7ab55d2febe048b5d6c5ecba6be2'
 const digest = value => createHash('sha256').update(value).digest('hex')
 const canonical = value => {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`

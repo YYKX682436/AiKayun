@@ -17,7 +17,7 @@ from pathlib import Path
 if len(sys.argv) != 2:
     raise SystemExit('usage: test-capture-staging-sbom.py VERIFIED_ARM64_RESTIC')
 binary = Path(sys.argv[1]).resolve(strict=True)
-expected = '26c5b4d898ef5ea434d638fcbab616c319761dbd71ffe0d3585b37a9af62a2e1'
+expected = '2afe80670531f7cc4eb7f445fe6edfe70faa691a679be4a0d78df088a72d24b6'
 if hashlib.sha256(binary.read_bytes()).hexdigest() != expected:
     raise SystemExit('fixture binary does not match fixed arm64 candidate')
 real_docker = shutil.which('docker')
