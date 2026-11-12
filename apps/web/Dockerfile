@@ -18,7 +18,7 @@ COPY packages/money packages/money
 COPY apps/web apps/web
 RUN pnpm --filter @aikayun/contracts build \
   && pnpm --filter @aikayun/money build \
-  && pnpm --filter @aikayun/web build \
+  && ROLLDOWN_WORKER_THREADS=2 RAYON_NUM_THREADS=2 pnpm --filter @aikayun/web build \
   && node scripts/release/prune-node-modules.mjs apps/web/.output/server/node_modules \
   && find apps/web/.output/server/node_modules -type f -name '*.ts' -delete \
   && find apps/web/.output -type f \( -name '*.map' -o -name '*.d.ts' -o -iname 'README*' -o -iname 'CHANGELOG*' -o -iname 'CONTRIBUTING*' \) -delete \
