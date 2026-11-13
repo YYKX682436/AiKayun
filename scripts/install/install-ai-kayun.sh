@@ -401,6 +401,8 @@ download_and_verify_release() {
   for file in release-manifest.json release-manifest.jws release-manifest.cosign.bundle; do
     fetch_https_file "${RELEASE_BASE}${file}" "$WORK_DIR/release/$file" || fail "Could not download $file."
   done
+  chmod 0755 "$WORK_DIR/release"
+  chmod 0644 "$WORK_DIR/release/release-manifest.json" "$WORK_DIR/release/release-manifest.cosign.bundle"
   docker run --rm --mount "type=bind,source=$WORK_DIR/release,target=/release,readonly" --entrypoint cosign "$COSIGN_IMAGE" \
     verify-blob --bundle /release/release-manifest.cosign.bundle \
     --certificate-identity "$RELEASE_CERT_IDENTITY" --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
