@@ -1328,7 +1328,7 @@ upgrade_install() {
       'const fs=require("node:fs");process.stdout.write(JSON.parse(fs.readFileSync("/release/release-manifest.json","utf8")).database.migration_checksums_sha256)')" || \
     fail 'The live PostgreSQL major version, applied migration registry, identity binding, or complete migration checksum does not match.'
   compose_with_release "$UPGRADE_STAGING_DIR/compose.yaml" false run --rm --no-deps \
-    production-install-init verify >/dev/null || fail 'The candidate release could not verify the existing installation identity and Pending Key.'
+    production-install-init dist/production-install-init.js verify >/dev/null || fail 'The candidate release could not verify the existing installation identity and Pending Key.'
 
   write_upgrade_journal preacceptance_probe
   compose_with_release "$UPGRADE_STAGING_DIR/compose.yaml" true up -d --force-recreate --no-deps api || \
@@ -1369,7 +1369,7 @@ upgrade_install() {
   compose up -d --force-recreate --no-deps web || \
     fail 'The candidate Web failed after the API became active. Automatic rollback is blocked; Caddy remains stopped and all data is retained.'
   wait_healthy web 300 || fail 'The candidate Web health check failed after the API became active. Automatic rollback is blocked; inspect before retrying.'
-  compose run --rm --no-deps production-install-init verify >/dev/null || \
+  compose run --rm --no-deps production-install-init dist/production-install-init.js verify >/dev/null || \
     fail 'The running candidate could not verify the existing identity and Pending Key. Automatic rollback is blocked.'
   verify_running_program_image api "$CANDIDATE_API_IMAGE" || \
     fail 'The running API image does not match the signed candidate manifest. Automatic rollback is blocked.'

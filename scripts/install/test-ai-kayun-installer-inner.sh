@@ -419,6 +419,13 @@ if [[ "$1" == compose ]]; then
         event compose_migration_default_entrypoint
       fi
       if [[ "$service" == production-install-init ]]; then
+        if (($#)); then
+          if [[ "$*" != 'dist/production-install-init.js verify' ]]; then
+            event compose_identity_verification_command_invalid
+            exit 1
+          fi
+          event compose_identity_verify
+        fi
         mkdir -p "$AIKAYUN_TEST_STATE/identity"
         [[ -f "$AIKAYUN_TEST_STATE/identity/installation.json" ]] || \
           printf 'controlled isolated identity\n' > "$AIKAYUN_TEST_STATE/identity/installation.json"
@@ -722,6 +729,7 @@ if [[ "$SCENARIO" == upgrade-* ]]; then
       [[ "$(snapshot_upgrade_data)" == "$old_data_snapshot" ]]
       [[ "$(grep -c '^compose_migration_default_entrypoint$' "$EVENT_LOG" || true)" == "$old_default_migration_count" ]]
       grep -Fq 'compose_upgrade_database_check_readonly' "$EVENT_LOG"
+      [[ "$(grep -c '^compose_identity_verify$' "$EVENT_LOG" || true)" == 2 ]]
       ! grep -Eq '^volume_create:' <(tail -n "+$((before_upgrade_events + 1))" "$EVENT_LOG")
       [[ ! -e "$FAKE_STATE/upgrade-lock-held" && ! -e "$TARGET_DIR/.upgrade-journal.json" ]]
       printf 'Signed customer upgrade succeeded; exact migration registry was checked read-only; business volumes, secrets, and identity hashes stayed unchanged.\n'

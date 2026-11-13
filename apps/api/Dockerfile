@@ -103,6 +103,8 @@ COPY --from=build --chown=1000:1000 /runtime-root/var/lib/aikayun/ /var/lib/aika
 COPY --from=build --chown=1000:1000 /prod/api/package.json ./package.json
 COPY --from=build --chown=1000:1000 /prod/api/node_modules ./node_modules
 COPY --from=build --chown=1000:1000 /prod/api/dist ./dist
+# Compatibility with installed upgrade launchers that invoke `node verify`.
+COPY --chown=1000:1000 apps/api/scripts/release/legacy-upgrade-verify.mjs ./verify
 COPY --from=build /runtime-root/usr/ /usr/
 USER 1000:1000
 EXPOSE 3001
