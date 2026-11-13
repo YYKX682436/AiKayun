@@ -1,0 +1,365 @@
+name: aikayun-restore-isolated
+
+x-restore-labels: &restore-labels
+  com.aikayun.restore.run: ${AIKAYUN_RESTORE_RUN_ID:?Missing isolated restore run ID}
+  com.aikayun.restore.scope: isolated-restore-v1
+
+services:
+  db:
+    image: ${AIKAYUN_POSTGRES_IMAGE:?Missing verified PostgreSQL 18 image}
+    restart: "no"
+    environment:
+      POSTGRES_DB: aikayun
+      POSTGRES_USER: aikayun_restore_bootstrap
+      POSTGRES_PASSWORD_FILE: /run/restore/bootstrap-password
+    volumes:
+      - type: volume
+        source: credentials
+        target: /run/restore
+        read_only: true
+        volume:
+          nocopy: true
+      - type: volume
+        source: database
+        target: /var/lib/postgresql
+        volume:
+          nocopy: true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aikayun_restore_bootstrap -d aikayun"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    labels: *restore-labels
+    networks: [restore]
+
+  restore-secrets:
+    image: ${AIKAYUN_POSTGRES_IMAGE:?Missing verified PostgreSQL 18 image}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        cp /input/bootstrap-password /output/bootstrap-password;
+        cp /input/readonly-password /output/readonly-password;
+        chown 0:0 /output/bootstrap-password;
+        chmod 0400 /output/bootstrap-password /output/readonly-password;
+        chown 1000:1000 /output/readonly-password
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,nodev,size=8m"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+    restart: "no"
+    volumes:
+      - type: bind
+        source: ${AIKAYUN_RESTORE_BOOTSTRAP_PASSWORD_FILE:?Missing isolated DB password}
+        target: /input/bootstrap-password
+        read_only: true
+      - type: bind
+        source: ${AIKAYUN_RESTORE_READONLY_PASSWORD_FILE:?Missing read-only DB password}
+        target: /input/readonly-password
+        read_only: true
+      - type: volume
+        source: credentials
+        target: /output
+        volume: { nocopy: true }
+    labels: *restore-labels
+
+  restore-source:
+    image: ${AIKAYUN_BACKUP_RESTIC_IMAGE:?Missing verified Restic image}
+    entrypoint: ["/usr/bin/restic"]
+    command:
+      - --repo
+      - /repo
+      - --password-file
+      - /run/password
+      - --no-cache
+      - --no-lock
+      - --quiet
+      - restore
+      - ${AIKAYUN_RESTORE_SOURCE_SNAPSHOT_ID:?Missing verified source snapshot}
+      - --target
+      - /restore
+      - --sparse
+      - --verify
+      - --include
+      - /sources/state
+      - --include
+      - /sources/caddy-data
+      - --include
+      - /sources/caddy-config
+      - --include
+      - /sources/staging/payload/database.dump
+      - --include
+      - /sources/deployment/secrets/payment_credential_key_ring
+      - --include
+      - /sources/deployment/secrets/code_pool_encryption_key_ring
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,nodev,size=64m"
+      - "/restore:rw,noexec,nosuid,nodev,size=8m"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+    restart: "no"
+    volumes:
+      - type: bind
+        source: ${AIKAYUN_RESTORE_REPOSITORY:?Missing backup repository}
+        target: /repo
+        read_only: true
+      - type: bind
+        source: ${AIKAYUN_RESTORE_PASSWORD_FILE:?Missing Restic password file}
+        target: /run/password
+        read_only: true
+      - type: volume
+        source: state
+        target: /restore/sources/state
+        volume: { nocopy: true }
+      - type: volume
+        source: caddy_data
+        target: /restore/sources/caddy-data
+        volume: { nocopy: true }
+      - type: volume
+        source: caddy_config
+        target: /restore/sources/caddy-config
+        volume: { nocopy: true }
+      - type: volume
+        source: database_input
+        target: /restore/sources/staging/payload
+        volume: { nocopy: true }
+      - type: volume
+        source: deployment_keys
+        target: /restore/sources/deployment/secrets
+        volume: { nocopy: true }
+    labels: *restore-labels
+
+  restore-manifest:
+    image: ${AIKAYUN_BACKUP_RESTIC_IMAGE:?Missing verified Restic image}
+    entrypoint: ["/usr/bin/restic"]
+    command:
+      - --repo
+      - /repo
+      - --password-file
+      - /run/password
+      - --no-cache
+      - --no-lock
+      - --quiet
+      - restore
+      - ${AIKAYUN_RESTORE_MANIFEST_SNAPSHOT_ID:?Missing verified manifest snapshot}
+      - --target
+      - /restore
+      - --sparse
+      - --verify
+      - --include
+      - ${AIKAYUN_RESTORE_MANIFEST_DIRECTORY:?Missing verified manifest directory}/manifest.json
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,nodev,size=64m"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+    restart: "no"
+    volumes:
+      - type: bind
+        source: ${AIKAYUN_RESTORE_REPOSITORY:?Missing backup repository}
+        target: /repo
+        read_only: true
+      - type: bind
+        source: ${AIKAYUN_RESTORE_PASSWORD_FILE:?Missing Restic password file}
+        target: /run/password
+        read_only: true
+      - type: volume
+        source: manifest
+        target: /restore
+        volume: { nocopy: true }
+    labels: *restore-labels
+
+  restore-database:
+    image: ${AIKAYUN_POSTGRES_IMAGE:?Missing verified PostgreSQL 18 image}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        export PGPASSWORD="$(cat /run/restore/bootstrap-password)";
+        pg_restore --exit-on-error --no-owner --no-privileges --host=db --port=5432
+        --username=aikayun_restore_bootstrap --dbname=aikayun /restore/database.dump
+    restart: "no"
+    environment:
+      PGAPPNAME: aikayun_isolated_restore_database
+    volumes:
+      - type: volume
+        source: database_input
+        target: /restore
+        read_only: true
+        volume: { nocopy: true }
+      - type: volume
+        source: credentials
+        target: /run/restore
+        read_only: true
+        volume: { nocopy: true }
+    labels: *restore-labels
+    networks: [restore]
+
+  restore-readonly-role:
+    image: ${AIKAYUN_POSTGRES_IMAGE:?Missing verified PostgreSQL 18 image}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        export PGPASSWORD="$(cat /run/restore/bootstrap-password)";
+        readonly_password="$(cat /run/restore/readonly-password)";
+        psql -X --no-password --set=ON_ERROR_STOP=1 --host=db --port=5432
+        --username=aikayun_restore_bootstrap --dbname=aikayun
+        --command="CREATE ROLE aikayun_restore_ro LOGIN PASSWORD '$$readonly_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION; GRANT CONNECT ON DATABASE aikayun TO aikayun_restore_ro; GRANT USAGE ON SCHEMA public TO aikayun_restore_ro; GRANT SELECT ON ALL TABLES IN SCHEMA public TO aikayun_restore_ro; GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO aikayun_restore_ro;" || { echo RESTORE_READONLY_ROLE_CREATE_FAILED >&2; exit 61; }
+    restart: "no"
+    volumes:
+      - type: volume
+        source: credentials
+        target: /run/restore
+        read_only: true
+        volume: { nocopy: true }
+    labels: *restore-labels
+    networks: [restore]
+
+  restore-input-permissions:
+    image: ${AIKAYUN_POSTGRES_IMAGE:?Missing verified PostgreSQL 18 image}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        if test -f /database/database.dump; then echo RESTORE_DATABASE_PRESENT;
+        else echo RESTORE_INPUT_DATABASE_MISSING >&2; exit 41; fi;
+        restored_manifest="$$(find /manifest -type f -name manifest.json -print -quit)" || { echo RESTORE_INPUT_MANIFEST_SCAN_FAILED >&2; exit 51; };
+        if test -z "$$restored_manifest"; then echo RESTORE_INPUT_MANIFEST_MISSING >&2; exit 42; fi;
+        test ! -L "$$restored_manifest" || { echo RESTORE_INPUT_MANIFEST_SYMLINK >&2; exit 45; };
+        find /manifest -type l -print -quit | grep -q . && { echo RESTORE_INPUT_MANIFEST_TREE_SYMLINK >&2; exit 46; };
+        find /manifest ! -type d ! -type f -print -quit | grep -q . && { echo RESTORE_INPUT_MANIFEST_TREE_SPECIAL >&2; exit 50; };
+        find /manifest -type f ! -path "$$restored_manifest" -print -quit | grep -q . && { echo RESTORE_INPUT_MANIFEST_TREE_UNEXPECTED >&2; exit 47; };
+        if test "$$restored_manifest" != /manifest/manifest.json; then mv -- "$$restored_manifest" /manifest/manifest.json || { echo RESTORE_INPUT_MANIFEST_MOVE_FAILED >&2; exit 48; }; fi;
+        find /manifest -depth -mindepth 1 -type d -empty -delete || { echo RESTORE_INPUT_MANIFEST_DIR_CLEANUP_FAILED >&2; exit 51; };
+        test -f /manifest/manifest.json && test ! -L /manifest/manifest.json || { echo RESTORE_INPUT_MANIFEST_NORMALIZATION_FAILED >&2; exit 49; };
+        test -f /keys/payment_credential_key_ring && test ! -L /keys/payment_credential_key_ring || { echo RESTORE_INPUT_PAYMENT_KEY_MISSING >&2; exit 53; };
+        test -f /keys/code_pool_encryption_key_ring && test ! -L /keys/code_pool_encryption_key_ring || { echo RESTORE_INPUT_DELIVERY_KEY_MISSING >&2; exit 54; };
+        chown 1000:1000 /database /manifest /keys /database/database.dump /manifest/manifest.json || { echo RESTORE_INPUT_OWNER_CHANGE_FAILED >&2; exit 43; };
+        chmod 0700 /database /manifest /keys || { echo RESTORE_INPUT_DIRECTORY_MODE_CHANGE_FAILED >&2; exit 52; };
+        chmod 0400 /database/database.dump /manifest/manifest.json || { echo RESTORE_INPUT_MODE_CHANGE_FAILED >&2; exit 44; }
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,nodev,size=8m"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+    restart: "no"
+    volumes:
+      - type: volume
+        source: database_input
+        target: /database
+        volume: { nocopy: true }
+      - type: volume
+        source: manifest
+        target: /manifest
+        volume: { nocopy: true }
+      - type: volume
+        source: deployment_keys
+        target: /keys
+        volume: { nocopy: true }
+    labels: *restore-labels
+
+  validate:
+    image: ${AIKAYUN_API_IMAGE:?Missing verified API image}
+    entrypoint: ["/nodejs/bin/node"]
+    command: ["/app/dist/backup/isolated-restore-cli.js"]
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,nodev,size=8m"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+    environment:
+      NODE_ENV: production
+      API_HOST: 127.0.0.1
+      API_PORT: "1"
+      PUBLIC_ORIGIN: https://www.iana.org
+      COOKIE_SECURE: "true"
+      TRUST_PROXY_CIDRS: 127.0.0.1/32
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: aikayun
+      PGUSER: aikayun_restore_ro
+      PGPASSWORD_FILE: /run/restore/credentials/readonly-password
+      PGOPTIONS: -c default_transaction_read_only=on
+      MEDIA_ROOT: /var/lib/aikayun/media
+      PRIVATE_FILE_ROOT: /var/lib/aikayun/private-files
+      INSTANCE_IDENTITY_ROOT: /var/lib/aikayun/identity
+      LICENSE_TRUST_STORE_ROOT: /var/lib/aikayun/license-trust
+      LICENSE_PENDING_KEY_ROOT: /var/lib/aikayun/license-pending
+      PAYMENT_CREDENTIAL_KEY_RING_FILE: /run/restore/keys/payment_credential_key_ring
+      CODE_POOL_ENCRYPTION_KEY_RING_FILE: /run/restore/keys/code_pool_encryption_key_ring
+      AIKAYUN_RESTORE_RUN_ID: ${AIKAYUN_RESTORE_RUN_ID:?Missing isolated restore run ID}
+      AIKAYUN_RESTORE_SET_ID: ${AIKAYUN_RESTORE_SET_ID:?Missing backup set ID}
+      AIKAYUN_RESTORE_SOURCE_SNAPSHOT_ID: ${AIKAYUN_RESTORE_SOURCE_SNAPSHOT_ID:?Missing source snapshot ID}
+      AIKAYUN_RESTORE_MANIFEST_SNAPSHOT_ID: ${AIKAYUN_RESTORE_MANIFEST_SNAPSHOT_ID:?Missing manifest snapshot ID}
+      AIKAYUN_RESTORE_RELEASE_ID: ${AIKAYUN_RESTORE_RELEASE_ID:?Missing verified release ID}
+      AIKAYUN_RESTORE_API_DIGEST: ${AIKAYUN_RESTORE_API_DIGEST:?Missing verified API image digest}
+      AIKAYUN_RESTORE_WEB_DIGEST: ${AIKAYUN_RESTORE_WEB_DIGEST:?Missing verified Web image digest}
+      AIKAYUN_RESTORE_POSTGRES_DIGEST: ${AIKAYUN_RESTORE_POSTGRES_DIGEST:?Missing verified PostgreSQL image digest}
+      AIKAYUN_RESTORE_CADDY_DIGEST: ${AIKAYUN_RESTORE_CADDY_DIGEST:?Missing verified Caddy image digest}
+      AIKAYUN_RESTORE_TEST_DIAGNOSTICS: ${AIKAYUN_RESTORE_TEST_DIAGNOSTICS:-false}
+    volumes:
+      - type: volume
+        source: state
+        target: /var/lib/aikayun
+        read_only: true
+        volume: { nocopy: true }
+      - type: volume
+        source: deployment_keys
+        target: /run/restore/keys
+        read_only: true
+        volume: { nocopy: true }
+      - type: volume
+        source: database_input
+        target: /run/restore/database
+        read_only: true
+        volume: { nocopy: true }
+      - type: volume
+        source: manifest
+        target: /run/restore/manifest
+        read_only: true
+        volume: { nocopy: true }
+      - type: volume
+        source: credentials
+        target: /run/restore/credentials
+        read_only: true
+        volume: { nocopy: true }
+    labels: *restore-labels
+    networks: [restore]
+
+networks:
+  restore:
+    name: ${AIKAYUN_RESTORE_PROJECT:?Missing isolated project name}_restore
+    internal: true
+    labels: *restore-labels
+
+volumes:
+  database:
+    labels: *restore-labels
+  credentials:
+    labels: *restore-labels
+  state:
+    labels: *restore-labels
+  caddy_data:
+    labels: *restore-labels
+  caddy_config:
+    labels: *restore-labels
+  database_input:
+    labels: *restore-labels
+  deployment_keys:
+    labels: *restore-labels
+  manifest:
+    labels: *restore-labels

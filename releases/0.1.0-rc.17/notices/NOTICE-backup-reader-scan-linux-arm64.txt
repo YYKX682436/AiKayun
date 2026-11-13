@@ -1,0 +1,1 @@
+{"schema":"aikayun.backup-reader-notice-scan.v1","scanner":"aquasec/trivy@sha256:33f816d414b9d582d25bb737ffa4a632ae34e222f7ec1b50252cef0ce2266006","scope":"notice-files-only","arch":"arm64","notice_sha256":"c51cc27b7d078bf232683b5f37faaa17f6433b9a5b2ccbc89a724e0a52f979ee","findings":0}
