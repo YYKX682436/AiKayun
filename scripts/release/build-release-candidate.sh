@@ -272,12 +272,14 @@ for platform in linux/amd64 linux/arm64; do
 done
 
 for platform in linux/amd64 linux/arm64; do
-  AIKAYUN_VALIDATION_POSTGRES_IMAGE="$postgres_staging_image" \
-    "$source_root/scripts/release/test-runtime-platform.sh" "$platform" "$api_staging_index_ref" "$web_staging_index_ref" \
+  AIKAYUN_VALIDATION_POSTGRES_IMAGE="${staging_api_repository}@$(digest_for postgres "$platform")" \
+  AIKAYUN_VALIDATION_CADDY_IMAGE="${caddy_image%@*}@$(digest_for caddy "$platform")" \
+    "$source_root/scripts/release/test-runtime-platform.sh" "$platform" \
+    "${staging_api_repository}@$(digest_for api "$platform")" "${staging_web_repository}@$(digest_for web "$platform")" \
     '202611100002_payment_expiry_and_refund_completion'
 done
 migration_path="$work/migration-checksums.json"
-container_id="$(docker create --platform linux/amd64 "$api_staging_index_ref")"
+container_id="$(docker create --platform linux/amd64 "${staging_api_repository}@${api_amd64}")"
 docker cp "$container_id:/app/dist/db/migration-checksums.json" "$migration_path"
 docker rm "$container_id" >/dev/null
 migration_head="$(jq -er '.migration_head | select(test("^[0-9]{12}_[A-Za-z0-9_-]+$"))' "$migration_path")"
