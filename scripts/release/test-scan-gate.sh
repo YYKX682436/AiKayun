@@ -7,7 +7,7 @@ candidate_script="$repo_root/scripts/release/build-release-candidate.sh"
 # The final GHCR repository is empty on a first release. All pre-promotion
 # container reads must therefore use the private staging digest.
 pre_promotion="$(sed -n '1,/api_promoted_digest=/p' "$candidate_script")"
-grep -Fq 'docker create --platform linux/amd64 "$api_staging_index_ref"' <<<"$pre_promotion" || {
+grep -Fq 'docker create --platform linux/amd64 "${staging_api_repository}@${api_amd64}"' <<<"$pre_promotion" || {
   echo 'First-release migration metadata still reads the unpublished final API image.' >&2
   exit 1
 }
