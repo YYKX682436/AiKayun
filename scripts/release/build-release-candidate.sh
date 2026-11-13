@@ -13,7 +13,7 @@ postgres_image='ghcr.io/yykx682436/aikayun-postgres@sha256:b36f0783117de373b3ce8
 caddy_image='docker.io/library/caddy@sha256:78bd35025c7ba85961dd149ae670315129954e77abe2383ac47c89106b35ade9'
 syft_image='anchore/syft@sha256:825cad3a952c87676a6d07e9a3bb05ac9c401d598360070e970aa46d54c1727e'
 trivy_image='aquasec/trivy@sha256:33f816d414b9d582d25bb737ffa4a632ae34e222f7ec1b50252cef0ce2266006'
-skopeo_image='quay.io/skopeo/stable@sha256:87a0dd8d9a093c87681706a2cb8ae51757af8c12340f04ab024c85badc6dcc07'
+skopeo_image='quay.io/skopeo/stable@sha256:9fdeeda2801cf93a0a15bfb2154e44a0c5a0f3650e54586165bd1b732e503702'
 go_toolchain_image='golang@sha256:c65ecfe613b539ac74c62a4c3b2c27e8f8a6076384c8f27e8a3c0f3be17cc385'
 owner="${GITHUB_REPOSITORY_OWNER,,}"
 release_tag="v${version}"
@@ -113,7 +113,7 @@ fi
 grep -q 'non-test HTTPS origin' "$work/test-root-check.stderr" || fail 'The commercial build gate did not reject a test issuer.'
 
 node "$source_root/scripts/release/verify-origin.mjs" "$AIKAYUN_RELEASE_ORIGIN" >/dev/null
-origin_status="$(curl --proto '=https' --tlsv1.2 --silent --show-error --output /dev/null \
+origin_status="$(curl --proto '=https' --tlsv1.2 --silent --show-error --retry 3 --retry-delay 2 --output /dev/null \
   --write-out '%{http_code}' --head "${AIKAYUN_RELEASE_ORIGIN%/}/releases/${version}/release-index.json")"
 [[ "$origin_status" == 404 ]] || fail 'The public release path already exists or could not be proven unused.'
 if git -C "$source_root" ls-remote --exit-code --tags origin "refs/tags/${release_tag}" >/dev/null 2>&1; then
@@ -122,6 +122,7 @@ else
   result=$?
   [[ "$result" == 2 ]] || fail 'Could not prove the source release tag is unused.'
 fi
+export DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.docker}"
 printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin >/dev/null
 registry_logged_in=1
 owner_type="$(gh api "/users/${GITHUB_REPOSITORY_OWNER}" --jq .type)"

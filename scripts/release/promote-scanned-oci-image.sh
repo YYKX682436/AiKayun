@@ -45,17 +45,17 @@ skopeo_run() {
     --entrypoint /usr/bin/skopeo "$skopeo_image" "$@"
 }
 
-skopeo_run --authfile /auth/config.json inspect --raw "docker://${source_ref}" > "$source_manifest"
+skopeo_run inspect --raw --authfile /auth/config.json "docker://${source_ref}" > "$source_manifest"
 observed_source_digest="$(skopeo_run manifest-digest "/work/$(basename "$source_manifest")")"
 [[ "$observed_source_digest" == "$source_digest" ]] || { echo 'Staging manifest digest did not match its pinned reference.' >&2; exit 1; }
 
-skopeo_run --authfile /auth/config.json copy --all --preserve-digests \
+skopeo_run copy --all --preserve-digests --authfile /auth/config.json \
   --digestfile "/work/$(basename "$copied_digest_file")" \
-  "docker://${source_ref}" "docker://${destination_repository}:${tag}"
+  "docker://${source_ref}" "docker://${destination_repository}:${tag}" >&2
 copied_digest="$(tr -d '\r\n' < "$copied_digest_file")"
 [[ "$copied_digest" == "$source_digest" ]] || { echo 'OCI promotion changed the manifest digest.' >&2; exit 1; }
 
-skopeo_run --authfile /auth/config.json inspect --raw \
+skopeo_run inspect --raw --authfile /auth/config.json \
   "docker://${destination_repository}:${tag}" > "$destination_manifest"
 observed_destination_digest="$(skopeo_run manifest-digest "/work/$(basename "$destination_manifest")")"
 [[ "$observed_destination_digest" == "$source_digest" ]] || { echo 'Destination tag does not resolve to the verified staging digest.' >&2; exit 1; }
