@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "product": "aikayun",
+  "version": "0.1.0-rc.14",
+  "release_id": "aikayun-0.1.0-rc.14",
+  "channel": "candidate",
+  "download_base_url": "https://releases.aiove.top/releases/0.1.0-rc.14/",
+  "manifest": "release-manifest.json",
+  "manifest_signature": "release-manifest.jws",
+  "manifest_cosign_bundle": "release-manifest.cosign.bundle",
+  "release_signature_root": "release-signing-root.jwk.json",
+  "artifacts": "release-manifest.json:artifacts"
+}

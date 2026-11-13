@@ -1,0 +1,266 @@
+{
+  "schema": 1,
+  "migration_head": "202611100002_payment_expiry_and_refund_completion",
+  "migrations": [
+    {
+      "name": "202610150001_admin_auth",
+      "sha256": "b457d179a8f73bd677ec91e3726719c8edf8f7706baafbd1095ced81272cdcce"
+    },
+    {
+      "name": "202610160001_product_catalog_core",
+      "sha256": "2f72aa57ea279e9bf875e6d8274795c01346a279f12285929b2230aab46cff46"
+    },
+    {
+      "name": "202610160002_product_sku_invariant",
+      "sha256": "341ffe2292827c93db1374f6363bfaf9e33551409af57ab3f92139da427085b8"
+    },
+    {
+      "name": "202610160003_product_taxonomy_options",
+      "sha256": "d7cbf310dc45fbf52c35147f9cb87fb3689efae6b1208dbe7bee8465e6d4af49"
+    },
+    {
+      "name": "202610160004_product_catalog_r1",
+      "sha256": "26e59c67a53260bad9180d9de2d58fa9d6c9de0c7ea1340fc3b7ce87f77a116b"
+    },
+    {
+      "name": "202610160005_product_pricing_inventory",
+      "sha256": "a95765999a869764080eff88e7cb9e6c87a721ee4540b1932927db59122fdc9c"
+    },
+    {
+      "name": "202610170001_inventory_retirement_safety",
+      "sha256": "2a388b5c029915b2cb3b9c6dd896909ec1cdf6892dddd39b76fbfdc90dbe728f"
+    },
+    {
+      "name": "202610170002_product_management",
+      "sha256": "74b0994d24ffd2f71f9cd1acf4f05ba6c859e11a0ca6fae67d89ceedd50f27d7"
+    },
+    {
+      "name": "202610170003_product_media_and_rich_content",
+      "sha256": "b1fbba9f88dd239fa8b320bdd02b7adcf6e33937d578a61be68130d6ad6d5663"
+    },
+    {
+      "name": "202610170004_product_creation_idempotency",
+      "sha256": "7bf13459f5bc6855fb357b6500ec411073e903d80a82526605045b16e45f3140"
+    },
+    {
+      "name": "202610180001_trade_foundation",
+      "sha256": "e57b4b615517f535c0362eeefb8aa7861012d5cc42c8ae971631769ecd56426c"
+    },
+    {
+      "name": "202610190001_customer_sessions",
+      "sha256": "af926c2746a7902c9845345cc20e13f11e064887b525f9326287891927230d93"
+    },
+    {
+      "name": "202610190002_customer_management",
+      "sha256": "06c9598999a8945bb6e27860e9cb0bdcdf9cb4a32dd23eed9bae9fb1198b7d4e"
+    },
+    {
+      "name": "202610190003_customer_cart",
+      "sha256": "6d39c2fdc337fb124b6827cf66c79a9210bd6a597fac35d762029d894a409d67"
+    },
+    {
+      "name": "202610190004_orders",
+      "sha256": "d3f934aa7f4fcdb02c4857644bf7a67c9c4161fbe6352d1a65b35b7d89ae9f73"
+    },
+    {
+      "name": "202610200001_purchase_limits",
+      "sha256": "02df2d7e03157314f7040d270ba4bffdd7132ce37650ae34efa72eba6ef5737c"
+    },
+    {
+      "name": "202610200002_online_payments",
+      "sha256": "c8173faf37e1caa46def5c17084cab494b1e0b65714e08d3eb314a3c7c20229b"
+    },
+    {
+      "name": "202610200003_payment_reconciliation",
+      "sha256": "c827002d64a398a85d2597ca77f55f61bbcb36b9bd611c08455602e0ce81573b"
+    },
+    {
+      "name": "202610200004_wallet_payments",
+      "sha256": "356959ebcdd4553ce9a5ad44fc07180cb077d95418fbffc3b63aba95ebd7b65f"
+    },
+    {
+      "name": "202610200005_refunds",
+      "sha256": "3587950b5dd7d8c21851746c5e1e2cfe541285cfcd9afa16a40138972cec77bb"
+    },
+    {
+      "name": "202610210001_withdrawals",
+      "sha256": "2e779406d75c93ccdf374a5dbea784b4e47a609b2b260e69ce6907c2b77db125"
+    },
+    {
+      "name": "202610210002_code_pool",
+      "sha256": "454fa217a009fb27c8a641bf908104a928c0809f7b19ef28283cc8bc5af10226"
+    },
+    {
+      "name": "202610210003_code_pool_operation_key",
+      "sha256": "ef6bd3533d8d65b4dd3d19a497cfcd1bcb9a970df72416604dde03db9aa97d32"
+    },
+    {
+      "name": "202610210004_fixed_delivery",
+      "sha256": "91af59856b8e565c83729fe040489962f7a46561b3e8c344d0b01dde9c923583"
+    },
+    {
+      "name": "202610210005_private_file_delivery",
+      "sha256": "9e29e7ecd4941020cb02e1a5ca6626d6807971844f8468aafbf6c23ffa17be0d"
+    },
+    {
+      "name": "202610230001_external_api_delivery",
+      "sha256": "57b50d920159c5f2a76f484d907ff7dd006a0aa9b19b3d4e05d82876fb4a2603"
+    },
+    {
+      "name": "202610230002_digital_fulfillment_acceptance",
+      "sha256": "8be66dde9b52e2ff992ac852ea2aa76df87efed935039208d88d484899f35917"
+    },
+    {
+      "name": "202610240001_kayixin_readonly",
+      "sha256": "3d96c9c9aa0f921f2c49c8f23b1ad6cf21673719c7a0c45334a03fb2bbdee60e"
+    },
+    {
+      "name": "202610240002_purchase_forms_drafts",
+      "sha256": "12299a2d18190a322c0bad207c920bc5051d3d1384d548581144f1eaa90b8587"
+    },
+    {
+      "name": "202610240003_purchase_form_audit_product_identity",
+      "sha256": "2a687d822e52627da2a7a9a56e33f8222ebbf64f49fee7fc988729ecf0987995"
+    },
+    {
+      "name": "202610250001_purchase_lines",
+      "sha256": "ee40c7838b41cf2150f5a8da093e09c9411e58f80810301c22bf438241de2527"
+    },
+    {
+      "name": "202610250002_purchase_snapshot_manifest_r1",
+      "sha256": "4c40c3930973ff5152c18f2a2ecb368bd506dd32b1f38ecf229a56a1d5a769df"
+    },
+    {
+      "name": "202610250003_purchase_form_activation_state",
+      "sha256": "789e465631c7512726463d271c0aa68dce2cd13871b05a8f3b19ed4a645c97cc"
+    },
+    {
+      "name": "202610250004_cart_replacement_drafts",
+      "sha256": "a718bb652c3cdbd813c4457b96b2c29994a4deb6f73df23d728e84431e99c240"
+    },
+    {
+      "name": "202610260001_supplier_product_mappings",
+      "sha256": "5c3fb5e6195b36296cfff09ce7dc2f1e4a93eebbc5b0250f84bf38788cf67277"
+    },
+    {
+      "name": "202610260002_product_pricing_rules",
+      "sha256": "f78887fe78f512264907251260e664e7c7b22bf79c12b3ea89afe7ff74bf98f7"
+    },
+    {
+      "name": "202610270001_supplier_quote_observations",
+      "sha256": "8788d156024619fb8967b114c22fe0ee927d2fa93d737cffa9aa017c5681dc08"
+    },
+    {
+      "name": "202610270002_supplier_quote_source_consistency",
+      "sha256": "387acc8aceacfdf06a06d43b787097aeb49b5e71b09280f9b18047063468693a"
+    },
+    {
+      "name": "202610270003_procurement_identity",
+      "sha256": "02bf311c87f73091a21bc25c485db62bad505e3c3621bc3f9b03df1dd690c6f4"
+    },
+    {
+      "name": "202610270004_procurement_risk_budget",
+      "sha256": "25906c70dffe980f5b3174a9ac776abe22a8e3711da4f5e91dad3d8e6710ca4e"
+    },
+    {
+      "name": "202610270005_procurement_execution",
+      "sha256": "fcd587d72c24789477286e72c09fc28e60e0b206ce462f50ee36b09d0d6bf165"
+    },
+    {
+      "name": "202610270006_procurement_identity_conflict_guard",
+      "sha256": "b691b3ab1f1d41d5b6ef984931f82334120c0f376c57758a10fafa2468f7f809"
+    },
+    {
+      "name": "202610270007_procurement_global_conflicts",
+      "sha256": "db2f9dd66a96307ce19099b47a12c4a1d513200dbdffeacd20dccd7e901f96d5"
+    },
+    {
+      "name": "202610290001_installation_identity",
+      "sha256": "3a593bad6489cf1643783b4d49c1d3766b3575b17ec37774e87c473fc4ff4170"
+    },
+    {
+      "name": "202610300001_local_license_operations",
+      "sha256": "69d66e3e1dc0550f92c2c322757dd8a0d5badf8927f487fdfcb7e6e69056351b"
+    },
+    {
+      "name": "202610300002_single_initial_activation_attempt",
+      "sha256": "6b9599827aaa4d54b4fc9058dce5b60cae1d75122c89b355a0f5b3a90c4dbe95"
+    },
+    {
+      "name": "202610300003_license_operation_result_archive",
+      "sha256": "f50c7321bca49cea05068c8fc98324a494c81d2f16a1e17d54cda15956fcb120"
+    },
+    {
+      "name": "202610300004_license_result_archive_presence",
+      "sha256": "26923e635f409c2dce9bddf18d1d461c43bca166125cfce5de19f46a420707de"
+    },
+    {
+      "name": "202610310001_license_operation_trusted_rejection",
+      "sha256": "8fe80e3d25667ac688bebba4383133535d93a82b08befccff56411a8a548cef5"
+    },
+    {
+      "name": "202610310002_license_operation_recovery_attempts",
+      "sha256": "26e7c8637fd0c1e3cbc123da928d05f3d76f30f61763b4e0255b40e93a36ea1b"
+    },
+    {
+      "name": "202610310003_instance_license_state",
+      "sha256": "283e1d902db3b30af350f24c9856b9ecda429ed971f9411d5870e4f9cda7cd33"
+    },
+    {
+      "name": "202610311001_instance_license_refusal_first",
+      "sha256": "0327d36a1559f936da838cf1a9d272f97fc235acb6e53234ca64bb6016b35d5a"
+    },
+    {
+      "name": "202611010001_trusted_license_time_watermark",
+      "sha256": "efeb9b47756a946edf75b19f153d18aa84ba44169239ea697035b4f78166c2d5"
+    },
+    {
+      "name": "202611010002_instance_license_expired_refusal",
+      "sha256": "fcc84b60d53e832d8160ab541e3078af1908bbe6f642a6af902bfc1967d9d0c6"
+    },
+    {
+      "name": "202611010003_license_operation_renewal_attempts",
+      "sha256": "e98bd45b38872834db79c0a8c91f33c58c42f44e8c40976370c869dc769eab8f"
+    },
+    {
+      "name": "202611010004_license_renewal_retry",
+      "sha256": "470f807559df3eba3584b20109cbbeece62edd6708eceb5b9b50eb9e5de036da"
+    },
+    {
+      "name": "202611010005_trusted_bundle_head",
+      "sha256": "06933f63872c914f5efe3f5e7567ea09877ee8893a6245261305acc40316f3a1"
+    },
+    {
+      "name": "202611030001_admin_setup_state",
+      "sha256": "fa6e6e227504eabf335f8210bbadb58529c348c9bdba62766c5e8c48feade584"
+    },
+    {
+      "name": "202611030002_license_pending_key_binding",
+      "sha256": "955a62676d18ae764139b7782f2565aa27523655c5db0c992793a9b1ac51f388"
+    },
+    {
+      "name": "202611040001_operations_worker_health",
+      "sha256": "c14d0551a13aa9be1ccec5006aa52a0b1b62344e2579ac972dcd08359dffc3c9"
+    },
+    {
+      "name": "202611040002_file_check_results",
+      "sha256": "e57eeeffba0481572917036c5ebac540ee0c9e1e4bb0e6babb2ce7a68ac40cba"
+    },
+    {
+      "name": "202611090001_storefront_brand_settings",
+      "sha256": "6d5a4c242dde1d754ded3828dd3d8e4b4ce1cdde70f93c12accb3c062a9657dc"
+    },
+    {
+      "name": "202611090002_storefront_featured_products",
+      "sha256": "a24ff29b7d2cff1c137a5f8f4850b0e63930b71d099b070bd229153a538d749d"
+    },
+    {
+      "name": "202611100001_storefront_support_settings",
+      "sha256": "b87abb9b7f12afc1897fa2e5303f36ab4bddf722440d2fa739e34075f14c3974"
+    },
+    {
+      "name": "202611100002_payment_expiry_and_refund_completion",
+      "sha256": "713e9963975e873daadd6c6edd369545308e5ee20af16ab2bb252ebcd6c38c16"
+    }
+  ]
+}
