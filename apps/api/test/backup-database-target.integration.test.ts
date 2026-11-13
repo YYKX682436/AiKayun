@@ -8,7 +8,7 @@ import type { Database } from '../src/db/types.js'
 import { withProvenFixtureDatabaseTarget, type ProvenDatabaseTarget } from '../src/backup/database-target.js'
 
 const enabled = process.env.AIKAYUN_TEST_LOCAL_DOCKER === 'true'
-const image = 'docker.io/library/postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873'
+const image = process.env.AIKAYUN_TEST_POSTGRES_IMAGE || 'docker.io/library/postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873'
 const noop = async () => {}
 describe.skipIf(!enabled)('pinned database target proof against isolated PostgreSQL containers', () => {
   let binary: string, socket: string

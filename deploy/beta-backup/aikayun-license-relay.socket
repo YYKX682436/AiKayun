@@ -1,0 +1,10 @@
+[Unit]
+Description=AiKayun license relay on Docker host bridge
+
+[Socket]
+ListenStream=172.17.0.1:4319
+FreeBind=true
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

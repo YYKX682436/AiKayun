@@ -1,3 +1,4 @@
+import { isBackupPostgresImage } from './postgres-image.js'
 import { lstat, realpath } from 'node:fs/promises'
 import { isAbsolute, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
@@ -49,7 +50,7 @@ async function verifyExecutable(input: DatabaseTargetInput) {
 async function withTarget<T>(input: DatabaseTargetInput, scope: Fixture, operation: (target: ProvenDatabaseTarget) => Promise<T>): Promise<T> {
   if (!input || !input.databaseConfig || typeof operation !== 'function' || typeof input.assertLock !== 'function' ||
       typeof input.assertSignedDeployment !== 'function' || !/^[a-f0-9]{64}$/.test(input.containerId) ||
-      !/^docker\.io\/library\/postgres@sha256:[a-f0-9]{64}$/.test(input.postgresImage) ||
+      !isBackupPostgresImage(input.postgresImage) ||
       !/^[a-z_][a-z0-9_]{0,62}$/.test(input.database) || !/^[a-z_][a-z0-9_]{0,62}$/.test(input.bootstrapUser)) {
     throw new Error('BACKUP_DATABASE_TARGET_UNVERIFIED')
   }

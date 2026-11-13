@@ -1,3 +1,4 @@
+import { matchesBackupPostgresImage } from './postgres-image.js'
 import type { Kysely } from 'kysely'
 import type { Database } from '../db/types.js'
 import type { PaymentCredentialKeyRing } from '../config.js'
@@ -61,7 +62,7 @@ function create(input: CaptureOperationsInput, applicationUid: number, fixture?:
   async function verifiedRelease() {
     const release = await input.readAuthenticatedRelease()
     if (!release || !release.database || typeof release.releaseId !== 'string' || !release.images ||
-        release.postgresImage !== `docker.io/library/postgres@${release.images.postgres}` || !(release.signedChecksums instanceof Uint8Array) ||
+        !matchesBackupPostgresImage(release.postgresImage, release.images.postgres) || !(release.signedChecksums instanceof Uint8Array) ||
         !(release.compiledChecksums instanceof Uint8Array) || release.postgresImage !== volumes.postgresImage ||
         (requireTrustInspector && (typeof input.backupResticImage !== 'string' ||
           !/^ghcr\.io\/yykx682436\/aikayun-backup-restic@sha256:[a-f0-9]{64}$/.test(input.backupResticImage) ||

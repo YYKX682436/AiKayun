@@ -1,0 +1,8 @@
+[Unit]
+Description=AiKayun verified production backup
+Requires=docker.service var-lib-aikayun\x2dbackup-staging.mount
+After=docker.service var-lib-aikayun\x2dbackup-staging.mount
+
+[Service]
+Type=oneshot
+ExecStart=/opt/aikayun/aikayun backup create

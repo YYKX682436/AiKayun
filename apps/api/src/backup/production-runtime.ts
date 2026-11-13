@@ -1,3 +1,4 @@
+import { matchesBackupPostgresImage } from './postgres-image.js'
 import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import type { PoolConfig } from 'pg'
@@ -46,7 +47,7 @@ export async function runProductionBackupRuntime(input: ProductionBackupRuntimeI
       !/^ghcr\.io\/yykx682436\/aikayun-backup-restic@sha256:[a-f0-9]{64}$/.test(input.backupResticImage) ||
       input.dump.user !== 'aikayun_bootstrap' || input.fence.deployment !== input.snapshot.deployment ||
       (!hostBroker && !dockerPathsMatch) ||
-      input.volumes.postgresImage !== `docker.io/library/postgres@${input.images.postgres}`) {
+      !matchesBackupPostgresImage(input.volumes.postgresImage, input.images.postgres)) {
     throw new Error('BACKUP_CAPTURE_AUTHORITY_MISSING')
   }
   try {

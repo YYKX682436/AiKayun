@@ -1,3 +1,4 @@
+import { isBackupPostgresImage } from './postgres-image.js'
 import { trustedAncestors } from './restic-local.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
@@ -39,7 +40,7 @@ async function validate(input: VolumeArchiveTarget) {
       (root.mode & 0o777) !== 0o700 || root.uid !== process.getuid?.()) throw new Error('ARCHIVE_PATH_INVALID')
   await trustedAncestors(input.dockerBinary)
   await trustedAncestors(input.dockerSocket)
-  if (!/^docker\.io\/library\/postgres@sha256:[a-f0-9]{64}$/.test(input.postgresImage)) throw new Error('ARCHIVE_IMAGE_INVALID')
+  if (!isBackupPostgresImage(input.postgresImage)) throw new Error('ARCHIVE_IMAGE_INVALID')
   if (input.timeoutMs !== undefined && (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > 24 * 60 * 60 * 1000)) throw new Error('ARCHIVE_TIMEOUT_INVALID')
   if (input.signal?.aborted) throw new Error('ARCHIVE_INTERRUPTED')
   await input.assertSecureStaging()

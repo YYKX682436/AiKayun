@@ -129,6 +129,15 @@ describe('direct Restic production capture wiring', () => {
     expect(mocks.cleanupProof).toHaveBeenCalledWith('pinned-db')
     expect(mocks.removeStage).toHaveBeenCalledTimes(2)
   })
+  it('accepts the project PostgreSQL image only when its digest matches the authenticated release', async () => {
+    const value = input(); prepareMocks()
+    const postgresImage = `ghcr.io/yykx682436/aikayun-postgres@${digestImage}`
+    value.volumes.postgresImage = postgresImage
+    value.readAuthenticatedRelease = vi.fn(async () => ({ ...await input().readAuthenticatedRelease(), postgresImage }))
+    await expect(runProductionBackupRuntime(value)).resolves.toMatchObject({ status: 'verified' })
+    value.volumes.postgresImage = `ghcr.io/yykx682436/aikayun-postgres@sha256:${'d'.repeat(64)}`
+    await expect(runProductionBackupRuntime(value)).rejects.toThrow('BACKUP_CAPTURE_AUTHORITY_MISSING')
+  })
   it('rejects a changed signed Restic reader digest before starting a reader', async () => {
     const value = input(); prepareMocks()
     value.readAuthenticatedRelease = vi.fn(async () => ({ ...await input().readAuthenticatedRelease(),

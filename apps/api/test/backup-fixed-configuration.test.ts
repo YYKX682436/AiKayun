@@ -29,4 +29,11 @@ describe('fixed installer configuration', () => {
     expect(() => assertFixedComposeConfiguration(fixture, { ...expected, domain: '$(unsafe)' })).toThrow('BACKUP_FIXED_CONFIGURATION_INVALID')
     expect(() => assertFixedComposeConfiguration(fixture, { ...expected, api: `ghcr.io/other/aikayun-api@sha256:${sha}` })).toThrow('BACKUP_FIXED_CONFIGURATION_INVALID')
   })
+  it('accepts the signed project PostgreSQL image but still binds its exact digest', () => {
+    const postgres = `ghcr.io/yykx682436/aikayun-postgres@sha256:${sha}`
+    const projectFixture = Buffer.from(fixture.toString().replace(expected.postgres, postgres))
+    expect(() => assertFixedComposeConfiguration(projectFixture, { ...expected, postgres })).not.toThrow()
+    expect(() => assertFixedComposeConfiguration(projectFixture, { ...expected, postgres: `ghcr.io/yykx682436/aikayun-postgres@sha256:${'b'.repeat(64)}` })).toThrow('BACKUP_FIXED_CONFIGURATION_INVALID')
+    expect(() => assertFixedComposeConfiguration(projectFixture, { ...expected, postgres: `ghcr.io/other/aikayun-postgres@sha256:${sha}` })).toThrow('BACKUP_FIXED_CONFIGURATION_INVALID')
+  })
 })

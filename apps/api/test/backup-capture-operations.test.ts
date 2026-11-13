@@ -35,4 +35,15 @@ describe('production capture proof boundaries', () => {
       signedChecksums: Buffer.from('fixture'), compiledChecksums: Buffer.from('fixture'), postgresImage: `docker.io/library/postgres@sha256:${'b'.repeat(64)}` })
     await expect(createProductionCaptureOperations(input).readEvidence()).rejects.toThrow('BACKUP_CAPTURE_RELEASE_UNVERIFIED')
   })
+  it('accepts the authenticated project PostgreSQL image before proceeding to staging', async () => {
+    const input = fixture()
+    const digest = `sha256:${'a'.repeat(64)}`
+    const postgresImage = `ghcr.io/yykx682436/aikayun-postgres@${digest}`
+    input.volumes.postgresImage = postgresImage
+    input.readAuthenticatedRelease = async () => ({ releaseId: 'fixture', images: { api: digest, web: digest, postgres: digest, caddy: digest },
+      backupResticImage: input.backupResticImage!, database: { engine_major: 18, migration_head: 'fixture', migration_checksums_sha256: 'a'.repeat(64) },
+      signedChecksums: Buffer.from('fixture'), compiledChecksums: Buffer.from('fixture'), postgresImage })
+    input.assertSecureStaging = async () => { throw new Error('staging reached') }
+    await expect(createProductionCaptureOperations(input).readEvidence()).rejects.toThrow('staging reached')
+  })
 })

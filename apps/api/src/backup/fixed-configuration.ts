@@ -1,3 +1,5 @@
+import { isBackupPostgresImage } from './postgres-image.js'
+
 /** Check bytes from the fixed deployment .env against the installer-generated
  * configuration. The caller must first authenticate both the release manifest
  * and install-state via the installer-owned verifier while holding its lock.
@@ -14,7 +16,7 @@ export function assertFixedComposeConfiguration(bytes: Uint8Array, expected: {
       expected.domain.includes('..') ||
       !/^ghcr\.io\/yykx682436\/aikayun-api@sha256:[a-f0-9]{64}$/.test(expected.api) ||
       !/^ghcr\.io\/yykx682436\/aikayun-web@sha256:[a-f0-9]{64}$/.test(expected.web) ||
-      !/^docker\.io\/library\/postgres@sha256:[a-f0-9]{64}$/.test(expected.postgres) ||
+      !isBackupPostgresImage(expected.postgres) ||
       !/^docker\.io\/library\/caddy@sha256:[a-f0-9]{64}$/.test(expected.caddy)) throw new Error('BACKUP_FIXED_CONFIGURATION_INVALID')
   const exact = [
     `AIKAYUN_PUBLIC_HOST=${expected.domain}`,

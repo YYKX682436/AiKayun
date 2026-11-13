@@ -1,0 +1,11 @@
+[Unit]
+Description=AiKayun non-swapping backup staging
+
+[Mount]
+What=tmpfs
+Where=/var/lib/aikayun-backup/staging
+Type=tmpfs
+Options=noswap,nosuid,nodev,noexec,mode=0700,size=768M
+
+[Install]
+WantedBy=multi-user.target
