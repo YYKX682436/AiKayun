@@ -14,7 +14,7 @@
     "lint": "eslint .",
     "test:unit": "pnpm --filter @aikayun/money test",
     "test:api": "pnpm --filter @aikayun/api test",
-    "test:release": "node --test apps/api/scripts/release/manifest.test.mjs scripts/release/reject-unverified-restic-helper.test.mjs && bash scripts/release/test-backup-host-broker.sh && bash scripts/release/test-backup-isolated-compose.sh && bash scripts/release/test-image-metadata.sh",
+    "test:release": "node --test apps/api/scripts/release/manifest.test.mjs scripts/release/reject-unverified-restic-helper.test.mjs scripts/release/wait-for-pages-build.test.mjs && bash scripts/release/test-backup-host-broker.sh && bash scripts/release/test-backup-isolated-compose.sh && bash scripts/release/test-image-metadata.sh",
     "test": "pnpm test:unit && pnpm test:api && pnpm test:release",
     "e2e": "pnpm --filter @aikayun/web test:e2e",
     "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && PLAYWRIGHT_USE_PRODUCTION_SERVER=true pnpm e2e && pnpm --filter @aikayun/web test:e2e:production-brand",

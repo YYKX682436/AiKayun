@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises'
 import { join, relative, resolve, sep } from 'node:path'
+import { waitForPagesBuild } from './wait-for-pages-build.mjs'
 
 const [directoryArg, version] = process.argv.slice(2)
 const origin = process.env.AIKAYUN_RELEASE_ORIGIN
@@ -80,14 +81,7 @@ const published = await api('/git/refs/heads/gh-pages', 'PATCH', { sha: commit.s
 if (published.object?.sha !== commit.sha) throw new Error('Publishing branch did not move to the new release commit')
 
 await api('/pages/builds', 'POST', {}, [201])
-let built = false
-for (let attempt = 0; attempt < 120; attempt++) {
-  const build = await api('/pages/builds/latest')
-  if (build.commit === commit.sha && build.status === 'built') { built = true; break }
-  if (build.commit === commit.sha && build.status === 'errored') throw new Error('GitHub Pages build failed')
-  await new Promise(resolve => setTimeout(resolve, 5000))
-}
-if (!built) throw new Error('Timed out waiting for the GitHub Pages release build')
+await waitForPagesBuild(() => api('/pages/builds?per_page=100'), commit.sha)
 
 for (const { key, digest, size } of expected) {
   const relativeKey = key.split(sep).map(encodeURIComponent).join('/')
