@@ -12,6 +12,7 @@ useSeoMeta({ title: '商品管理' })
 const route = useRoute()
 const router = useRouter()
 const { request } = useAdminApi()
+const toast = useToast()
 const allFilterValue = '__all__'
 const items = ref<ProductListItem[]>([])
 const categories = ref<AdminProductCategories['categories']>([])
@@ -22,6 +23,7 @@ const errorMessage = ref('')
 const categoryError = ref('')
 const actionMessage = ref('')
 const busyId = ref('')
+const copiedProductId = ref('')
 const searchInput = ref(String(route.query.search ?? ''))
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -33,6 +35,7 @@ const categoryId = computed(() => String(route.query.categoryId ?? ''))
 const sortBy = computed(() => String(route.query.sortBy ?? 'updatedAt'))
 const sortOrder = computed(() => String(route.query.sortOrder ?? 'desc'))
 const search = computed(() => String(route.query.search ?? ''))
+
 type ProductListQuery = {
   page: number
   pageSize: number
@@ -43,6 +46,7 @@ type ProductListQuery = {
   sortBy: string
   sortOrder: string
 }
+
 const productQuery = computed<ProductListQuery>(() => ({
   page: page.value,
   pageSize: pageSize.value,
@@ -53,18 +57,18 @@ const productQuery = computed<ProductListQuery>(() => ({
   sortBy: sortBy.value,
   sortOrder: sortOrder.value,
 }))
+
 let latestProductRequest = 0
 let routeSearchSync: string | null = null
 
 const columns: TableColumn<ProductListItem>[] = [
   { id: 'coverImage', header: '封面' },
   { accessorKey: 'name', header: '商品' },
-  { accessorKey: 'productType', header: '性质' },
   { accessorKey: 'status', header: '状态' },
-  { accessorKey: 'skuCount', header: 'SKU' },
   { id: 'priceRange', header: '有效售价' },
+  { accessorKey: 'skuCount', header: 'SKU' },
   { id: 'categories', header: '主分类' },
-  { id: 'timestamps', header: '创建 / 更新' },
+  { id: 'timestamps', header: '更新时间' },
   { id: 'actions', header: '操作' },
 ]
 
@@ -95,6 +99,17 @@ const sortItems = [
 ]
 const sortValue = computed(() => `${sortBy.value}:${sortOrder.value}`)
 
+const hasActiveFilters = computed(() => {
+  return Boolean(
+    search.value ||
+    status.value ||
+    productType.value ||
+    categoryId.value ||
+    sortBy.value !== 'updatedAt' ||
+    sortOrder.value !== 'desc',
+  )
+})
+
 function updateQuery(patch: Record<string, string | number | undefined>) {
   const next: Record<string, string> = {}
   for (const [key, value] of Object.entries({ ...route.query, ...patch })) {
@@ -106,6 +121,19 @@ function updateQuery(patch: Record<string, string | number | undefined>) {
     if (value !== undefined && value !== null && value !== '') current[key] = String(value)
   }
   if (stableEntries(current) !== stableEntries(next)) void router.push({ query: next })
+}
+
+function resetAllFilters() {
+  searchInput.value = ''
+  updateQuery({
+    search: '',
+    status: '',
+    productType: '',
+    categoryId: '',
+    sortBy: 'updatedAt',
+    sortOrder: 'desc',
+    page: 1,
+  })
 }
 
 async function loadCategories() {
@@ -150,6 +178,7 @@ async function loadProducts(queryState: ProductListQuery) {
     if (requestId === latestProductRequest) loading.value = false
   }
 }
+
 function reloadProducts() { void loadProducts({ ...productQuery.value }) }
 
 watch(productQuery, (queryState) => {
@@ -162,9 +191,11 @@ watch(productQuery, (queryState) => {
   }
   void loadProducts({ ...queryState })
 }, { immediate: true })
+
 onMounted(() => {
   void loadCategories()
 })
+
 watch(searchInput, (value) => {
   if (routeSearchSync === value) {
     routeSearchSync = null
@@ -173,6 +204,7 @@ watch(searchInput, (value) => {
   if (searchTimer) clearTimeout(searchTimer)
   searchTimer = setTimeout(() => updateQuery({ search: value.trim(), page: 1 }), 350)
 })
+
 onBeforeUnmount(() => {
   latestProductRequest++
   if (searchTimer) clearTimeout(searchTimer)
@@ -190,6 +222,20 @@ function statusName(value: ProductListItem['status']) {
   return value === 'draft' ? '草稿' : value === 'active' ? '销售中' : value === 'paused' ? '已暂停' : '已归档'
 }
 
+function productStatusColor(value: ProductListItem['status']) {
+  if (value === 'active') return 'success'
+  if (value === 'paused') return 'warning'
+  if (value === 'draft') return 'info'
+  return 'neutral'
+}
+
+function productTransitionIcon(status: ProductListItem['status']) {
+  if (status === 'active') return 'i-lucide-play'
+  if (status === 'paused') return 'i-lucide-pause'
+  if (status === 'archived') return 'i-lucide-archive'
+  return 'i-lucide-undo'
+}
+
 function priceRange(product: ProductListItem) {
   if (!product.priceRange) return '无有效价格'
   if (product.priceRange.min === product.priceRange.max) return `¥${product.priceRange.min}`
@@ -205,6 +251,39 @@ function allowedTransition(current: ProductListItem['status']) {
   if (current === 'active') return [{ label: '暂停销售', status: 'paused' as const }, { label: '归档', status: 'archived' as const }]
   if (current === 'paused') return [{ label: '重新上架', status: 'active' as const }, { label: '归档', status: 'archived' as const }]
   return [{ label: '恢复为草稿', status: 'draft' as const }]
+}
+
+function productMenuItems(product: ProductListItem) {
+  return [
+    [{
+      label: '复制商品',
+      icon: 'i-lucide-copy',
+      onSelect: () => copyProduct(product),
+    }],
+    allowedTransition(product.status).map(action => ({
+      label: action.label,
+      icon: productTransitionIcon(action.status),
+      onSelect: () => changeLifecycle(product, action.status),
+    })),
+  ]
+}
+
+async function copyProductId(id: string) {
+  try {
+    await navigator.clipboard.writeText(id)
+    copiedProductId.value = id
+    toast.add({
+      title: '已复制商品 ID',
+      description: id,
+      color: 'success',
+      icon: 'i-lucide-copy-check',
+    })
+    setTimeout(() => {
+      if (copiedProductId.value === id) copiedProductId.value = ''
+    }, 2000)
+  } catch {
+    // 忽略剪贴板写入失败
+  }
 }
 
 async function changeLifecycle(product: ProductListItem, next: ProductListItem['status']) {
@@ -256,23 +335,21 @@ async function copyProduct(product: ProductListItem) {
 
     <template #body>
       <main class="mx-auto w-full max-w-[90rem] min-w-0 px-4 py-5 sm:px-6 lg:px-8">
-        <header class="mb-5 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+        <header class="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <p class="text-sm font-medium text-primary">
-              目录
-            </p>
-            <h1 class="mt-1 text-2xl font-semibold tracking-tight text-highlighted">
+            <h1 class="text-xl sm:text-2xl font-bold tracking-tight text-highlighted">
               商品管理
             </h1>
-            <p class="mt-1 text-sm text-muted">
-              管理商品资料、规格、价格与生命周期。
+            <p class="mt-0.5 text-xs sm:text-sm text-muted">
+              商品资料、规格、价格与销售生命周期
             </p>
           </div>
           <UButton
             to="/admin/products/new"
             icon="i-lucide-plus"
-            size="lg"
-            class="min-h-11 shrink-0"
+            color="primary"
+            size="md"
+            class="font-medium shrink-0 shadow-xs min-h-10 sm:min-h-9"
           >
             新建商品
           </UButton>
@@ -327,64 +404,150 @@ async function copyProduct(product: ProductListItem) {
 
         <section
           aria-label="商品筛选"
-          class="mb-4 grid gap-3 rounded-xl border border-default bg-elevated p-3 sm:grid-cols-2 lg:grid-cols-6 lg:p-4"
+          class="mb-4 rounded-xl border border-default bg-elevated p-3 sm:p-4 shadow-2xs space-y-3"
         >
-          <UFormField
-            label="搜索名称、商品 ID 或 SKU 编码"
-            class="sm:col-span-2"
+          <div class="grid grid-cols-2 gap-2.5 sm:grid-cols-2 lg:grid-cols-12">
+            <div class="col-span-2 lg:col-span-4">
+              <UInput
+                v-model="searchInput"
+                aria-label="搜索商品"
+                placeholder="搜索商品名称、ID 或 SKU 编码"
+                icon="i-lucide-search"
+                class="w-full"
+                size="md"
+              >
+                <template
+                  v-if="searchInput"
+                  #trailing
+                >
+                  <UButton
+                    icon="i-lucide-x"
+                    size="xs"
+                    color="neutral"
+                    variant="ghost"
+                    aria-label="清空搜索"
+                    class="size-5 p-0 text-muted hover:text-highlighted"
+                    @click="searchInput = ''; updateQuery({ search: '', page: 1 })"
+                  />
+                </template>
+              </UInput>
+            </div>
+            <div class="col-span-1 lg:col-span-2">
+              <USelect
+                :model-value="status || allFilterValue"
+                :items="statusItems"
+                class="w-full"
+                size="md"
+                aria-label="商品状态筛选"
+                @update:model-value="value => updateQuery({ status: String(value) === allFilterValue ? '' : String(value), page: 1 })"
+              />
+            </div>
+            <div class="col-span-1 lg:col-span-2">
+              <USelect
+                :model-value="categoryId || allFilterValue"
+                :items="categoryItems"
+                class="w-full"
+                size="md"
+                aria-label="商品分类筛选"
+                @update:model-value="value => updateQuery({ categoryId: String(value) === allFilterValue ? '' : String(value), page: 1 })"
+              />
+            </div>
+            <div class="col-span-1 lg:col-span-2">
+              <USelect
+                :model-value="productType || allFilterValue"
+                :items="typeItems"
+                class="w-full"
+                size="md"
+                aria-label="商品性质筛选"
+                @update:model-value="value => updateQuery({ productType: String(value) === allFilterValue ? '' : String(value), page: 1 })"
+              />
+            </div>
+            <div class="col-span-1 lg:col-span-2">
+              <USelect
+                :model-value="sortValue"
+                :items="sortItems"
+                class="w-full"
+                size="md"
+                aria-label="商品排序方式"
+                @update:model-value="value => { const [sortBy, sortOrder] = String(value).split(':'); updateQuery({ sortBy, sortOrder, page: 1 }) }"
+              />
+            </div>
+          </div>
+
+          <div
+            v-if="hasActiveFilters"
+            class="flex flex-wrap items-center gap-2 pt-2 border-t border-default/50 text-xs text-muted"
           >
-            <UInput
-              v-model="searchInput"
-              aria-label="搜索商品"
-              placeholder="输入名称、商品 ID 或 SKU 编码"
-              icon="i-lucide-search"
-              class="w-full"
-              size="lg"
-            />
-          </UFormField>
-          <UFormField label="商品状态">
-            <USelect
-              :model-value="status || allFilterValue"
-              :items="statusItems"
-              class="w-full"
-              size="lg"
-              aria-label="商品状态筛选"
-              @update:model-value="value => updateQuery({ status: String(value) === allFilterValue ? '' : String(value), page: 1 })"
-            />
-          </UFormField>
-          <UFormField label="商品性质">
-            <USelect
-              :model-value="productType || allFilterValue"
-              :items="typeItems"
-              class="w-full"
-              size="lg"
-              aria-label="商品性质筛选"
-              @update:model-value="value => updateQuery({ productType: String(value) === allFilterValue ? '' : String(value), page: 1 })"
-            />
-          </UFormField>
-          <UFormField label="商品分类">
-            <USelect
-              :model-value="categoryId || allFilterValue"
-              :items="categoryItems"
-              class="w-full"
-              size="lg"
-              aria-label="商品分类筛选"
-              @update:model-value="value => updateQuery({ categoryId: String(value) === allFilterValue ? '' : String(value), page: 1 })"
-            />
-          </UFormField>
-          <UFormField label="排序方式">
-            <USelect
-              :model-value="sortValue"
-              :items="sortItems"
-              class="w-full"
-              size="lg"
-              aria-label="商品排序方式"
-              @update:model-value="value => { const [sortBy, sortOrder] = String(value).split(':'); updateQuery({ sortBy, sortOrder, page: 1 }) }"
-            />
-          </UFormField>
+            <span class="font-medium text-default">活跃筛选：</span>
+            <UBadge
+              v-if="search"
+              color="neutral"
+              variant="subtle"
+              size="xs"
+              class="gap-1 cursor-pointer hover:bg-muted"
+              @click="searchInput = ''; updateQuery({ search: '', page: 1 })"
+            >
+              搜索: {{ search }}
+              <UIcon
+                name="i-lucide-x"
+                class="size-3"
+              />
+            </UBadge>
+            <UBadge
+              v-if="status"
+              color="neutral"
+              variant="subtle"
+              size="xs"
+              class="gap-1 cursor-pointer hover:bg-muted"
+              @click="updateQuery({ status: '', page: 1 })"
+            >
+              状态: {{ statusItems.find(s => s.value === status)?.label }}
+              <UIcon
+                name="i-lucide-x"
+                class="size-3"
+              />
+            </UBadge>
+            <UBadge
+              v-if="categoryId"
+              color="neutral"
+              variant="subtle"
+              size="xs"
+              class="gap-1 cursor-pointer hover:bg-muted"
+              @click="updateQuery({ categoryId: '', page: 1 })"
+            >
+              分类: {{ categoryItems.find(c => c.value === categoryId)?.label }}
+              <UIcon
+                name="i-lucide-x"
+                class="size-3"
+              />
+            </UBadge>
+            <UBadge
+              v-if="productType"
+              color="neutral"
+              variant="subtle"
+              size="xs"
+              class="gap-1 cursor-pointer hover:bg-muted"
+              @click="updateQuery({ productType: '', page: 1 })"
+            >
+              性质: {{ typeItems.find(t => t.value === productType)?.label }}
+              <UIcon
+                name="i-lucide-x"
+                class="size-3"
+              />
+            </UBadge>
+            <UButton
+              size="xs"
+              color="neutral"
+              variant="ghost"
+              class="text-xs text-muted hover:text-highlighted"
+              @click="resetAllFilters"
+            >
+              清空全部筛选
+            </UButton>
+          </div>
         </section>
 
-        <div class="mb-3 flex min-h-7 items-center justify-between gap-3 text-sm text-muted">
+        <div class="mb-3 flex min-h-7 items-center justify-between gap-3 text-xs sm:text-sm text-muted">
           <p aria-live="polite">
             {{ loading ? '正在加载商品…' : `共 ${total} 件商品` }}
           </p>
@@ -394,7 +557,8 @@ async function copyProduct(product: ProductListItem) {
               :model-value="String(pageSize)"
               :items="[{ label: '20', value: '20' }, { label: '50', value: '50' }, { label: '100', value: '100' }]"
               aria-label="每页商品数"
-              class="w-24"
+              class="w-20"
+              size="xs"
               @update:model-value="value => updateQuery({ pageSize: Number(value), page: 1 })"
             />
           </label>
@@ -422,78 +586,139 @@ async function copyProduct(product: ProductListItem) {
 
         <div
           v-else
-          class="hidden overflow-hidden rounded-xl border border-default bg-elevated lg:block"
+          class="hidden overflow-x-auto rounded-xl border border-default bg-elevated shadow-2xs lg:block"
         >
           <UTable
             :data="items"
             :columns="columns"
             :loading="loading"
             class="w-full"
+            :ui="{
+              th: 'px-3 py-2.5 text-xs font-semibold text-muted bg-muted/20 whitespace-nowrap',
+              td: 'px-3 py-2.5 text-sm',
+            }"
           >
+            <template #coverImage-header>
+              <span class="w-10 block text-center">封面</span>
+            </template>
             <template #coverImage-cell="{ row }">
-              <img
-                v-if="row.original.coverImage"
-                :src="row.original.coverImage.thumbnailUrl"
-                alt=""
-                class="size-12 rounded-md object-cover"
-                loading="lazy"
-              >
-              <span
-                v-else
-                class="grid size-12 place-items-center rounded-md bg-muted text-muted"
-              ><UIcon
-                name="i-lucide-image"
-                aria-hidden="true"
-              /></span>
+              <div class="relative size-10 overflow-hidden rounded-lg border border-default/60 bg-muted/20 shrink-0">
+                <img
+                  v-if="row.original.coverImage"
+                  :src="row.original.coverImage.thumbnailUrl"
+                  alt=""
+                  class="size-full object-cover"
+                  loading="lazy"
+                >
+                <div
+                  v-else
+                  class="grid size-full place-items-center text-muted"
+                >
+                  <UIcon
+                    name="i-lucide-package"
+                    class="size-5"
+                  />
+                </div>
+              </div>
             </template>
+
             <template #name-cell="{ row }">
-              <NuxtLink
-                :to="`/admin/products/${row.original.id}`"
-                class="block max-w-64 truncate font-medium text-highlighted hover:text-primary focus-visible:outline-2 focus-visible:outline-primary"
-              >
-                {{ row.original.name }}
-              </NuxtLink>
-              <span class="mt-1 block font-mono text-xs text-dimmed">{{ row.original.id }}</span>
+              <div class="min-w-0 max-w-xs">
+                <div class="flex items-center gap-1.5 min-w-0">
+                  <NuxtLink
+                    :to="`/admin/products/${row.original.id}`"
+                    class="truncate font-semibold text-highlighted hover:text-primary transition-colors focus-visible:outline-2 focus-visible:outline-primary"
+                  >
+                    {{ row.original.name }}
+                  </NuxtLink>
+                  <UBadge
+                    color="neutral"
+                    variant="subtle"
+                    size="xs"
+                    class="shrink-0 font-normal"
+                  >
+                    {{ productTypeName(row.original.productType) }}
+                  </UBadge>
+                </div>
+                <div class="mt-0.5 flex items-center gap-1.5 text-xs text-dimmed font-mono">
+                  <span class="truncate">{{ row.original.id }}</span>
+                  <UButton
+                    :icon="copiedProductId === row.original.id ? 'i-lucide-check' : 'i-lucide-copy'"
+                    size="xs"
+                    color="neutral"
+                    variant="ghost"
+                    :aria-label="`复制商品 ID ${row.original.id}`"
+                    class="size-5 p-0 text-muted hover:text-highlighted shrink-0"
+                    @click.stop="copyProductId(row.original.id)"
+                  />
+                </div>
+              </div>
             </template>
-            <template #productType-cell="{ row }">
-              {{ productTypeName(row.original.productType) }}
-            </template>
+
             <template #status-cell="{ row }">
               <UBadge
-                :color="row.original.status === 'active' ? 'success' : row.original.status === 'archived' ? 'neutral' : row.original.status === 'paused' ? 'warning' : 'info'"
+                :color="productStatusColor(row.original.status)"
                 variant="subtle"
+                size="sm"
+                class="font-medium whitespace-nowrap"
               >
                 {{ statusName(row.original.status) }}
               </UBadge>
             </template>
+
             <template #priceRange-cell="{ row }">
-              <span :class="row.original.priceRange ? 'font-medium text-highlighted' : 'text-muted'">{{ priceRange(row.original) }}</span>
+              <span
+                class="tabular-nums whitespace-nowrap"
+                :class="row.original.priceRange ? 'font-semibold text-highlighted' : 'text-xs text-muted'"
+              >
+                {{ priceRange(row.original) }}
+              </span>
             </template>
+
+            <template #skuCount-cell="{ row }">
+              <span class="text-xs text-muted tabular-nums whitespace-nowrap">
+                {{ row.original.skuCount }} 个
+              </span>
+            </template>
+
             <template #categories-cell="{ row }">
-              {{ categoryName(row.original) }}
+              <span class="text-xs text-default truncate max-w-[7rem] block whitespace-nowrap">
+                {{ categoryName(row.original) }}
+              </span>
             </template>
+
             <template #timestamps-cell="{ row }">
-              <div class="grid gap-1 text-xs text-muted">
-                <time :datetime="row.original.createdAt">创建 {{ formatDate(row.original.createdAt) }}</time>
-                <time :datetime="row.original.updatedAt">更新 {{ formatDate(row.original.updatedAt) }}</time>
+              <div class="flex flex-col text-xs text-muted leading-tight whitespace-nowrap">
+                <time
+                  :datetime="row.original.updatedAt"
+                  class="text-highlighted font-medium"
+                >{{ formatDate(row.original.updatedAt) }}</time>
+                <time
+                  :datetime="row.original.createdAt"
+                  class="text-dimmed text-[11px] mt-0.5"
+                >创建 {{ formatDate(row.original.createdAt) }}</time>
               </div>
             </template>
+
+            <template #actions-header>
+              <span class="w-20 block text-right">操作</span>
+            </template>
             <template #actions-cell="{ row }">
-              <div class="flex items-center gap-1">
+              <div class="flex items-center justify-end gap-1 whitespace-nowrap">
                 <UButton
                   :to="`/admin/products/${row.original.id}`"
-                  size="sm"
+                  size="xs"
                   color="primary"
-                  variant="ghost"
+                  variant="outline"
                 >
                   编辑
                 </UButton>
-                <UDropdownMenu :items="[[{ label: '复制商品', icon: 'i-lucide-copy', onSelect: () => copyProduct(row.original) }], allowedTransition(row.original.status).map(action => ({ label: action.label, icon: 'i-lucide-repeat-2', onSelect: () => changeLifecycle(row.original, action.status) }))]">
+                <UDropdownMenu :items="productMenuItems(row.original)">
                   <UButton
                     icon="i-lucide-ellipsis"
                     color="neutral"
                     variant="ghost"
-                    size="sm"
+                    size="xs"
                     :loading="busyId === row.original.id"
                     :aria-label="`更多操作：${row.original.name}`"
                   />
@@ -511,9 +736,10 @@ async function copyProduct(product: ProductListItem) {
           <USkeleton
             v-for="index in 3"
             :key="index"
-            class="h-36 rounded-xl"
+            class="h-28 rounded-xl"
           />
         </section>
+
         <section
           v-else-if="items.length > 0"
           class="grid gap-3 lg:hidden"
@@ -522,87 +748,83 @@ async function copyProduct(product: ProductListItem) {
           <article
             v-for="product in items"
             :key="product.id"
-            class="min-w-0 rounded-xl border border-default bg-elevated p-3"
+            class="min-w-0 rounded-xl border border-default bg-elevated p-3.5 space-y-3 shadow-2xs"
           >
             <div class="flex min-w-0 gap-3">
-              <img
-                v-if="product.coverImage"
-                :src="product.coverImage.cardUrl"
-                alt=""
-                class="size-16 shrink-0 rounded-lg object-cover"
-                loading="lazy"
-              >
-              <span
-                v-else
-                class="grid size-16 shrink-0 place-items-center rounded-lg bg-muted text-muted"
-              ><UIcon
-                name="i-lucide-image"
-                aria-hidden="true"
-              /></span>
-              <div class="min-w-0 flex-1">
-                <NuxtLink
-                  :to="`/admin/products/${product.id}`"
-                  class="block truncate font-semibold text-highlighted"
+              <div class="relative size-14 shrink-0 overflow-hidden rounded-lg border border-default/60 bg-muted/20">
+                <img
+                  v-if="product.coverImage"
+                  :src="product.coverImage.cardUrl"
+                  alt=""
+                  class="size-full object-cover"
+                  loading="lazy"
                 >
-                  {{ product.name }}
-                </NuxtLink>
-                <p class="mt-1 truncate font-mono text-xs text-dimmed">
-                  {{ product.id }}
-                </p>
-                <div class="mt-2 flex flex-wrap items-center gap-2">
+                <div
+                  v-else
+                  class="grid size-full place-items-center text-muted"
+                >
+                  <UIcon
+                    name="i-lucide-package"
+                    class="size-6"
+                  />
+                </div>
+              </div>
+              <div class="min-w-0 flex-1">
+                <div class="flex items-start justify-between gap-2">
+                  <NuxtLink
+                    :to="`/admin/products/${product.id}`"
+                    class="block truncate font-semibold text-highlighted hover:text-primary transition-colors"
+                  >
+                    {{ product.name }}
+                  </NuxtLink>
                   <UBadge
-                    :color="product.status === 'active' ? 'success' : product.status === 'archived' ? 'neutral' : product.status === 'paused' ? 'warning' : 'info'"
+                    :color="productStatusColor(product.status)"
                     variant="subtle"
+                    size="xs"
+                    class="shrink-0 font-medium whitespace-nowrap"
                   >
                     {{ statusName(product.status) }}
                   </UBadge>
-                  <span class="text-xs text-muted">{{ productTypeName(product.productType) }}</span>
-                  <span class="text-xs text-muted">{{ product.skuCount }} 个 SKU</span>
+                </div>
+                <p class="mt-0.5 truncate font-mono text-xs text-dimmed">
+                  {{ product.id }}
+                </p>
+                <div class="mt-1.5 flex items-center justify-between text-xs">
+                  <span class="font-semibold tabular-nums text-highlighted text-sm">
+                    {{ priceRange(product) }}
+                  </span>
+                  <span class="text-muted">
+                    {{ categoryName(product) }} · {{ product.skuCount }} SKU
+                  </span>
                 </div>
               </div>
             </div>
-            <dl class="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 border-t border-default pt-3 text-sm">
-              <div>
-                <dt class="text-xs text-dimmed">
-                  有效售价
-                </dt><dd class="mt-0.5 font-medium text-highlighted">
-                  {{ priceRange(product) }}
-                </dd>
+
+            <div class="flex flex-wrap items-center justify-between gap-2 border-t border-default/60 pt-2.5 text-xs text-muted">
+              <div class="grid gap-0.5">
+                <time :datetime="product.createdAt">创建 {{ formatDate(product.createdAt) }}</time>
+                <time :datetime="product.updatedAt">更新 {{ formatDate(product.updatedAt) }}</time>
               </div>
-              <div>
-                <dt class="text-xs text-dimmed">
-                  主分类
-                </dt><dd class="mt-0.5 truncate text-highlighted">
-                  {{ categoryName(product) }}
-                </dd>
-              </div>
-              <div class="col-span-2">
-                <dt class="text-xs text-dimmed">
-                  创建 / 更新时间
-                </dt>
-                <dd class="mt-0.5 grid gap-1 text-muted">
-                  <time :datetime="product.createdAt">创建 {{ formatDate(product.createdAt) }}</time>
-                  <time :datetime="product.updatedAt">更新 {{ formatDate(product.updatedAt) }}</time>
-                </dd>
-              </div>
-            </dl>
-            <div class="mt-3 flex gap-2 border-t border-default pt-3">
-              <UButton
-                :to="`/admin/products/${product.id}`"
-                block
-                size="lg"
-              >
-                编辑
-              </UButton>
-              <UDropdownMenu :items="[[{ label: '复制商品', icon: 'i-lucide-copy', onSelect: () => copyProduct(product) }], allowedTransition(product.status).map(action => ({ label: action.label, onSelect: () => changeLifecycle(product, action.status) }))]">
+              <div class="flex items-center gap-2">
                 <UButton
-                  icon="i-lucide-ellipsis"
+                  :to="`/admin/products/${product.id}`"
+                  size="sm"
                   color="neutral"
                   variant="outline"
-                  size="lg"
-                  :aria-label="`更多操作：${product.name}`"
-                />
-              </UDropdownMenu>
+                >
+                  编辑
+                </UButton>
+                <UDropdownMenu :items="productMenuItems(product)">
+                  <UButton
+                    icon="i-lucide-ellipsis"
+                    color="neutral"
+                    variant="outline"
+                    size="sm"
+                    :loading="busyId === product.id"
+                    :aria-label="`更多操作：${product.name}`"
+                  />
+                </UDropdownMenu>
+              </div>
             </div>
           </article>
         </section>

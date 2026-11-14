@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { TableColumn } from '@nuxt/ui'
 import type { AdminOrderPage } from '@aikayun/contracts'
 
 definePageMeta({ layout: 'admin', middleware: 'admin-auth' })
@@ -8,12 +9,14 @@ useResponseHeader('Cache-Control').value = 'private, no-store, max-age=0'
 const route = useRoute()
 const router = useRouter()
 const { request } = useAdminApi()
+const toast = useToast()
 const orders = ref<AdminOrderPage['items']>([])
 const total = ref(0)
 const totalPages = ref(0)
 const searchInput = ref(typeof route.query.search === 'string' ? route.query.search : '')
 const loading = ref(false)
 const errorMessage = ref('')
+const copiedOrderId = ref('')
 let sequence = 0
 
 const validStatuses = ['all', 'pending_payment', 'processing', 'completed', 'closed'] as const
@@ -38,11 +41,35 @@ const statusOptions = [
   { label: '已关闭', value: 'closed' },
 ]
 
+const columns: TableColumn<AdminOrderPage['items'][number]>[] = [
+  { id: 'id', header: '订单编号' },
+  { id: 'status', header: '状态' },
+  { id: 'owner', header: '顾客 / 账号' },
+  { id: 'itemCount', header: '订单项' },
+  { id: 'totalAmount', header: '金额' },
+  { id: 'createdAt', header: '下单时间' },
+  { id: 'actions', header: '操作' },
+]
+
 function stateLabel(order: AdminOrderPage['items'][number]): string {
   if (order.status === 'pending_payment') return '等待付款'
   if (order.status === 'processing') return order.paymentStatus === 'not_required' ? '等待交付' : '付款成功 · 等待交付'
   if (order.status === 'completed') return '已完成'
   return '已关闭'
+}
+
+function stateColor(order: AdminOrderPage['items'][number]) {
+  if (order.status === 'completed') return 'success'
+  if (order.status === 'closed') return 'neutral'
+  if (order.status === 'pending_payment') return 'warning'
+  return 'primary'
+}
+
+function stateIcon(order: AdminOrderPage['items'][number]) {
+  if (order.status === 'completed') return 'i-lucide-check-circle-2'
+  if (order.status === 'closed') return 'i-lucide-x-circle'
+  if (order.status === 'pending_payment') return 'i-lucide-circle-alert'
+  return 'i-lucide-clock'
 }
 
 function ownerLabel(order: AdminOrderPage['items'][number]): string {
@@ -53,6 +80,24 @@ function ownerLabel(order: AdminOrderPage['items'][number]): string {
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
+}
+
+async function copyOrderId(id: string) {
+  try {
+    await navigator.clipboard.writeText(id)
+    copiedOrderId.value = id
+    toast.add({
+      title: '已复制订单编号',
+      description: id,
+      color: 'success',
+      icon: 'i-lucide-copy-check',
+    })
+    setTimeout(() => {
+      if (copiedOrderId.value === id) copiedOrderId.value = ''
+    }, 2000)
+  } catch {
+    // 忽略剪贴板写入失败
+  }
 }
 
 async function loadOrders() {
@@ -127,79 +172,86 @@ onBeforeUnmount(() => { sequence++ })
         id="admin-main-content"
         class="mx-auto w-full max-w-[90rem] min-w-0 px-4 py-5 sm:px-6 lg:px-8"
       >
-        <header class="mb-6">
+        <header class="mb-5 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <p class="text-sm font-medium text-primary">
-              订单与履约
-            </p>
-            <h1 class="mt-1 text-3xl font-semibold tracking-tight text-highlighted">
+            <h1 class="text-xl sm:text-2xl font-bold tracking-tight text-highlighted">
               订单管理
             </h1>
-            <p class="mt-2 max-w-3xl text-sm leading-6 text-muted">
-              查看真实成交快照、顾客或游客归属、库存事件与人工数字交付记录。
+            <p class="mt-0.5 text-xs sm:text-sm text-muted">
+              查看真实成交快照、顾客归属与履约交付记录
             </p>
           </div>
         </header>
 
-        <UCard
-          :ui="{ body: 'p-4 sm:p-5' }"
-          class="mb-5 min-w-0"
+        <section
+          aria-label="订单筛选"
+          class="mb-4 rounded-xl border border-default bg-elevated p-3 sm:p-4 shadow-2xs"
         >
           <form
-            class="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,1fr)_12rem_auto] sm:items-end"
+            class="flex flex-col gap-2.5 sm:grid sm:grid-cols-[minmax(0,1fr)_12rem_auto] sm:items-center"
             role="search"
             @submit.prevent="submitSearch"
           >
-            <UFormField
-              label="搜索订单"
-              name="orderSearch"
-              hint="完整订单 UUID 或顾客完整用户名"
+            <UInput
+              id="order-search"
+              v-model="searchInput"
+              class="w-full"
+              icon="i-lucide-search"
+              placeholder="搜索订单 UUID 或顾客用户名"
+              autocomplete="off"
+              aria-label="搜索完整订单 UUID 或顾客用户名"
+              size="md"
             >
-              <UInput
-                id="order-search"
-                v-model="searchInput"
-                class="w-full"
-                icon="i-lucide-search"
-                placeholder="输入订单 UUID 或用户名"
-                autocomplete="off"
-                aria-label="搜索完整订单 UUID 或顾客用户名"
-              />
-            </UFormField>
-            <UFormField
-              label="订单状态"
-              name="orderStatus"
-            >
+              <template
+                v-if="searchInput"
+                #trailing
+              >
+                <UButton
+                  icon="i-lucide-x"
+                  size="xs"
+                  color="neutral"
+                  variant="ghost"
+                  aria-label="清除搜索输入"
+                  class="size-5 p-0 text-muted hover:text-highlighted"
+                  @click="clearSearch"
+                />
+              </template>
+            </UInput>
+            <div class="grid grid-cols-[1fr_auto] gap-2 sm:contents">
               <USelect
                 id="order-status-filter"
                 :model-value="status"
                 :items="statusOptions"
                 value-key="value"
                 class="w-full"
+                size="md"
                 aria-label="按订单状态筛选"
                 @update:model-value="setStatus(String($event))"
               />
-            </UFormField>
-            <div class="flex flex-wrap gap-2 sm:justify-end">
-              <UButton
-                type="submit"
-                icon="i-lucide-search"
-                class="min-h-11"
-              >
-                搜索
-              </UButton>
-              <UButton
-                v-if="search || searchInput"
-                type="button"
-                color="neutral"
-                variant="outline"
-                class="min-h-11"
-                @click="clearSearch"
-              >
-                清空搜索
-              </UButton>
+              <div class="flex items-center gap-2">
+                <UButton
+                  type="submit"
+                  icon="i-lucide-search"
+                  size="md"
+                  class="min-h-9"
+                >
+                  搜索
+                </UButton>
+                <UButton
+                  v-if="search || searchInput"
+                  type="button"
+                  color="neutral"
+                  variant="outline"
+                  size="md"
+                  class="min-h-9"
+                  @click="clearSearch"
+                >
+                  清空搜索
+                </UButton>
+              </div>
             </div>
           </form>
-        </UCard>
+        </section>
 
         <UAlert
           v-if="errorMessage"
@@ -214,6 +266,7 @@ onBeforeUnmount(() => { sequence++ })
             <UButton
               color="error"
               variant="outline"
+              size="sm"
               :loading="loading"
               @click="loadOrders"
             >
@@ -221,6 +274,18 @@ onBeforeUnmount(() => { sequence++ })
             </UButton>
           </template>
         </UAlert>
+
+        <div class="mb-3 flex items-center justify-between gap-3 text-xs sm:text-sm text-muted">
+          <p aria-live="polite">
+            {{ loading ? '正在加载订单…' : `共 ${total} 笔订单` }}
+          </p>
+          <div
+            v-if="totalPages > 1"
+            class="text-xs text-muted"
+          >
+            第 {{ page }} / {{ totalPages }} 页
+          </div>
+        </div>
 
         <div
           v-if="loading && !orders.length"
@@ -231,9 +296,10 @@ onBeforeUnmount(() => { sequence++ })
           <div
             v-for="index in 5"
             :key="index"
-            class="h-24 animate-pulse rounded-xl border border-default bg-elevated motion-reduce:animate-none"
+            class="h-16 animate-pulse rounded-xl border border-default bg-elevated motion-reduce:animate-none"
           />
         </div>
+
         <UAlert
           v-else-if="!loading && !errorMessage && !orders.length"
           color="neutral"
@@ -244,51 +310,200 @@ onBeforeUnmount(() => { sequence++ })
           role="status"
           aria-live="polite"
         />
-        <section
+
+        <div
           v-else-if="orders.length"
-          class="space-y-3"
-          aria-label="后台订单列表"
-          :aria-busy="loading"
+          class="space-y-4"
         >
-          <article
-            v-for="order in orders"
-            :key="order.id"
-            class="grid min-w-0 gap-3 rounded-xl border border-default bg-elevated p-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:p-5"
-          >
-            <div class="min-w-0">
-              <div class="flex flex-wrap items-center gap-2">
-                <h2 class="break-all font-mono text-sm font-semibold text-highlighted">
-                  {{ order.id }}
-                </h2>
+          <!-- 桌面端表格视图 -->
+          <div class="hidden overflow-x-auto rounded-xl border border-default bg-elevated shadow-2xs lg:block">
+            <UTable
+              :data="orders"
+              :columns="columns"
+              :loading="loading"
+              class="w-full"
+            >
+              <template #id-cell="{ row }">
+                <div class="flex items-center gap-1.5 min-w-0">
+                  <UTooltip
+                    :text="row.original.id"
+                    :content="{ side: 'top' }"
+                  >
+                    <h2 class="font-mono text-xs font-semibold text-highlighted truncate max-w-[13rem]">
+                      <NuxtLink
+                        :to="`/admin/orders/${row.original.id}`"
+                        class="hover:text-primary transition-colors focus-visible:outline-2 focus-visible:outline-primary"
+                      >
+                        {{ row.original.id }}
+                      </NuxtLink>
+                    </h2>
+                  </UTooltip>
+                  <UButton
+                    :icon="copiedOrderId === row.original.id ? 'i-lucide-check' : 'i-lucide-copy'"
+                    size="xs"
+                    color="neutral"
+                    variant="ghost"
+                    :aria-label="`复制订单编号 ${row.original.id}`"
+                    class="size-6 p-0 text-muted hover:text-highlighted shrink-0"
+                    @click.stop="copyOrderId(row.original.id)"
+                  />
+                </div>
+              </template>
+
+              <template #status-cell="{ row }">
                 <UBadge
-                  :color="order.status === 'completed' ? 'success' : order.status === 'closed' ? 'neutral' : order.status === 'pending_payment' ? 'warning' : 'primary'"
-                  variant="soft"
+                  :color="stateColor(row.original)"
+                  variant="subtle"
+                  size="sm"
+                  class="gap-1 font-medium whitespace-nowrap"
                 >
-                  {{ stateLabel(order) }}
+                  <UIcon
+                    :name="stateIcon(row.original)"
+                    class="size-3.5"
+                  />
+                  <span>{{ stateLabel(row.original) }}</span>
+                </UBadge>
+              </template>
+
+              <template #owner-cell="{ row }">
+                <div class="flex items-center gap-1.5 text-xs sm:text-sm text-default">
+                  <UIcon
+                    :name="row.original.ownerType === 'customer' ? 'i-lucide-user' : 'i-lucide-user-x'"
+                    class="size-4 shrink-0 text-muted"
+                  />
+                  <span class="truncate max-w-[11rem]">
+                    {{ row.original.ownerType === 'customer' ? (row.original.customerUsername ?? row.original.customerId ?? '已删除账户') : '游客会话' }}
+                  </span>
+                </div>
+              </template>
+
+              <template #itemCount-cell="{ row }">
+                <span class="text-xs text-muted tabular-nums whitespace-nowrap">
+                  {{ row.original.itemCount }} 项商品
+                </span>
+              </template>
+
+              <template #totalAmount-cell="{ row }">
+                <div class="text-right">
+                  <span class="font-semibold tabular-nums text-highlighted text-sm sm:text-base">
+                    ¥{{ row.original.totalAmount }}
+                  </span>
+                </div>
+              </template>
+
+              <template #createdAt-cell="{ row }">
+                <time
+                  :datetime="row.original.createdAt"
+                  class="text-xs text-muted block whitespace-nowrap"
+                >
+                  {{ formatDate(row.original.createdAt) }}
+                </time>
+              </template>
+
+              <template #actions-cell="{ row }">
+                <div class="flex items-center justify-end whitespace-nowrap">
+                  <UButton
+                    :to="`/admin/orders/${row.original.id}`"
+                    size="xs"
+                    :color="row.original.status === 'processing' ? 'primary' : 'neutral'"
+                    :variant="row.original.status === 'processing' ? 'solid' : 'outline'"
+                  >
+                    查看详情
+                  </UButton>
+                </div>
+              </template>
+            </UTable>
+          </div>
+
+          <!-- 手机端卡片视图 -->
+          <section
+            class="space-y-3 lg:hidden"
+            aria-label="后台订单列表"
+            :aria-busy="loading"
+          >
+            <article
+              v-for="order in orders"
+              :key="order.id"
+              class="rounded-xl border border-default bg-elevated p-3.5 space-y-3 shadow-2xs"
+            >
+              <div class="flex items-center justify-between gap-2">
+                <div class="flex items-center gap-1.5 min-w-0">
+                  <UTooltip :text="order.id">
+                    <h2 class="font-mono text-xs font-semibold text-highlighted truncate max-w-[13rem]">
+                      <NuxtLink
+                        :to="`/admin/orders/${order.id}`"
+                        class="hover:text-primary transition-colors"
+                      >
+                        {{ order.id }}
+                      </NuxtLink>
+                    </h2>
+                  </UTooltip>
+                  <UButton
+                    :icon="copiedOrderId === order.id ? 'i-lucide-check' : 'i-lucide-copy'"
+                    size="xs"
+                    color="neutral"
+                    variant="ghost"
+                    :aria-label="`复制订单编号 ${order.id}`"
+                    class="size-6 p-0 text-muted hover:text-highlighted shrink-0"
+                    @click.stop="copyOrderId(order.id)"
+                  />
+                </div>
+                <UBadge
+                  :color="stateColor(order)"
+                  variant="subtle"
+                  size="xs"
+                  class="gap-1 shrink-0 font-medium whitespace-nowrap"
+                >
+                  <UIcon
+                    :name="stateIcon(order)"
+                    class="size-3"
+                  />
+                  <span>{{ stateLabel(order) }}</span>
                 </UBadge>
               </div>
-              <p class="mt-2 text-sm text-muted">
-                {{ ownerLabel(order) }} · {{ formatDate(order.createdAt) }} · {{ order.itemCount }} 个订单项
-              </p>
+
+              <div class="flex items-center justify-between text-xs text-muted border-t border-default/60 pt-2.5">
+                <div class="flex items-center gap-1 truncate max-w-[14rem]">
+                  <UIcon
+                    :name="order.ownerType === 'customer' ? 'i-lucide-user' : 'i-lucide-user-x'"
+                    class="size-3.5 shrink-0"
+                  />
+                  <span class="truncate">{{ ownerLabel(order) }}</span>
+                </div>
+                <span class="shrink-0 tabular-nums">{{ order.itemCount }} 个订单项</span>
+              </div>
+
               <p
                 v-if="order.status === 'pending_payment'"
-                class="mt-1 text-xs text-muted"
+                class="text-xs text-amber-600 dark:text-amber-400 bg-amber-500/10 rounded-md px-2 py-1"
               >
                 待付款订单不会显示支付成功操作。
               </p>
-            </div>
-            <div class="flex items-center justify-between gap-3 sm:justify-end">
-              <span class="text-lg font-semibold tabular-nums text-highlighted">¥{{ order.totalAmount }}</span>
-              <UButton
-                :to="`/admin/orders/${order.id}`"
-                color="primary"
-                variant="outline"
-              >
-                查看详情
-              </UButton>
-            </div>
-          </article>
 
+              <div class="flex items-center justify-between border-t border-default/60 pt-2.5">
+                <time
+                  :datetime="order.createdAt"
+                  class="text-xs text-muted block"
+                >
+                  {{ formatDate(order.createdAt) }}
+                </time>
+                <div class="flex items-center gap-3 shrink-0">
+                  <span class="text-base font-semibold tabular-nums text-highlighted">¥{{ order.totalAmount }}</span>
+                  <UButton
+                    :to="`/admin/orders/${order.id}`"
+                    size="sm"
+                    :color="order.status === 'processing' ? 'primary' : 'neutral'"
+                    :variant="order.status === 'processing' ? 'solid' : 'outline'"
+                    class="whitespace-nowrap"
+                  >
+                    查看详情
+                  </UButton>
+                </div>
+              </div>
+            </article>
+          </section>
+
+          <!-- 分页器 -->
           <nav
             v-if="totalPages > 1"
             class="flex flex-wrap items-center justify-between gap-3 pt-2"
@@ -297,6 +512,7 @@ onBeforeUnmount(() => { sequence++ })
             <UButton
               color="neutral"
               variant="outline"
+              size="sm"
               :disabled="loading || page <= 1"
               @click="setPage(page - 1)"
             >
@@ -306,13 +522,14 @@ onBeforeUnmount(() => { sequence++ })
             <UButton
               color="neutral"
               variant="outline"
+              size="sm"
               :disabled="loading || page >= totalPages"
               @click="setPage(page + 1)"
             >
               下一页
             </UButton>
           </nav>
-        </section>
+        </div>
       </main>
     </template>
   </UDashboardPanel>
