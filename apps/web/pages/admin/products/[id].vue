@@ -655,7 +655,13 @@ function fulfillmentMethodLabel(method: ManualFulfillmentConfig['method']): stri
 }
 
 function scrollToSection(id: string) {
-  if (import.meta.client) document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  if (import.meta.client) {
+    const el = document.getElementById(id)
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      activeSection.value = id
+    }
+  }
 }
 
 async function loadCodePoolEntries() {
@@ -1888,6 +1894,80 @@ function formatDate(value: string) {
 }
 function priceForSku(skuId: string) { return pricePage.value?.items.find(row => row.skuId === skuId) }
 function inventoryForSku(skuId: string) { return inventorySummary.value?.variants.find(row => row.skuId === skuId) }
+
+const activeSection = ref('basic')
+let sectionObserver: IntersectionObserver | null = null
+
+const navSections = computed(() => [
+  { id: 'basic', label: '基本资料', icon: 'i-lucide-info', dirty: dirty.basic, saving: saving.value === 'basic', error: Boolean(sectionErrors.basic) },
+  { id: 'purchase-limits', label: '购买限制', icon: 'i-lucide-shield-alert', dirty: productPurchaseLimitDraftDirty.value, saving: saving.value === 'purchase-limits', error: Boolean(sectionErrors.purchaseLimits) },
+  { id: 'categories', label: '商品分类', icon: 'i-lucide-folder-tree', dirty: dirty.categories, saving: saving.value === 'categories', error: Boolean(sectionErrors.categories) },
+  { id: 'gallery', label: '图片相册', icon: 'i-lucide-image', dirty: dirty.gallery, saving: saving.value === 'gallery', error: Boolean(sectionErrors.gallery) },
+  { id: 'rich-content', label: '图文详情', icon: 'i-lucide-file-text', dirty: dirty.rich, saving: saving.value === 'rich', error: Boolean(sectionErrors.rich) },
+  { id: 'variants', label: '规格与 SKU', icon: 'i-lucide-layers', dirty: dirty.matrix, saving: saving.value === 'matrix' || saving.value === 'matrix-preview', error: Boolean(sectionErrors.matrix) },
+  { id: 'prices', label: '价格与策略', icon: 'i-lucide-tag', dirty: dirty.prices || pricingRulesDirty.value, saving: saving.value === 'prices' || saving.value === 'cost-preview' || saving.value === 'cost-confirm', error: Boolean(sectionErrors.prices) },
+  { id: 'inventory', label: '库存与交付', icon: 'i-lucide-boxes', dirty: dirty.inventory, saving: saving.value === 'inventory' || saving.value.startsWith('manual-fulfillment-') || saving.value === 'inventory-adjustment', error: Boolean(sectionErrors.inventory) },
+  { id: 'attributes', label: '商品属性', icon: 'i-lucide-list', dirty: dirty.attributes, saving: saving.value === 'attributes', error: Boolean(sectionErrors.attributes) },
+  { id: 'advanced', label: '高级操作', icon: 'i-lucide-settings', dirty: false, saving: saving.value === 'lifecycle' || saving.value === 'copy' || saving.value === 'delete', error: Boolean(sectionErrors.lifecycle || sectionErrors.advanced) },
+])
+
+const skuStatusCounts = computed(() => {
+  const variants = product.value?.variants ?? []
+  let active = 0
+  let paused = 0
+  let retired = 0
+  for (const v of variants) {
+    if (v.retiredAt || retireSkuIds.value.includes(v.id)) {
+      retired++
+    } else if (skuEnabledDraft[v.id] ?? v.enabled) {
+      active++
+    } else {
+      paused++
+    }
+  }
+  return { total: variants.length, active, paused, retired }
+})
+
+const totalStockStats = computed(() => {
+  if (!inventorySummary.value) return null
+  let totalStocked = 0
+  let totalAvailable = 0
+  let hasUnlimited = false
+  for (const row of inventorySummary.value.variants) {
+    if (row.inventory.mode === 'unlimited') {
+      hasUnlimited = true
+    } else if (row.inventory.mode === 'quantity') {
+      totalStocked += row.inventory.stocked ?? 0
+      totalAvailable += row.inventory.available ?? 0
+    }
+  }
+  return { totalStocked, totalAvailable, hasUnlimited }
+})
+
+onMounted(() => {
+  if (typeof IntersectionObserver !== 'undefined') {
+    sectionObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          activeSection.value = entry.target.id
+        }
+      }
+    }, {
+      rootMargin: '-80px 0px -55% 0px',
+      threshold: 0
+    })
+    const sectionIds = ['basic', 'purchase-limits', 'categories', 'gallery', 'rich-content', 'variants', 'prices', 'inventory', 'attributes', 'advanced']
+    for (const id of sectionIds) {
+      const el = document.getElementById(id)
+      if (el) sectionObserver.observe(el)
+    }
+  }
+})
+
+onUnmounted(() => {
+  sectionObserver?.disconnect()
+  sectionObserver = null
+})
 </script>
 
 <template>
@@ -1941,63 +2021,114 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
         <template v-else-if="product">
           <nav
             aria-label="面包屑"
-            class="mb-4 text-sm text-muted"
+            class="mb-4 flex items-center justify-between text-sm text-muted"
           >
-            <NuxtLink
-              to="/admin/products"
-              class="rounded-sm hover:text-primary focus-visible:outline-2 focus-visible:outline-primary"
-            >
-              商品管理
-            </NuxtLink>
-            <span
-              aria-hidden="true"
-              class="px-2"
-            >/</span>
-            <span class="text-highlighted">编辑商品</span>
+            <div class="flex items-center gap-2">
+              <NuxtLink
+                to="/admin/products"
+                class="inline-flex items-center gap-1 rounded-sm text-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-primary transition-colors"
+              >
+                <UIcon
+                  name="i-lucide-arrow-left"
+                  class="size-4"
+                />
+                商品管理
+              </NuxtLink>
+              <span
+                aria-hidden="true"
+                class="text-dimmed"
+              >/</span>
+              <span class="text-highlighted font-medium">编辑商品</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <UBadge
+                v-if="hasUnsavedChanges"
+                color="warning"
+                variant="subtle"
+                class="hidden sm:inline-flex items-center gap-1 text-xs"
+              >
+                <span class="size-1.5 rounded-full bg-warning animate-pulse" />
+                有未保存修改
+              </UBadge>
+            </div>
           </nav>
 
-          <header class="mb-5 flex min-w-0 flex-col gap-4 border-b border-default pb-5 sm:flex-row sm:items-start sm:justify-between">
-            <div class="min-w-0 flex-1">
-              <div class="flex flex-wrap items-center gap-2">
-                <UBadge
-                  :color="product.status === 'active' ? 'success' : product.status === 'archived' ? 'neutral' : product.status === 'paused' ? 'warning' : 'info'"
-                  variant="subtle"
-                >
-                  {{ statusName }}
-                </UBadge>
-                <UBadge
+          <header class="mb-6 rounded-2xl border border-default bg-elevated/70 p-5 backdrop-blur-sm sm:p-6 shadow-xs">
+            <div class="flex min-w-0 flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-2">
+                  <UBadge
+                    :color="product.status === 'active' ? 'success' : product.status === 'archived' ? 'neutral' : product.status === 'paused' ? 'warning' : 'info'"
+                    variant="subtle"
+                    class="font-medium"
+                  >
+                    {{ statusName }}
+                  </UBadge>
+                  <UBadge
+                    color="neutral"
+                    variant="outline"
+                  >
+                    {{ product.productType === 'digital' ? '数字商品' : product.productType === 'physical' ? '实物商品' : '服务' }}
+                  </UBadge>
+                  <UBadge
+                    color="neutral"
+                    variant="subtle"
+                    class="font-mono text-xs"
+                  >
+                    修订 {{ product.revision }}
+                  </UBadge>
+                  <span class="font-mono text-xs text-dimmed select-all">{{ product.id }}</span>
+                </div>
+                <h1 class="mt-2.5 break-words text-2xl font-bold tracking-tight text-highlighted sm:text-3xl">
+                  {{ product.name }}
+                </h1>
+                <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
+                  <span class="inline-flex items-center gap-1.5">
+                    <UIcon
+                      name="i-lucide-layers"
+                      class="size-3.5 text-dimmed"
+                    />
+                    {{ product.variants.length }} 个 SKU
+                  </span>
+                  <span
+                    v-if="totalStockStats"
+                    class="inline-flex items-center gap-1.5"
+                  >
+                    <UIcon
+                      name="i-lucide-boxes"
+                      class="size-3.5 text-dimmed"
+                    />
+                    {{ totalStockStats.hasUnlimited ? '包含无限库存' : `可售库存 ${totalStockStats.totalAvailable} 件` }}
+                  </span>
+                  <span class="inline-flex items-center gap-1.5">
+                    <UIcon
+                      name="i-lucide-clock"
+                      class="size-3.5 text-dimmed"
+                    />
+                    创建于 {{ formatDate(product.createdAt) }}
+                  </span>
+                </div>
+              </div>
+              <div class="flex flex-wrap items-center gap-2.5 sm:self-start lg:self-center">
+                <UButton
+                  to="/admin/products"
                   color="neutral"
                   variant="outline"
+                  size="md"
+                  icon="i-lucide-arrow-left"
                 >
-                  {{ product.productType === 'digital' ? '数字商品' : product.productType === 'physical' ? '实物商品' : '服务' }}
-                </UBadge>
-                <span class="font-mono text-xs text-dimmed">{{ product.id }}</span>
+                  返回列表
+                </UButton>
+                <UButton
+                  icon="i-lucide-save"
+                  size="md"
+                  :loading="saving === 'basic'"
+                  :disabled="isArchived || saving !== '' || !dirty.basic"
+                  @click="saveBasic"
+                >
+                  保存基本资料
+                </UButton>
               </div>
-              <h1 class="mt-2 break-words text-2xl font-semibold tracking-tight text-highlighted sm:text-3xl">
-                {{ product.name }}
-              </h1>
-              <p class="mt-1 text-sm text-muted">
-                商品修订 {{ product.revision }} · 创建于 {{ formatDate(product.createdAt) }}
-              </p>
-            </div>
-            <div class="flex flex-wrap gap-2 sm:justify-end">
-              <UButton
-                to="/admin/products"
-                color="neutral"
-                variant="outline"
-                size="lg"
-              >
-                返回列表
-              </UButton>
-              <UButton
-                icon="i-lucide-save"
-                size="lg"
-                :loading="saving === 'basic'"
-                :disabled="isArchived || saving !== '' || !dirty.basic"
-                @click="saveBasic"
-              >
-                保存基本资料
-              </UButton>
             </div>
           </header>
 
@@ -2102,39 +2233,83 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
             </div>
           </section>
 
-          <div class="grid min-w-0 gap-8 lg:grid-cols-[minmax(0,1fr)_17rem] lg:gap-10">
-            <div class="min-w-0 divide-y divide-default">
+          <nav
+            aria-label="快捷分组导航"
+            class="sticky top-0 z-20 -mx-4 mb-6 flex items-center gap-2 overflow-x-auto border-b border-default bg-default/95 px-4 py-2.5 backdrop-blur no-scrollbar lg:hidden"
+          >
+            <button
+              v-for="item in navSections"
+              :key="item.id"
+              type="button"
+              class="relative inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition-colors"
+              :class="activeSection === item.id ? 'bg-primary text-white shadow-xs' : 'bg-elevated text-muted hover:text-highlighted border border-default'"
+              @click="scrollToSection(item.id)"
+            >
+              <UIcon
+                :name="item.icon"
+                class="size-3.5"
+              />
+              <span>{{ item.label }}</span>
+              <span
+                v-if="item.dirty"
+                class="size-1.5 rounded-full"
+                :class="activeSection === item.id ? 'bg-white' : 'bg-warning animate-pulse'"
+              />
+            </button>
+          </nav>
+
+          <div class="grid min-w-0 gap-8 lg:grid-cols-[minmax(0,1fr)_18rem] lg:gap-8">
+            <div class="min-w-0 space-y-8">
               <section
                 id="basic"
                 aria-labelledby="basic-title"
-                class="py-6 first:pt-0"
+                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
               >
-                <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2
-                      id="basic-title"
-                      class="text-lg font-semibold text-highlighted"
-                    >
-                      基本信息
-                    </h2>
-                    <p class="mt-1 text-sm text-muted">
-                      商品名称、说明和性质。
-                    </p>
+                <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
+                  <div class="flex items-center gap-2.5">
+                    <div class="rounded-lg bg-primary/10 p-2 text-primary">
+                      <UIcon
+                        name="i-lucide-info"
+                        class="size-5"
+                      />
+                    </div>
+                    <div>
+                      <div class="flex items-center gap-2">
+                        <h2
+                          id="basic-title"
+                          class="text-base sm:text-lg font-bold text-highlighted"
+                        >
+                          基本信息
+                        </h2>
+                        <UBadge
+                          v-if="dirty.basic"
+                          color="warning"
+                          variant="subtle"
+                        >
+                          未保存
+                        </UBadge>
+                        <UBadge
+                          v-else-if="sectionSuccess.basic"
+                          color="success"
+                          variant="subtle"
+                        >
+                          已保存
+                        </UBadge>
+                      </div>
+                      <p class="mt-0.5 text-xs text-muted">
+                        商品名称、说明和性质
+                      </p>
+                    </div>
                   </div>
-                  <UBadge
-                    v-if="dirty.basic"
-                    color="warning"
-                    variant="subtle"
+                  <UButton
+                    size="sm"
+                    icon="i-lucide-save"
+                    :loading="saving === 'basic'"
+                    :disabled="isArchived || saving !== '' || !dirty.basic"
+                    @click="saveBasic"
                   >
-                    未保存
-                  </UBadge>
-                  <UBadge
-                    v-else-if="sectionSuccess.basic"
-                    color="success"
-                    variant="subtle"
-                  >
-                    已保存
-                  </UBadge>
+                    保存基本信息
+                  </UButton>
                 </header>
                 <UAlert
                   v-if="sectionErrors.basic"
@@ -2206,30 +2381,50 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 </div>
               </section>
 
+              
               <section
                 id="purchase-limits"
                 aria-labelledby="purchase-limits-title"
-                class="py-6"
+                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
               >
-                <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2
-                      id="purchase-limits-title"
-                      class="text-lg font-semibold text-highlighted"
-                    >
-                      购买限制
-                    </h2>
-                    <p class="mt-1 text-sm text-muted">
-                      商品级规则汇总约束该商品下的所有 SKU。留空表示不限制；修改只影响新报价与新订单。
-                    </p>
+                <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
+                  <div class="flex items-center gap-2.5">
+                    <div class="rounded-lg bg-primary/10 p-2 text-primary">
+                      <UIcon
+                        name="i-lucide-shield-alert"
+                        class="size-5"
+                      />
+                    </div>
+                    <div>
+                      <div class="flex items-center gap-2">
+                        <h2
+                          id="purchase-limits-title"
+                          class="text-base sm:text-lg font-bold text-highlighted"
+                        >
+                          购买限制
+                        </h2>
+                        <UBadge
+                          v-if="skuPurchaseLimitDraftDirty"
+                          color="warning"
+                          variant="subtle"
+                        >
+                          有未保存的购买限制
+                        </UBadge>
+                      </div>
+                      <p class="mt-0.5 text-xs text-muted">
+                        商品级限购规则，留空表示不限制；修改只影响新订单
+                      </p>
+                    </div>
                   </div>
-                  <UBadge
-                    v-if="skuPurchaseLimitDraftDirty"
-                    color="warning"
-                    variant="subtle"
+                  <UButton
+                    size="sm"
+                    icon="i-lucide-save"
+                    :loading="saving === 'purchase-limits'"
+                    :disabled="isArchived || saving !== '' || !productPurchaseLimitDraftDirty"
+                    @click="saveProductPurchaseLimits"
                   >
-                    有未保存的购买限制
-                  </UBadge>
+                    保存商品限制
+                  </UButton>
                 </header>
                 <UAlert
                   v-if="sectionErrors.purchaseLimits"
@@ -2308,24 +2503,42 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 </div>
               </section>
 
+              
               <section
                 id="categories"
                 aria-labelledby="categories-title"
-                class="py-6"
+                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
               >
-                <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2
-                      id="categories-title"
-                      class="text-lg font-semibold text-highlighted"
-                    >
-                      商品分类
-                    </h2>
-                    <p class="mt-1 text-sm text-muted">
-                      主分类用于列表归类；可添加辅助分类，也可保持未分类。
-                    </p>
+                <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
+                  <div class="flex items-center gap-2.5">
+                    <div class="rounded-lg bg-primary/10 p-2 text-primary">
+                      <UIcon
+                        name="i-lucide-folder-tree"
+                        class="size-5"
+                      />
+                    </div>
+                    <div>
+                      <div class="flex items-center gap-2">
+                        <h2
+                          id="categories-title"
+                          class="text-base sm:text-lg font-bold text-highlighted"
+                        >
+                          商品分类
+                        </h2>
+                        <UBadge
+                          v-if="dirty.categories"
+                          color="warning"
+                          variant="subtle"
+                        >
+                          未保存
+                        </UBadge>
+                      </div>
+                      <p class="mt-0.5 text-xs text-muted">
+                        主分类用于列表归类；可添加辅助分类，也可保持未分类
+                      </p>
+                    </div>
                   </div>
-                  <div class="flex gap-2">
+                  <div class="flex items-center gap-2">
                     <UButton
                       size="sm"
                       color="neutral"
@@ -2336,13 +2549,15 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                     >
                       管理分类
                     </UButton>
-                    <UBadge
-                      v-if="dirty.categories"
-                      color="warning"
-                      variant="subtle"
+                    <UButton
+                      size="sm"
+                      icon="i-lucide-save"
+                      :loading="saving === 'categories'"
+                      :disabled="isArchived || saving !== '' || !dirty.categories"
+                      @click="saveCategories"
                     >
-                      未保存
-                    </UBadge>
+                      保存分类
+                    </UButton>
                   </div>
                 </header>
                 <UAlert
@@ -2424,30 +2639,52 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 </div>
               </section>
 
+              
               <section
                 id="gallery"
                 aria-labelledby="gallery-title"
-                class="py-6"
+                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
               >
-                <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2
-                      id="gallery-title"
-                      class="text-lg font-semibold text-highlighted"
-                    >
-                      商品图片
-                    </h2>
-                    <p class="mt-1 text-sm text-muted">
-                      最多 20 张。相册中的第一张图片作为封面；移除只解除相册引用。
-                    </p>
+                <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
+                  <div class="flex items-center gap-2.5">
+                    <div class="rounded-lg bg-primary/10 p-2 text-primary">
+                      <UIcon
+                        name="i-lucide-image"
+                        class="size-5"
+                      />
+                    </div>
+                    <div>
+                      <div class="flex items-center gap-2">
+                        <h2
+                          id="gallery-title"
+                          class="text-base sm:text-lg font-bold text-highlighted"
+                        >
+                          商品图片
+                        </h2>
+                        <UBadge
+                          v-if="dirty.gallery"
+                          color="warning"
+                          variant="subtle"
+                        >
+                          待保存关联
+                        </UBadge>
+                      </div>
+                      <p class="mt-0.5 text-xs text-muted">
+                        最多 20 张；第一张图片作为封面；移除只解除相册引用
+                      </p>
+                    </div>
                   </div>
-                  <UBadge
-                    v-if="dirty.gallery"
-                    color="warning"
-                    variant="subtle"
-                  >
-                    待保存关联
-                  </UBadge>
+                  <div class="flex items-center gap-2">
+                    <UButton
+                      size="sm"
+                      icon="i-lucide-save"
+                      :loading="saving === 'gallery'"
+                      :disabled="isArchived || saving !== '' || !dirty.gallery"
+                      @click="saveGallery"
+                    >
+                      保存相册
+                    </UButton>
+                  </div>
                 </header>
                 <UAlert
                   v-if="sectionErrors.gallery"
@@ -2580,30 +2817,50 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 </div>
               </section>
 
+              
               <section
                 id="rich-content"
                 aria-labelledby="rich-title"
-                class="py-6"
+                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
               >
-                <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2
-                      id="rich-title"
-                      class="text-lg font-semibold text-highlighted"
-                    >
-                      图文详情
-                    </h2>
-                    <p class="mt-1 text-sm text-muted">
-                      使用 D5 的结构化 JSON；正文图片按 mediaId 关联，不保存 URL 作为图片身份。
-                    </p>
+                <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
+                  <div class="flex items-center gap-2.5">
+                    <div class="rounded-lg bg-primary/10 p-2 text-primary">
+                      <UIcon
+                        name="i-lucide-file-text"
+                        class="size-5"
+                      />
+                    </div>
+                    <div>
+                      <div class="flex items-center gap-2">
+                        <h2
+                          id="rich-title"
+                          class="text-base sm:text-lg font-bold text-highlighted"
+                        >
+                          图文详情
+                        </h2>
+                        <UBadge
+                          v-if="dirty.rich"
+                          color="warning"
+                          variant="subtle"
+                        >
+                          未保存
+                        </UBadge>
+                      </div>
+                      <p class="mt-0.5 text-xs text-muted">
+                        使用结构化 JSON；正文图片按 mediaId 关联
+                      </p>
+                    </div>
                   </div>
-                  <UBadge
-                    v-if="dirty.rich"
-                    color="warning"
-                    variant="subtle"
+                  <UButton
+                    size="sm"
+                    icon="i-lucide-save"
+                    :loading="saving === 'rich'"
+                    :disabled="isArchived || saving !== '' || !dirty.rich"
+                    @click="saveRichContent"
                   >
-                    未保存
-                  </UBadge>
+                    保存图文详情
+                  </UButton>
                 </header>
                 <UAlert
                   v-if="sectionErrors.rich"
@@ -2641,6 +2898,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 </div>
               </section>
 
+              
               <AdminProductPurchaseFormAssignmentPanel
                 v-if="product"
                 :product-id="productId"
@@ -2650,31 +2908,110 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 @revision="setProductRevision"
               />
 
+              
               <section
                 id="variants"
                 aria-labelledby="variants-title"
-                class="py-6"
+                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs space-y-6"
               >
-                <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2
-                      id="variants-title"
-                      class="text-lg font-semibold text-highlighted"
+                <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
+                  <div class="flex items-center gap-2.5">
+                    <div class="rounded-lg bg-primary/10 p-2 text-primary">
+                      <UIcon
+                        name="i-lucide-layers"
+                        class="size-5"
+                      />
+                    </div>
+                    <div>
+                      <div class="flex items-center gap-2">
+                        <h2
+                          id="variants-title"
+                          class="text-base sm:text-lg font-bold text-highlighted"
+                        >
+                          规格与 SKU
+                        </h2>
+                        <UBadge
+                          v-if="dirty.matrix"
+                          color="warning"
+                          variant="subtle"
+                        >
+                          未保存
+                        </UBadge>
+                        <UBadge
+                          v-else-if="sectionSuccess.matrix"
+                          color="success"
+                          variant="subtle"
+                        >
+                          已保存
+                        </UBadge>
+                      </div>
+                      <p class="mt-0.5 text-xs text-muted">
+                        最多 5 组规格、每组 50 个值、每件商品最多 1000 个 SKU。SKU 身份由组合键保持稳定。
+                      </p>
+                    </div>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <UButton
+                      color="neutral"
+                      variant="outline"
+                      size="sm"
+                      icon="i-lucide-scan-search"
+                      :loading="saving === 'matrix-preview'"
+                      :disabled="isArchived || saving !== '' || !dirty.matrix || matrixCombinationLimitExceeded"
+                      @click="previewMatrix"
                     >
-                      规格与 SKU
-                    </h2>
-                    <p class="mt-1 text-sm text-muted">
-                      最多 5 组规格、每组 50 个值、每件商品最多 1000 个 SKU。SKU 身份由组合键保持稳定。
+                      预览 SKU 差异
+                    </UButton>
+                    <UButton
+                      v-if="matrixPreview"
+                      size="sm"
+                      :loading="saving === 'matrix'"
+                      :disabled="isArchived || saving !== '' || (matrixNeedsConfirmation && !confirmMatrixChanges) || matrixBlockedChanges.length > 0"
+                      @click="saveMatrix"
+                    >
+                      保存规格与 SKU
+                    </UButton>
+                  </div>
+                </header>
+
+                <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                  <div class="rounded-xl border border-default bg-elevated/70 p-3 shadow-2xs">
+                    <div class="flex items-center justify-between text-xs text-muted">
+                      <span>规格组</span>
+                      <span class="text-dimmed">上限 5 组</span>
+                    </div>
+                    <p class="mt-1 text-xl font-bold tabular-nums text-highlighted">
+                      {{ groupsDraft.length }} <span class="text-xs font-normal text-muted">/ 5</span>
                     </p>
                   </div>
-                  <UBadge
-                    v-if="dirty.matrix"
-                    color="warning"
-                    variant="subtle"
-                  >
-                    未保存
-                  </UBadge>
-                </header>
+                  <div class="rounded-xl border border-default bg-elevated/70 p-3 shadow-2xs">
+                    <div class="flex items-center justify-between text-xs text-muted">
+                      <span>可能生成组合</span>
+                      <span class="text-dimmed">笛卡尔积</span>
+                    </div>
+                    <p class="mt-1 text-xl font-bold tabular-nums text-highlighted">
+                      {{ allCombinations.length }} <span class="text-xs font-normal text-muted">个</span>
+                    </p>
+                  </div>
+                  <div class="rounded-xl border border-default bg-elevated/70 p-3 shadow-2xs">
+                    <div class="flex items-center justify-between text-xs text-muted">
+                      <span>已选保留组合</span>
+                      <span class="text-dimmed">{{ matrixMode === 'all' ? '全量模式' : '自选模式' }}</span>
+                    </div>
+                    <p class="mt-1 text-xl font-bold tabular-nums text-highlighted">
+                      {{ selectedCombinationCount }} <span class="text-xs font-normal text-muted">个</span>
+                    </p>
+                  </div>
+                  <div class="rounded-xl border border-default bg-elevated/70 p-3 shadow-2xs">
+                    <div class="flex items-center justify-between text-xs text-muted">
+                      <span>现有 SKU 清单</span>
+                      <span class="text-dimmed">身份稳定</span>
+                    </div>
+                    <p class="mt-1 text-xl font-bold tabular-nums text-highlighted">
+                      {{ product?.variants.length ?? 0 }} <span class="text-xs font-normal text-muted">个</span>
+                    </p>
+                  </div>
+                </div>
                 <UAlert
                   v-if="sectionErrors.matrix"
                   class="mb-3"
@@ -3048,7 +3385,25 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                         已有 SKU 的编码、身份和库存归属保持稳定。永久退役记录只读保留。
                       </p>
                     </div>
-                    <span class="text-xs text-muted">共 {{ product.variants.length }} 个</span>
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="text-xs text-muted">共 {{ product.variants.length }} 个</span>
+                      <span class="text-xs text-dimmed">·</span>
+                      <span class="inline-flex items-center gap-1 text-xs text-success">
+                        <span class="size-1.5 rounded-full bg-success" />
+                        {{ skuStatusCounts.active }} 启用
+                      </span>
+                      <span class="inline-flex items-center gap-1 text-xs text-warning">
+                        <span class="size-1.5 rounded-full bg-warning" />
+                        {{ skuStatusCounts.paused }} 停用
+                      </span>
+                      <span
+                        v-if="skuStatusCounts.retired > 0"
+                        class="inline-flex items-center gap-1 text-xs text-muted"
+                      >
+                        <span class="size-1.5 rounded-full bg-muted" />
+                        {{ skuStatusCounts.retired }} 退役
+                      </span>
+                    </div>
                   </div>
                   <ul class="divide-y divide-default rounded-lg border border-default">
                     <li
@@ -3213,30 +3568,52 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 </div>
               </section>
 
+              
               <section
                 id="prices"
                 aria-labelledby="prices-title"
-                class="py-6"
+                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs space-y-5"
               >
-                <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2
-                      id="prices-title"
-                      class="text-lg font-semibold text-highlighted"
-                    >
-                      价格
-                    </h2>
-                    <p class="mt-1 max-w-3xl text-sm leading-6 text-muted">
-                      售价和划线价可单独保存。成本按 CNY/件人工确认，最多五位小数；先预览成本与利润影响，再单独确认，不代表供应商实际扣费。复制商品不会复制成本，新 SKU 需重新确认。
-                    </p>
+                <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
+                  <div class="flex items-center gap-2.5">
+                    <div class="rounded-lg bg-primary/10 p-2 text-primary">
+                      <UIcon
+                        name="i-lucide-tag"
+                        class="size-5"
+                      />
+                    </div>
+                    <div>
+                      <div class="flex items-center gap-2">
+                        <h2
+                          id="prices-title"
+                          class="text-base sm:text-lg font-bold text-highlighted"
+                        >
+                          价格
+                        </h2>
+                        <UBadge
+                          v-if="dirty.prices || pricingRulesDirty"
+                          color="warning"
+                          variant="subtle"
+                        >
+                          未保存
+                        </UBadge>
+                      </div>
+                      <p class="mt-0.5 text-xs text-muted">
+                        售价与划线价可单独保存；成本按 CNY/件两步核定，不修改售价
+                      </p>
+                    </div>
                   </div>
-                  <UBadge
-                    v-if="dirty.prices || pricingRulesDirty"
-                    color="warning"
-                    variant="subtle"
-                  >
-                    未保存
-                  </UBadge>
+                  <div class="flex items-center gap-2">
+                    <UButton
+                      size="sm"
+                      icon="i-lucide-save"
+                      :loading="saving === 'prices'"
+                      :disabled="isArchived || saving !== '' || costOutcomeUnknown || !pricePage?.items.some(priceFieldsChanged)"
+                      @click="savePrices"
+                    >
+                      保存本页售价与划线价
+                    </UButton>
+                  </div>
                 </header>
                 <UAlert
                   v-if="sectionErrors.prices"
@@ -3409,22 +3786,80 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 />
               </section>
 
+              
               <section
                 id="inventory"
                 aria-labelledby="inventory-title"
-                class="py-6"
+                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs space-y-6"
               >
-                <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2
-                      id="inventory-title"
-                      class="text-lg font-semibold text-highlighted"
+                <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
+                  <div class="flex items-center gap-2.5">
+                    <div class="rounded-lg bg-primary/10 p-2 text-primary">
+                      <UIcon
+                        name="i-lucide-boxes"
+                        class="size-5"
+                      />
+                    </div>
+                    <div>
+                      <h2
+                        id="inventory-title"
+                        class="text-base sm:text-lg font-bold text-highlighted"
+                      >
+                        库存
+                      </h2>
+                      <p class="mt-0.5 text-xs text-muted">
+                        SKU 库存模式、履约交付配置与流水追踪
+                      </p>
+                    </div>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      class="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors bg-elevated hover:bg-muted text-muted hover:text-highlighted border border-default shadow-2xs"
+                      @click="scrollToSection('manual-delivery-title')"
                     >
-                      库存
-                    </h2>
-                    <p class="mt-1 text-sm text-muted">
-                      商品模式使用 SKU 独立修订；库存数量调整使用 inventory_revision 与唯一 operationId。
-                    </p>
+                      <UIcon
+                        name="i-lucide-truck"
+                        class="size-3.5"
+                      />
+                      履约方式
+                    </button>
+                    <button
+                      v-if="product?.productType === 'digital'"
+                      type="button"
+                      class="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors bg-elevated hover:bg-muted text-muted hover:text-highlighted border border-default shadow-2xs"
+                      @click="scrollToSection('code-pool-title')"
+                    >
+                      <UIcon
+                        name="i-lucide-key-round"
+                        class="size-3.5"
+                      />
+                      卡密池
+                    </button>
+                    <button
+                      v-if="product?.productType === 'digital'"
+                      type="button"
+                      class="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors bg-elevated hover:bg-muted text-muted hover:text-highlighted border border-default shadow-2xs"
+                      @click="scrollToSection('fixed-delivery-title')"
+                    >
+                      <UIcon
+                        name="i-lucide-file-text"
+                        class="size-3.5"
+                      />
+                      固定文本/链接
+                    </button>
+                    <button
+                      v-if="historySkuId"
+                      type="button"
+                      class="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors bg-elevated hover:bg-muted text-muted hover:text-highlighted border border-default shadow-2xs"
+                      @click="scrollToSection('inventory-adjust-title')"
+                    >
+                      <UIcon
+                        name="i-lucide-history"
+                        class="size-3.5"
+                      />
+                      调整流水
+                    </button>
                   </div>
                 </header>
                 <UAlert
@@ -3895,7 +4330,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                           <span class="text-xs text-muted">{{ fixedDeliveryVersions?.total ?? 0 }} 个版本</span>
                         </div>
                         <ul
-                          v-if="fixedDeliveryVersions?.items.length"
+                          v-if="fixedDeliveryVersions?.items?.length"
                           class="mt-2 divide-y divide-default"
                         >
                           <li
@@ -4232,7 +4667,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                       </UFormField>
                     </div>
                     <div
-                      v-if="codePoolEntries?.items.length"
+                      v-if="codePoolEntries?.items?.length"
                       class="mt-3 divide-y divide-default rounded-lg border border-default"
                     >
                       <article
@@ -4354,7 +4789,7 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                   </section>
 
                   <section
-                    v-if="codePoolBatches?.items.length"
+                    v-if="codePoolBatches?.items?.length"
                     class="mt-5 rounded-lg border border-default bg-elevated p-3 sm:p-4"
                     aria-labelledby="code-pool-batches-title"
                   >
@@ -4557,30 +4992,50 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 </section>
               </section>
 
+              
               <section
                 id="attributes"
                 aria-labelledby="attributes-title"
-                class="py-6"
+                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
               >
-                <header class="mb-4 flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2
-                      id="attributes-title"
-                      class="text-lg font-semibold text-highlighted"
-                    >
-                      商品属性
-                    </h2>
-                    <p class="mt-1 text-sm text-muted">
-                      可维护最多 30 条展示属性；不会生成虚构的销量或订单数据。
-                    </p>
+                <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
+                  <div class="flex items-center gap-2.5">
+                    <div class="rounded-lg bg-primary/10 p-2 text-primary">
+                      <UIcon
+                        name="i-lucide-list"
+                        class="size-5"
+                      />
+                    </div>
+                    <div>
+                      <div class="flex items-center gap-2">
+                        <h2
+                          id="attributes-title"
+                          class="text-base sm:text-lg font-bold text-highlighted"
+                        >
+                          商品属性
+                        </h2>
+                        <UBadge
+                          v-if="dirty.attributes"
+                          color="warning"
+                          variant="subtle"
+                        >
+                          未保存
+                        </UBadge>
+                      </div>
+                      <p class="mt-0.5 text-xs text-muted">
+                        可维护最多 30 条展示属性
+                      </p>
+                    </div>
                   </div>
-                  <UBadge
-                    v-if="dirty.attributes"
-                    color="warning"
-                    variant="subtle"
+                  <UButton
+                    size="sm"
+                    icon="i-lucide-save"
+                    :loading="saving === 'attributes'"
+                    :disabled="isArchived || saving !== '' || !dirty.attributes"
+                    @click="saveAttributes"
                   >
-                    未保存
-                  </UBadge>
+                    保存属性
+                  </UButton>
                 </header>
                 <UAlert
                   v-if="sectionErrors.attributes"
@@ -4650,20 +5105,31 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
                 </div>
               </section>
 
+              
               <section
                 id="advanced"
                 aria-labelledby="advanced-title"
-                class="py-6"
+                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
               >
-                <h2
-                  id="advanced-title"
-                  class="text-lg font-semibold text-highlighted"
-                >
-                  高级操作
-                </h2>
-                <p class="mt-1 text-sm text-muted">
-                  生命周期、复制和安全删除。
-                </p>
+                <div class="mb-5 flex items-center gap-2.5 border-b border-default pb-4">
+                  <div class="rounded-lg bg-primary/10 p-2 text-primary">
+                    <UIcon
+                      name="i-lucide-settings"
+                      class="size-5"
+                    />
+                  </div>
+                  <div>
+                    <h2
+                      id="advanced-title"
+                      class="text-base sm:text-lg font-bold text-highlighted"
+                    >
+                      高级操作
+                    </h2>
+                    <p class="mt-0.5 text-xs text-muted">
+                      生命周期状态流转、商品复制与安全归档删除
+                    </p>
+                  </div>
+                </div>
                 <UAlert
                   v-if="sectionErrors.lifecycle || sectionErrors.advanced"
                   class="mt-3"
@@ -4758,44 +5224,140 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
               </section>
             </div>
 
-            <aside class="min-w-0 lg:sticky lg:top-4 lg:self-start">
-              <div class="rounded-xl border border-default bg-elevated p-4">
-                <h2 class="font-semibold text-highlighted">
-                  保存状态
-                </h2>
-                <p class="mt-1 text-xs leading-5 text-muted">
-                  分区保存后更新商品修订号；库存数量单独维护库存修订。
-                </p>
-                <ul class="mt-4 grid gap-2 text-sm">
-                  <li
-                    v-for="[key, label] in [['basic', '基本信息'], ['categories', '分类'], ['gallery', '图片相册'], ['rich', '图文详情'], ['matrix', '规格与 SKU'], ['prices', '价格'], ['attributes', '商品属性']]"
-                    :key="key"
-                    class="flex items-center justify-between gap-2"
+            <aside class="min-w-0 lg:sticky lg:top-4 lg:self-start space-y-4">
+              <div class="rounded-2xl border border-default bg-elevated/80 p-4 backdrop-blur-sm shadow-xs">
+                <div class="flex items-center justify-between pb-3 border-b border-default">
+                  <div class="flex items-center gap-2">
+                    <UIcon
+                      name="i-lucide-compass"
+                      class="size-4 text-primary"
+                    />
+                    <h2 class="font-bold text-sm text-highlighted">
+                      章节导航
+                    </h2>
+                  </div>
+                  <UBadge
+                    v-if="hasUnsavedChanges"
+                    color="warning"
+                    variant="subtle"
+                    size="xs"
                   >
-                    <span class="text-muted">{{ label }}</span>
-                    <UBadge
-                      :color="(dirty[key as keyof typeof dirty] || (key === 'prices' && pricingRulesDirty)) ? 'warning' : 'success'"
-                      variant="subtle"
-                    >
-                      {{ (dirty[key as keyof typeof dirty] || (key === 'prices' && pricingRulesDirty)) ? '未保存' : '已保存' }}
-                    </UBadge>
-                  </li>
-                </ul>
-                <div class="mt-4 border-t border-default pt-4">
-                  <p class="text-xs text-muted">
-                    当前状态
-                  </p>
-                  <p class="mt-1 font-medium text-highlighted">
-                    {{ statusName }}
-                  </p>
-                  <p class="mt-2 text-xs text-muted">
-                    更新时间
-                  </p>
-                  <time
-                    :datetime="product?.updatedAt ?? ''"
-                    class="mt-1 block text-sm text-highlighted"
-                  >{{ product ? formatDate(product.updatedAt) : '' }}</time>
+                    有未保存
+                  </UBadge>
+                  <UBadge
+                    v-else
+                    color="success"
+                    variant="subtle"
+                    size="xs"
+                  >
+                    已全部保存
+                  </UBadge>
                 </div>
+
+                <nav
+                  aria-label="页面内导航"
+                  class="mt-3 space-y-1"
+                >
+                  <button
+                    v-for="item in navSections"
+                    :key="item.id"
+                    type="button"
+                    class="group flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-xs transition-all text-left"
+                    :class="activeSection === item.id ? 'bg-primary/10 text-primary font-medium' : 'text-muted hover:bg-muted/50 hover:text-highlighted'"
+                    @click="scrollToSection(item.id)"
+                  >
+                    <span class="flex items-center gap-2 truncate">
+                      <UIcon
+                        :name="item.icon"
+                        class="size-3.5 shrink-0 transition-colors"
+                        :class="activeSection === item.id ? 'text-primary' : 'text-dimmed group-hover:text-muted'"
+                      />
+                      <span class="truncate">{{ item.label }}</span>
+                    </span>
+                    <span class="shrink-0 ml-2">
+                      <span
+                        v-if="item.saving"
+                        class="inline-flex items-center gap-1 font-normal text-[11px] text-primary"
+                      >
+                        <UIcon
+                          name="i-lucide-loader-2"
+                          class="size-3 animate-spin"
+                        />
+                        保存中
+                      </span>
+                      <UBadge
+                        v-else-if="item.dirty"
+                        color="warning"
+                        variant="subtle"
+                        size="xs"
+                      >
+                        未保存
+                      </UBadge>
+                      <UBadge
+                        v-else-if="item.error"
+                        color="error"
+                        variant="subtle"
+                        size="xs"
+                      >
+                        错误
+                      </UBadge>
+                      <UIcon
+                        v-else
+                        name="i-lucide-check"
+                        class="size-3.5 text-success/60"
+                      />
+                    </span>
+                  </button>
+                </nav>
+              </div>
+
+              <div class="rounded-2xl border border-default bg-elevated/80 p-4 backdrop-blur-sm shadow-xs">
+                <h3 class="font-semibold text-xs text-muted uppercase tracking-wider">
+                  商品概况
+                </h3>
+                <dl class="mt-3 space-y-2.5 text-xs">
+                  <div class="flex items-center justify-between">
+                    <dt class="text-muted">
+                      销售状态
+                    </dt>
+                    <dd>
+                      <UBadge
+                        :color="(product && product.status === 'active') ? 'success' : (product && product.status === 'archived') ? 'neutral' : (product && product.status === 'paused') ? 'warning' : 'info'"
+                        variant="subtle"
+                        size="xs"
+                      >
+                        {{ statusName }}
+                      </UBadge>
+                    </dd>
+                  </div>
+                  <div class="flex items-center justify-between">
+                    <dt class="text-muted">
+                      SKU 数量
+                    </dt>
+                    <dd class="font-medium text-highlighted tabular-nums">
+                      {{ product?.variants ? product.variants.length : 0 }} 个
+                    </dd>
+                  </div>
+                  <div class="flex items-center justify-between">
+                    <dt class="text-muted">
+                      可售库存
+                    </dt>
+                    <dd class="font-medium text-highlighted tabular-nums">
+                      {{ totalStockStats?.hasUnlimited ? '包含无限库存' : `${totalStockStats?.totalAvailable ?? 0} 件` }}
+                    </dd>
+                  </div>
+                  <div class="flex items-center justify-between">
+                    <dt class="text-muted">
+                      更新时间
+                    </dt>
+                    <dd class="text-dimmed">
+                      <time :datetime="product?.updatedAt ?? ''">
+                        {{ product ? formatDate(product.updatedAt) : '' }}
+                      </time>
+                    </dd>
+                  </div>
+                </dl>
+
                 <UButton
                   class="mt-4 w-full"
                   icon="i-lucide-save"
