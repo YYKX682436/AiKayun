@@ -121,3 +121,43 @@ input {
   background: var(--ui-color-neutral-700);
 }
 
+/* Storefront Apple-inspired aesthetic tokens and refinements */
+[data-aikayun-area="storefront"] {
+  --ui-header-height: 3.75rem;
+}
+
+[data-aikayun-area="storefront"] .storefront-glass-header {
+  background-color: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+}
+
+.dark[data-aikayun-area="storefront"] .storefront-glass-header {
+  background-color: rgba(10, 15, 29, 0.82);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+}
+
+[data-aikayun-area="storefront"] .storefront-card {
+  transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.24s cubic-bezier(0.16, 1, 0.3, 1),
+              border-color 0.2s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  [data-aikayun-area="storefront"] .storefront-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.03);
+  }
+  .dark[data-aikayun-area="storefront"] .storefront-card:hover {
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.35), 0 8px 10px -6px rgba(0, 0, 0, 0.2);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-aikayun-area="storefront"] .storefront-card,
+  [data-aikayun-area="storefront"] .storefront-card:hover {
+    transform: none !important;
+  }
+}
+

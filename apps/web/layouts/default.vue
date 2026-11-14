@@ -32,7 +32,7 @@ onMounted(() => {
 
 <template>
   <div
-    class="min-h-dvh bg-default"
+    class="flex min-h-dvh flex-col bg-default"
     :data-storefront-ready="storefrontReady ? 'true' : 'false'"
   >
     <NuxtLink
@@ -42,20 +42,21 @@ onMounted(() => {
       跳转到主要内容
     </NuxtLink>
 
-    <header class="border-b border-default bg-elevated">
-      <UContainer class="flex min-h-16 flex-wrap items-center justify-between gap-x-2 gap-y-1 py-2">
+    <header class="sticky top-0 z-40 border-b border-default/70 bg-elevated/80 backdrop-blur-md storefront-glass-header transition-colors">
+      <UContainer class="flex h-15 items-center justify-between gap-x-3 py-2 sm:h-16">
         <NuxtLink
           to="/"
-          class="flex min-w-0 shrink items-center gap-2 rounded-sm font-semibold text-highlighted focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary sm:gap-2.5"
+          class="group flex min-w-0 shrink items-center gap-2.5 rounded-lg focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary"
         >
           <BrandMark
             :name="storeBrand.storeName"
             :logo-url="storeBrand.storeLogoUrl"
+            class="transition-transform duration-200 group-hover:scale-105"
           />
-          <span class="max-w-[3.25rem] truncate text-sm sm:max-w-[12rem] sm:text-base">{{ storeBrand.storeName }}</span>
+          <span class="max-w-[7.5rem] truncate text-sm font-semibold tracking-tight text-highlighted transition-colors group-hover:text-primary sm:max-w-[14rem] sm:text-base md:max-w-none">{{ storeBrand.storeName }}</span>
         </NuxtLink>
 
-        <div class="ml-auto flex shrink-0 items-center gap-0 sm:gap-1">
+        <div class="ml-auto flex shrink-0 items-center gap-1 sm:gap-1.5">
           <StorefrontCategoryNav :categories="categories" />
           <UButton
             to="/search"
@@ -63,18 +64,18 @@ onMounted(() => {
             variant="ghost"
             icon="i-lucide-search"
             aria-label="搜索商品"
-            class="min-h-11 min-w-9 px-1.5 sm:min-w-10 sm:px-2"
+            class="min-h-10 min-w-9 rounded-lg px-2 text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:min-h-11 sm:min-w-10 sm:px-2.5"
           >
             <span class="hidden xl:inline">搜索商品</span>
           </UButton>
           <NuxtLink
             to="/cart"
-            class="relative flex min-h-11 min-w-10 items-center justify-center gap-1 rounded-lg px-2 text-sm font-medium text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:px-3"
+            class="relative flex min-h-10 min-w-9 items-center justify-center gap-1.5 rounded-lg px-2 text-sm font-medium text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:min-h-11 sm:min-w-10 sm:px-2.5"
             :aria-label="`购物车，${shoppingCart.currentQuantity.value} 件商品`"
           >
             <UIcon
-              name="i-lucide-shopping-cart"
-              class="size-4 shrink-0"
+              name="i-lucide-shopping-bag"
+              class="size-4.5 shrink-0"
               aria-hidden="true"
             />
             <span class="hidden sm:inline">购物车</span>
@@ -82,7 +83,7 @@ onMounted(() => {
               v-if="shoppingCart.currentQuantity.value > 0"
               color="primary"
               size="xs"
-              class="absolute -right-0.5 -top-0.5 min-w-5 justify-center px-1 tabular-nums"
+              class="absolute -right-0.5 -top-0.5 min-w-5 justify-center px-1 tabular-nums shadow-xs"
               aria-hidden="true"
             >
               {{ shoppingCart.currentQuantity.value > 99 ? '99+' : shoppingCart.currentQuantity.value }}
@@ -90,38 +91,38 @@ onMounted(() => {
           </NuxtLink>
           <NuxtLink
             to="/orders"
-            class="hidden min-h-11 min-w-10 items-center justify-center rounded-lg px-2 text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary min-[360px]:flex"
+            class="hidden min-h-10 min-w-9 items-center justify-center rounded-lg px-2 text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary min-[400px]:flex sm:min-h-11 sm:min-w-10 sm:px-2.5"
             aria-label="我的订单"
             title="我的订单"
           >
             <UIcon
               name="i-lucide-receipt-text"
-              class="size-4"
+              class="size-4.5"
               aria-hidden="true"
             />
           </NuxtLink>
           <NuxtLink
             v-if="customerApi.session.value"
             to="/wallet"
-            class="hidden min-h-11 min-w-10 items-center justify-center rounded-lg px-2 text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:flex"
+            class="hidden min-h-10 min-w-9 items-center justify-center rounded-lg px-2 text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:flex sm:min-h-11 sm:min-w-10 sm:px-2.5"
             aria-label="我的钱包"
             title="我的钱包"
           >
             <UIcon
               name="i-lucide-wallet"
-              class="size-4"
+              class="size-4.5"
               aria-hidden="true"
             />
           </NuxtLink>
           <ThemeModeSelect />
           <NuxtLink
             :to="customerApi.session.value ? '/account' : '/login'"
-            class="flex min-h-11 min-w-10 items-center justify-center gap-1 rounded-lg px-2 text-sm font-medium text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:px-3"
+            class="flex min-h-10 min-w-9 items-center justify-center gap-1.5 rounded-lg px-2 text-sm font-medium text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:min-h-11 sm:min-w-10 sm:px-3"
             :aria-label="customerApi.session.value ? `顾客账户，${customerApi.session.value.customer.username}` : '顾客登录'"
           >
             <UIcon
               :name="customerApi.session.value ? 'i-lucide-user-round-check' : 'i-lucide-user-round'"
-              class="size-4 shrink-0"
+              class="size-4.5 shrink-0"
               aria-hidden="true"
             />
             <span class="hidden max-w-28 truncate sm:inline">
@@ -130,9 +131,9 @@ onMounted(() => {
           </NuxtLink>
           <NuxtLink
             to="/admin/login"
-            class="hidden min-h-11 items-center rounded-lg px-3 text-sm font-medium text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary xl:inline-flex"
+            class="hidden min-h-11 items-center rounded-lg px-2.5 text-xs font-medium text-dimmed transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary xl:inline-flex"
           >
-            管理入口
+            管理
           </NuxtLink>
         </div>
       </UContainer>
@@ -140,33 +141,50 @@ onMounted(() => {
 
     <slot />
 
-    <footer class="border-t border-default bg-elevated">
-      <UContainer class="flex flex-wrap items-center justify-between gap-2 py-5 text-sm text-muted">
-        <span>{{ storeBrand.storeName }}</span>
-        <nav
-          aria-label="商城辅助导航"
-          class="flex flex-wrap items-center gap-2"
-        >
-          <NuxtLink
-            to="/orders"
-            class="min-h-11 content-center rounded-lg px-2 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+    <footer class="mt-auto border-t border-default/70 bg-elevated/50 py-10 transition-colors">
+      <UContainer>
+        <div class="flex flex-col items-center justify-between gap-6 sm:flex-row">
+          <div class="flex items-center gap-2.5">
+            <BrandMark
+              :name="storeBrand.storeName"
+              :logo-url="storeBrand.storeLogoUrl"
+              class="size-7 rounded-lg text-xs"
+            />
+            <span class="text-sm font-semibold tracking-tight text-highlighted">{{ storeBrand.storeName }}</span>
+            <span class="text-xs text-dimmed">© {{ new Date().getFullYear() }}</span>
+          </div>
+
+          <nav
+            aria-label="商城辅助导航"
+            class="flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm text-muted"
           >
-            订单查询
-          </NuxtLink>
-          <NuxtLink
-            v-if="supportStatus === 'success' && support?.channels.length"
-            to="/support"
-            class="min-h-11 content-center rounded-lg px-2 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-          >
-            联系客服
-          </NuxtLink>
-          <NuxtLink
-            to="/admin/login"
-            class="min-h-11 content-center rounded-lg px-2 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-          >
-            管理入口
-          </NuxtLink>
-        </nav>
+            <NuxtLink
+              to="/"
+              class="transition-colors hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+            >
+              首页
+            </NuxtLink>
+            <NuxtLink
+              to="/orders"
+              class="transition-colors hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+            >
+              订单查询
+            </NuxtLink>
+            <NuxtLink
+              v-if="supportStatus === 'success' && support?.channels.length"
+              to="/support"
+              class="transition-colors hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+            >
+              联系客服
+            </NuxtLink>
+            <NuxtLink
+              to="/admin/login"
+              class="text-dimmed transition-colors hover:text-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+            >
+              管理入口
+            </NuxtLink>
+          </nav>
+        </div>
       </UContainer>
     </footer>
   </div>

@@ -59,21 +59,20 @@ useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
 </script>
 
 <template>
-  <main id="main-content">
-    <UContainer class="py-6 sm:py-9">
+  <main id="main-content" class="flex-1 pb-16">
+    <UContainer class="pt-6 sm:pt-8 md:pt-10">
+      <!-- 推荐精选专区 (仅在第一页且有推荐商品时优雅呈现) -->
       <section
         v-if="page === 1 && featuredProducts.length"
-        class="mb-8 sm:mb-10"
+        class="mb-10 sm:mb-14"
         aria-labelledby="featured-products-title"
       >
-        <div class="mb-4 flex flex-wrap items-end justify-between gap-3">
-          <div>
-            <p class="text-sm font-medium text-primary">
-              店主精选
-            </p>
+        <div class="mb-4 flex items-center justify-between gap-3 sm:mb-5">
+          <div class="flex items-center gap-2">
+            <span class="inline-flex size-2 rounded-full bg-primary" aria-hidden="true" />
             <h2
               id="featured-products-title"
-              class="mt-1 text-xl font-semibold text-highlighted sm:text-2xl"
+              class="text-lg font-semibold tracking-tight text-highlighted sm:text-xl md:text-2xl"
             >
               精选推荐
             </h2>
@@ -82,74 +81,78 @@ useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
         <StorefrontProductGrid :products="featuredProducts" />
       </section>
 
-      <div class="mb-5 flex flex-wrap items-end justify-between gap-3 sm:mb-7">
-        <div>
-          <p class="text-sm font-medium text-muted">
-            店铺商品
-          </p>
-          <h1
-            id="all-products-title"
-            class="mt-1 text-2xl font-semibold text-highlighted sm:text-3xl"
+      <!-- 全部商品分区 (核心浏览与选购) -->
+      <section aria-labelledby="all-products-title">
+        <div class="mb-5 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2 border-b border-default/50 pb-3 sm:mb-6">
+          <div class="flex items-baseline gap-2.5">
+            <h1
+              id="all-products-title"
+              class="text-xl font-semibold tracking-tight text-highlighted sm:text-2xl"
+            >
+              全部商品
+            </h1>
+          </div>
+          <p
+            v-if="data"
+            class="text-xs text-dimmed sm:text-sm"
+            aria-live="polite"
           >
-            全部商品
-          </h1>
+            共 <span class="font-medium text-muted tabular-nums">{{ data.total }}</span> 件在售商品
+          </p>
         </div>
-        <p
-          v-if="data"
-          class="text-sm text-muted"
-          aria-live="polite"
-        >
-          共 {{ data.total }} 件商品
-        </p>
-      </div>
 
-      <UAlert
-        v-if="error"
-        color="error"
-        variant="subtle"
-        title="商品暂时无法加载"
-        description="请检查网络后重试。"
-        :actions="[{ label: '重试', onClick: () => refresh() }]"
-        class="mb-5"
-      />
+        <UAlert
+          v-if="error"
+          color="error"
+          variant="subtle"
+          title="商品暂时无法加载"
+          description="请检查网络后重试。"
+          :actions="[{ label: '重试', onClick: () => refresh() }]"
+          class="mb-6 rounded-xl"
+        />
 
-      <div
-        v-if="status === 'pending' && !data"
-        class="grid grid-cols-1 gap-3 min-[360px]:grid-cols-2 sm:gap-4 lg:grid-cols-4 xl:grid-cols-5"
-        aria-label="正在加载商品"
-      >
         <div
-          v-for="item in 8"
-          :key="item"
-          class="overflow-hidden rounded-xl border border-default"
+          v-if="status === 'pending' && !data"
+          class="grid grid-cols-2 gap-3.5 sm:gap-4.5 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-4 2xl:grid-cols-5"
+          aria-label="正在加载商品"
         >
-          <div class="aspect-[4/3] animate-pulse bg-muted motion-reduce:animate-none" />
-          <div class="space-y-2 p-4">
-            <div class="h-4 w-3/4 animate-pulse rounded bg-muted motion-reduce:animate-none" /><div class="h-4 w-1/3 animate-pulse rounded bg-muted motion-reduce:animate-none" />
+          <div
+            v-for="item in 10"
+            :key="item"
+            class="overflow-hidden rounded-2xl border border-default/60 bg-elevated"
+          >
+            <div class="aspect-square animate-pulse bg-muted/70 motion-reduce:animate-none" />
+            <div class="space-y-2.5 p-3 sm:p-4">
+              <div class="h-4 w-3/4 animate-pulse rounded bg-muted motion-reduce:animate-none" />
+              <div class="h-3 w-1/2 animate-pulse rounded bg-muted/60 motion-reduce:animate-none" />
+              <div class="pt-2">
+                <div class="h-5 w-1/3 animate-pulse rounded bg-muted motion-reduce:animate-none" />
+              </div>
+            </div>
           </div>
         </div>
-      </div>
 
-      <template v-else-if="data && products.length">
-        <StorefrontProductGrid :products="products" />
-        <StorefrontPagination
-          v-if="data.totalPages > 1"
-          :page="data.page"
-          :total-pages="data.totalPages"
-          :query="route.query"
-          class="mt-7"
+        <template v-else-if="data && products.length">
+          <StorefrontProductGrid :products="products" />
+          <StorefrontPagination
+            v-if="data.totalPages > 1"
+            :page="data.page"
+            :total-pages="data.totalPages"
+            :query="route.query"
+            class="mt-8 sm:mt-10"
+          />
+        </template>
+
+        <UEmpty
+          v-else-if="data && products.length === 0"
+          icon="i-lucide-package-open"
+          title="暂无可展示的商品"
+          description="店铺目前还没有公开销售的商品，请稍后再来看看。"
+          variant="naked"
+          size="lg"
+          class="min-h-72"
         />
-      </template>
-
-      <UEmpty
-        v-else-if="data && products.length === 0"
-        icon="i-lucide-package-open"
-        title="暂无可展示的商品"
-        description="店铺目前还没有公开销售的商品，请稍后再来看看。"
-        variant="naked"
-        size="lg"
-        class="min-h-64"
-      />
+      </section>
     </UContainer>
   </main>
 </template>

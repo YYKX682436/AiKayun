@@ -24,10 +24,10 @@ const priceLabel = computed(() => {
 <template>
   <NuxtLink
     :to="`/products/${product.id}`"
-    class="group flex min-w-0 flex-col overflow-hidden rounded-xl border border-default bg-elevated transition-colors duration-150 ease-out hover:border-primary/40 hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+    class="storefront-card group flex min-w-0 flex-col overflow-hidden rounded-2xl border border-default/70 bg-elevated focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
     :aria-label="`${product.name}，${priceLabel}`"
   >
-    <div class="relative aspect-[4/3] w-full overflow-hidden bg-muted">
+    <div class="relative aspect-square w-full overflow-hidden bg-muted/50">
       <img
         v-if="product.cover && !imageFailed"
         :src="product.cover.url"
@@ -37,55 +37,65 @@ const priceLabel = computed(() => {
         :loading="priority ? 'eager' : 'lazy'"
         :fetchpriority="priority ? 'high' : 'auto'"
         decoding="async"
-        class="h-full w-full object-cover transition-transform duration-200 ease-out motion-reduce:transition-none group-hover:scale-[1.02]"
+        class="h-full w-full object-cover transition-transform duration-300 ease-out motion-reduce:transition-none group-hover:scale-105"
         @error="imageFailed = true"
       >
       <div
         v-else
-        class="flex h-full w-full items-center justify-center text-muted"
+        class="flex h-full w-full items-center justify-center text-dimmed"
         aria-hidden="true"
       >
         <UIcon
-          name="i-lucide-image"
-          class="size-8"
+          name="i-lucide-package"
+          class="size-8 stroke-[1.5] opacity-50 sm:size-10"
         />
       </div>
-    </div>
 
-    <div class="flex min-h-32 flex-1 flex-col p-3 sm:p-4">
-      <div class="flex min-w-0 items-start justify-between gap-2">
-        <h2 class="line-clamp-2 min-w-0 text-sm font-medium leading-6 text-highlighted sm:text-base">
-          {{ product.name }}
-        </h2>
+      <!-- Type badge floating on top right of image for clean look -->
+      <div class="absolute right-2 top-2">
         <UBadge
           color="neutral"
           variant="subtle"
           size="xs"
-          class="shrink-0"
+          class="bg-elevated/85 backdrop-blur-xs text-[11px] font-medium shadow-xs"
         >
           {{ typeLabels[product.productType] }}
         </UBadge>
       </div>
+    </div>
+
+    <div class="flex flex-1 flex-col p-3 sm:p-4">
+      <h2 class="line-clamp-2 min-h-10 text-[13px] font-medium leading-snug text-highlighted transition-colors group-hover:text-primary sm:min-h-11 sm:text-sm sm:leading-snug">
+        {{ product.name }}
+      </h2>
 
       <p
         v-if="product.description"
-        class="mt-1 line-clamp-2 text-sm leading-5 text-muted"
+        class="mt-1 line-clamp-1 text-xs text-muted sm:text-[13px]"
       >
         {{ product.description }}
       </p>
 
-      <div class="mt-auto flex flex-wrap items-end justify-between gap-x-2 gap-y-1 pt-3">
-        <p
-          class="min-w-0 break-all text-base font-semibold tabular-nums text-highlighted sm:text-lg"
-          :class="product.priceRange ? 'text-primary' : 'text-muted'"
-        >
-          {{ priceLabel }}
-        </p>
+      <div class="mt-auto flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1.5 pt-3">
+        <div class="min-w-0">
+          <span
+            v-if="product.priceRange"
+            class="text-xs font-medium text-primary sm:text-sm"
+          >¥</span>
+          <span
+            class="min-w-0 text-base font-semibold tracking-tight tabular-nums sm:text-lg"
+            :class="product.priceRange ? 'text-primary' : 'text-muted text-sm font-normal'"
+          >
+            {{ product.priceRange ? (product.priceRange.min === product.priceRange.max ? product.priceRange.min : `${product.priceRange.min} 起`) : '暂无可选售价' }}
+          </span>
+        </div>
+
         <UBadge
           v-if="product.selectionStatus === 'none'"
           color="neutral"
           variant="soft"
           size="xs"
+          class="text-[11px]"
         >
           暂无可选规格
         </UBadge>
@@ -94,6 +104,7 @@ const priceLabel = computed(() => {
           color="warning"
           variant="soft"
           size="xs"
+          class="text-[11px]"
         >
           暂时缺货
         </UBadge>
@@ -102,6 +113,7 @@ const priceLabel = computed(() => {
           color="neutral"
           variant="subtle"
           size="xs"
+          class="text-[11px]"
         >
           供货状态待确认
         </UBadge>

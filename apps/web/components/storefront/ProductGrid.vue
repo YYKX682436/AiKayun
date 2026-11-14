@@ -5,7 +5,7 @@ defineProps<{ products: PublicProductCard[] }>()
 </script>
 
 <template>
-  <ul class="grid min-w-0 grid-cols-1 gap-3 min-[360px]:grid-cols-2 sm:gap-4 lg:grid-cols-4 xl:grid-cols-5">
+  <ul class="grid min-w-0 grid-cols-2 gap-3.5 sm:gap-4.5 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-4 2xl:grid-cols-5">
     <li
       v-for="(product, index) in products"
       :key="product.id"
@@ -13,7 +13,7 @@ defineProps<{ products: PublicProductCard[] }>()
     >
       <StorefrontProductCard
         :product="product"
-        :priority="index === 0"
+        :priority="index < 4"
       />
     </li>
   </ul>
