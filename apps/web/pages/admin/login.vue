@@ -44,17 +44,28 @@ async function submitLogin() {
 
 <template>
   <div
-    class="min-h-dvh bg-default"
+    class="min-h-dvh flex flex-col bg-default text-default"
     :data-admin-login-ready="clientReady ? 'true' : 'false'"
   >
-    <header class="border-b border-default bg-elevated">
-      <UContainer class="flex min-h-16 items-center justify-between gap-4 py-2">
+    <header class="border-b border-default/70 bg-elevated/80 backdrop-blur-md sticky top-0 z-30">
+      <UContainer class="flex h-14 items-center justify-between gap-4">
         <NuxtLink
           to="/"
-          class="flex min-h-11 items-center gap-3 rounded-sm font-semibold text-highlighted focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary"
+          class="flex items-center gap-2.5 rounded-lg font-semibold text-highlighted transition-opacity hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
         >
-          <BrandMark name="AiKayun" />
-          <span>AiKayun</span>
+          <BrandMark
+            name="AiKayun"
+            class="size-7"
+          />
+          <span class="text-sm font-semibold tracking-tight">AiKayun</span>
+          <UBadge
+            variant="subtle"
+            color="neutral"
+            size="xs"
+            class="hidden sm:inline-flex"
+          >
+            工作区
+          </UBadge>
         </NuxtLink>
         <ThemeModeSelect />
       </UContainer>
@@ -62,122 +73,190 @@ async function submitLogin() {
 
     <main
       id="main-content"
-      class="mx-auto grid min-h-[calc(100dvh-4rem)] w-full min-w-0 max-w-7xl lg:grid-cols-2"
+      class="mx-auto flex flex-1 w-full max-w-7xl items-center p-4 sm:p-6 lg:p-8"
     >
-      <section
-        aria-labelledby="login-intro-title"
-        class="flex min-w-0 items-center px-4 py-10 sm:px-8 lg:px-12 lg:py-16"
-      >
-        <div class="max-w-xl">
-          <p class="text-sm font-medium text-primary">
-            AiKayun 管理后台
-          </p>
-          <h1
-            id="login-intro-title"
-            class="mt-3 text-3xl font-semibold leading-tight text-highlighted sm:text-4xl"
-          >
-            店铺管理工作区
-          </h1>
-          <p class="mt-4 max-w-lg leading-7 text-muted">
-            此入口仅供管理员使用。登录后可查看当前已经开放的店铺管理内容。
-          </p>
-          <NuxtLink
-            to="/"
-            class="mt-6 inline-flex min-h-11 items-center gap-2 rounded-lg px-3 text-sm font-medium text-muted transition-colors hover:bg-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-          >
-            <UIcon
-              name="i-lucide-arrow-left"
-              class="size-4"
-              aria-hidden="true"
+      <div class="grid w-full items-center gap-8 lg:grid-cols-12 lg:gap-12">
+        <!-- Left Brand & Context Intro -->
+        <section
+          aria-labelledby="login-intro-title"
+          class="lg:col-span-7 space-y-6"
+        >
+          <div class="space-y-3">
+            <div class="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
+              <UIcon
+                name="i-lucide-shield-check"
+                class="size-3.5"
+              />
+              <span>AiKayun 管理工作区</span>
+            </div>
+            <h1
+              id="login-intro-title"
+              class="text-3xl font-bold tracking-tight text-highlighted sm:text-4xl"
+            >
+              数字商品管理工作台
+            </h1>
+            <p class="max-w-xl text-sm leading-6 text-muted sm:text-base">
+              面向数字商品、卡密自动发卡及渠道供应链的独立管理系统。登录后可进入控制中心查看实时经营状况。
+            </p>
+          </div>
+
+          <div class="grid gap-3 pt-2 sm:grid-cols-3">
+            <div class="space-y-1 rounded-xl border border-default/70 bg-elevated p-3.5">
+              <div class="flex items-center gap-2 text-sm font-medium text-primary">
+                <UIcon
+                  name="i-lucide-zap"
+                  class="size-4"
+                />
+                <span>自动发卡</span>
+              </div>
+              <p class="text-xs leading-relaxed text-muted">
+                卡密与交付文件准时处理
+              </p>
+            </div>
+            <div class="space-y-1 rounded-xl border border-default/70 bg-elevated p-3.5">
+              <div class="flex items-center gap-2 text-sm font-medium text-primary">
+                <UIcon
+                  name="i-lucide-scale"
+                  class="size-4"
+                />
+                <span>账单核验</span>
+              </div>
+              <p class="text-xs leading-relaxed text-muted">
+                多支付通道精准回执对账
+              </p>
+            </div>
+            <div class="space-y-1 rounded-xl border border-default/70 bg-elevated p-3.5">
+              <div class="flex items-center gap-2 text-sm font-medium text-primary">
+                <UIcon
+                  name="i-lucide-lock"
+                  class="size-4"
+                />
+                <span>安全自主</span>
+              </div>
+              <p class="text-xs leading-relaxed text-muted">
+                独立部署与数据自主掌控
+              </p>
+            </div>
+          </div>
+
+          <div class="pt-2">
+            <NuxtLink
+              to="/"
+              class="inline-flex items-center gap-2 text-sm font-medium text-muted hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary transition-colors"
+            >
+              <UIcon
+                name="i-lucide-arrow-left"
+                class="size-4"
+                aria-hidden="true"
+              />
+              返回店铺首页
+            </NuxtLink>
+          </div>
+        </section>
+
+        <!-- Right Auth Form Card -->
+        <section
+          aria-labelledby="login-title"
+          class="lg:col-span-5 flex justify-center"
+        >
+          <UCard class="w-full max-w-md border border-default/80 bg-elevated shadow-sm">
+            <template #header>
+              <div class="space-y-1">
+                <h2
+                  id="login-title"
+                  class="text-xl font-bold tracking-tight text-highlighted"
+                >
+                  管理员登录
+                </h2>
+                <p class="text-xs text-muted">
+                  使用管理员邮箱和密码继续。
+                </p>
+              </div>
+            </template>
+
+            <UAlert
+              v-if="errorMessage"
+              class="mb-5"
+              color="error"
+              variant="soft"
+              :title="errorMessage"
+              role="alert"
+              aria-live="assertive"
             />
-            返回店铺
-          </NuxtLink>
-        </div>
-      </section>
 
-      <section
-        aria-labelledby="login-title"
-        class="flex min-w-0 items-center justify-center border-t border-default bg-muted/40 px-4 py-10 sm:px-8 lg:border-l lg:border-t-0 lg:px-12 lg:py-16"
-      >
-        <UCard class="w-full min-w-0 max-w-md bg-elevated">
-          <template #header>
-            <h2
-              id="login-title"
-              class="text-2xl font-semibold text-highlighted"
+            <form
+              class="grid gap-4"
+              method="post"
+              action="/api/v1/admin/auth/login"
+              :aria-busy="busy"
+              @submit.prevent="submitLogin"
             >
-              管理员登录
-            </h2>
-            <p class="mt-2 text-sm leading-6 text-muted">
-              使用管理员邮箱和密码继续。
-            </p>
-          </template>
-
-          <UAlert
-            v-if="errorMessage"
-            class="mb-6"
-            color="error"
-            variant="soft"
-            :title="errorMessage"
-            role="alert"
-            aria-live="assertive"
-          />
-
-          <form
-            class="grid gap-5"
-            method="post"
-            action="/api/v1/admin/auth/login"
-            :aria-busy="busy"
-            @submit.prevent="submitLogin"
-          >
-            <UFormField
-              label="管理员邮箱"
-              name="email"
-              required
-            >
-              <UInput
-                v-model="email"
-                type="email"
-                autocomplete="username"
-                inputmode="email"
+              <UFormField
+                label="管理员邮箱"
+                name="email"
                 required
-                class="w-full"
-                size="lg"
-                :disabled="busy || !clientReady"
-              />
-            </UFormField>
-            <UFormField
-              label="密码"
-              name="password"
-              required
-            >
-              <UInput
-                v-model="password"
-                type="password"
-                autocomplete="current-password"
-                required
-                class="w-full"
-                size="lg"
-                :disabled="busy || !clientReady"
-              />
-            </UFormField>
-            <UButton
-              type="submit"
-              size="lg"
-              block
-              :loading="busy"
-              :disabled="busy || !clientReady"
-            >
-              安全登录
-            </UButton>
-          </form>
+              >
+                <UInput
+                  v-model="email"
+                  type="email"
+                  autocomplete="username"
+                  inputmode="email"
+                  required
+                  placeholder="admin@example.com"
+                  icon="i-lucide-mail"
+                  class="w-full"
+                  size="lg"
+                  :disabled="busy || !clientReady"
+                />
+              </UFormField>
 
-          <template #footer>
-            <p class="text-sm leading-6 text-muted">
-              请勿在共享设备上保存管理员密码。管理接口通过服务端会话验证。
-            </p>
-          </template>
-        </UCard>
-      </section>
+              <UFormField
+                label="密码"
+                name="password"
+                required
+              >
+                <UInput
+                  v-model="password"
+                  type="password"
+                  autocomplete="current-password"
+                  required
+                  placeholder="••••••••"
+                  icon="i-lucide-lock"
+                  class="w-full"
+                  size="lg"
+                  :disabled="busy || !clientReady"
+                />
+              </UFormField>
+
+              <div class="pt-1">
+                <UButton
+                  type="submit"
+                  size="lg"
+                  block
+                  icon="i-lucide-log-in"
+                  :loading="busy"
+                  :disabled="busy || !clientReady"
+                  class="min-h-11"
+                >
+                  安全登录
+                </UButton>
+              </div>
+            </form>
+
+            <template #footer>
+              <div class="flex items-start gap-2 text-xs leading-relaxed text-muted">
+                <UIcon
+                  name="i-lucide-shield-alert"
+                  class="mt-0.5 size-4 shrink-0 text-muted"
+                />
+                <p>
+                  请勿在共享设备上保存管理员密码。管理接口通过服务端会话验证。
+                </p>
+              </div>
+            </template>
+          </UCard>
+        </section>
+      </div>
     </main>
   </div>
 </template>

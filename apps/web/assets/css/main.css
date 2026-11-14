@@ -96,3 +96,28 @@ input {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Admin workspace visual tokens and polish */
+[data-aikayun-area="admin"] {
+  --ui-radius: 0.5rem;
+  --ui-header-height: 3.5rem;
+}
+
+[data-aikayun-area="admin"] ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+[data-aikayun-area="admin"] ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+[data-aikayun-area="admin"] ::-webkit-scrollbar-thumb {
+  background: var(--ui-color-neutral-300);
+  border-radius: 3px;
+}
+
+.dark[data-aikayun-area="admin"] ::-webkit-scrollbar-thumb {
+  background: var(--ui-color-neutral-700);
+}
+

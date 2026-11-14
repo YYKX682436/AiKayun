@@ -125,37 +125,65 @@ async function logout() {
       <main
         id="admin-main"
         tabindex="-1"
-        class="mx-auto w-full max-w-6xl p-4 focus:outline-none sm:p-6 lg:p-8"
+        class="mx-auto w-full max-w-7xl space-y-6 p-4 focus:outline-none sm:p-6 lg:p-8"
       >
+        <!-- Top Workspace Bar -->
         <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div class="min-w-0">
-            <p class="text-sm font-medium text-primary">
-              工作区
-            </p>
-            <h1 class="mt-1 text-3xl font-semibold tracking-tight text-highlighted">
+            <h1 class="text-2xl font-bold tracking-tight text-highlighted sm:text-3xl">
               管理概览
             </h1>
-            <p class="mt-2 max-w-2xl text-sm leading-6 text-muted">
-              查看当前管理员会话与已开放的管理内容。
+            <p class="mt-1 text-sm text-muted">
+              店铺核心经营指标与系统运行状态概览。
             </p>
           </div>
 
-          <UButton
-            color="neutral"
-            variant="outline"
-            icon="i-lucide-log-out"
-            :loading="busy"
-            :disabled="busy"
-            class="min-h-11 shrink-0"
-            @click="logout"
-          >
-            退出登录
-          </UButton>
+          <div class="flex flex-wrap items-center gap-2.5">
+            <UButton
+              to="/admin/orders"
+              color="neutral"
+              variant="outline"
+              icon="i-lucide-receipt"
+              class="min-h-11"
+            >
+              查看订单
+            </UButton>
+            <UButton
+              to="/admin/operations"
+              color="neutral"
+              variant="outline"
+              icon="i-lucide-activity"
+              class="min-h-11"
+            >
+              运维中心
+            </UButton>
+            <UButton
+              color="neutral"
+              variant="outline"
+              icon="i-lucide-refresh-cw"
+              :loading="businessOverviewPending || refreshingBusinessOverview"
+              :disabled="businessOverviewPending || refreshingBusinessOverview"
+              class="min-h-11"
+              @click="refreshBusinessData"
+            >
+              刷新经营数据
+            </UButton>
+            <UButton
+              color="neutral"
+              variant="ghost"
+              icon="i-lucide-log-out"
+              :loading="busy"
+              :disabled="busy"
+              class="min-h-11 text-muted hover:text-error"
+              @click="logout"
+            >
+              退出登录
+            </UButton>
+          </div>
         </div>
 
         <UAlert
           v-if="logoutError"
-          class="mt-6"
           color="error"
           variant="soft"
           :title="logoutError"
@@ -163,143 +191,28 @@ async function logout() {
           aria-live="assertive"
         />
 
-        <section
-          aria-labelledby="session-title"
-          class="mt-8"
-        >
-          <h2
-            id="session-title"
-            class="text-lg font-semibold text-highlighted"
-          >
-            当前会话
-          </h2>
-          <UCard class="mt-4 max-w-2xl">
-            <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-              <div class="min-w-0">
-                <p class="text-sm text-muted">
-                  管理员邮箱
-                </p>
-                <p class="mt-1 break-all font-medium text-highlighted">
-                  {{ session?.data.admin.email }}
-                </p>
-              </div>
-              <UBadge
-                color="success"
-                variant="soft"
-                icon="i-lucide-shield-check"
-                class="w-fit shrink-0"
-              >
-                已验证
-              </UBadge>
-            </div>
-          </UCard>
-        </section>
-
-        <section
-          aria-labelledby="license-title"
-          class="mt-10 border-t border-default pt-8"
-        >
-          <h2
-            id="license-title"
-            class="text-lg font-semibold text-highlighted"
-          >
-            经营授权状态
-          </h2>
-          <UCard class="mt-4 max-w-2xl">
-            <p
-              v-if="licenseError"
-              role="status"
-              class="text-sm text-muted"
-            >
-              授权状态暂时无法读取。
-            </p>
-            <template v-else>
-              <p class="font-medium text-highlighted">
-                {{ licenseStatus }}
-              </p>
-              <p
-                v-if="license?.data.allowedUntil"
-                class="mt-2 text-sm text-muted"
-              >
-                有效截止：{{ license.data.allowedUntil }}
-              </p>
-              <p class="mt-2 text-sm text-muted">
-                新订单和充值以提交时的授权检查为准；已有业务继续处理。
-              </p>
-            </template>
-            <UButton
-              class="mt-4"
-              color="neutral"
-              variant="outline"
-              @click="refreshLicense()"
-            >
-              刷新状态
-            </UButton>
-            <UButton
-              to="/admin/license"
-              class="mt-4 ml-2"
-              icon="i-lucide-key-round"
-            >
-              管理授权
-            </UButton>
-          </UCard>
-        </section>
-
+        <!-- Section: 经营数据 (Hero Section at Top!) -->
         <section
           aria-labelledby="business-data-title"
-          class="mt-10 border-t border-default pt-8"
+          class="space-y-4"
         >
-          <div class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-            <div>
-              <p class="text-sm font-medium text-muted">
-                店铺经营
-              </p>
-              <h2
-                id="business-data-title"
-                class="mt-1 text-xl font-semibold text-highlighted"
-              >
-                经营数据
-              </h2>
-              <p class="mt-2 text-sm text-muted">
-                今日订单与付款按北京时间自然日统计。
-              </p>
-            </div>
-            <div class="flex flex-wrap gap-2">
-              <UButton
-                to="/admin/orders"
-                color="neutral"
-                variant="outline"
-                icon="i-lucide-receipt"
-                class="min-h-11"
-              >
-                查看订单
-              </UButton>
-              <UButton
-                to="/admin/operations"
-                color="neutral"
-                variant="outline"
-                icon="i-lucide-activity"
-                class="min-h-11"
-              >
-                运维中心
-              </UButton>
-              <UButton
-                color="neutral"
-                variant="outline"
-                icon="i-lucide-refresh-cw"
-                :loading="businessOverviewPending || refreshingBusinessOverview"
-                :disabled="businessOverviewPending || refreshingBusinessOverview"
-                class="min-h-11"
-                @click="refreshBusinessData"
-              >
-                刷新经营数据
-              </UButton>
-            </div>
+          <div class="flex flex-col gap-1 sm:flex-row sm:items-baseline sm:justify-between">
+            <h2
+              id="business-data-title"
+              class="text-lg font-semibold tracking-tight text-highlighted"
+            >
+              经营数据
+            </h2>
+            <p
+              v-if="businessOverview"
+              class="text-xs text-muted"
+            >
+              {{ businessPeriodLabel }} · {{ businessMeasuredAtLabel }}
+            </p>
           </div>
 
           <UAlert
             v-if="businessOverviewError"
-            class="mt-5"
             color="error"
             variant="soft"
             title="经营数据暂时无法读取"
@@ -310,7 +223,6 @@ async function logout() {
 
           <UCard
             v-else-if="businessOverviewPending && !businessOverview"
-            class="mt-5"
           >
             <p
               role="status"
@@ -321,62 +233,20 @@ async function logout() {
           </UCard>
 
           <template v-else-if="businessOverview">
-            <p class="mt-4 text-xs text-muted">
-              {{ businessPeriodLabel }} · {{ businessMeasuredAtLabel }}
-            </p>
-            <div class="mt-4 grid grid-cols-1 gap-3 min-[360px]:grid-cols-2 xl:grid-cols-4">
-              <component
-                :is="metric.to ? NuxtLink : 'div'"
-                v-for="metric in businessMetrics"
-                :key="metric.label"
-                :to="metric.to"
-                :role="metric.to ? undefined : 'group'"
-                :aria-label="metric.label"
-                class="block min-w-0 rounded-xl focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-              >
-                <UCard class="h-full transition-shadow hover:shadow-md">
-                  <div class="flex items-start justify-between gap-3">
-                    <div class="min-w-0">
-                      <p class="text-sm text-muted">
-                        {{ metric.label }}
-                      </p>
-                      <p class="mt-3 text-3xl font-semibold tabular-nums text-highlighted">
-                        {{ metric.value }}
-                      </p>
-                    </div>
-                    <span
-                      class="flex shrink-0 items-center gap-2 text-primary"
-                      aria-hidden="true"
-                    >
-                      <UIcon
-                        :name="metric.icon"
-                        class="size-5"
-                      />
-                      <UIcon
-                        v-if="metric.to"
-                        name="i-lucide-arrow-up-right"
-                        class="size-4"
-                      />
-                    </span>
-                  </div>
-                </UCard>
-              </component>
-            </div>
-
+            <!-- Featured Payment Card -->
             <div
               role="group"
               aria-label="今日已确认订单付款"
-              class="mt-3"
             >
-              <UCard>
+              <UCard class="border border-default/80 bg-elevated transition-all hover:shadow-xs">
                 <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div>
                     <p class="text-sm font-medium text-muted">
                       今日已确认订单付款
                     </p>
-                    <p class="mt-2 text-3xl font-semibold tabular-nums text-highlighted">
+                    <p class="mt-2 text-3xl font-bold tracking-tight tabular-nums text-highlighted sm:text-4xl">
                       {{ formatCnyAmount(businessOverview.todayConfirmedOrderPaymentAmount) }}
-                      <span class="text-base font-medium text-muted">CNY</span>
+                      <span class="ml-1 text-base font-semibold text-muted">CNY</span>
                     </p>
                   </div>
                   <UBadge
@@ -388,16 +258,60 @@ async function logout() {
                     已确认
                   </UBadge>
                 </div>
-                <p class="mt-3 text-xs leading-5 text-muted">
-                  按付款回执记录时间统计；仅含关联真实订单、支付成功、准时回执且没有开放对账案例的付款。包含外部支付、钱包现金和赠送余额，按回执原金额汇总，不扣退款；不代表净收入、现金实收或利润。
+                <p class="mt-3 border-t border-default/60 pt-3 text-xs leading-5 text-muted">
+                  今日订单与付款按北京时间自然日统计。按付款回执记录时间统计；仅含关联真实订单、支付成功、准时回执且没有开放对账案例的付款。包含外部支付、钱包现金和赠送余额，按回执原金额汇总，不扣退款；不代表净收入、现金实收或利润。
                 </p>
               </UCard>
+            </div>
+
+            <!-- KPI Metric Cards Grid -->
+            <div class="grid grid-cols-1 gap-3.5 min-[360px]:grid-cols-2 xl:grid-cols-4">
+              <component
+                :is="metric.to ? NuxtLink : 'div'"
+                v-for="metric in businessMetrics"
+                :key="metric.label"
+                :to="metric.to"
+                :role="metric.to ? undefined : 'group'"
+                :aria-label="metric.label"
+                class="group block min-w-0 rounded-xl focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              >
+                <UCard class="h-full border border-default/80 bg-elevated transition-all hover:border-primary/50 hover:shadow-xs">
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0">
+                      <p class="text-sm font-medium text-muted">
+                        {{ metric.label }}
+                      </p>
+                      <p class="mt-2.5 text-2xl font-bold tracking-tight tabular-nums text-highlighted sm:text-3xl">
+                        {{ metric.value }}
+                      </p>
+                    </div>
+                    <span
+                      class="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary transition-colors group-hover:bg-primary group-hover:text-inverted"
+                      aria-hidden="true"
+                    >
+                      <UIcon
+                        :name="metric.icon"
+                        class="size-5"
+                      />
+                    </span>
+                  </div>
+                  <div
+                    v-if="metric.to"
+                    class="mt-3 flex items-center gap-1 text-xs font-medium text-primary"
+                  >
+                    <span>前往处理</span>
+                    <UIcon
+                      name="i-lucide-arrow-right"
+                      class="size-3.5 transition-transform group-hover:translate-x-0.5"
+                    />
+                  </div>
+                </UCard>
+              </component>
             </div>
           </template>
 
           <UAlert
             v-else
-            class="mt-5"
             color="error"
             variant="soft"
             title="经营数据暂时无法读取"
@@ -406,6 +320,142 @@ async function logout() {
             aria-live="assertive"
           />
         </section>
+
+        <!-- Section: 系统状态与会话 (2 Columns, neat and compact) -->
+        <div class="grid grid-cols-1 gap-4 pt-2 lg:grid-cols-2">
+          <!-- 经营授权状态 -->
+          <section
+            aria-labelledby="license-title"
+            class="h-full"
+          >
+            <UCard class="flex h-full flex-col justify-between border border-default/80 bg-elevated">
+              <template #header>
+                <div class="flex items-center justify-between gap-2">
+                  <div class="flex items-center gap-2">
+                    <UIcon
+                      name="i-lucide-key-round"
+                      class="size-4 text-primary"
+                    />
+                    <h2
+                      id="license-title"
+                      class="text-base font-semibold text-highlighted"
+                    >
+                      经营授权状态
+                    </h2>
+                  </div>
+                  <UBadge
+                    v-if="!licenseError"
+                    :color="license?.data.status === 'active' || license?.data.status === 'offline_valid' ? 'success' : 'warning'"
+                    variant="soft"
+                  >
+                    {{ licenseStatus }}
+                  </UBadge>
+                </div>
+              </template>
+
+              <div class="space-y-2">
+                <p
+                  v-if="licenseError"
+                  role="status"
+                  class="text-sm text-muted"
+                >
+                  授权状态暂时无法读取。
+                </p>
+                <template v-else>
+                  <p
+                    v-if="license?.data.allowedUntil"
+                    class="text-sm font-medium text-highlighted"
+                  >
+                    有效截止：<span class="font-normal tabular-nums text-muted">{{ license.data.allowedUntil }}</span>
+                  </p>
+                  <p class="text-xs leading-5 text-muted">
+                    新订单和充值以提交时的授权检查为准；已有业务继续处理。
+                  </p>
+                </template>
+              </div>
+
+              <template #footer>
+                <div class="flex flex-wrap items-center gap-2">
+                  <UButton
+                    color="neutral"
+                    variant="outline"
+                    size="sm"
+                    icon="i-lucide-refresh-cw"
+                    @click="refreshLicense()"
+                  >
+                    刷新状态
+                  </UButton>
+                  <UButton
+                    to="/admin/license"
+                    size="sm"
+                    icon="i-lucide-shield"
+                  >
+                    管理授权
+                  </UButton>
+                </div>
+              </template>
+            </UCard>
+          </section>
+
+          <!-- 当前会话 -->
+          <section
+            aria-labelledby="session-title"
+            class="h-full"
+          >
+            <UCard class="flex h-full flex-col justify-between border border-default/80 bg-elevated">
+              <template #header>
+                <div class="flex items-center justify-between gap-2">
+                  <div class="flex items-center gap-2">
+                    <UIcon
+                      name="i-lucide-user-check"
+                      class="size-4 text-primary"
+                    />
+                    <h2
+                      id="session-title"
+                      class="text-base font-semibold text-highlighted"
+                    >
+                      当前会话
+                    </h2>
+                  </div>
+                  <UBadge
+                    color="success"
+                    variant="soft"
+                    icon="i-lucide-shield-check"
+                  >
+                    已验证
+                  </UBadge>
+                </div>
+              </template>
+
+              <div class="space-y-2">
+                <p class="text-xs text-muted">
+                  已登录管理员
+                </p>
+                <p class="break-all text-sm font-semibold text-highlighted sm:text-base">
+                  {{ session?.data.admin.email }}
+                </p>
+                <p class="text-xs text-muted">
+                  接口通过安全 HTTP Cookie 与 CSRF 双重校验。
+                </p>
+              </div>
+
+              <template #footer>
+                <div class="flex items-center gap-2">
+                  <UButton
+                    to="/admin/operations"
+                    color="neutral"
+                    variant="ghost"
+                    size="sm"
+                    icon="i-lucide-activity"
+                    class="text-muted hover:text-highlighted"
+                  >
+                    系统指标
+                  </UButton>
+                </div>
+              </template>
+            </UCard>
+          </section>
+        </div>
       </main>
     </template>
   </UDashboardPanel>
