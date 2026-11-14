@@ -106,113 +106,142 @@ const navigationItems: NavigationMenuItem[][] = [
 </script>
 
 <template>
-  <NuxtLink
-    to="#admin-main"
-    class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-elevated focus:px-4 focus:py-3 focus:text-highlighted focus:shadow-lg"
-  >
-    跳转到主要内容
-  </NuxtLink>
-
-  <UDashboardGroup
-    storage="cookie"
-    storage-key="aikayun-admin-workspace"
-    class="bg-default"
-  >
-    <UDashboardSidebar
-      id="admin-navigation"
-      mode="slideover"
-      collapsible
-      resizable
-      :toggle="false"
-      :default-size="18"
-      :min-size="14"
-      :max-size="22"
-      :collapsed-size="4"
-      :menu="{
-        side: 'left',
-        title: '后台导航',
-        description: '选择可用的管理区域或返回店铺。',
-      }"
-      :ui="{ content: 'w-[min(19rem,calc(100vw-1rem))] max-w-none' }"
-      class="bg-elevated border-e border-default/70"
+  <UTheme :ui="adminThemeUi">
+    <NuxtLink
+      to="#admin-main"
+      class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-elevated focus:px-4 focus:py-3 focus:text-highlighted focus:shadow-lg"
     >
-      <template #header="{ collapsed, collapse }">
-        <div class="flex h-full w-full items-center justify-between gap-2 overflow-hidden">
-          <NuxtLink
-            to="/admin"
-            class="flex min-w-0 items-center gap-2.5 rounded-lg font-semibold text-highlighted transition-opacity hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-            :title="collapsed ? 'AiKayun 管理后台' : undefined"
-          >
-            <BrandMark
-              name="AiKayun"
-              class="size-7 shrink-0"
-            />
-            <span
-              v-if="!collapsed"
-              class="min-w-0 leading-tight"
+      跳转到主要内容
+    </NuxtLink>
+
+    <UDashboardGroup
+      storage="cookie"
+      storage-key="aikayun-admin-workspace"
+      class="bg-default"
+    >
+      <UDashboardSidebar
+        id="admin-navigation"
+        mode="slideover"
+        collapsible
+        resizable
+        :toggle="false"
+        :default-size="18"
+        :min-size="14"
+        :max-size="22"
+        :collapsed-size="4"
+        :menu="{
+          side: 'left',
+          title: '后台导航',
+          description: '选择可用的管理区域或返回店铺。',
+        }"
+        :ui="{ content: 'w-[min(19rem,calc(100vw-1rem))] max-w-none' }"
+        class="border-e border-default/70 bg-elevated"
+      >
+        <template #header="{ collapsed, collapse }">
+          <div class="flex h-full w-full items-center justify-between gap-2 overflow-hidden">
+            <UTooltip
+              text="AiKayun 管理后台"
+              :content="{ side: 'right' }"
+              :disabled="!collapsed"
             >
-              <span class="block truncate text-sm font-semibold tracking-tight">AiKayun</span>
-              <span class="block text-xs font-normal text-muted">管理后台</span>
-            </span>
-          </NuxtLink>
+              <NuxtLink
+                to="/admin"
+                class="flex min-w-0 items-center gap-2.5 rounded-lg font-semibold text-highlighted transition-opacity hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                :aria-label="collapsed ? 'AiKayun 管理后台' : undefined"
+                :title="collapsed ? 'AiKayun 管理后台' : undefined"
+              >
+                <BrandMark
+                  name="AiKayun"
+                  class="size-7 shrink-0"
+                />
+                <span
+                  v-if="!collapsed"
+                  class="min-w-0 leading-tight"
+                >
+                  <span class="block truncate text-sm font-semibold tracking-tight">AiKayun</span>
+                  <span class="block text-xs font-normal text-muted">管理后台</span>
+                </span>
+              </NuxtLink>
+            </UTooltip>
 
-          <UButton
-            v-if="!collapsed"
-            color="neutral"
-            variant="ghost"
-            size="xs"
-            icon="i-lucide-panel-left-close"
-            aria-label="折叠侧边栏"
-            class="hidden lg:flex shrink-0 text-muted hover:text-highlighted"
-            @click="collapse(true)"
-          />
-        </div>
-      </template>
+            <UTooltip
+              text="折叠侧边栏"
+              :content="{ side: 'right' }"
+            >
+              <UButton
+                v-if="!collapsed"
+                color="neutral"
+                variant="ghost"
+                size="xs"
+                icon="i-lucide-panel-left-close"
+                aria-label="折叠侧边栏"
+                title="折叠侧边栏"
+                class="hidden shrink-0 text-muted hover:text-highlighted lg:flex"
+                @click="collapse(true)"
+              />
+            </UTooltip>
+          </div>
+        </template>
 
-      <template #default="{ collapsed }">
-        <div
-          role="group"
-          aria-label="后台导航"
-          class="grid gap-3"
-        >
-          <UNavigationMenu
-            :items="navigationItems"
-            :collapsed="collapsed"
-            orientation="vertical"
-            highlight
-            tooltip
-            class="w-full"
-          />
-        </div>
-      </template>
+        <template #default="{ collapsed }">
+          <div
+            role="group"
+            aria-label="后台导航"
+            class="grid gap-3"
+          >
+            <UNavigationMenu
+              :items="navigationItems"
+              :collapsed="collapsed"
+              orientation="vertical"
+              highlight
+              tooltip
+              class="w-full"
+            />
+          </div>
+        </template>
 
-      <template #footer="{ collapsed, collapse }">
-        <div class="flex flex-col gap-1 w-full">
-          <UButton
-            to="/"
-            color="neutral"
-            variant="ghost"
-            icon="i-lucide-store"
-            :label="collapsed ? undefined : '返回店铺'"
-            :tooltip="collapsed ? '返回店铺' : undefined"
-            block
-            class="justify-start text-muted hover:text-highlighted"
-          />
-          <UButton
-            color="neutral"
-            variant="ghost"
-            :icon="collapsed ? 'i-lucide-panel-left-open' : 'i-lucide-panel-left-close'"
-            :label="collapsed ? undefined : '折叠导航'"
-            :tooltip="collapsed ? '展开导航' : undefined"
-            aria-label="切换侧边栏展开状态"
-            block
-            class="hidden lg:flex justify-start text-muted hover:text-highlighted"
-            @click="collapse(!collapsed)"
-          />
-        </div>
-      </template>
-    </UDashboardSidebar>
+        <template #footer="{ collapsed, collapse }">
+          <div class="flex w-full flex-col gap-1">
+            <UTooltip
+              text="返回店铺"
+              :content="{ side: 'right' }"
+              :disabled="!collapsed"
+            >
+              <UButton
+                to="/"
+                color="neutral"
+                variant="ghost"
+                icon="i-lucide-store"
+                :label="collapsed ? undefined : '返回店铺'"
+                :aria-label="collapsed ? '返回店铺' : undefined"
+                title="返回店铺"
+                block
+                class="justify-start text-muted hover:text-highlighted"
+              />
+            </UTooltip>
 
-    <slot />
-  </UDashboardGroup>
+            <UTooltip
+              :text="collapsed ? '展开导航' : '折叠导航'"
+              :content="{ side: 'right' }"
+              :disabled="!collapsed"
+            >
+              <UButton
+                color="neutral"
+                variant="ghost"
+                :icon="collapsed ? 'i-lucide-panel-left-open' : 'i-lucide-panel-left-close'"
+                :label="collapsed ? undefined : '折叠导航'"
+                :aria-label="collapsed ? '展开导航' : '折叠导航'"
+                :title="collapsed ? '展开导航' : '折叠导航'"
+                block
+                class="hidden justify-start text-muted hover:text-highlighted lg:flex"
+                @click="collapse(!collapsed)"
+              />
+            </UTooltip>
+          </div>
+        </template>
+      </UDashboardSidebar>
+
+      <slot />
+    </UDashboardGroup>
+  </UTheme>
 </template>

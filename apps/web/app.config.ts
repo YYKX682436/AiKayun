@@ -10,19 +10,16 @@ export default defineAppConfig({
       neutral: 'slate',
     },
     button: {
-      slots: { base: 'rounded-lg font-medium transition-colors' },
+      slots: { base: 'rounded-lg' },
     },
     input: {
       slots: { base: 'rounded-lg' },
     },
-    badge: {
-      slots: { base: 'rounded-md font-medium' },
-    },
     card: {
-      slots: { root: 'rounded-xl transition-shadow' },
+      slots: { root: 'rounded-xl' },
       variants: {
         variant: {
-          outline: { root: 'bg-elevated ring ring-default/70 shadow-xs' },
+          outline: { root: 'bg-elevated' },
         },
       },
     },
@@ -32,32 +29,6 @@ export default defineAppConfig({
           false: { content: 'rounded-2xl' },
           true: { content: 'rounded-none' },
         },
-      },
-    },
-    dashboardNavbar: {
-      slots: {
-        root: 'h-14 border-b border-default/70 bg-elevated/80 backdrop-blur-md sticky top-0 z-30 px-4 sm:px-6',
-        title: 'text-base font-semibold text-highlighted tracking-tight',
-        toggle: 'min-h-11 min-w-11',
-      },
-    },
-    dashboardSidebar: {
-      slots: {
-        root: 'border-e border-default/70 bg-elevated',
-        header: 'h-14 border-b border-default/60 px-4',
-        footer: 'border-t border-default/60 px-3 py-3',
-      },
-    },
-    navigationMenu: {
-      slots: {
-        label: 'px-3 pt-3 pb-1 text-xs font-semibold text-muted uppercase tracking-wider',
-        link: 'rounded-lg font-medium transition-colors text-sm py-2 px-3',
-      },
-    },
-    table: {
-      slots: {
-        th: 'text-xs font-semibold text-muted bg-muted/25 py-3 px-4 uppercase tracking-wider',
-        td: 'py-3.5 px-4 text-sm',
       },
     },
   },
