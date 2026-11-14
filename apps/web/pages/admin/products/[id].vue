@@ -62,20 +62,23 @@ const productPurchaseLimitDraft = reactive({ perOrder: '', lifetime: '', rolling
 const skuPurchaseLimitDrafts = reactive<Record<string, { perOrder: string; lifetime: string; rolling24Hours: string }>>({})
 const productPurchaseLimitDraftDirty = computed(() => {
   const current = product.value
-  return Boolean(current && (['perOrder', 'lifetime', 'rolling24Hours'] as const).some(key => productPurchaseLimitDraft[key] !== String(current.purchaseLimits[key] ?? '')))
+  return Boolean(current && (['perOrder', 'lifetime', 'rolling24Hours'] as const).some(key => productPurchaseLimitDraft[key] !== String(current.purchaseLimits?.[key] ?? '')))
 })
 const skuPurchaseLimitDraftDirty = computed(() => {
   const current = product.value
   if (!current) return false
   const keys = ['perOrder', 'lifetime', 'rolling24Hours'] as const
-  const productChanged = keys.some(key => productPurchaseLimitDraft[key] !== String(current.purchaseLimits[key] ?? ''))
-  const skuChanged = current.variants.some(variant => {
+  return current.variants.some(variant => {
     const draft = skuPurchaseLimitDrafts[variant.id]
-    return draft && keys.some(key => draft[key] !== String(variant.purchaseLimits[key] ?? ''))
+    return draft && keys.some(key => draft[key] !== String(variant.purchaseLimits?.[key] ?? ''))
   })
-  return productChanged || skuChanged
 })
-const hasUnsavedChanges = computed(() => Object.values(dirty).some(Boolean) || pricingRulesDirty.value || skuPurchaseLimitDraftDirty.value)
+const hasUnsavedChanges = computed(() =>
+  Object.values(dirty).some(Boolean)
+  || pricingRulesDirty.value
+  || productPurchaseLimitDraftDirty.value
+  || skuPurchaseLimitDraftDirty.value
+)
 const conflictSection = ref('')
 const conflictLatest = ref<ProductDetail | null>(null)
 const conflictPrices = ref<AdminProductVariantPricesPage | null>(null)
@@ -107,6 +110,7 @@ let costOperationSequence = 0
 let activeCostOperation: number | null = null
 
 const inventorySummary = shallowRef<AdminProductInventorySummary | null>(null)
+const inventoryLoading = ref(false)
 const manualFulfillment = ref<ManualFulfillmentConfigPage>([])
 const manualFulfillmentLoading = ref(false)
 const fixedDeliverySkuId = ref('')
@@ -451,7 +455,12 @@ async function refreshPricesAfterPricingApply() {
 }
 
 async function loadInventory() {
-  inventorySummary.value = await request<AdminProductInventorySummary>(`/api/v1/admin/products/${productId.value}/inventory`)
+  inventoryLoading.value = true
+  try {
+    inventorySummary.value = await request<AdminProductInventorySummary>(`/api/v1/admin/products/${productId.value}/inventory`)
+  } finally {
+    inventoryLoading.value = false
+  }
 }
 
 async function loadManualFulfillment() {
@@ -1620,7 +1629,7 @@ async function confirmCostChanges() {
   }
 }
 
-watch(productId, () => {
+watch(productId, (newId, oldId) => {
   costOperationSequence++
   conflictRequestSequence++
   costOutcomeUnknown.value = false
@@ -1633,6 +1642,10 @@ watch(productId, () => {
   costPreview.value = null
   costPreviewOpen.value = false
   confirmManualCost.value = false
+  if (newId !== oldId) {
+    cleanupSectionObserver()
+    void loadProduct()
+  }
 })
 async function changePricePage(page: number) {
   if (dirty.prices && !window.confirm('本页价格尚未保存，切换页面会丢弃这些输入。继续吗？')) return
@@ -1898,13 +1911,16 @@ function inventoryForSku(skuId: string) { return inventorySummary.value?.variant
 const activeSection = ref('basic')
 let sectionObserver: IntersectionObserver | null = null
 
+const isSkuPurchaseLimitsSaving = computed(() => saving.value.startsWith('skuPurchaseLimits:'))
+const hasSkuPurchaseLimitsError = computed(() => Object.keys(sectionErrors).some(k => k.startsWith('skuPurchaseLimits:') && Boolean(sectionErrors[k])))
+
 const navSections = computed(() => [
   { id: 'basic', label: '基本资料', icon: 'i-lucide-info', dirty: dirty.basic, saving: saving.value === 'basic', error: Boolean(sectionErrors.basic) },
   { id: 'purchase-limits', label: '购买限制', icon: 'i-lucide-shield-alert', dirty: productPurchaseLimitDraftDirty.value, saving: saving.value === 'purchase-limits', error: Boolean(sectionErrors.purchaseLimits) },
   { id: 'categories', label: '商品分类', icon: 'i-lucide-folder-tree', dirty: dirty.categories, saving: saving.value === 'categories', error: Boolean(sectionErrors.categories) },
   { id: 'gallery', label: '图片相册', icon: 'i-lucide-image', dirty: dirty.gallery, saving: saving.value === 'gallery', error: Boolean(sectionErrors.gallery) },
   { id: 'rich-content', label: '图文详情', icon: 'i-lucide-file-text', dirty: dirty.rich, saving: saving.value === 'rich', error: Boolean(sectionErrors.rich) },
-  { id: 'variants', label: '规格与 SKU', icon: 'i-lucide-layers', dirty: dirty.matrix, saving: saving.value === 'matrix' || saving.value === 'matrix-preview', error: Boolean(sectionErrors.matrix) },
+  { id: 'variants', label: '规格与 SKU', icon: 'i-lucide-layers', dirty: dirty.matrix || skuPurchaseLimitDraftDirty.value, saving: saving.value === 'matrix' || saving.value === 'matrix-preview' || isSkuPurchaseLimitsSaving.value, error: Boolean(sectionErrors.matrix) || hasSkuPurchaseLimitsError.value },
   { id: 'prices', label: '价格与策略', icon: 'i-lucide-tag', dirty: dirty.prices || pricingRulesDirty.value, saving: saving.value === 'prices' || saving.value === 'cost-preview' || saving.value === 'cost-confirm', error: Boolean(sectionErrors.prices) },
   { id: 'inventory', label: '库存与交付', icon: 'i-lucide-boxes', dirty: dirty.inventory, saving: saving.value === 'inventory' || saving.value.startsWith('manual-fulfillment-') || saving.value === 'inventory-adjustment', error: Boolean(sectionErrors.inventory) },
   { id: 'attributes', label: '商品属性', icon: 'i-lucide-list', dirty: dirty.attributes, saving: saving.value === 'attributes', error: Boolean(sectionErrors.attributes) },
@@ -1933,40 +1949,77 @@ const totalStockStats = computed(() => {
   let totalStocked = 0
   let totalAvailable = 0
   let hasUnlimited = false
+  let quantitySkuCount = 0
+  let unlimitedSkuCount = 0
   for (const row of inventorySummary.value.variants) {
     if (row.inventory.mode === 'unlimited') {
       hasUnlimited = true
+      unlimitedSkuCount++
     } else if (row.inventory.mode === 'quantity') {
+      quantitySkuCount++
       totalStocked += row.inventory.stocked ?? 0
       totalAvailable += row.inventory.available ?? 0
     }
   }
-  return { totalStocked, totalAvailable, hasUnlimited }
+  return { totalStocked, totalAvailable, hasUnlimited, quantitySkuCount, unlimitedSkuCount }
 })
 
-onMounted(() => {
-  if (typeof IntersectionObserver !== 'undefined') {
-    sectionObserver = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (entry.isIntersecting) {
-          activeSection.value = entry.target.id
-        }
-      }
-    }, {
-      rootMargin: '-80px 0px -55% 0px',
-      threshold: 0
-    })
-    const sectionIds = ['basic', 'purchase-limits', 'categories', 'gallery', 'rich-content', 'variants', 'prices', 'inventory', 'attributes', 'advanced']
-    for (const id of sectionIds) {
-      const el = document.getElementById(id)
-      if (el) sectionObserver.observe(el)
-    }
+const sectionIds = ['basic', 'purchase-limits', 'categories', 'gallery', 'rich-content', 'variants', 'prices', 'inventory', 'attributes', 'advanced'] as const
+
+function cleanupSectionObserver() {
+  if (sectionObserver) {
+    sectionObserver.disconnect()
+    sectionObserver = null
   }
-})
+}
+
+function setupSectionObserver() {
+  cleanupSectionObserver()
+  if (!import.meta.client || typeof IntersectionObserver === 'undefined') return
+  if (loading.value || !product.value) return
+
+  const visibleSections = new Set<string>()
+
+  sectionObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) {
+        visibleSections.add(entry.target.id)
+      } else {
+        visibleSections.delete(entry.target.id)
+      }
+    }
+    for (const id of sectionIds) {
+      if (visibleSections.has(id)) {
+        activeSection.value = id
+        break
+      }
+    }
+  }, {
+    rootMargin: '-70px 0px -30% 0px',
+    threshold: 0,
+  })
+
+  for (const id of sectionIds) {
+    const el = document.getElementById(id)
+    if (el) sectionObserver.observe(el)
+  }
+}
+
+watch(
+  [() => loading.value, () => product.value?.id],
+  async ([isLoading, prodId]) => {
+    if (!isLoading && prodId) {
+      await nextTick()
+      setupSectionObserver()
+    } else {
+      cleanupSectionObserver()
+    }
+  },
+  { flush: 'post' }
+)
 
 onUnmounted(() => {
-  sectionObserver?.disconnect()
-  sectionObserver = null
+  cleanupSectionObserver()
 })
 </script>
 
@@ -2093,12 +2146,42 @@ onUnmounted(() => {
                   <span
                     v-if="totalStockStats"
                     class="inline-flex items-center gap-1.5"
+                    title="各 SKU 数量模式可用库存合计，不代表所有库存均满足销售资格"
                   >
                     <UIcon
                       name="i-lucide-boxes"
                       class="size-3.5 text-dimmed"
                     />
-                    {{ totalStockStats.hasUnlimited ? '包含无限库存' : `可售库存 ${totalStockStats.totalAvailable} 件` }}
+                    <span v-if="totalStockStats.quantitySkuCount > 0">
+                      数量库存可用 {{ totalStockStats.totalAvailable }} 件
+                      <span
+                        v-if="totalStockStats.hasUnlimited"
+                        class="text-dimmed"
+                      >
+                        （另含无限库存）
+                      </span>
+                    </span>
+                    <span
+                      v-else-if="totalStockStats.hasUnlimited"
+                    >
+                      含无限库存规格
+                    </span>
+                    <span
+                      v-else
+                      class="text-dimmed"
+                    >
+                      未配置数量库存
+                    </span>
+                  </span>
+                  <span
+                    v-else-if="inventoryLoading || loading"
+                    class="inline-flex items-center gap-1.5 text-dimmed"
+                  >
+                    <UIcon
+                      name="i-lucide-boxes"
+                      class="size-3.5 text-dimmed"
+                    />
+                    库存读取中…
                   </span>
                   <span class="inline-flex items-center gap-1.5">
                     <UIcon
@@ -2251,7 +2334,15 @@ onUnmounted(() => {
               />
               <span>{{ item.label }}</span>
               <span
-                v-if="item.dirty"
+                v-if="item.saving"
+                class="size-1.5 rounded-full bg-primary animate-ping"
+              />
+              <span
+                v-else-if="item.error"
+                class="size-1.5 rounded-full bg-error"
+              />
+              <span
+                v-else-if="item.dirty"
                 class="size-1.5 rounded-full"
                 :class="activeSection === item.id ? 'bg-white' : 'bg-warning animate-pulse'"
               />
@@ -2404,11 +2495,18 @@ onUnmounted(() => {
                           购买限制
                         </h2>
                         <UBadge
-                          v-if="skuPurchaseLimitDraftDirty"
+                          v-if="productPurchaseLimitDraftDirty"
                           color="warning"
                           variant="subtle"
                         >
-                          有未保存的购买限制
+                          未保存
+                        </UBadge>
+                        <UBadge
+                          v-else-if="sectionSuccess.purchaseLimits"
+                          color="success"
+                          variant="subtle"
+                        >
+                          已保存
                         </UBadge>
                       </div>
                       <p class="mt-0.5 text-xs text-muted">
@@ -2931,7 +3029,14 @@ onUnmounted(() => {
                           规格与 SKU
                         </h2>
                         <UBadge
-                          v-if="dirty.matrix"
+                          v-if="isSkuPurchaseLimitsSaving"
+                          color="primary"
+                          variant="subtle"
+                        >
+                          保存限购中…
+                        </UBadge>
+                        <UBadge
+                          v-else-if="dirty.matrix || skuPurchaseLimitDraftDirty"
                           color="warning"
                           variant="subtle"
                         >
@@ -5338,12 +5443,34 @@ onUnmounted(() => {
                       {{ product?.variants ? product.variants.length : 0 }} 个
                     </dd>
                   </div>
-                  <div class="flex items-center justify-between">
+                  <div class="flex items-start justify-between gap-2">
                     <dt class="text-muted">
-                      可售库存
+                      <div>数量库存可用</div>
+                      <div class="text-[11px] leading-tight text-dimmed">
+                        合计可用量，不代表均满足实际销售资格
+                      </div>
                     </dt>
-                    <dd class="font-medium text-highlighted tabular-nums">
-                      {{ totalStockStats?.hasUnlimited ? '包含无限库存' : `${totalStockStats?.totalAvailable ?? 0} 件` }}
+                    <dd class="text-right font-medium text-highlighted tabular-nums">
+                      <template v-if="inventoryLoading || !totalStockStats">
+                        <span class="text-xs font-normal text-dimmed">读取中…</span>
+                      </template>
+                      <template v-else-if="totalStockStats.quantitySkuCount > 0">
+                        <div>{{ totalStockStats.totalAvailable }} 件</div>
+                        <div
+                          v-if="totalStockStats.hasUnlimited"
+                          class="text-[11px] font-normal text-primary"
+                        >
+                          另含无限库存规格
+                        </div>
+                      </template>
+                      <template v-else-if="totalStockStats.hasUnlimited">
+                        <div class="text-xs font-medium text-primary">
+                          含无限库存规格
+                        </div>
+                      </template>
+                      <template v-else>
+                        <span class="font-normal text-dimmed">—</span>
+                      </template>
                     </dd>
                   </div>
                   <div class="flex items-center justify-between">
