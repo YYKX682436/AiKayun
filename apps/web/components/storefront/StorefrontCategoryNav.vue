@@ -4,6 +4,8 @@ import type { PublicCategory } from '@aikayun/contracts'
 
 const props = defineProps<{ categories: PublicCategory[] }>()
 const route = useRoute()
+const customerApi = useCustomerApi()
+const { data: support, status: supportStatus } = useStorefrontSupport()
 const drawerOpen = ref(false)
 
 watch(() => route.path, () => {
@@ -55,7 +57,7 @@ const desktopItems = computed<NavigationMenuItem[]>(() => {
   <UDrawer
     v-model:open="drawerOpen"
     title="商品分类"
-    description="按分类浏览店铺商品。"
+    description="按分类浏览店铺商品与快捷服务。"
     direction="right"
     :handle="false"
     :ui="{ content: 'w-[min(22rem,90vw)]', body: 'p-3' }"
@@ -75,6 +77,38 @@ const desktopItems = computed<NavigationMenuItem[]>(() => {
           @navigate="drawerOpen = false"
         />
       </nav>
+
+      <div class="mt-5 border-t border-default/70 pt-4">
+        <p class="px-3 pb-1 text-xs font-medium text-dimmed">商城服务</p>
+        <nav aria-label="商城快捷导航" class="space-y-0.5">
+          <NuxtLink
+            to="/orders"
+            class="flex min-h-11 items-center gap-2.5 rounded-lg px-3 text-sm font-medium text-highlighted transition-colors hover:bg-muted"
+            @click="drawerOpen = false"
+          >
+            <UIcon name="i-lucide-receipt-text" class="size-4.5 text-muted" />
+            <span>我的订单</span>
+          </NuxtLink>
+          <NuxtLink
+            v-if="customerApi.session.value"
+            to="/wallet"
+            class="flex min-h-11 items-center gap-2.5 rounded-lg px-3 text-sm font-medium text-highlighted transition-colors hover:bg-muted"
+            @click="drawerOpen = false"
+          >
+            <UIcon name="i-lucide-wallet" class="size-4.5 text-muted" />
+            <span>我的钱包</span>
+          </NuxtLink>
+          <NuxtLink
+            v-if="supportStatus === 'success' && support?.channels.length"
+            to="/support"
+            class="flex min-h-11 items-center gap-2.5 rounded-lg px-3 text-sm font-medium text-highlighted transition-colors hover:bg-muted"
+            @click="drawerOpen = false"
+          >
+            <UIcon name="i-lucide-headset" class="size-4.5 text-muted" />
+            <span>联系客服</span>
+          </NuxtLink>
+        </nav>
+      </div>
     </template>
   </UDrawer>
 </template>

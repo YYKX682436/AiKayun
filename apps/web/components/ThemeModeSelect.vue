@@ -32,7 +32,13 @@ const preference = computed<ModeOption>({
       aria-label="显示模式"
       title="显示模式"
       size="sm"
-      class="min-h-11 min-w-[6.5rem]"
+      class="min-h-11 w-9 min-w-9 sm:w-auto sm:min-w-[6.5rem]"
+      :ui="{
+        base: 'justify-center ps-2 pe-2 sm:ps-8 sm:pe-8 min-w-9 w-9 sm:w-auto',
+        value: 'hidden sm:inline',
+        trailing: 'hidden sm:inline-flex',
+        leading: 'inset-y-0 start-0 flex items-center sm:absolute sm:ps-2.5',
+      }"
     />
 
     <template #fallback>
@@ -44,7 +50,13 @@ const preference = computed<ModeOption>({
         aria-label="显示模式"
         title="显示模式"
         size="sm"
-        class="min-h-11 min-w-[6.5rem]"
+        class="min-h-11 w-9 min-w-9 sm:w-auto sm:min-w-[6.5rem]"
+        :ui="{
+          base: 'justify-center ps-2 pe-2 sm:ps-8 sm:pe-8 min-w-9 w-9 sm:w-auto',
+          value: 'hidden sm:inline',
+          trailing: 'hidden sm:inline-flex',
+          leading: 'inset-y-0 start-0 flex items-center sm:absolute sm:ps-2.5',
+        }"
         disabled
       />
     </template>

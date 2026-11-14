@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import type { PublicProductCard } from '@aikayun/contracts'
 
-defineProps<{ products: PublicProductCard[] }>()
+withDefaults(defineProps<{
+  products: PublicProductCard[]
+  priorityFirst?: boolean
+}>(), {
+  priorityFirst: true,
+})
 </script>
 
 <template>
@@ -13,7 +18,7 @@ defineProps<{ products: PublicProductCard[] }>()
     >
       <StorefrontProductCard
         :product="product"
-        :priority="index < 4"
+        :priority="priorityFirst && index === 0"
       />
     </li>
   </ul>

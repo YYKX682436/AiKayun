@@ -78,7 +78,7 @@ useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
             </h2>
           </div>
         </div>
-        <StorefrontProductGrid :products="featuredProducts" />
+        <StorefrontProductGrid :products="featuredProducts" :priority-first="true" />
       </section>
 
       <!-- 全部商品分区 (核心浏览与选购) -->
@@ -133,7 +133,7 @@ useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
         </div>
 
         <template v-else-if="data && products.length">
-          <StorefrontProductGrid :products="products" />
+          <StorefrontProductGrid :products="products" :priority-first="!featuredProducts.length" />
           <StorefrontPagination
             v-if="data.totalPages > 1"
             :page="data.page"

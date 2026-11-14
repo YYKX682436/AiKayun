@@ -43,20 +43,20 @@ onMounted(() => {
     </NuxtLink>
 
     <header class="sticky top-0 z-40 border-b border-default/70 bg-elevated/80 backdrop-blur-md storefront-glass-header transition-colors">
-      <UContainer class="flex h-15 items-center justify-between gap-x-3 py-2 sm:h-16">
+      <UContainer class="flex h-15 items-center justify-between gap-x-2 py-2 sm:h-16 sm:gap-x-3">
         <NuxtLink
           to="/"
-          class="group flex min-w-0 shrink items-center gap-2.5 rounded-lg focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary"
+          class="group flex min-w-0 shrink items-center gap-2 rounded-lg focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary sm:gap-2.5"
         >
           <BrandMark
             :name="storeBrand.storeName"
             :logo-url="storeBrand.storeLogoUrl"
-            class="transition-transform duration-200 group-hover:scale-105"
+            class="shrink-0 transition-transform duration-200 group-hover:scale-105"
           />
-          <span class="max-w-[7.5rem] truncate text-sm font-semibold tracking-tight text-highlighted transition-colors group-hover:text-primary sm:max-w-[14rem] sm:text-base md:max-w-none">{{ storeBrand.storeName }}</span>
+          <span class="truncate text-sm font-semibold tracking-tight text-highlighted transition-colors group-hover:text-primary sm:text-base">{{ storeBrand.storeName }}</span>
         </NuxtLink>
 
-        <div class="ml-auto flex shrink-0 items-center gap-1 sm:gap-1.5">
+        <div class="ml-auto flex shrink-0 items-center gap-0.5 sm:gap-1.5">
           <StorefrontCategoryNav :categories="categories" />
           <UButton
             to="/search"
@@ -64,13 +64,13 @@ onMounted(() => {
             variant="ghost"
             icon="i-lucide-search"
             aria-label="搜索商品"
-            class="min-h-10 min-w-9 rounded-lg px-2 text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:min-h-11 sm:min-w-10 sm:px-2.5"
+            class="min-h-11 min-w-9 rounded-lg px-1.5 text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:min-w-10 sm:px-2.5"
           >
             <span class="hidden xl:inline">搜索商品</span>
           </UButton>
           <NuxtLink
             to="/cart"
-            class="relative flex min-h-10 min-w-9 items-center justify-center gap-1.5 rounded-lg px-2 text-sm font-medium text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:min-h-11 sm:min-w-10 sm:px-2.5"
+            class="relative flex min-h-11 min-w-9 items-center justify-center gap-1.5 rounded-lg px-1.5 text-sm font-medium text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:min-w-10 sm:px-2.5"
             :aria-label="`购物车，${shoppingCart.currentQuantity.value} 件商品`"
           >
             <UIcon
@@ -91,7 +91,7 @@ onMounted(() => {
           </NuxtLink>
           <NuxtLink
             to="/orders"
-            class="hidden min-h-10 min-w-9 items-center justify-center rounded-lg px-2 text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary min-[400px]:flex sm:min-h-11 sm:min-w-10 sm:px-2.5"
+            class="hidden min-h-11 min-w-9 items-center justify-center rounded-lg px-2 text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:flex sm:min-w-10 sm:px-2.5"
             aria-label="我的订单"
             title="我的订单"
           >
@@ -104,7 +104,7 @@ onMounted(() => {
           <NuxtLink
             v-if="customerApi.session.value"
             to="/wallet"
-            class="hidden min-h-10 min-w-9 items-center justify-center rounded-lg px-2 text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:flex sm:min-h-11 sm:min-w-10 sm:px-2.5"
+            class="hidden min-h-11 min-w-9 items-center justify-center rounded-lg px-2 text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:flex sm:min-w-10 sm:px-2.5"
             aria-label="我的钱包"
             title="我的钱包"
           >
@@ -117,7 +117,7 @@ onMounted(() => {
           <ThemeModeSelect />
           <NuxtLink
             :to="customerApi.session.value ? '/account' : '/login'"
-            class="flex min-h-10 min-w-9 items-center justify-center gap-1.5 rounded-lg px-2 text-sm font-medium text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:min-h-11 sm:min-w-10 sm:px-3"
+            class="flex min-h-11 min-w-9 items-center justify-center gap-1.5 rounded-lg px-1.5 text-sm font-medium text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:min-w-10 sm:px-3"
             :aria-label="customerApi.session.value ? `顾客账户，${customerApi.session.value.customer.username}` : '顾客登录'"
           >
             <UIcon

@@ -5,9 +5,56 @@ const productId = '550e8400-e29b-41d4-a716-446655440000'
 const hiddenCategoryId = '550e8400-e29b-41d4-a716-446655440002'
 const brokenPaths = new Set()
 
+const svgCloudServer = `data:image/svg+xml;utf8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600"><rect width="600" height="600" fill="#f8fafc"/><rect x="120" y="160" width="360" height="80" rx="16" fill="#eff6ff" stroke="#3b82f6" stroke-width="4"/><circle cx="170" cy="200" r="10" fill="#3b82f6"/><circle cx="210" cy="200" r="10" fill="#60a5fa"/><rect x="340" y="190" width="100" height="20" rx="6" fill="#bfdbfe"/><rect x="120" y="260" width="360" height="80" rx="16" fill="#eff6ff" stroke="#3b82f6" stroke-width="4"/><circle cx="170" cy="300" r="10" fill="#3b82f6"/><circle cx="210" cy="300" r="10" fill="#60a5fa"/><rect x="340" y="290" width="100" height="20" rx="6" fill="#bfdbfe"/><rect x="120" y="360" width="360" height="80" rx="16" fill="#eff6ff" stroke="#3b82f6" stroke-width="4"/><circle cx="170" cy="400" r="10" fill="#3b82f6"/><circle cx="210" cy="400" r="10" fill="#60a5fa"/><rect x="340" y="390" width="100" height="20" rx="6" fill="#bfdbfe"/></svg>')}`
+
+const svgFidoKey = `data:image/svg+xml;utf8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600"><rect width="600" height="600" fill="#f8fafc"/><rect x="220" y="140" width="160" height="320" rx="32" fill="#1e293b"/><circle cx="300" cy="230" r="32" fill="#334155" stroke="#0ea5e9" stroke-width="6"/><rect x="250" y="370" width="100" height="40" rx="10" fill="#0ea5e9"/><rect x="270" y="110" width="60" height="40" rx="6" fill="#94a3b8"/></svg>')}`
+
+const sampleProducts = [
+  {
+    id: productId,
+    name: '云服务器轻量订阅月卡 (标准版)',
+    description: '即时自动发货，支持全协议 API 密钥与一键配置',
+    productType: 'digital',
+    selectionStatus: 'available',
+    inventoryStatus: 'in_stock',
+    priceRange: { min: '29.90', max: '29.90', currency: 'CNY' },
+    cover: { url: svgCloudServer, alt: '云服务器轻量订阅月卡', width: 600, height: 600 },
+  },
+  {
+    id: '550e8400-e29b-41d4-a716-446655440011',
+    name: '安全双因子认证硬件令牌 FIDO2',
+    description: 'Type-C 与 NFC 双模，无缝兼容各操作系统',
+    productType: 'physical',
+    selectionStatus: 'available',
+    inventoryStatus: 'in_stock',
+    priceRange: { min: '128.00', max: '198.00', currency: 'CNY' },
+    cover: { url: svgFidoKey, alt: '安全双因子认证硬件令牌 FIDO2', width: 600, height: 600 },
+  },
+  {
+    id: '550e8400-e29b-41d4-a716-446655440022',
+    name: '企业域名解析与 SSL 证书部署服务',
+    description: '专业工程师一对一技术支持与极速排查',
+    productType: 'service',
+    selectionStatus: 'available',
+    inventoryStatus: 'unconfirmed',
+    priceRange: { min: '80.00', max: '80.00', currency: 'CNY' },
+    cover: null,
+  },
+  {
+    id: '550e8400-e29b-41d4-a716-446655440033',
+    name: '开发者高阶 API 专属算力包',
+    description: '专线高并发配额，资源紧张补货中',
+    productType: 'digital',
+    selectionStatus: 'available',
+    inventoryStatus: 'out_of_stock',
+    priceRange: { min: '199.00', max: '199.00', currency: 'CNY' },
+    cover: null,
+  },
+]
+
 function page(url) {
   const pageNumber = Number(url.searchParams.get('page') ?? 1)
-  return { items: [], page: pageNumber, pageSize: 24, total: 25, totalPages: 2 }
+  return { items: pageNumber === 1 ? sampleProducts : [], page: pageNumber, pageSize: 24, total: 25, totalPages: 2 }
 }
 
 function category() {
@@ -77,6 +124,10 @@ const server = createServer(async (request, response) => {
     response.writeHead(200).end(JSON.stringify({ data: {
       channels: [{ name: 'SSR售后渠道', type: 'https', content: 'https://support.example.test/contact' }],
     } }))
+    return
+  }
+  if (url.pathname === '/api/v1/public/storefront/featured-products') {
+    response.writeHead(200).end(JSON.stringify({ data: { products: [sampleProducts[0], sampleProducts[1]] } }))
     return
   }
   if (url.pathname === '/api/v1/public/products') {
