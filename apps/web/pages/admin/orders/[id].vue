@@ -186,7 +186,7 @@ const navSections = computed(() => {
       hasWarning: data.value.payments.needsReconciliation,
     },
   ]
-  if (refunds.value && refunds.value.items.length > 0) {
+  if (refunds.value) {
     list.push({
       id: 'refunds',
       label: '退款售后',
@@ -536,6 +536,29 @@ onBeforeUnmount(() => {
         id="admin-main-content"
         class="mx-auto w-full max-w-[90rem] min-w-0 px-4 py-5 sm:px-6 lg:px-8"
       >
+        <!-- 全局错误通知（包括首次加载失败与后续操作失败） -->
+        <UAlert
+          v-if="errorMessage"
+          class="mb-5"
+          color="error"
+          variant="soft"
+          :title="errorMessage"
+          role="alert"
+          aria-live="assertive"
+        >
+          <template #actions>
+            <UButton
+              color="error"
+              variant="outline"
+              size="xs"
+              :loading="loading"
+              @click="loadOrder"
+            >
+              重新读取
+            </UButton>
+          </template>
+        </UAlert>
+
         <!-- 骨架屏加载状态 -->
         <div
           v-if="loading && !data"
@@ -652,34 +675,11 @@ onBeforeUnmount(() => {
                   <span class="text-xs text-muted">项需关注</span>
                 </div>
                 <span class="text-[11px] text-dimmed">
-                  {{ pendingActionCount > 0 ? '优先在下方完成履约或对账' : '当前所有操作均已完成' }}
+                  {{ pendingActionCount > 0 ? '优先在下方完成履约或对账' : '暂无待人工处理事项' }}
                 </span>
               </div>
             </div>
           </header>
-
-          <!-- 全局错误与成功通知 -->
-          <UAlert
-            v-if="errorMessage"
-            class="mb-5"
-            color="error"
-            variant="soft"
-            :title="errorMessage"
-            role="alert"
-            aria-live="assertive"
-          >
-            <template #actions>
-              <UButton
-                color="error"
-                variant="outline"
-                size="xs"
-                :loading="loading"
-                @click="loadOrder"
-              >
-                重新读取
-              </UButton>
-            </template>
-          </UAlert>
 
           <UAlert
             v-if="successMessage"
@@ -2082,11 +2082,11 @@ onBeforeUnmount(() => {
                     </UBadge>
                     <UBadge
                       v-else
-                      color="success"
+                      color="neutral"
                       variant="subtle"
                       size="xs"
                     >
-                      已全部处理
+                      暂无待处理
                     </UBadge>
                   </div>
 
