@@ -96,7 +96,10 @@ async function copyOrderId(id: string) {
       if (copiedOrderId.value === id) copiedOrderId.value = ''
     }, 2000)
   } catch {
-    // 忽略剪贴板写入失败
+    toast.add({
+      title: '复制失败，请手动复制',
+      color: 'error',
+    })
   }
 }
 
@@ -207,6 +210,7 @@ onBeforeUnmount(() => { sequence++ })
                 #trailing
               >
                 <UButton
+                  type="button"
                   icon="i-lucide-x"
                   size="xs"
                   color="neutral"

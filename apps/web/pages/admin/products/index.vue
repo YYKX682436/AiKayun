@@ -98,6 +98,8 @@ const sortItems = [
   { label: '价格从低到高', value: 'price:asc' },
 ]
 const sortValue = computed(() => `${sortBy.value}:${sortOrder.value}`)
+const isNonDefaultSort = computed(() => sortBy.value !== 'updatedAt' || sortOrder.value !== 'desc')
+const currentSortLabel = computed(() => sortItems.find(s => s.value === sortValue.value)?.label ?? '自定义排序')
 
 const hasActiveFilters = computed(() => {
   return Boolean(
@@ -105,8 +107,7 @@ const hasActiveFilters = computed(() => {
     status.value ||
     productType.value ||
     categoryId.value ||
-    sortBy.value !== 'updatedAt' ||
-    sortOrder.value !== 'desc',
+    isNonDefaultSort.value,
   )
 })
 
@@ -130,8 +131,8 @@ function resetAllFilters() {
     status: '',
     productType: '',
     categoryId: '',
-    sortBy: 'updatedAt',
-    sortOrder: 'desc',
+    sortBy: undefined,
+    sortOrder: undefined,
     page: 1,
   })
 }
@@ -282,7 +283,10 @@ async function copyProductId(id: string) {
       if (copiedProductId.value === id) copiedProductId.value = ''
     }, 2000)
   } catch {
-    // 忽略剪贴板写入失败
+    toast.add({
+      title: '复制失败，请手动复制',
+      color: 'error',
+    })
   }
 }
 
@@ -421,6 +425,7 @@ async function copyProduct(product: ProductListItem) {
                   #trailing
                 >
                   <UButton
+                    type="button"
                     icon="i-lucide-x"
                     size="xs"
                     color="neutral"
@@ -469,7 +474,14 @@ async function copyProduct(product: ProductListItem) {
                 class="w-full"
                 size="md"
                 aria-label="商品排序方式"
-                @update:model-value="value => { const [sortBy, sortOrder] = String(value).split(':'); updateQuery({ sortBy, sortOrder, page: 1 }) }"
+                @update:model-value="value => {
+                  const [by, order] = String(value).split(':')
+                  if (by === 'updatedAt' && order === 'desc') {
+                    updateQuery({ sortBy: undefined, sortOrder: undefined, page: 1 })
+                  } else {
+                    updateQuery({ sortBy: by, sortOrder: order, page: 1 })
+                  }
+                }"
               />
             </div>
           </div>
@@ -479,67 +491,71 @@ async function copyProduct(product: ProductListItem) {
             class="flex flex-wrap items-center gap-2 pt-2 border-t border-default/50 text-xs text-muted"
           >
             <span class="font-medium text-default">活跃筛选：</span>
-            <UBadge
+            <UButton
               v-if="search"
               color="neutral"
               variant="subtle"
               size="xs"
-              class="gap-1 cursor-pointer hover:bg-muted"
+              trailing-icon="i-lucide-x"
+              :aria-label="`清除搜索筛选: ${search}`"
+              class="font-normal"
               @click="searchInput = ''; updateQuery({ search: '', page: 1 })"
             >
               搜索: {{ search }}
-              <UIcon
-                name="i-lucide-x"
-                class="size-3"
-              />
-            </UBadge>
-            <UBadge
+            </UButton>
+            <UButton
               v-if="status"
               color="neutral"
               variant="subtle"
               size="xs"
-              class="gap-1 cursor-pointer hover:bg-muted"
+              trailing-icon="i-lucide-x"
+              :aria-label="`清除状态筛选: ${statusItems.find(s => s.value === status)?.label}`"
+              class="font-normal"
               @click="updateQuery({ status: '', page: 1 })"
             >
               状态: {{ statusItems.find(s => s.value === status)?.label }}
-              <UIcon
-                name="i-lucide-x"
-                class="size-3"
-              />
-            </UBadge>
-            <UBadge
+            </UButton>
+            <UButton
               v-if="categoryId"
               color="neutral"
               variant="subtle"
               size="xs"
-              class="gap-1 cursor-pointer hover:bg-muted"
+              trailing-icon="i-lucide-x"
+              :aria-label="`清除分类筛选: ${categoryItems.find(c => c.value === categoryId)?.label}`"
+              class="font-normal"
               @click="updateQuery({ categoryId: '', page: 1 })"
             >
               分类: {{ categoryItems.find(c => c.value === categoryId)?.label }}
-              <UIcon
-                name="i-lucide-x"
-                class="size-3"
-              />
-            </UBadge>
-            <UBadge
+            </UButton>
+            <UButton
               v-if="productType"
               color="neutral"
               variant="subtle"
               size="xs"
-              class="gap-1 cursor-pointer hover:bg-muted"
+              trailing-icon="i-lucide-x"
+              :aria-label="`清除性质筛选: ${typeItems.find(t => t.value === productType)?.label}`"
+              class="font-normal"
               @click="updateQuery({ productType: '', page: 1 })"
             >
               性质: {{ typeItems.find(t => t.value === productType)?.label }}
-              <UIcon
-                name="i-lucide-x"
-                class="size-3"
-              />
-            </UBadge>
+            </UButton>
+            <UButton
+              v-if="isNonDefaultSort"
+              color="neutral"
+              variant="subtle"
+              size="xs"
+              trailing-icon="i-lucide-x"
+              :aria-label="`恢复默认排序: ${currentSortLabel}`"
+              class="font-normal"
+              @click="updateQuery({ sortBy: undefined, sortOrder: undefined, page: 1 })"
+            >
+              排序: {{ currentSortLabel }}
+            </UButton>
             <UButton
               size="xs"
               color="neutral"
               variant="ghost"
-              class="text-xs text-muted hover:text-highlighted"
+              class="text-xs text-muted hover:text-highlighted font-normal"
               @click="resetAllFilters"
             >
               清空全部筛选
