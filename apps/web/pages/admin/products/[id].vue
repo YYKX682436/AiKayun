@@ -3036,6 +3036,13 @@ onUnmounted(() => {
                           保存限购中…
                         </UBadge>
                         <UBadge
+                          v-else-if="sectionErrors.matrix || hasSkuPurchaseLimitsError"
+                          color="error"
+                          variant="subtle"
+                        >
+                          错误
+                        </UBadge>
+                        <UBadge
                           v-else-if="dirty.matrix || skuPurchaseLimitDraftDirty"
                           color="warning"
                           variant="subtle"
@@ -5391,20 +5398,20 @@ onUnmounted(() => {
                         保存中
                       </span>
                       <UBadge
-                        v-else-if="item.dirty"
-                        color="warning"
-                        variant="subtle"
-                        size="xs"
-                      >
-                        未保存
-                      </UBadge>
-                      <UBadge
                         v-else-if="item.error"
                         color="error"
                         variant="subtle"
                         size="xs"
                       >
                         错误
+                      </UBadge>
+                      <UBadge
+                        v-else-if="item.dirty"
+                        color="warning"
+                        variant="subtle"
+                        size="xs"
+                      >
+                        未保存
                       </UBadge>
                       <UIcon
                         v-else
@@ -5451,8 +5458,11 @@ onUnmounted(() => {
                       </div>
                     </dt>
                     <dd class="text-right font-medium text-highlighted tabular-nums">
-                      <template v-if="inventoryLoading || !totalStockStats">
+                      <template v-if="inventoryLoading">
                         <span class="text-xs font-normal text-dimmed">读取中…</span>
+                      </template>
+                      <template v-else-if="!totalStockStats">
+                        <span class="text-xs font-normal text-dimmed">暂不可用</span>
                       </template>
                       <template v-else-if="totalStockStats.quantitySkuCount > 0">
                         <div>{{ totalStockStats.totalAvailable }} 件</div>
