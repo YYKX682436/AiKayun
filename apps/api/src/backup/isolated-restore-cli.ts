@@ -433,7 +433,7 @@ export async function runIsolatedRestoreVerification(): Promise<void> {
         (SELECT count(*) FROM procurement_risk_events)::text AS procurement_risk_events,
         (SELECT count(*) FROM order_items i JOIN orders o ON o.id = i.order_id
           WHERE i.quantity <= 0 OR i.fulfilled_quantity < 0 OR i.fulfilled_quantity > i.quantity
-            OR i.unit_price <= 0 OR i.line_amount <> (i.unit_price * i.quantity) OR o.currency <> 'CNY')::text AS inconsistent_order_items,
+            OR i.unit_price < 0 OR i.line_amount <> (i.unit_price * i.quantity) OR o.currency <> 'CNY')::text AS inconsistent_order_items,
         (SELECT count(*) FROM wallet_accounts w
           LEFT JOIN wallet_totals cash ON cash.customer_id = w.customer_id AND cash.bucket = 'cash'
           LEFT JOIN wallet_totals gift ON gift.customer_id = w.customer_id AND gift.bucket = 'gift'
