@@ -21,6 +21,7 @@ import { codePoolFingerprint, decryptCodePoolContent } from '../src/commerce/cod
 import { insertNoFormPurchaseSnapshot } from './fixtures/purchase-line.js'
 import { createSignedBusinessLicense } from './fixtures/signed-business-license.js'
 import { startZpayHttpFixture } from './fixtures/zpay-http-server.js'
+import { createNewObligationGate, LicenseNewObligationError } from '../src/licensing/new-obligation-gate.js'
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL
 const testOrigin = 'http://localhost:3000'
@@ -4087,6 +4088,77 @@ describe('purchase limit acceptance on PostgreSQL', () => {
     expect(stale.statusCode).toBe(409)
     expect(stale.json().error.code).toBe('PRODUCT_REVISION_CONFLICT')
   })
+  it('allows concurrent orders across independent customers and SKUs without license singleton lock serialization', async () => {
+    const admin = await createAdmin()
+    const customer1 = await createCustomer()
+    const customer2 = await createCustomer()
+    const catalog1 = await createCatalog({ mode: 'quantity', stock: 5 })
+    const catalog2 = await createCatalog({ mode: 'quantity', stock: 5 })
+    await enableManual(catalog1, admin)
+    await enableManual(catalog2, admin)
+
+    const items1 = [{ skuId: catalog1.skuId, quantity: 1 }]
+    const items2 = [{ skuId: catalog2.skuId, quantity: 1 }]
+    const quote1 = await quote(items1, customer1)
+    const quote2 = await quote(items2, customer2)
+    expect(quote1.statusCode).toBe(200)
+    expect(quote2.statusCode).toBe(200)
+
+    const gate = createNewObligationGate({
+      db, pool: licensePool, identityRoot: appConfig.identityRoot,
+      pendingKeyRoot: appConfig.licensePendingKeyRoot,
+      trustStoreRoot: appConfig.licenseTrustStoreRoot,
+      test: { releaseConfig: licenseFixture.options.releaseConfig, trustStore: licenseFixture.options.trustStore, pool: licensePool },
+    })
+
+    let releaseT1!: () => void
+    let signalT1Locked!: () => void
+    const t1Gate = new Promise<void>(resolve => { releaseT1 = resolve })
+    const t1Locked = new Promise<void>(resolve => { signalT1Locked = resolve })
+
+    // Transaction 1 enters gate check (acquiring FOR SHARE on instance_license_state,
+    // installation_binding, and shared advisory lock) and holds them without committing.
+    const t1 = db.transaction().execute(async (trx1) => {
+      await gate.withTransactionScope(async () => {
+        await gate.assertNewObligationAllowed(trx1, 'create_order')
+      })
+      signalT1Locked()
+      await t1Gate
+    })
+
+    await t1Locked
+
+    // While Transaction 1 is still open and holding the license admission locks:
+    // Under the previous architecture, Customer 2 calling createOrder would attempt to acquire
+    // FOR UPDATE on instance_license_state or UPDATE instance_license_state, blocking until T1 finished.
+    // Under our refactored architecture, Customer 2 completes immediately without blocking!
+    const key2 = randomUUID()
+    const order2 = await createOrder(items2, quote2.json().data.quoteToken, customer2, key2)
+    expect(order2.statusCode).toBe(201)
+    const order2Id = order2.json().data.order.id
+    expect(order2Id).toBeDefined()
+
+    // Concurrently, wallet top-up admission check also succeeds under the shared admission lock
+    await db.transaction().execute(async (trxTopUp) => {
+      await gate.withTransactionScope(async () => {
+        await gate.assertNewObligationAllowed(trxTopUp, 'create_top_up')
+      })
+    })
+
+    // Release Transaction 1 so it completes cleanly
+    releaseT1()
+    await t1
+
+    // Idempotency replay with the same key returns the existing order and created: false
+    const replay2 = await createOrder(items2, quote2.json().data.quoteToken, customer2, key2)
+    expect(replay2.statusCode).toBe(200)
+    expect(replay2.json().data).toMatchObject({ created: false, order: { id: order2Id } })
+
+    // Conflicting idempotency payload returns 409
+    const conflict2 = await createOrder([{ skuId: catalog2.skuId, quantity: 2 }], quote2.json().data.quoteToken, customer2, key2)
+    expect(conflict2.statusCode).toBe(409)
+    expect(conflict2.json().error.code).toBe('ORDER_IDEMPOTENCY_CONFLICT')
+  })
   it('preserves an existing order and idempotency after the frozen center revocation is projected', async () => {
     const admin = await createAdmin()
     const customer = await createCustomer()
@@ -4111,6 +4183,14 @@ describe('purchase limit acceptance on PostgreSQL', () => {
     expect(denied.statusCode).toBe(403)
     expect(denied.json().error.code).toBe('LICENSE_NEW_OBLIGATION_BLOCKED')
     expect(await db.selectFrom('orders').select('id').where('idempotency_key', '=', deniedKey).execute()).toHaveLength(0)
+    const postRevocationGate = createNewObligationGate({
+      db, pool: licensePool, identityRoot: appConfig.identityRoot,
+      pendingKeyRoot: appConfig.licensePendingKeyRoot,
+      trustStoreRoot: appConfig.licenseTrustStoreRoot,
+      test: { releaseConfig: licenseFixture.options.releaseConfig, trustStore: licenseFixture.options.trustStore, pool: licensePool },
+    })
+    await expect(postRevocationGate.withTransactionScope(() => db.transaction().execute(trx => postRevocationGate.assertNewObligationAllowed(trx, 'create_top_up'))))
+      .rejects.toBeInstanceOf(LicenseNewObligationError)
     expect((await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie } })).statusCode).toBe(200)
     expect((await inject({ method: 'POST', url: `/api/v1/customer/orders/${orderId}/cancel`, headers: customerHeaders(customer) })).statusCode).toBe(200)
   }, 90_000)

@@ -67,15 +67,12 @@ pnpm build:packages
 export NODE_ENV=test
 export TEST_DATABASE_URL="postgres://license:license-test-only@127.0.0.1:${postgres_port}/${database_name}"
 export LICENSE_CENTER_CHECKOUT="$center_checkout"
+readonly test_files="${TEST_FILES:-test/license-center-challenge.interop.test.ts test/license-operation-store.integration.test.ts test/admin-activation.interop.integration.test.ts}"
 if [[ -n "$test_filter" ]]; then
   pnpm --filter @aikayun/api exec vitest run \
-    test/license-center-challenge.interop.test.ts \
-    test/license-operation-store.integration.test.ts \
-    test/admin-activation.interop.integration.test.ts \
+    $test_files \
     --testNamePattern "$test_filter"
 else
   pnpm --filter @aikayun/api exec vitest run \
-    test/license-center-challenge.interop.test.ts \
-    test/license-operation-store.integration.test.ts \
-    test/admin-activation.interop.integration.test.ts
+    $test_files
 fi

@@ -29,10 +29,9 @@ function parseWatermark(value: string | null): number | null {
 }
 
 /**
- * Caller must already hold installation_binding then instance_license_state FOR UPDATE.
- * File first, then DB: a rolled back/unknown SQL commit can only leave the durable file ahead.
+ * Read-only verification of trusted time. Does not mutate the DB row or watermark file.
  */
-export async function advanceLicenseTrustedTime(input: {
+export async function verifyLicenseTrustedTime(input: {
   tx: LicenseStateTransaction
   row: LicenseStateRow
   pendingRoot: string
@@ -83,9 +82,30 @@ export async function advanceLicenseTrustedTime(input: {
     throw new LicenseClockSuspectError('clock_rollback')
   }
 
+  return Object.freeze({ trustedTimeMs: floor, trustedTimeSeconds: Math.floor(floor / 1_000) })
+}
+
+/**
+ * Caller must already hold installation_binding then instance_license_state FOR UPDATE.
+ * File first, then DB: a rolled back/unknown SQL commit can only leave the durable file ahead.
+ */
+export async function advanceLicenseTrustedTime(input: {
+  tx: LicenseStateTransaction
+  row: LicenseStateRow
+  pendingRoot: string
+  identity: TimeWatermarkIdentity
+  signedTimeMs?: number | null
+  databaseTimeMs?: number
+  useProcessAnchor?: boolean
+}): Promise<{ readonly trustedTimeMs: number; readonly trustedTimeSeconds: number }> {
+  const verified = await verifyLicenseTrustedTime(input)
+  const persistedDbMs = parseWatermark(input.row.trusted_time_high_water_ms)
+  const file = await readTrustedTimeWatermark(input.pendingRoot, input.identity)
+  const fileMs = file.status === 'valid' ? file.record.high_water_ms : null
+
   // Preserve millisecond precision so the half-open JWT boundary is exact; JWT exp values
   // are integer seconds, and flooring below rejects at exp while preserving the final valid ms.
-  const durableFloorMs = floor
+  const durableFloorMs = verified.trustedTimeMs
   if (file.status !== 'valid' || fileMs! < durableFloorMs) {
     await advanceTrustedTimeWatermarkFile(input.pendingRoot, input.identity, durableFloorMs)
   }
@@ -93,5 +113,5 @@ export async function advanceLicenseTrustedTime(input: {
     await input.tx.updateTable('instance_license_state').set({ trusted_time_high_water_ms: String(durableFloorMs) })
       .where('singleton', '=', true).executeTakeFirstOrThrow()
   }
-  return Object.freeze({ trustedTimeMs: durableFloorMs, trustedTimeSeconds: Math.floor(durableFloorMs / 1_000) })
+  return verified
 }

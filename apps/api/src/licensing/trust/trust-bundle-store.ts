@@ -1034,6 +1034,13 @@ export class TrustBundleStore {
   async holdForTransaction(): Promise<void> {
     const scope = transactionScope.getStore();
     if (!scope || scope.closed) throw new Error('Trust admission requires an enclosing transaction scope');
+    if (this.coordinator) {
+      if (scope.directory && scope.directory !== this.directory) {
+        throw new Error('A transaction cannot mix trust directories');
+      }
+      scope.directory = this.directory;
+      return;
+    }
     if (scope.release) {
       if (scope.directory !== this.directory) throw new Error('A transaction cannot mix trust directories');
       return;
