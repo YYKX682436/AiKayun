@@ -44,13 +44,24 @@ get_version_tag() {
 sync_source() {
   log_info "Syncing local repository to ${SSH_HOST}:${REMOTE_SRC_DIR}..."
   rsync -az --delete \
-    --exclude='node_modules' \
     --exclude='.git' \
+    --exclude='.env' \
+    --exclude='.env.*' \
+    --exclude='node_modules' \
+    --exclude='.pnpm-store' \
+    --exclude='.nuxt' \
     --exclude='.output' \
     --exclude='dist' \
+    --exclude='coverage' \
+    --exclude='playwright-report' \
+    --exclude='test-results' \
     --exclude='.agents' \
     --exclude='.serena' \
     --exclude='.gemini' \
+    --exclude='.vscode' \
+    --exclude='.idea' \
+    --exclude='.DS_Store' \
+    --exclude='*.log' \
     --exclude='tmp' \
     ./ "${SSH_HOST}:${REMOTE_SRC_DIR}/"
   log_success "Source synced."
@@ -175,28 +186,73 @@ compose_cmd() {
   echo "sudo -n docker compose -f ${RELEASE_COMPOSE} -f ${LICENSE_OVERLAY} -f ${OPT_OVERLAY} --env-file ${ENV_FILE}"
 }
 
-deploy_services() {
+wait_for_services() {
+  local cmd="$1"
+  shift
   local services=("$@")
-  local cmd
-  cmd="$(compose_cmd)"
-  log_info "Deploying service(s): ${services[*]}..."
-  run_ssh "${cmd} up -d ${services[*]}"
-  log_info "Waiting for healthy status..."
-  local timeout=45
+  local timeout=60
   local interval=3
   local elapsed=0
+
+  log_info "Waiting for service(s) to become healthy: ${services[*]}..."
+
   while [ $elapsed -lt $timeout ]; do
-    local unhealthy
-    unhealthy="$(run_ssh "${cmd} ps --filter 'status=running' --format '{{.Service}} {{.Health}}' | grep -v -E 'healthy|^$' || true")"
-    if [ -z "$unhealthy" ]; then
-      log_success "All targeted services are healthy!"
+    local all_healthy=true
+    local status_lines
+    status_lines="$(run_ssh "${cmd} ps -a ${services[*]} --format '{{.Service}}\t{{.State}}\t{{.Health}}'")"
+
+    for svc in "${services[@]}"; do
+      local line
+      line="$(grep -E "^${svc}[[:space:]]" <<< "$status_lines" || true)"
+      if [ -z "$line" ]; then
+        log_err "Target service '${svc}' not found in compose project."
+        return 1
+      fi
+
+      local svc_name state health
+      svc_name="$(awk '{print $1}' <<< "$line")"
+      state="$(awk '{print $2}' <<< "$line")"
+      health="$(awk '{print $3}' <<< "$line")"
+
+      if [ "$state" = "exited" ] || [ "$state" = "dead" ]; then
+        log_err "Target service '${svc}' failed (state=${state})."
+        run_ssh "${cmd} logs --tail=50 ${svc}"
+        return 1
+      fi
+
+      if [ "$health" = "unhealthy" ]; then
+        log_err "Target service '${svc}' reported unhealthy."
+        run_ssh "${cmd} logs --tail=50 ${svc}"
+        return 1
+      fi
+
+      if [ "$state" != "running" ] || [ "$health" != "healthy" ]; then
+        all_healthy=false
+      fi
+    done
+
+    if [ "$all_healthy" = true ]; then
+      log_success "All targeted service(s) [${services[*]}] are running and healthy!"
       return 0
     fi
+
     sleep $interval
     elapsed=$((elapsed + interval))
   done
-  log_warn "Some services may still be initializing. Checking compose status..."
-  run_ssh "${cmd} ps"
+
+  log_err "Timed out waiting for service(s) [${services[*]}] to become healthy after ${timeout}s."
+  run_ssh "${cmd} ps -a ${services[*]}"
+  return 1
+}
+
+deploy_services() {
+  local services=("$@")
+  ensure_dev_overlay_exists
+  local cmd
+  cmd="$(compose_cmd)"
+  log_info "Deploying service(s): ${services[*]}..."
+  run_ssh "${cmd} up -d --no-deps ${services[*]}"
+  wait_for_services "$cmd" "${services[@]}"
 }
 
 check_status() {
@@ -226,18 +282,27 @@ db_reset_data() {
   log_warn "Resetting commerce test data on dev store..."
   log_warn "Target Database: aikayun (Postgres container: aikayun-db-1)"
   log_warn "Preserved: installation_binding, instance_license_state, admin_users, migrations"
-  
-  run_ssh "sudo -n docker exec aikayun-db-1 psql -U aikayun_bootstrap -d aikayun -c \"
+
+  ensure_dev_overlay_exists
+  local cmd
+  cmd="$(compose_cmd)"
+
+  log_info "Pausing Web and API services to prevent concurrent database writes..."
+  run_ssh "${cmd} stop web api"
+
+  local reset_err=0
+
+  log_info "Executing safe table truncate (RESTRICT mode) on non-system commerce tables..."
+  run_ssh "sudo -n docker exec aikayun-db-1 psql -U aikayun_bootstrap -d aikayun -v ON_ERROR_STOP=1 -c \"
 DO \\\$\\\$
 DECLARE
   cur_db text := current_database();
   target_tables text;
+  r record;
 BEGIN
   IF cur_db <> 'aikayun' THEN
     RAISE EXCEPTION 'SAFETY GATE TRIGGERED: Refusing to reset non-store database: %', cur_db;
   END IF;
-
-  SET LOCAL session_replication_role = replica;
 
   SELECT string_agg(quote_ident(tablename), ', ')
   INTO target_tables
@@ -258,24 +323,113 @@ BEGIN
     );
 
   IF target_tables IS NOT NULL AND target_tables <> '' THEN
-    EXECUTE 'TRUNCATE TABLE ' || target_tables || ' RESTART IDENTITY CASCADE';
+    FOR r IN (
+      SELECT quote_ident(tablename) AS tbl
+      FROM pg_tables
+      WHERE schemaname = 'public'
+        AND tablename NOT IN (
+          'installation_binding',
+          'installation_identity_initializations',
+          'instance_license_state',
+          'local_license_operations',
+          'local_license_operation_attempts',
+          'admin_setup_state',
+          'admin_users',
+          'admin_sessions',
+          'admin_setup_sessions',
+          'kysely_migration',
+          'kysely_migration_lock'
+        )
+    ) LOOP
+      EXECUTE 'ALTER TABLE ' || r.tbl || ' DISABLE TRIGGER USER';
+    END LOOP;
+
+    EXECUTE 'TRUNCATE TABLE ' || target_tables || ' RESTART IDENTITY RESTRICT';
+
+    FOR r IN (
+      SELECT quote_ident(tablename) AS tbl
+      FROM pg_tables
+      WHERE schemaname = 'public'
+        AND tablename NOT IN (
+          'installation_binding',
+          'installation_identity_initializations',
+          'instance_license_state',
+          'local_license_operations',
+          'local_license_operation_attempts',
+          'admin_setup_state',
+          'admin_users',
+          'admin_sessions',
+          'admin_setup_sessions',
+          'kysely_migration',
+          'kysely_migration_lock'
+        )
+    ) LOOP
+      EXECUTE 'ALTER TABLE ' || r.tbl || ' ENABLE TRIGGER USER';
+    END LOOP;
   END IF;
 END \\\$\\\$;
-\""
+\"" || reset_err=1
 
-  # Clean media and private files directory in state volume, preserving identity & license
-  run_ssh "sudo -n find /data/docker/volumes/aikayun_state/_data/media -mindepth 1 -delete 2>/dev/null || true; \
-sudo -n find /data/docker/volumes/aikayun_state/_data/private-files -mindepth 1 -delete 2>/dev/null || true"
+  if [ $reset_err -eq 0 ]; then
+    log_info "Cleaning media and private-files in aikayun_state volume..."
+    run_ssh "bash -s" <<'CLEAN_EOF' || reset_err=1
+set -Eeuo pipefail
+vol_mount="$(sudo -n docker volume inspect aikayun_state --format '{{.Mountpoint}}' 2>/dev/null || true)"
+if [ -z "$vol_mount" ] || [ ! -d "$vol_mount" ]; then
+  echo "ERROR: aikayun_state volume mountpoint not found or invalid: '$vol_mount'" >&2
+  exit 1
+fi
 
-  log_success "Store test data has been reset cleanly."
-  log_info "Verification:"
-  run_ssh "sudo -n docker exec aikayun-db-1 psql -U aikayun_bootstrap -d aikayun -c \"
-SELECT count(*) AS binding_count FROM installation_binding;
-SELECT count(*) AS license_count FROM instance_license_state;
-SELECT count(*) AS admin_count FROM admin_users;
-SELECT count(*) AS order_count FROM orders;
-SELECT count(*) AS product_count FROM products;
-\""
+media_dir="${vol_mount}/media"
+private_files_dir="${vol_mount}/private-files"
+
+if [ ! -d "$media_dir" ]; then
+  echo "ERROR: media directory not found: '$media_dir'" >&2
+  exit 1
+fi
+if [ ! -d "$private_files_dir" ]; then
+  echo "ERROR: private-files directory not found: '$private_files_dir'" >&2
+  exit 1
+fi
+
+sudo -n find "$media_dir" -mindepth 1 -delete
+sudo -n find "$private_files_dir" -mindepth 1 -delete
+CLEAN_EOF
+  fi
+
+  log_info "Resuming Web and API services..."
+  run_ssh "${cmd} up -d --no-deps web api"
+  wait_for_services "$cmd" web api
+
+  if [ $reset_err -ne 0 ]; then
+    log_err "Store reset failed."
+    return 1
+  fi
+
+  log_info "Verifying preserved admin and license bindings..."
+  local check_result
+  check_result="$(run_ssh "sudo -n docker exec aikayun-db-1 psql -U aikayun_bootstrap -d aikayun -t -A -c \"
+SELECT 
+  (SELECT count(*) FROM installation_binding) || '|' ||
+  (SELECT count(*) FROM instance_license_state) || '|' ||
+  (SELECT count(*) FROM admin_users) || '|' ||
+  (SELECT count(*) FROM orders) || '|' ||
+  (SELECT count(*) FROM products);
+\"")"
+
+  local b_count l_count a_count o_count p_count
+  IFS='|' read -r b_count l_count a_count o_count p_count <<< "$check_result"
+  if [ "${b_count:-0}" -lt 1 ] || [ "${l_count:-0}" -lt 1 ] || [ "${a_count:-0}" -lt 1 ]; then
+    log_err "CRITICAL SAFETY FAILURE: Protected tables compromised! (binding=${b_count}, license=${l_count}, admin=${a_count})"
+    return 1
+  fi
+
+  log_success "Store test data reset successfully."
+  printf "  - installation_binding: %s (preserved)\n" "$b_count"
+  printf "  - instance_license_state: %s (preserved)\n" "$l_count"
+  printf "  - admin_users: %s (preserved)\n" "$a_count"
+  printf "  - orders: %s (cleared)\n" "$o_count"
+  printf "  - products: %s (cleared)\n" "$p_count"
 }
 
 case "${1:-help}" in
