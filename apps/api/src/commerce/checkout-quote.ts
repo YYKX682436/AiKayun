@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto'
 import { sql, type Kysely, type Transaction } from 'kysely'
 import {
-  type CartSkuQuantity,
   type CheckoutRequestLineV2,
   type CheckoutQuote,
   type CheckoutQuoteItem,
@@ -21,7 +20,9 @@ import type { PurchaseDraftOwner } from './purchase-forms.js'
 import { normalizePurchaseLineRequests, resolvePurchaseLinesInTransaction,
   type ResolvedPurchaseLine } from './purchase-lines.js'
 
-const maxCartLines = 50
+export type SkuQuantity = { skuId: string; quantity: number }
+
+const maxPurchaseLines = 1
 const maxLineQuantity = 99
 
 export class CheckoutQuoteError extends Error {
@@ -77,12 +78,12 @@ type QuoteSkuRow = {
   required_purchase_form_version_id: string | null
 }
 
-export function normalizeCheckoutItems(items: CartSkuQuantity[]): CartSkuQuantity[] {
+export function normalizeCheckoutItems(items: SkuQuantity[]): SkuQuantity[] {
   const quantities = new Map<string, number>()
   for (const item of items) {
     const quantity = (quantities.get(item.skuId) ?? 0) + item.quantity
     if (quantity > maxLineQuantity) {
-      throw new CheckoutQuoteError(400, 'CART_QUANTITY_LIMIT', `同一 SKU 的数量不能超过 ${maxLineQuantity}。`)
+      throw new CheckoutQuoteError(400, 'PURCHASE_QUANTITY_LIMIT', `同一规格的数量不能超过 ${maxLineQuantity}。`)
     }
     quantities.set(item.skuId, quantity)
   }
@@ -90,7 +91,7 @@ export function normalizeCheckoutItems(items: CartSkuQuantity[]): CartSkuQuantit
     .map(([skuId, quantity]) => ({ skuId, quantity }))
 }
 
-export function checkoutRequestHash(items: CartSkuQuantity[]): string {
+export function checkoutRequestHash(items: SkuQuantity[]): string {
   return createHash('sha256').update(JSON.stringify(normalizeCheckoutItems(items))).digest('hex')
 }
 
@@ -170,15 +171,15 @@ function purchaseLimitStatus(options: {
  */
 export async function quoteCheckoutItems(
   db: Db,
-  inputItems: CartSkuQuantity[],
+  inputItems: SkuQuantity[],
   customerId: string | null,
   config: AppConfig,
   options: { skipPurchaseFormRequirement?: boolean } = {},
 ): Promise<CheckoutQuote> {
   const customerAuthenticated = customerId !== null
   const items = normalizeCheckoutItems(inputItems)
-  if (items.length > maxCartLines) {
-    throw new CheckoutQuoteError(400, 'CART_ITEM_LIMIT', `一次报价最多包含 ${maxCartLines} 个 SKU。`)
+  if (items.length !== maxPurchaseLines) {
+    throw new CheckoutQuoteError(400, 'PURCHASE_ITEM_LIMIT', '每笔订单只允许购买一个规格。')
   }
   const skuIds = items.map(item => item.skuId)
   const quantities = items.map(item => item.quantity)

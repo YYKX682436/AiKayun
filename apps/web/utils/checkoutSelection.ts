@@ -19,13 +19,13 @@ function readSelections(): StoredSelection[] {
   const parsed = JSON.parse(raw) as unknown
   if (!Array.isArray(parsed) || parsed.length > 100 || parsed.some(item => !item || typeof item !== 'object'
     || typeof item.id !== 'string' || typeof item.fingerprint !== 'string' || !Array.isArray(item.items))) {
-    throw new Error('本机结算选择记录无效，请重新从购物车进入。')
+    throw new Error('本机结算选择记录无效，请重新发起购买。')
   }
   return parsed as StoredSelection[]
 }
 
 export function saveCheckoutSelection(items: CheckoutRequestLineV2[]): string {
-  if (!import.meta.client) return '/cart'
+  if (!import.meta.client) return '/products'
   const sharedId = readSharedSelectionId(items)
   if (sharedId) return `/checkout?intent=${encodeURIComponent(sharedId)}`
   const fingerprint = selectionFingerprint(items)
@@ -40,7 +40,7 @@ export function saveCheckoutSelection(items: CheckoutRequestLineV2[]): string {
 
 /** Create a new opaque selection after an explicit ownership transition. */
 export function saveFreshCheckoutSelection(items: CheckoutRequestLineV2[]): string {
-  if (!import.meta.client) return '/cart'
+  if (!import.meta.client) return '/products'
   const fingerprint = selectionFingerprint(items)
   const selections = readSelections()
   const id = crypto.randomUUID()

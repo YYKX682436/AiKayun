@@ -93,6 +93,7 @@ beforeAll(async () => {
     '202611090002_storefront_featured_products',
     '202611100001_storefront_support_settings',
     '202611100002_payment_expiry_and_refund_completion',
+    '202611160001_remove_shopping_cart',
   ])
   const repeat = await migrator.migrateToLatest(); if (repeat.error) throw repeat.error
   expect(repeat.results).toEqual([])

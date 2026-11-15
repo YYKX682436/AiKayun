@@ -1068,8 +1068,7 @@ describe('Fastify API with PostgreSQL 18', () => {
     expect(result.rows.map((row) => row.table_name)).toEqual([
       'admin_product_creation_requests', 'admin_sessions', 'admin_setup_sessions', 'admin_setup_state', 'admin_users',
       'api_fulfillment_audit_events', 'code_pool_batches',
-      'code_pool_entries', 'code_pool_withdrawal_entries', 'customer_cart_items', 'customer_cart_line_replacement_drafts',
-      'customer_cart_merge_requests', 'customer_management_audit',
+      'code_pool_entries', 'code_pool_withdrawal_entries', 'customer_management_audit',
       'customer_sessions', 'customers', 'guest_order_sessions',
       'installation_binding', 'installation_identity_initializations', 'instance_license_state',
       'local_license_operation_attempts', 'local_license_operations',

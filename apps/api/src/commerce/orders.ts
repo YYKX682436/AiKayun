@@ -32,6 +32,7 @@ import {
 import type {
   AdminOrderDetail,
   AdminOrderPage,
+  CheckoutQuote,
   CreateOrderBody,
   ManualFulfillmentDeliveryBody,
   OrderPurchaseData,
@@ -54,8 +55,8 @@ import {
   verifyDoubleSubmitCsrf,
 } from '../auth/security.js'
 import type { Database, FulfillmentMethod, OrderStatus as DbOrderStatus } from '../db/types.js'
-import { CheckoutQuoteError, checkoutRequestHash, normalizeCheckoutItems,
-  quoteCheckoutItems, quoteCheckoutPurchaseLines } from './checkout-quote.js'
+import { CheckoutQuoteError,
+  quoteCheckoutPurchaseLines } from './checkout-quote.js'
 import { normalizePurchaseLineRequests, purchaseLineContentIdentity,
   purchaseLineRequestHash, PurchaseLineError, type ResolvedPurchaseLine } from './purchase-lines.js'
 import { PurchaseDraftServiceError, type PurchaseDraftOwner } from './purchase-forms.js'
@@ -95,7 +96,7 @@ class OrderError extends Error {
 }
 
 class CheckoutConflict extends Error {
-  constructor(readonly code: string, override readonly message: string, readonly currentQuote: Awaited<ReturnType<typeof quoteCheckoutItems>>) {
+  constructor(readonly code: string, override readonly message: string, readonly currentQuote: CheckoutQuote) {
     super(message)
     this.name = 'CheckoutConflict'
   }
@@ -583,10 +584,8 @@ async function createOrderTransaction(
   gate: NewObligationGate,
   expectedGuestSessionId?: string,
 ): Promise<{ created: boolean; order: OrderDetail }> {
-  const v2 = 'version' in body && body.version === 2
-  const legacyItems = v2 ? null : normalizeCheckoutItems(body.items)
-  const requestedLines = v2 ? normalizePurchaseLineRequests(body.items) : null
-  const requestHash = v2 ? purchaseLineRequestHash(body.items) : checkoutRequestHash(legacyItems!)
+  const requestedLines = normalizePurchaseLineRequests(body.items)
+  const requestHash = purchaseLineRequestHash(body.items)
   let ownerType: 'customer' | 'guest'
   let ownerId: string
   if (customer) {
@@ -596,7 +595,7 @@ async function createOrderTransaction(
     ownerType = 'customer'
     ownerId = customer.id
   } else {
-    ownerId = await assertGuestSession(trx, guestToken, v2)
+    ownerId = await assertGuestSession(trx, guestToken, true)
     ownerType = 'guest'
   }
   assertExpectedGuestOwner(expectedGuestSessionId, ownerType, ownerId)
@@ -607,13 +606,12 @@ async function createOrderTransaction(
 
   await trx.selectFrom('storefront_customer_policy').select('singleton')
     .where('singleton', '=', true).forShare().executeTakeFirstOrThrow()
-  await lockCheckoutCatalog(trx, (v2 ? requestedLines! : legacyItems!).map(item => item.skuId))
+  await lockCheckoutCatalog(trx, requestedLines.map(item => item.skuId))
   const owner: PurchaseDraftOwner = customer
     ? { kind: 'customer', customer }
     : { kind: 'guest', guestSessionToken: guestToken ?? '' }
-  const purchaseQuote = v2 ? await quoteCheckoutPurchaseLines(trx, body.items, owner, config) : null
-  const currentQuote = purchaseQuote?.quote
-    ?? await quoteCheckoutItems(trx, legacyItems!, customer?.id ?? null, config)
+  const purchaseQuote = await quoteCheckoutPurchaseLines(trx, body.items, owner, config)
+  const currentQuote = purchaseQuote.quote
   if (currentQuote.quoteToken !== body.quoteToken) {
     throw new CheckoutConflict('CHECKOUT_QUOTE_CHANGED', '价格、商品状态、库存、限购规则或可购额度已变化，请核对最新报价后重新提交。', currentQuote)
   }
@@ -678,7 +676,7 @@ async function createOrderTransaction(
       line_amount: item.lineTotal,
     }).execute()
     const resolved = item.lineId ? resolvedLines.get(item.lineId) : null
-    if (v2 && !resolved) throw new Error('Version 2 quote is missing its resolved purchase line')
+    if (!resolved) throw new Error('Order quote is missing its resolved purchase line')
     await persistOrderPurchaseSnapshotInTransaction(trx, config, {
       orderItemId,
       contentIdentity: resolved?.contentIdentity ?? purchaseLineContentIdentity(item.skuId, null, null, null),

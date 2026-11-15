@@ -190,18 +190,11 @@ beforeAll(async () => {
 afterAll(async () => { if (db) await db.destroy() })
 
 describe('⑥-2B forward purchase data gates in PostgreSQL', () => {
-  it('preserves old deleted-SKU cart and order facts without inventing form snapshots', async () => {
+  it('preserves old order facts without inventing form snapshots and confirms cart tables are dropped', async () => {
     expect(await db.selectFrom('storefront_customer_policy').select('purchase_forms_status')
       .executeTakeFirstOrThrow()).toMatchObject({ purchase_forms_status: 'preparing' })
-    const oldLine = await db.selectFrom('customer_cart_items').selectAll()
-      .where('customer_id', '=', oldCustomerId).executeTakeFirstOrThrow()
-    expect(oldLine).toMatchObject({
-      sku_id: oldSkuId, quantity: 7, revision: 1,
-      content_identity: noFormIdentity(oldSkuId),
-      draft_id: null, template_version_id: null,
-    })
-    expect(oldLine.created_at.toISOString()).toBe('2026-10-01T00:00:00.000Z')
-    expect(oldLine.updated_at.toISOString()).toBe('2026-10-01T00:00:00.000Z')
+    const cartTable = await sql<{ to_regclass: string | null }>`SELECT to_regclass('public.customer_cart_items')`.execute(db)
+    expect(cartTable.rows[0].to_regclass).toBeNull()
     expect(await db.selectFrom('orders').select(['purchase_snapshot_version', 'request_sha256'])
       .where('id', '=', oldOrderId).executeTakeFirstOrThrow())
       .toMatchObject({ purchase_snapshot_version: 1, request_sha256: 'b'.repeat(64) })
@@ -214,17 +207,7 @@ describe('⑥-2B forward purchase data gates in PostgreSQL', () => {
     }).execute()).rejects.toMatchObject({ constraint: 'order_purchase_snapshot_insert_invalid' })
   })
 
-  it('deduplicates migrated no-form rows, increments line revision, and rejects forged old orders', async () => {
-    const oldLine = await db.selectFrom('customer_cart_items').select(['line_id', 'revision', 'content_identity'])
-      .where('customer_id', '=', oldCustomerId).executeTakeFirstOrThrow()
-    await expect(db.insertInto('customer_cart_items').values({
-      customer_id: oldCustomerId, sku_id: oldSkuId, quantity: 1,
-      content_identity: oldLine.content_identity,
-      draft_id: null, draft_revision: null, template_version_id: null, normalization_version: null,
-    }).execute()).rejects.toMatchObject({ constraint: 'customer_cart_items_content_unique' })
-    const updated = await db.updateTable('customer_cart_items').set({ quantity: 8 })
-      .where('line_id', '=', oldLine.line_id).returning(['line_id', 'revision']).executeTakeFirstOrThrow()
-    expect(updated).toMatchObject({ line_id: oldLine.line_id, revision: oldLine.revision + 1 })
+  it('rejects forged old orders without purchase snapshot version', async () => {
     await expect(db.insertInto('orders').values({
       id: randomUUID(), customer_id: oldCustomerId, guest_order_session_id: null,
       idempotency_key: randomUUID(), request_sha256: 'a'.repeat(64),
@@ -234,45 +217,14 @@ describe('⑥-2B forward purchase data gates in PostgreSQL', () => {
     }).execute()).rejects.toMatchObject({ constraint: 'orders_purchase_snapshot_version_required' })
   })
 
-  it('allows only a coordinated draft payload edit and enforces cart content and draft uniqueness', async () => {
+  it('allows draft payload edits directly without cart bindings', async () => {
     const owner = await customer()
-    const skuId = randomUUID()
     const versionId = await templateVersion()
     const draftA = await draft(owner, versionId)
-    const draftB = await draft(owner, versionId)
-    const lineA = await db.insertInto('customer_cart_items').values({
-      customer_id: owner, sku_id: skuId, quantity: 1,
-      content_identity: '1'.repeat(64), draft_id: draftA,
-      draft_revision: 1, template_version_id: versionId, normalization_version: 1,
-    }).returning(['line_id', 'revision']).executeTakeFirstOrThrow()
-    await expect(db.insertInto('customer_cart_items').values({
-      customer_id: owner, sku_id: skuId, quantity: 1,
-      content_identity: '1'.repeat(64), draft_id: draftB,
-      draft_revision: 1, template_version_id: versionId, normalization_version: 1,
-    }).execute()).rejects.toMatchObject({ constraint: 'customer_cart_items_content_unique' })
-    await expect(db.insertInto('customer_cart_items').values({
-      customer_id: owner, sku_id: randomUUID(), quantity: 1,
-      content_identity: '2'.repeat(64), draft_id: draftA,
-      draft_revision: 1, template_version_id: versionId, normalization_version: 1,
-    }).execute()).rejects.toMatchObject({ constraint: 'customer_cart_items_draft_unique' })
-    await expect(db.updateTable('purchase_drafts').set({ encrypted_payload: Buffer.from([2]) })
-      .where('id', '=', draftA).execute()).rejects.toMatchObject({
-      constraint: 'purchase_draft_cart_payload_binding',
-    })
-    expect((await db.selectFrom('purchase_drafts').select('revision')
-      .where('id', '=', draftA).executeTakeFirstOrThrow()).revision).toBe(1)
-    await db.transaction().execute(async (trx) => {
-      const changed = await trx.updateTable('purchase_drafts')
-        .set({ encrypted_payload: Buffer.from([3]) }).where('id', '=', draftA)
-        .returning('revision').executeTakeFirstOrThrow()
-      await trx.updateTable('customer_cart_items').set({
-        draft_revision: changed.revision, content_identity: '3'.repeat(64),
-      }).where('line_id', '=', lineA.line_id).execute()
-    })
-    expect(await db.selectFrom('customer_cart_items').select(['revision', 'content_identity', 'draft_revision'])
-      .where('line_id', '=', lineA.line_id).executeTakeFirstOrThrow()).toMatchObject({
-      revision: lineA.revision + 1, content_identity: '3'.repeat(64), draft_revision: 2,
-    })
+    await db.updateTable('purchase_drafts').set({ encrypted_payload: Buffer.from([3]) })
+      .where('id', '=', draftA).execute()
+    expect((await db.selectFrom('purchase_drafts').select('id')
+      .where('id', '=', draftA).executeTakeFirstOrThrow()).id).toBe(draftA)
   })
 
   it('rejects same-SKU split lines when their combined SKU limit or stock is exceeded', async () => {

@@ -52,7 +52,7 @@ export function purchaseLineContentIdentity(
 }
 
 export function normalizePurchaseLineRequests(items: PurchaseLineRequest[]): NormalizedPurchaseLineRequest[] {
-  if (items.length < 1 || items.length > 50) throw new PurchaseLineError('CART_ITEM_LIMIT', '一次购买最多包含 50 个购买行。')
+  if (items.length !== 1) throw new PurchaseLineError('PURCHASE_ITEM_LIMIT', '每笔订单只允许购买一个规格。')
   const lineIds = new Set<string>()
   const draftIds = new Set<string>()
   const skuQuantities = new Map<string, number>()
@@ -72,10 +72,10 @@ export function normalizePurchaseLineRequests(items: PurchaseLineRequest[]): Nor
       throw new PurchaseLineError('PURCHASE_LINE_REVISION_INVALID', '购买行草稿修订无效。')
     }
     if (!Number.isSafeInteger(item.quantity) || item.quantity < 1 || item.quantity > 99) {
-      throw new PurchaseLineError('CART_QUANTITY_LIMIT', '购买行数量必须为 1 至 99。')
+      throw new PurchaseLineError('PURCHASE_QUANTITY_LIMIT', '购买行数量必须为 1 至 99。')
     }
     const total = (skuQuantities.get(skuId) ?? 0) + item.quantity
-    if (total > 99) throw new PurchaseLineError('CART_QUANTITY_LIMIT', '同一 SKU 的购买数量不能超过 99。')
+    if (total > 99) throw new PurchaseLineError('PURCHASE_QUANTITY_LIMIT', '同一 SKU 的购买数量不能超过 99。')
     skuQuantities.set(skuId, total)
     return { lineId, skuId, quantity: item.quantity, draftId, draftRevision }
   })
@@ -157,7 +157,7 @@ export async function resolvePurchaseLinesInTransaction(
       continue
     }
     const quantity = existing.quantity + line.quantity
-    if (quantity > 99) throw new PurchaseLineError('CART_QUANTITY_LIMIT', '同一 SKU 的购买数量不能超过 99。')
+    if (quantity > 99) throw new PurchaseLineError('PURCHASE_QUANTITY_LIMIT', '同一 SKU 的购买数量不能超过 99。')
     existing.quantity = quantity
     existing.sourceLineIds.push(...line.sourceLineIds)
   }

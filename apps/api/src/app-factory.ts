@@ -50,7 +50,7 @@ import { registerAdminApiFulfillmentRoutes } from './catalog/admin-api-fulfillme
 import { registerProductMediaRoutes } from './media/admin.js'
 import { registerPublicProductRoutes } from './catalog/public-products.js'
 import { registerStorefrontFeaturedProductRoutes } from './catalog/storefront-featured-products.js'
-import { registerCustomerCartRoutes } from './commerce/customer-cart.js'
+import { registerCheckoutQuoteRoutes } from './commerce/checkout-quote-routes.js'
 import { registerCustomerPurchaseFormRoutes } from './commerce/customer-purchase-forms.js'
 import { registerOrderRoutes } from './commerce/orders.js'
 import { registerAdminBusinessOverviewRoutes } from './commerce/admin-business-overview.js'
@@ -287,7 +287,7 @@ export async function createAppInternal(options: {
     ...(options.licenseForTests?.testTls === undefined ? {} : { testTls: options.licenseForTests.testTls }),
   })
   registerCustomerAuthRoutes(app, db, config, dummyPasswordHash)
-  registerCustomerCartRoutes(app, db, config)
+  registerCheckoutQuoteRoutes(app, db, config)
   await registerCustomerPurchaseFormRoutes(app, db, config)
   registerAdminBusinessOverviewRoutes(app, db, config)
   registerOrderRoutes(app, db, config, gate)

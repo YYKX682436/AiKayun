@@ -408,6 +408,8 @@ describe('⑥-2B R1 ordered purchase snapshot manifest gates', () => {
       migrationName: '202611100001_storefront_support_settings', status: 'Success',
     }), expect.objectContaining({
       migrationName: '202611100002_payment_expiry_and_refund_completion', status: 'Success',
+    }), expect.objectContaining({
+      migrationName: '202611160001_remove_shopping_cart', status: 'Success',
     })])
     expect(await durableRows()).toEqual(before)
     const repeated = await migrator.migrateToLatest()

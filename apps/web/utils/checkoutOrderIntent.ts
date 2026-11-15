@@ -49,7 +49,7 @@ export function v2SelectionFingerprint(items: CheckoutRequestLineV2[]): string {
 }
 
 function validItems(value: unknown): value is CheckoutRequestLineV2[] {
-  if (!Array.isArray(value) || value.length < 1 || value.length > 50) return false
+  if (!Array.isArray(value) || value.length !== 1) return false
   const lineIds = new Set<string>()
   const skuTotals = new Map<string, number>()
   for (const item of value) {

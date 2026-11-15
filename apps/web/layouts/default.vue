@@ -6,7 +6,6 @@ const categories = computed(() => categoriesResponse.value?.data.categories ?? [
 const storefrontReady = ref(false)
 const route = useRoute()
 const customerApi = useCustomerApi()
-const shoppingCart = useShoppingCart()
 
 if (!customerApi.sessionResolved.value) {
   const sessionCookie = useCookie<string | null>('aikayun_customer_session')
@@ -18,15 +17,8 @@ watch(() => route.path, () => {
   if (customerApi.session.value && route.path !== '/account' && route.path !== '/wallet') void customerApi.refreshSession()
 })
 
-watch(
-  () => customerApi.sessionResolved.value ? customerApi.identityVersion.value : undefined,
-  () => { if (import.meta.client) void shoppingCart.syncSession() },
-  { flush: 'sync' },
-)
-
 onMounted(() => {
   storefrontReady.value = true
-  void shoppingCart.syncSession()
 })
 </script>
 
@@ -68,27 +60,6 @@ onMounted(() => {
           >
             <span class="hidden xl:inline">搜索商品</span>
           </UButton>
-          <NuxtLink
-            to="/cart"
-            class="relative flex min-h-11 min-w-9 items-center justify-center gap-1.5 rounded-lg px-1.5 text-sm font-medium text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:min-w-10 sm:px-2.5"
-            :aria-label="`购物车，${shoppingCart.currentQuantity.value} 件商品`"
-          >
-            <UIcon
-              name="i-lucide-shopping-bag"
-              class="size-4.5 shrink-0"
-              aria-hidden="true"
-            />
-            <span class="hidden sm:inline">购物车</span>
-            <UBadge
-              v-if="shoppingCart.currentQuantity.value > 0"
-              color="primary"
-              size="xs"
-              class="absolute -right-0.5 -top-0.5 min-w-5 justify-center px-1 tabular-nums shadow-xs"
-              aria-hidden="true"
-            >
-              {{ shoppingCart.currentQuantity.value > 99 ? '99+' : shoppingCart.currentQuantity.value }}
-            </UBadge>
-          </NuxtLink>
           <NuxtLink
             to="/orders"
             class="hidden min-h-11 min-w-9 items-center justify-center rounded-lg px-2 text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:flex sm:min-w-10 sm:px-2.5"

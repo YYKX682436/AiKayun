@@ -111,7 +111,6 @@ function draftResponse(view: Awaited<ReturnType<typeof getPurchaseDraft>>, skuId
       byteSize: attachment.byte_size!,
       width: attachment.width!,
       height: attachment.height!,
-      ...(attachment.replaces_attachment_id ? { replacesAttachmentId: attachment.replaces_attachment_id } : {}),
       url: `/api/v1/storefront/purchase-drafts/${view.id}/attachments/${attachment.id}`,
     })),
   }
@@ -176,12 +175,7 @@ export async function registerCustomerPurchaseFormRoutes(
           ? query.where('draft.customer_id', '=', identity.customerId).where('draft.guest_order_session_id', 'is', null)
           : query.where('draft.guest_order_session_id', '=', identity.guestSessionId).where('draft.customer_id', 'is', null)
         const rows = await query.orderBy('draft.updated_at', 'desc').orderBy('draft.id').limit(50).execute()
-        const bound = identity.kind === 'customer' && rows.length
-          ? new Set((await trx.selectFrom('customer_cart_items').select('draft_id')
-            .where('customer_id', '=', identity.customerId).where('draft_id', 'in', rows.map(row => row.id)).execute())
-            .flatMap(row => row.draft_id ? [row.draft_id] : []))
-          : new Set<string>()
-        return rows.filter(row => !bound.has(row.id)).map(row => ({
+        return rows.map(row => ({
           id: row.id,
           templateVersionId: row.template_version_id,
           revision: row.revision,

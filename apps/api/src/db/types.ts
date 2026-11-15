@@ -279,40 +279,6 @@ export interface CustomerManagementAuditTable {
   created_at: Generated<Date>
 }
 
-export interface CustomerCartItemsTable {
-  line_id: Generated<string>
-  customer_id: string
-  sku_id: string
-  quantity: number
-  revision: Generated<number>
-  content_identity: string
-  draft_id: string | null
-  draft_revision: number | null
-  template_version_id: string | null
-  normalization_version: number | null
-  created_at: Generated<Date>
-  updated_at: Generated<Date>
-}
-
-export interface CustomerCartLineReplacementDraftsTable {
-  line_id: string
-  customer_id: string
-  source_draft_id: string
-  replacement_draft_id: string
-  source_line_revision: number
-  source_draft_revision: number
-  omitted_source_attachment_ids: string[]
-  created_at: Generated<Date>
-}
-
-export interface CustomerCartMergeRequestsTable {
-  customer_id: string
-  merge_id: string
-  request_sha256: string
-  skipped_sku_ids: string[]
-  created_at: Generated<Date>
-}
-
 export interface GuestOrderSessionsTable {
   id: string
   token_hash: string
@@ -437,7 +403,6 @@ export interface PurchaseDraftAttachmentsTable {
   width: number | null
   height: number | null
   sha256: string | null
-  replaces_attachment_id: string | null
   created_at: Generated<Date>
   updated_at: Generated<Date>
 }
@@ -1549,9 +1514,6 @@ export interface Database {
   customers: CustomersTable
   customer_sessions: CustomerSessionsTable
   customer_management_audit: CustomerManagementAuditTable
-  customer_cart_items: CustomerCartItemsTable
-  customer_cart_line_replacement_drafts: CustomerCartLineReplacementDraftsTable
-  customer_cart_merge_requests: CustomerCartMergeRequestsTable
   guest_order_sessions: GuestOrderSessionsTable
   product_variant_fulfillment: ProductVariantFulfillmentTable
   product_variant_fulfillment_versions: ProductVariantFulfillmentVersionsTable

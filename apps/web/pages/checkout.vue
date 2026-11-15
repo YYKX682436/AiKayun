@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { CartSkuQuantity, CheckoutQuote, CheckoutQuoteItem, CheckoutRequestLineV2, GuestOrderSession } from '@aikayun/contracts'
+import type { CheckoutQuote, CheckoutQuoteItem, CheckoutRequestLineV2, GuestOrderSession } from '@aikayun/contracts'
 import type { CreateOrderResult } from '@aikayun/contracts'
 import { CheckoutConflictError, CustomerApiError } from '~/composables/useCustomerApi'
 import { loadCheckoutSelection } from '~/utils/checkoutSelection'
@@ -11,13 +11,11 @@ import {
 } from '~/utils/checkoutOrderIntent'
 import type { PendingOrderIntentV2 } from '~/utils/checkoutOrderIntent'
 import type { OrderIntentV2 } from '~/utils/checkoutOrderIntent'
-import { bindNewLegacyGuestOrder, forgetCompletedLegacyGuestOrder, legacyGuestOrderOwner } from '~/utils/legacyCheckoutGuestOwner'
 
 const route = useRoute()
 const router = useRouter()
 const customerApi = useCustomerApi()
 type CheckoutRequest = typeof customerApi.request
-const shoppingCart = useShoppingCart()
 const quote = ref<CheckoutQuote | null>(null)
 const busy = ref(false)
 const errorMessage = ref('')
@@ -25,12 +23,10 @@ const submitError = ref('')
 const pendingOwnerBlocked = ref(false)
 let requestSequence = 0
 const clientReady = ref(false)
-type CheckoutSelection =
-  | { version: 1; items: CartSkuQuantity[] }
-  | { version: 2; items: CheckoutRequestLineV2[] }
+type CheckoutSelection = { version: 2; items: CheckoutRequestLineV2[] }
 type CheckoutOperationContext = {
   selectionId: string | null
-  requestVersion: 1 | 2 | null
+  requestVersion: 2 | null
   selection: CheckoutSelection | null
   selectionFingerprint: string | null
   quoteToken: string | null
@@ -56,55 +52,31 @@ function isUuid(value: unknown): value is string {
 
 function parseRequestedItems(): CheckoutSelection | null {
   const intentId = route.query.intent
-  let raw = route.query.items
-  if (typeof intentId === 'string') {
-    if (!clientReady.value) return null
-    try {
-      const saved = loadCheckoutSelection(intentId)
-      raw = saved ? JSON.stringify(saved) : null
-    } catch {
-      return null
-    }
-  }
-  if (typeof raw !== 'string' || raw.length > 16000) return null
+  if (typeof intentId !== 'string' || !isUuid(intentId)) return null
+  if (!clientReady.value) return null
   try {
-    const parsed = JSON.parse(raw) as unknown
-    if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 50) return null
-    const legacyItems: CartSkuQuantity[] = []
-    const lineItems: CheckoutRequestLineV2[] = []
-    const seenLineIds = new Set<string>()
-    let requestVersion: 1 | 2 | null = null
-    const skuTotals = new Map<string, number>()
-    for (const item of parsed) {
-      if (!item || typeof item !== 'object' || !('skuId' in item) || !('quantity' in item)) return null
-      const skuId = String(item.skuId)
-      const quantity = item.quantity
-      if (!isUuid(skuId)
-        || !Number.isSafeInteger(quantity) || (quantity as number) < 1 || (quantity as number) > 99) return null
-      const total = (skuTotals.get(skuId) ?? 0) + (quantity as number)
-      if (total > 99) return null
-      skuTotals.set(skuId, total)
-      if ('lineId' in item) {
-        if (requestVersion === 1 || !isUuid(item.lineId) || seenLineIds.has(item.lineId)) return null
-        requestVersion = 2
-        seenLineIds.add(item.lineId)
-        const hasDraftId = Object.hasOwn(item, 'draftId')
-        const hasDraftRevision = Object.hasOwn(item, 'draftRevision')
-        if (hasDraftId !== hasDraftRevision) return null
-        if (hasDraftId && (item.draftId !== null || item.draftRevision !== null)
-          && (!isUuid(item.draftId) || !Number.isSafeInteger(item.draftRevision) || (item.draftRevision as number) < 1)) return null
-        if (Object.keys(item).some(key => !['lineId', 'skuId', 'quantity', 'draftId', 'draftRevision'].includes(key))) return null
-        lineItems.push({ ...item } as CheckoutRequestLineV2)
-      } else {
-        if (requestVersion === 2 || Object.keys(item).some(key => !['skuId', 'quantity'].includes(key))) return null
-        requestVersion = 1
-        legacyItems.push({ skuId, quantity: quantity as number })
-      }
+    const raw = loadCheckoutSelection(intentId)
+    if (!raw || !Array.isArray(raw) || raw.length !== 1) return null
+    const item = raw[0] as { lineId?: unknown; skuId?: unknown; quantity?: unknown; draftId?: unknown; draftRevision?: unknown }
+    if (!item || typeof item !== 'object') return null
+    const skuId = typeof item.skuId === 'string' ? item.skuId : ''
+    const lineId = typeof item.lineId === 'string' ? item.lineId : ''
+    const quantity = typeof item.quantity === 'number' ? item.quantity : 0
+    if (!isUuid(skuId) || !isUuid(lineId) || !Number.isSafeInteger(quantity) || quantity < 1 || quantity > 99) return null
+    const hasDraftId = Object.hasOwn(item, 'draftId')
+    const hasDraftRevision = Object.hasOwn(item, 'draftRevision')
+    if (hasDraftId !== hasDraftRevision) return null
+    const draftId = item.draftId
+    const draftRevision = item.draftRevision
+    if (hasDraftId && (draftId !== null || draftRevision !== null)
+      && (typeof draftId !== 'string' || !isUuid(draftId) || typeof draftRevision !== 'number' || !Number.isSafeInteger(draftRevision) || draftRevision < 1)) return null
+    const line: CheckoutRequestLineV2 = {
+      lineId,
+      skuId,
+      quantity,
+      ...(typeof draftId === 'string' && typeof draftRevision === 'number' ? { draftId, draftRevision } : {}),
     }
-    // V2 requests need an opaque selection URL so a completed receipt can
-    // remain bound to that exact operation across tabs and browser restarts.
-    if (requestVersion === 2 && typeof intentId !== 'string') return null
-    return requestVersion === 2 ? { version: 2, items: lineItems } : { version: 1, items: legacyItems }
+    return { version: 2, items: [line] }
   } catch {
     return null
   }
@@ -120,11 +92,9 @@ const isCustomer = computed(() => Boolean(customerApi.session.value?.customer.id
 const loginRedirect = computed(() => {
   let target = route.fullPath
   const selection = requestedSelection.value
-  const selected = selection?.version === 2 && selection.items.length === 1 ? selection.items[0] : undefined
+  const selected = selection?.items[0]
   const selectedDraftId = selected && 'draftId' in selected && typeof selected.draftId === 'string' ? selected.draftId : null
-  const isCartLine = selectedDraftId !== null && shoppingCart.guestItems.value.some(item =>
-    'draftId' in item && typeof item.draftId === 'string' && item.draftId.toLowerCase() === selectedDraftId.toLowerCase())
-  if (!isCustomer.value && selectedDraftId && !isCartLine && route.query.claimGuestDraft !== '1') {
+  if (!isCustomer.value && selectedDraftId && route.query.claimGuestDraft !== '1') {
     const [pathname, query = ''] = target.split('?', 2)
     const params = new URLSearchParams(query)
     params.set('claimGuestDraft', '1')
@@ -161,34 +131,26 @@ function statusLabel(item: CheckoutQuoteItem): string {
 }
 
 function purchaseEditPath(item: CheckoutQuoteItem): string {
-  if (!item.productId) return '/cart'
+  if (!item.productId) return '/products'
   const query = new URLSearchParams({ skuId: item.skuId, quantity: String(item.quantity) })
   if (item.draftId) query.set('draftId', item.draftId)
-  const cartLine = item.lineId
-    ? shoppingCart.cartView.value?.items.find(candidate => candidate.lineId === item.lineId)
-    : undefined
-  if (cartLine?.lineId) {
-    query.set('editLineId', cartLine.lineId)
-    if (cartLine.lineRevision !== null) query.set('lineRevision', String(cartLine.lineRevision))
-    if (cartLine.draftRevision !== null) query.set('expectedDraftRevision', String(cartLine.draftRevision))
-  }
-  query.set('returnToCheckout', '1')
   return `/products/${encodeURIComponent(item.productId)}?${query.toString()}`
 }
 
+const backToProductPath = computed(() => {
+  const item = quote.value?.items[0]
+  if (item) return purchaseEditPath(item)
+  return '/products'
+})
+
 function cloneSelection(selection: CheckoutSelection | null): CheckoutSelection | null {
   if (!selection) return null
-  return selection.version === 2
-    ? { version: 2, items: selection.items.map(item => ({ ...item })) }
-    : { version: 1, items: selection.items.map(item => ({ ...item })) }
+  return { version: 2, items: selection.items.map(item => ({ ...item })) }
 }
 
 function selectionFingerprint(selection: CheckoutSelection | null): string | null {
   if (!selection) return null
-  const items = selection.version === 2
-    ? [...selection.items].sort((left, right) => left.lineId.localeCompare(right.lineId))
-    : selection.items
-  return `${selection.version}:${JSON.stringify(items)}`
+  return `2:${JSON.stringify(selection.items)}`
 }
 
 function routeSelectionId(): string | null {
@@ -230,14 +192,17 @@ async function loadQuote(context = captureOperationContext()) {
   errorMessage.value = ''
   quote.value = null
   quoteGeneration.value = null
-  if (!context.selection) {
+  if (!context.selection || context.selection.items.length !== 1) {
     busy.value = false
-    errorMessage.value = '报价链接无效，请返回购物车重新选择商品。'
+    errorMessage.value = '结算链接无效或已过期，请返回商品页重新发起购买。'
     return
   }
   busy.value = true
   try {
-    const result = await shoppingCart.quote(context.selection.items)
+    const result = await customerApi.request<CheckoutQuote>('/api/v1/checkout/quote', {
+      method: 'POST',
+      body: { version: 2, items: context.selection.items },
+    })
     if (sequence === requestSequence && pageContextIsCurrent(context)) {
       quote.value = result
       quoteGeneration.value = context.pageGeneration
@@ -251,51 +216,12 @@ async function loadQuote(context = captureOperationContext()) {
   }
 }
 
-function canonicalItems(items: CartSkuQuantity[]): CartSkuQuantity[] {
-  const counts = new Map<string, number>()
-  for (const item of items) counts.set(item.skuId, (counts.get(item.skuId) ?? 0) + item.quantity)
-  return [...counts].sort(([left], [right]) => left.localeCompare(right)).map(([skuId, quantity]) => ({ skuId, quantity }))
-}
-
 async function currentOrderOwnerId(request: CheckoutRequest): Promise<string> {
   const customerId = customerApi.session.value?.customer.id
   if (customerId) return customerId
   const session = await request<GuestOrderSession>('/api/v1/guest/session', { method: 'POST' })
   if (!isUuid(session.sessionId)) throw new Error('游客会话无法确认，请稍后重试。')
   return `guest:${session.sessionId}`
-}
-
-function orderIntentKey(items: CartSkuQuantity[], ownerId: string, actualOwnerId: string): string {
-  if (!import.meta.client) throw new Error('请在浏览器中继续创建订单。')
-  const fingerprint = JSON.stringify(canonicalItems(items))
-  const storageKey = `aikayun-order-intent-v1:${ownerId}:${fingerprint}`
-  let existing: string | null
-  try {
-    existing = sessionStorage.getItem(storageKey)
-  } catch {
-    throw new Error('浏览器暂时无法保存安全的提交标识。请启用会话存储后重试。')
-  }
-  if (existing && /^[0-9a-f-]{36}$/iu.test(existing)) {
-    const boundOwner = ownerId === 'guest' ? legacyGuestOrderOwner(existing) : null
-    if (boundOwner && boundOwner !== actualOwnerId) throw new PendingOwnerConflictError()
-    return existing
-  }
-  const key = crypto.randomUUID()
-  if (ownerId === 'guest') bindNewLegacyGuestOrder(key, actualOwnerId)
-  try {
-    sessionStorage.setItem(storageKey, key)
-  } catch {
-    throw new Error('浏览器暂时无法保存安全的提交标识。请启用会话存储后重试。')
-  }
-  return key
-}
-
-function removeOrderIntent(items: CartSkuQuantity[], ownerId: string, idempotencyKey: string): void {
-  const storageKey = `aikayun-order-intent-v1:${ownerId}:${JSON.stringify(canonicalItems(items))}`
-  try {
-    sessionStorage.removeItem(storageKey)
-    if (ownerId === 'guest') forgetCompletedLegacyGuestOrder(idempotencyKey)
-  } catch { /* The completed order remains available through order history. */ }
 }
 
 function guestOrderHeaders(ownerId: string): Record<string, string> | undefined {
@@ -408,39 +334,8 @@ async function createOrder() {
   activeSubmissionGeneration.value = context.pageGeneration
   submitError.value = ''
   try {
-    if (context.requestVersion === 2) {
-      const orderId = await processV2Intent(context)
-      if (orderId) await showCompletedOrder(orderId, context)
-    } else {
-      const selection = context.selection
-      if (selection?.version !== 1 || !context.quoteToken) return
-      const completed = await withOrderSubmissionLock(() => customerApi.withCheckoutIdentity(async (request) => {
-        if (!identityContextIsCurrent(context)) return null
-        const actualOwnerId = await currentOrderOwnerId(request)
-        if (!identityContextIsCurrent(context)) return null
-        // Keep the historical v1 storage key; new guest keys have a separate
-        // owner receipt so an unknown result cannot cross a later guest session.
-        const ownerId = actualOwnerId.startsWith('guest:') ? 'guest' : actualOwnerId
-        const idempotencyKey = orderIntentKey(selection.items, ownerId, actualOwnerId)
-        const result = await request<CreateOrderResult>('/api/v1/checkout/orders', {
-          method: 'POST', headers: guestOrderHeaders(actualOwnerId),
-          body: { idempotencyKey, quoteToken: context.quoteToken, items: selection.items },
-        })
-        return { result, ownerId, idempotencyKey }
-      }))
-      if (!completed || !identityContextIsCurrent(context)) return
-      if (!pageContextIsCurrent(context)) {
-        // The v1 response confirms completion and its historical key is only
-        // a temporary retry record; remove it without taking over a new page.
-        removeOrderIntent(selection.items, completed.ownerId, completed.idempotencyKey)
-        return
-      }
-      const orderPath = `/orders/${completed.result.order.id}`
-      await navigateTo(orderPath)
-      if (identityContextIsCurrent(context) && route.path === orderPath) {
-        removeOrderIntent(selection.items, completed.ownerId, completed.idempotencyKey)
-      }
-    }
+    const orderId = await processV2Intent(context)
+    if (orderId) await showCompletedOrder(orderId, context)
   } catch (error) {
     if (!identityContextIsCurrent(context) || !pageContextIsCurrent(context)) return
     if (error instanceof PendingOwnerConflictError || (error instanceof CustomerApiError && error.code === 'GUEST_SESSION_CHANGED')) pendingOwnerBlocked.value = true
@@ -459,10 +354,10 @@ async function createOrder() {
 }
 
 async function replayPendingV2(context: CheckoutOperationContext): Promise<void> {
-  if (!import.meta.client || context.selection?.version === 1 || submitting.value
+  if (!import.meta.client || submitting.value
     || !customerApi.sessionResolved.value || !pageContextIsCurrent(context)) return
   try {
-    if (!hasOrderIntentV2(context.selection?.version === 2 ? context.selection.items : null, context.selectionId)) return
+    if (!hasOrderIntentV2(context.selection?.items ?? null, context.selectionId)) return
     activeSubmissionGeneration.value = context.pageGeneration
     const orderId = await processV2Intent(context)
     if (orderId) await showCompletedOrder(orderId, context)
@@ -551,7 +446,7 @@ function formatDate(value: string): string {
       <div class="flex flex-wrap items-center justify-between gap-4">
         <div>
           <NuxtLink
-            to="/cart"
+            :to="backToProductPath"
             class="inline-flex min-h-10 items-center gap-1.5 rounded-xl border border-default/70 bg-elevated/60 px-3.5 py-2 text-xs sm:text-sm font-medium text-muted shadow-2xs backdrop-blur-xs transition-all hover:border-default hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
           >
             <UIcon
@@ -559,7 +454,7 @@ function formatDate(value: string): string {
               class="size-4"
               aria-hidden="true"
             />
-            返回购物车
+            返回商品
           </NuxtLink>
         </div>
         <div class="text-right sm:text-left sm:order-first">
@@ -689,8 +584,11 @@ function formatDate(value: string): string {
                     <h2 class="break-words text-base sm:text-lg font-semibold tracking-tight text-highlighted">
                       {{ item.productName ?? '商品信息暂不可用' }}
                     </h2>
-                    <p class="mt-1 text-xs text-muted">
-                      购买行 {{ index + 1 }}<span v-if="item.draftId"> · 已绑定填写资料</span>
+                    <p
+                      v-if="item.draftId"
+                      class="mt-1 text-xs text-muted"
+                    >
+                      已绑定购买资料
                     </p>
                   </div>
                   <UBadge
@@ -850,13 +748,13 @@ function formatDate(value: string): string {
                 重新报价
               </UButton>
               <UButton
-                to="/cart"
-                color="primary"
+                :to="backToProductPath"
+                color="neutral"
                 variant="soft"
                 size="sm"
                 class="justify-center rounded-xl text-xs font-medium"
               >
-                返回购物车调整
+                返回修改
               </UButton>
             </div>
           </div>

@@ -107,7 +107,6 @@ export function useCustomerApi() {
 
   function requiresCurrentSessionProbe(path: string): boolean {
     return path === customerPasswordPath
-      || path.includes('/api/v1/customer/cart')
       || path.startsWith('/api/v1/storefront/purchase-drafts')
       || path.includes('/api/v1/customer/orders')
       || path === '/api/v1/checkout/quote'
@@ -404,7 +403,6 @@ export function useCustomerApi() {
     } catch (error) {
       const normalized = normalizeError(error)
       const invalidCustomerRequest = path.includes('/profile')
-        || path.includes('/customer/cart')
         || path.endsWith('/auth/logout')
       if (identityAtStart === identityVersion.value
         && normalized.status === 401

@@ -68,6 +68,7 @@ import { storefrontBrandSettingsMigration } from './migrations/202611090001_stor
 import { storefrontFeaturedProductsMigration } from './migrations/202611090002_storefront_featured_products.js'
 import { storefrontSupportSettingsMigration } from './migrations/202611100001_storefront_support_settings.js'
 import { paymentExpiryAndRefundCompletionMigration } from './migrations/202611100002_payment_expiry_and_refund_completion.js'
+import { removeShoppingCartMigration } from './migrations/202611160001_remove_shopping_cart.js'
 
 export class AppMigrationProvider implements MigrationProvider {
   async getMigrations(): Promise<Record<string, Migration>> {
@@ -137,6 +138,7 @@ export class AppMigrationProvider implements MigrationProvider {
       '202611090002_storefront_featured_products': storefrontFeaturedProductsMigration,
       '202611100001_storefront_support_settings': storefrontSupportSettingsMigration,
       '202611100002_payment_expiry_and_refund_completion': paymentExpiryAndRefundCompletionMigration,
+      '202611160001_remove_shopping_cart': removeShoppingCartMigration,
     }
     verifyMigrationChecksums(migrations)
     return migrations
