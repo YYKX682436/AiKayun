@@ -543,38 +543,37 @@ function formatDate(value: string): string {
 </script>
 
 <template>
-  <UContainer class="py-7 sm:py-10">
+  <UContainer class="py-6 sm:py-10">
     <main
       id="main-content"
-      class="mx-auto max-w-4xl"
+      class="mx-auto max-w-6xl"
     >
-      <div class="flex flex-wrap items-end justify-between gap-3">
+      <div class="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <p class="text-sm font-medium text-primary">
-            购物车
+          <NuxtLink
+            to="/cart"
+            class="inline-flex min-h-10 items-center gap-1.5 rounded-xl border border-default/70 bg-elevated/60 px-3.5 py-2 text-xs sm:text-sm font-medium text-muted shadow-2xs backdrop-blur-xs transition-all hover:border-default hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+          >
+            <UIcon
+              name="i-lucide-arrow-left"
+              class="size-4"
+              aria-hidden="true"
+            />
+            返回购物车
+          </NuxtLink>
+        </div>
+        <div class="text-right sm:text-left sm:order-first">
+          <p class="text-xs font-semibold uppercase tracking-wider text-primary">
+            结算流程
           </p>
-          <h1 class="mt-1 text-2xl font-semibold tracking-tight text-highlighted sm:text-3xl">
+          <h1 class="mt-0.5 text-2xl font-bold tracking-tight text-highlighted sm:text-3xl">
             确认订单
           </h1>
-          <p class="mt-2 text-sm text-muted">
-            提交时会在数据库事务中重新核对价格、购买资格并预留数量库存。
-          </p>
         </div>
-        <NuxtLink
-          to="/cart"
-          class="inline-flex min-h-11 items-center gap-2 rounded-lg px-3 text-sm font-medium text-primary hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-        >
-          <UIcon
-            name="i-lucide-arrow-left"
-            class="size-4"
-            aria-hidden="true"
-          />
-          返回购物车
-        </NuxtLink>
       </div>
 
       <UAlert
-        class="mt-6"
+        class="mt-5 rounded-2xl border border-info/30 bg-info/5 shadow-xs"
         color="info"
         variant="subtle"
         icon="i-lucide-shield-check"
@@ -584,7 +583,7 @@ function formatDate(value: string): string {
 
       <UAlert
         v-if="quote?.policyReasons.includes('guest_checkout_disabled') || quote?.policyReasons.includes('guest_free_claim_disabled')"
-        class="mt-4"
+        class="mt-4 rounded-2xl border border-warning/30 bg-warning/5 shadow-xs"
         color="warning"
         variant="subtle"
         title="此商品需要登录后继续"
@@ -595,6 +594,8 @@ function formatDate(value: string): string {
             :to="loginRedirect"
             color="primary"
             variant="outline"
+            size="sm"
+            class="rounded-lg"
           >
             登录后继续
           </UButton>
@@ -603,7 +604,7 @@ function formatDate(value: string): string {
 
       <UAlert
         v-if="purchaseLoginRequired"
-        class="mt-4"
+        class="mt-4 rounded-2xl border border-warning/30 bg-warning/5 shadow-xs"
         color="warning"
         variant="subtle"
         title="该商品需要登录后购买"
@@ -614,6 +615,8 @@ function formatDate(value: string): string {
             :to="loginRedirect"
             color="primary"
             variant="outline"
+            size="sm"
+            class="rounded-lg"
           >
             登录后继续
           </UButton>
@@ -622,7 +625,7 @@ function formatDate(value: string): string {
 
       <UAlert
         v-if="errorMessage"
-        class="mt-4"
+        class="mt-4 rounded-2xl border border-error/30 bg-error/5 shadow-xs"
         color="error"
         variant="subtle"
         :title="errorMessage"
@@ -633,6 +636,8 @@ function formatDate(value: string): string {
           <UButton
             color="error"
             variant="outline"
+            size="sm"
+            class="rounded-lg"
             :loading="busy"
             @click="loadQuote()"
           >
@@ -643,7 +648,7 @@ function formatDate(value: string): string {
 
       <UAlert
         v-if="submitError"
-        class="mt-4"
+        class="mt-4 rounded-2xl border border-error/30 bg-error/5 shadow-xs"
         color="error"
         variant="soft"
         :title="submitError"
@@ -653,160 +658,209 @@ function formatDate(value: string): string {
 
       <div
         v-if="busy && !quote"
-        class="mt-6 space-y-3"
+        class="mt-6 space-y-4"
         aria-label="正在计算报价"
         aria-busy="true"
       >
         <div
           v-for="index in 2"
           :key="index"
-          class="h-24 animate-pulse rounded-xl border border-default bg-elevated motion-reduce:animate-none"
+          class="h-32 animate-pulse rounded-2xl border border-default/60 bg-elevated/40 motion-reduce:animate-none"
         />
       </div>
 
       <section
         v-else-if="quote"
-        class="mt-6 grid gap-5"
+        class="mt-6 grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem] lg:items-start xl:gap-8"
       >
-        <ul
-          class="space-y-3"
-          aria-label="报价商品"
-        >
-          <li
-            v-for="(item, index) in quote.items"
-            :key="item.lineId ?? `legacy:${item.skuId}`"
-            class="grid min-w-0 gap-3 rounded-xl border border-default bg-elevated p-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:p-5"
+        <div class="min-w-0 space-y-4">
+          <ul
+            class="space-y-3.5"
+            aria-label="报价商品"
           >
-            <div class="min-w-0">
-              <h2 class="break-words font-medium text-highlighted">
-                {{ item.productName ?? '商品信息暂不可用' }}
-              </h2>
-              <p class="mt-1 text-xs text-muted">
-                购买行 {{ index + 1 }}<span v-if="item.draftId"> · 已绑定填写资料</span>
-              </p>
-              <p
-                v-if="item.options.length"
-                class="mt-1 text-sm text-muted"
-              >
-                {{ item.options.map(option => `${option.groupName}：${option.valueName}`).join(' / ') }}
-              </p>
-              <p class="mt-1 break-all text-sm text-muted">
-                数量：{{ item.quantity }} <span v-if="item.skuCode">· SKU {{ item.skuCode }}</span>
-              </p>
-              <UBadge
-                class="mt-2"
-                :color="item.canPurchase ? 'success' : 'warning'"
-                variant="soft"
-              >
-                {{ statusLabel(item) }}
-              </UBadge>
-              <StorefrontPurchaseLimitNotice
-                class="mt-3"
-                :purchase-limits="item.purchaseLimits"
-              />
-              <div
-                v-if="item.purchasePreview"
-                class="mt-4 space-y-3"
-              >
-                <StorefrontPurchaseDataPreview
-                  title="本次购买资料"
-                  :definition="item.purchasePreview.definition"
-                  :values="item.purchasePreview.values"
-                  :attachments="item.purchasePreview.attachments.map(attachment => ({ id: attachment.id, fieldId: attachment.fieldId, url: attachment.url, byteSize: attachment.byteSize }))"
-                />
-                <NuxtLink
-                  v-if="item.draftId && !submitting && !pendingOwnerBlocked"
-                  :to="purchaseEditPath(item)"
-                  class="inline-flex min-h-11 items-center gap-2 rounded-lg px-2 text-sm font-medium text-primary underline underline-offset-2 hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-                >
-                  <UIcon
-                    name="i-lucide-pencil"
-                    aria-hidden="true"
-                  />
-                  编辑此购买行资料并重新报价
-                </NuxtLink>
-              </div>
-            </div>
-            <dl class="grid grid-cols-2 gap-x-5 text-right text-sm sm:min-w-36 sm:grid-cols-1 sm:gap-y-1">
-              <div>
-                <dt class="text-muted">
-                  单价
-                </dt><dd class="tabular-nums text-highlighted">
-                  {{ item.unitPrice === null ? '暂不可计价' : `¥${item.unitPrice}` }}
-                </dd>
-              </div>
-              <div>
-                <dt class="text-muted">
-                  小计
-                </dt><dd class="font-medium tabular-nums text-highlighted">
-                  {{ item.lineTotal === null ? '暂不可计价' : `¥${item.lineTotal}` }}
-                </dd>
-              </div>
-            </dl>
-          </li>
-        </ul>
+            <li
+              v-for="(item, index) in quote.items"
+              :key="item.lineId ?? `legacy:${item.skuId}`"
+              class="rounded-2xl border border-default/70 bg-elevated/70 p-4 shadow-xs backdrop-blur-xs transition-all hover:border-default sm:p-5"
+            >
+              <div class="flex flex-col gap-3">
+                <div class="flex flex-wrap items-start justify-between gap-2">
+                  <div class="min-w-0">
+                    <h2 class="break-words text-base sm:text-lg font-semibold tracking-tight text-highlighted">
+                      {{ item.productName ?? '商品信息暂不可用' }}
+                    </h2>
+                    <p class="mt-1 text-xs text-muted">
+                      购买行 {{ index + 1 }}<span v-if="item.draftId"> · 已绑定填写资料</span>
+                    </p>
+                  </div>
+                  <UBadge
+                    :color="item.canPurchase ? 'success' : 'warning'"
+                    variant="subtle"
+                    size="sm"
+                    class="rounded-md font-medium"
+                  >
+                    <UIcon
+                      :name="item.canPurchase ? 'i-lucide-check-circle-2' : 'i-lucide-alert-circle'"
+                      class="size-3.5"
+                    />
+                    {{ statusLabel(item) }}
+                  </UBadge>
+                </div>
 
-        <div class="grid gap-4 rounded-xl border border-default bg-elevated p-4 sm:grid-cols-[1fr_auto] sm:items-end sm:p-5">
-          <dl class="grid gap-2 text-sm">
-            <div class="flex justify-between gap-4">
+                <div
+                  v-if="item.options.length"
+                  class="flex flex-wrap gap-1.5 text-xs text-muted"
+                >
+                  <span
+                    v-for="option in item.options"
+                    :key="option.groupId"
+                    class="inline-flex items-center rounded-md border border-default/50 bg-muted/30 px-2 py-0.5"
+                  >
+                    <span class="text-muted/70">{{ option.groupName }}：</span>
+                    <span class="font-medium text-highlighted">{{ option.valueName }}</span>
+                  </span>
+                </div>
+
+                <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
+                  <span>数量：<strong class="font-semibold text-highlighted">{{ item.quantity }}</strong></span>
+                  <span
+                    v-if="item.skuCode"
+                    class="font-mono text-muted/70"
+                  >· SKU {{ item.skuCode }}</span>
+                </div>
+
+                <StorefrontPurchaseLimitNotice
+                  class="mt-1"
+                  :purchase-limits="item.purchaseLimits"
+                />
+
+                <div
+                  v-if="item.purchasePreview"
+                  class="mt-2 space-y-2.5"
+                >
+                  <StorefrontPurchaseDataPreview
+                    title="本次购买资料"
+                    :definition="item.purchasePreview.definition"
+                    :values="item.purchasePreview.values"
+                    :attachments="item.purchasePreview.attachments.map(attachment => ({ id: attachment.id, fieldId: attachment.fieldId, url: attachment.url, byteSize: attachment.byteSize }))"
+                  />
+                  <NuxtLink
+                    v-if="item.draftId && !submitting && !pendingOwnerBlocked"
+                    :to="purchaseEditPath(item)"
+                    class="inline-flex min-h-10 items-center gap-1.5 rounded-lg border border-primary/20 bg-primary/5 px-2.5 py-1 text-xs font-medium text-primary hover:bg-primary/10 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                  >
+                    <UIcon
+                      name="i-lucide-pencil"
+                      class="size-3.5"
+                      aria-hidden="true"
+                    />
+                    编辑此购买行资料并重新报价
+                  </NuxtLink>
+                </div>
+
+                <dl class="mt-2 flex flex-wrap items-baseline justify-between gap-3 border-t border-default/40 pt-3 text-xs sm:text-sm">
+                  <div>
+                    <dt class="inline text-muted">
+                      单价
+                    </dt>
+                    <dd class="inline ml-1.5 font-medium tabular-nums text-highlighted">
+                      {{ item.unitPrice === null ? '暂不可计价' : `¥${item.unitPrice}` }}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt class="inline text-muted">
+                      小计
+                    </dt>
+                    <dd class="inline ml-1.5 text-base font-semibold tabular-nums text-primary">
+                      {{ item.lineTotal === null ? '暂不可计价' : `¥${item.lineTotal}` }}
+                    </dd>
+                  </div>
+                </dl>
+              </div>
+            </li>
+          </ul>
+
+          <p
+            v-if="!isCustomer && !quote.guestCheckoutEnabled && quote.policyReasons.includes('guest_checkout_disabled')"
+            class="rounded-xl border border-warning/20 bg-warning/5 p-3.5 text-xs leading-5 text-muted"
+          >
+            登录后会以顾客身份再次读取商品价格和库存。当前页面仍未提交订单。
+          </p>
+        </div>
+
+        <aside
+          class="rounded-2xl border border-default/70 bg-elevated/70 p-5 sm:p-6 shadow-xs backdrop-blur-xs lg:sticky lg:top-24"
+          aria-label="订单总额与提交"
+        >
+          <h2 class="text-base sm:text-lg font-semibold tracking-tight text-highlighted">
+            结算汇总
+          </h2>
+          <dl class="mt-4 space-y-3 border-b border-default/60 pb-4 text-xs sm:text-sm">
+            <div class="flex items-center justify-between gap-4">
               <dt class="text-muted">
                 商品金额
-              </dt><dd class="tabular-nums text-highlighted">
+              </dt>
+              <dd class="font-medium tabular-nums text-highlighted">
                 ¥{{ quote.pricedSubtotal }}
               </dd>
             </div>
-            <div class="flex justify-between gap-4">
+            <div class="flex items-center justify-between gap-4">
               <dt class="text-muted">
                 报价时间
-              </dt><dd class="text-right text-muted">
+              </dt>
+              <dd class="text-right text-xs text-muted tabular-nums">
                 {{ formatDate(quote.quotedAt) }}
               </dd>
             </div>
+            <div class="flex items-baseline justify-between gap-4 pt-1">
+              <dt class="text-xs sm:text-sm font-medium text-highlighted">
+                {{ quote.totalComplete ? '当前报价合计' : '当前报价合计不完整' }}
+              </dt>
+              <dd class="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-primary">
+                {{ quote.totalAmount === null ? '无法完整计价' : `¥${quote.totalAmount}` }}
+              </dd>
+            </div>
           </dl>
-          <div class="text-right">
-            <p class="text-sm text-muted">
-              {{ quote.totalComplete ? '当前报价合计' : '当前报价合计不完整' }}
-            </p>
-            <p class="mt-1 text-2xl font-semibold tabular-nums text-primary">
-              {{ quote.totalAmount === null ? '无法完整计价' : `¥${quote.totalAmount}` }}
-            </p>
-          </div>
-        </div>
 
-        <p
-          v-if="!isCustomer && !quote.guestCheckoutEnabled && quote.policyReasons.includes('guest_checkout_disabled')"
-          class="text-sm text-muted"
-        >
-          登录后会以顾客身份再次读取商品价格和库存。当前页面仍未提交订单。
-        </p>
-        <div class="flex flex-wrap justify-end gap-2">
-          <UButton
-            color="neutral"
-            variant="outline"
-            icon="i-lucide-refresh-cw"
-            :loading="busy"
-            @click="loadQuote()"
-          >
-            重新报价
-          </UButton>
-          <UButton
-            to="/cart"
-            color="primary"
-            variant="soft"
-          >
-            返回购物车调整
-          </UButton>
-          <UButton
-            v-if="quote.canContinue"
-            color="primary"
-            icon="i-lucide-lock-keyhole"
-            :loading="submitting"
-            :disabled="submitting || busy || pendingOwnerBlocked"
-            @click="createOrder"
-          >
-            {{ submitting ? '正在安全创建订单' : '提交订单' }}
-          </UButton>
-        </div>
+          <div class="mt-5 space-y-2.5">
+            <UButton
+              v-if="quote.canContinue"
+              color="primary"
+              block
+              size="lg"
+              icon="i-lucide-lock-keyhole"
+              class="min-h-12 rounded-xl text-base font-semibold shadow-xs transition-all active:scale-[0.99]"
+              :loading="submitting"
+              :disabled="submitting || busy || pendingOwnerBlocked"
+              @click="createOrder"
+            >
+              {{ submitting ? '正在安全创建订单' : '提交订单' }}
+            </UButton>
+
+            <div class="grid grid-cols-2 gap-2 pt-1">
+              <UButton
+                color="neutral"
+                variant="outline"
+                size="sm"
+                icon="i-lucide-refresh-cw"
+                class="justify-center rounded-xl text-xs font-medium"
+                :loading="busy"
+                @click="loadQuote()"
+              >
+                重新报价
+              </UButton>
+              <UButton
+                to="/cart"
+                color="primary"
+                variant="soft"
+                size="sm"
+                class="justify-center rounded-xl text-xs font-medium"
+              >
+                返回购物车调整
+              </UButton>
+            </div>
+          </div>
+        </aside>
       </section>
     </main>
   </UContainer>

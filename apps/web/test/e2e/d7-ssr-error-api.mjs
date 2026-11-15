@@ -322,7 +322,7 @@ const server = createServer(async (request, response) => {
       'set-cookie': 'aikayun_customer_csrf=test-csrf-token; Path=/; SameSite=Lax',
     }).end(JSON.stringify({
       data: {
-        sessionId: 'guest-session-1',
+        sessionId: '550e8400-e29b-41d4-a716-446655440091',
         expiresAt: new Date(Date.now() + 86400000).toISOString(),
       },
     }))
@@ -535,16 +535,212 @@ const server = createServer(async (request, response) => {
     response.writeHead(200).end(JSON.stringify({ data: { templateId: null, templateName: '', templateVersionId: '', required: false, status: 'active', definition: { fields: [] } } }))
     return
   }
+  if (url.pathname === '/api/v1/checkout/orders' && request.method === 'POST') {
+    response.writeHead(201).end(JSON.stringify({
+      data: {
+        order: {
+          id: '550e8400-e29b-41d4-a716-446655440077',
+          orderNumber: 'AKY-20261115-0001',
+          totalAmount: '128.00',
+          status: 'pending_payment',
+        },
+      },
+    }))
+    return
+  }
   if (url.pathname === '/api/v1/checkout/quote' || url.pathname === '/api/v1/customer/cart/quote') {
+    let body = ''
+    for await (const chunk of request) body += chunk
+    let requestedList = []
+    try {
+      const parsed = JSON.parse(body)
+      if (Array.isArray(parsed)) requestedList = parsed
+      else if (Array.isArray(parsed?.items)) requestedList = parsed.items
+    } catch {
+      requestedList = []
+    }
+
+    const skuCatalog = {
+      '550e8400-e29b-41d4-a716-4466554400a1': {
+        productId: '550e8400-e29b-41d4-a716-446655440011',
+        productName: '安全双因子认证硬件令牌 FIDO2',
+        productType: 'physical',
+        productStatus: 'active',
+        skuCode: 'FIDO2-TYPEC-BLK',
+        unitPrice: '128.00',
+        options: [
+          { groupId: 'group-port', groupName: '接口规格', valueId: 'val-typec', valueName: 'Type-C' },
+          { groupId: 'group-color', groupName: '外观颜色', valueId: 'val-black', valueName: '深空黑' },
+        ],
+        purchaseLimits: {
+          product: { perOrderLimit: 5, lifetimeLimit: 10, rolling24HourLimit: null, lifetimePurchased: 0, rolling24HoursPurchased: 0, maxAvailable: 5, exceeded: false },
+          sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false },
+          requiresLogin: false,
+        },
+      },
+      '550e8400-e29b-41d4-a716-4466554400a2': {
+        productId: '550e8400-e29b-41d4-a716-446655440011',
+        productName: '安全双因子认证硬件令牌 FIDO2',
+        productType: 'physical',
+        productStatus: 'active',
+        skuCode: 'FIDO2-TYPEC-SLV',
+        unitPrice: '128.00',
+        options: [
+          { groupId: 'group-port', groupName: '接口规格', valueId: 'val-typec', valueName: 'Type-C' },
+          { groupId: 'group-color', groupName: '外观颜色', valueId: 'val-silver', valueName: '星光银' },
+        ],
+        purchaseLimits: {
+          product: { perOrderLimit: 5, lifetimeLimit: 10, rolling24HourLimit: null, lifetimePurchased: 0, rolling24HoursPurchased: 0, maxAvailable: 5, exceeded: false },
+          sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false },
+          requiresLogin: false,
+        },
+      },
+      '550e8400-e29b-41d4-a716-4466554400b1': {
+        productId: '550e8400-e29b-41d4-a716-446655440022',
+        productName: '企业域名解析与 SSL 证书部署服务',
+        productType: 'service',
+        productStatus: 'active',
+        skuCode: 'SSL-AUTO-DEPLOY',
+        unitPrice: '80.00',
+        options: [],
+        purchaseLimits: {
+          product: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: 0, rolling24HoursPurchased: 0, maxAvailable: null, exceeded: false },
+          sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false },
+          requiresLogin: false,
+        },
+      },
+    }
+
+    const defaultSku = {
+      productId: '550e8400-e29b-41d4-a716-446655440000',
+      productName: '安全测试商品',
+      productType: 'physical',
+      productStatus: 'active',
+      skuCode: 'SEC-TEST-001',
+      unitPrice: '99.00',
+      options: [],
+      purchaseLimits: {
+        product: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false },
+        sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false },
+        requiresLogin: false,
+      },
+    }
+
+    const items = requestedList.length > 0 ? requestedList.map(req => {
+      const info = skuCatalog[req.skuId] ?? defaultSku
+      const qty = Number(req.quantity) || 1
+      const priceNum = Number(info.unitPrice)
+      const lineTotal = (priceNum * qty).toFixed(2)
+      return {
+        lineId: req.lineId ?? null,
+        sourceLineIds: req.lineId ? [req.lineId] : [],
+        lineRevision: req.lineRevision ?? null,
+        draftId: req.draftId ?? null,
+        draftRevision: req.draftRevision ?? null,
+        templateVersionId: req.templateVersionId ?? null,
+        normalizationVersion: 1,
+        contentIdentity: null,
+        purchasePreview: req.draftId ? {
+          templateVersionId: '550e8400-e29b-41d4-a716-4466554400d2',
+          definition: {
+            fields: [
+              {
+                id: '550e8400-e29b-41d4-a716-4466554400f1',
+                meaningKey: 'domain',
+                type: 'text',
+                label: '待部署主域名',
+                required: true,
+              },
+              {
+                id: '550e8400-e29b-41d4-a716-4466554400f2',
+                meaningKey: 'server_env',
+                type: 'select',
+                label: '目标服务器环境',
+                required: true,
+                options: [
+                  { id: '550e8400-e29b-41d4-a716-4466554400e1', meaningKey: 'nginx', label: 'Nginx / OpenResty' },
+                  { id: '550e8400-e29b-41d4-a716-4466554400e2', meaningKey: 'caddy', label: 'Caddy' },
+                ],
+              },
+            ],
+          },
+          values: mockDrafts.get(req.draftId)?.values || {
+            '550e8400-e29b-41d4-a716-4466554400f1': 'shop.aiove.top',
+            '550e8400-e29b-41d4-a716-4466554400f2': '550e8400-e29b-41d4-a716-4466554400e2',
+          },
+          attachments: [],
+        } : null,
+        skuId: req.skuId,
+        productId: info.productId,
+        productName: info.productName,
+        productType: info.productType,
+        productStatus: info.productStatus,
+        skuCode: info.skuCode,
+        options: info.options,
+        unitPrice: info.unitPrice,
+        quantity: qty,
+        lineTotal,
+        inventoryMode: 'quantity',
+        fulfillmentMethod: 'manual',
+        fulfillmentRevision: 1,
+        fulfillmentVersionId: '550e8400-e29b-41d4-a716-446655440099',
+        availableQuantity: 20,
+        identityValid: true,
+        purchaseLimits: info.purchaseLimits,
+        canPurchase: true,
+        reason: null,
+      }
+    }) : [
+      {
+        lineId: null,
+        sourceLineIds: [],
+        lineRevision: null,
+        draftId: null,
+        draftRevision: null,
+        templateVersionId: null,
+        normalizationVersion: 1,
+        contentIdentity: null,
+        purchasePreview: null,
+        skuId: '550e8400-e29b-41d4-a716-4466554400a1',
+        productId: '550e8400-e29b-41d4-a716-446655440011',
+        productName: '安全双因子认证硬件令牌 FIDO2',
+        productType: 'physical',
+        productStatus: 'active',
+        skuCode: 'FIDO2-TYPEC-BLK',
+        options: [
+          { groupId: 'group-port', groupName: '接口规格', valueId: 'val-typec', valueName: 'Type-C' },
+          { groupId: 'group-color', groupName: '外观颜色', valueId: 'val-black', valueName: '深空黑' },
+        ],
+        unitPrice: '128.00',
+        quantity: 1,
+        lineTotal: '128.00',
+        inventoryMode: 'quantity',
+        fulfillmentMethod: 'manual',
+        fulfillmentRevision: 1,
+        fulfillmentVersionId: '550e8400-e29b-41d4-a716-446655440099',
+        availableQuantity: 20,
+        identityValid: true,
+        purchaseLimits: skuCatalog['550e8400-e29b-41d4-a716-4466554400a1'].purchaseLimits,
+        canPurchase: true,
+        reason: null,
+      },
+    ]
+
+    const subtotal = items.reduce((sum, item) => sum + Number(item.lineTotal || 0), 0).toFixed(2)
     response.writeHead(200).end(JSON.stringify({
       data: {
-        items: [
-          { skuId: '550e8400-e29b-41d4-a716-446655440003', canPurchase: true, purchaseLimits: { product: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, requiresLogin: false } },
-          { skuId: '550e8400-e29b-41d4-a716-4466554400a1', canPurchase: true, purchaseLimits: { product: { perOrderLimit: 5, lifetimeLimit: 10, rolling24HourLimit: null, lifetimePurchased: 0, rolling24HoursPurchased: 0, maxAvailable: 5, exceeded: false }, sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, requiresLogin: false } },
-          { skuId: '550e8400-e29b-41d4-a716-4466554400a2', canPurchase: true, purchaseLimits: { product: { perOrderLimit: 5, lifetimeLimit: 10, rolling24HourLimit: null, lifetimePurchased: 0, rolling24HoursPurchased: 0, maxAvailable: 5, exceeded: false }, sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, requiresLogin: false } },
-          { skuId: '550e8400-e29b-41d4-a716-4466554400a3', canPurchase: true, purchaseLimits: { product: { perOrderLimit: 5, lifetimeLimit: 10, rolling24HourLimit: null, lifetimePurchased: 0, rolling24HoursPurchased: 0, maxAvailable: 5, exceeded: false }, sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, requiresLogin: false } },
-          { skuId: '550e8400-e29b-41d4-a716-4466554400b1', canPurchase: true, purchaseLimits: { product: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: 0, rolling24HoursPurchased: 0, maxAvailable: null, exceeded: false }, sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, requiresLogin: false } },
-        ],
+        quotedAt: new Date().toISOString(),
+        quoteToken: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+        currency: 'CNY',
+        items,
+        pricedSubtotal: subtotal,
+        totalAmount: subtotal,
+        totalComplete: true,
+        canContinue: true,
+        customerAuthenticated: false,
+        guestCheckoutEnabled: true,
+        guestFreeClaimEnabled: false,
+        policyReasons: [],
       },
     }))
     return
