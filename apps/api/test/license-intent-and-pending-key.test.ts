@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { chmod, link, lstat, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -15,6 +15,7 @@ import {
   initializeTemporaryLicensePendingKey,
   LicensePendingKeyError,
   loadLicensePendingKey,
+  verifyBoundProductionLicensePendingKey,
 } from '../src/licensing/pending-encryption-key.js'
 
 const roots = new Set<string>()
@@ -121,25 +122,74 @@ describe('independent AES-256-GCM pending key store', () => {
     }
   })
 
-  it('accepts only an identity-bound trusted time watermark beside the Pending Key', async () => {
+  it('accepts only an identity-bound trusted time watermark and lock file beside the Pending Key', async () => {
     const directory = await root()
     const previous = process.env.NODE_ENV
     process.env.NODE_ENV = 'production'
     const identity = { databaseId: randomUUID(), instanceId: randomUUID(), identityJkt: Buffer.alloc(32, 5).toString('base64url') }
     const watermark = join(directory, 'license-time-watermark.json')
+    const lockPath = join(directory, '.license-time-watermark.lock')
     try {
       const first = await ensureProductionLicensePendingKey(directory, [], identity)
       await advanceTrustedTimeWatermarkFile(directory, identity, Date.now())
       const original = await readFile(watermark)
+
+      // Both ensure and verify succeed with valid watermark and valid lock file
       await expect(ensureProductionLicensePendingKey(directory, [], identity)).resolves.toEqual({ keyId: first.keyId, created: false })
       expect(await readFile(watermark)).toEqual(original)
 
+      const key = await loadLicensePendingKey(directory)
+      const sha256 = createHash('sha256').update(key.key).digest('hex')
+      await expect(
+        verifyBoundProductionLicensePendingKey(directory, { keyId: first.keyId, sha256 }, [], identity),
+      ).resolves.toMatchObject({ keyId: first.keyId })
+
+      // Verify lock file permissions and metadata
+      const lockStat = await lstat(lockPath)
+      expect(lockStat.isFile()).toBe(true)
+      expect(lockStat.isSymbolicLink()).toBe(false)
+      expect(lockStat.nlink).toBe(1)
+      expect(lockStat.mode & 0o777).toBe(0o600)
+
+      // 1. Lock file with invalid permissions is rejected
+      await chmod(lockPath, 0o644)
+      await expect(verifyBoundProductionLicensePendingKey(directory, { keyId: first.keyId, sha256 }, [], identity))
+        .rejects.toMatchObject({ code: 'pending_key_root_contents_invalid' })
+      await chmod(lockPath, 0o600)
+
+      // 2. Lock file as a symbolic link is rejected
+      const externalLockTarget = join(await root(), 'external-lock-target')
+      await writeFile(externalLockTarget, '', { mode: 0o600 })
+      await unlink(lockPath)
+      await symlink(externalLockTarget, lockPath)
+      await expect(verifyBoundProductionLicensePendingKey(directory, { keyId: first.keyId, sha256 }, [], identity))
+        .rejects.toMatchObject({ code: 'pending_key_root_contents_invalid' })
+      await unlink(lockPath)
+      await writeFile(lockPath, '', { mode: 0o600 })
+
+      // 3. Lock file with multiple hard links is rejected
+      const externalHardlink = join(await root(), 'lock-hardlink')
+      await link(lockPath, externalHardlink)
+      await expect(verifyBoundProductionLicensePendingKey(directory, { keyId: first.keyId, sha256 }, [], identity))
+        .rejects.toMatchObject({ code: 'pending_key_root_contents_invalid' })
+      await unlink(externalHardlink)
+
+      // 4. Valid lock file passes verification again
+      await expect(
+        verifyBoundProductionLicensePendingKey(directory, { keyId: first.keyId, sha256 }, [], identity),
+      ).resolves.toMatchObject({ keyId: first.keyId })
+
+      // 5. Wrong identity rejects watermark
       const wrongIdentity = { ...identity, instanceId: randomUUID() }
       await expect(ensureProductionLicensePendingKey(directory, [], wrongIdentity))
         .rejects.toMatchObject({ code: 'pending_key_watermark_invalid' })
       await writeFile(watermark, original)
+
+      // 6. Unknown file in directory is rejected
       await writeFile(join(directory, 'unexpected.json'), '{}', { mode: 0o600 })
       await expect(ensureProductionLicensePendingKey(directory, [], identity))
+        .rejects.toMatchObject({ code: 'pending_key_root_contents_invalid' })
+      await expect(verifyBoundProductionLicensePendingKey(directory, { keyId: first.keyId, sha256 }, [], identity))
         .rejects.toMatchObject({ code: 'pending_key_root_contents_invalid' })
     } finally {
       if (previous === undefined) delete process.env.NODE_ENV

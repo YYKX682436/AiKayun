@@ -2,7 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID }
 import { constants as fsConstants, existsSync } from 'node:fs'
 import { link, lstat, mkdir, open, realpath, readdir, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { readTrustedTimeWatermark } from './trusted-time-watermark.js'
+import { readTrustedTimeWatermark, trustedTimeWatermarkLockFileName } from './trusted-time-watermark.js'
 import type { TimeWatermarkIdentity } from './trusted-time-watermark.js'
 
 const keyFileName = 'license-pending-aes-256-gcm.json'
@@ -145,10 +145,51 @@ function errorCode(error: unknown): string | undefined {
     : undefined
 }
 
+async function validateTrustedTimeWatermarkLockFile(root: string): Promise<void> {
+  const lockPath = join(root, trustedTimeWatermarkLockFileName)
+  let before
+  try {
+    before = await lstat(lockPath)
+  } catch {
+    fail('pending_key_root_contents_invalid')
+  }
+  if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1) {
+    fail('pending_key_root_contents_invalid')
+  }
+  if ((before.mode & 0o777) !== 0o600 || (currentUid() !== undefined && before.uid !== currentUid())) {
+    fail('pending_key_root_contents_invalid')
+  }
+  let handle
+  try {
+    handle = await open(lockPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+    const after = await handle.stat()
+    if (
+      !after.isFile() ||
+      after.nlink !== 1 ||
+      (after.mode & 0o777) !== 0o600 ||
+      (currentUid() !== undefined && after.uid !== currentUid()) ||
+      before.dev !== after.dev ||
+      before.ino !== after.ino
+    ) {
+      fail('pending_key_root_contents_invalid')
+    }
+  } catch (error) {
+    if (error instanceof LicensePendingKeyError) throw error
+    fail('pending_key_root_contents_invalid')
+  } finally {
+    if (handle) await handle.close().catch(() => undefined)
+  }
+}
+
 async function stagedKeyFiles(root: string, names: string[], identity?: TimeWatermarkIdentity): Promise<string[]> {
-  const staged = names.filter(name => name !== keyFileName && name !== watermarkFileName)
+  const staged = names.filter(
+    name => name !== keyFileName && name !== watermarkFileName && name !== trustedTimeWatermarkLockFileName,
+  )
   if (staged.some(name => !/^\.pending-key-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u.test(name))) {
     fail('pending_key_root_contents_invalid')
+  }
+  if (names.includes(trustedTimeWatermarkLockFileName)) {
+    await validateTrustedTimeWatermarkLockFile(root)
   }
   if (names.includes(watermarkFileName)) {
     if (!identity) fail('pending_key_watermark_identity_unavailable')
