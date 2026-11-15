@@ -424,6 +424,30 @@ function inventoryLabel(inventory: PublicInventorySummary | undefined): string {
   return '库存尚未配置'
 }
 
+function getSelectedOptionValueName(groupId: string): string | null {
+  const valueId = selections[groupId]
+  if (!valueId || !product.value) return null
+  const group = product.value.optionGroups.find(g => g.id === groupId)
+  const val = group?.values.find(v => v.id === valueId)
+  return val?.name ?? null
+}
+
+const inventoryStatusClass = computed(() => {
+  const inv = selectedVariant.value?.inventory
+  if (!inv) return 'text-muted'
+  if (inv.mode === 'quantity' && inv.status === 'in_stock') return 'text-success'
+  if (inv.mode === 'quantity' && inv.status === 'out_of_stock') return 'text-warning'
+  return 'text-muted'
+})
+
+const inventoryStatusDotClass = computed(() => {
+  const inv = selectedVariant.value?.inventory
+  if (!inv) return 'bg-muted'
+  if (inv.mode === 'quantity' && inv.status === 'in_stock') return 'bg-success'
+  if (inv.mode === 'quantity' && inv.status === 'out_of_stock') return 'bg-warning'
+  return 'bg-muted'
+})
+
 async function refreshPurchaseQuote(): Promise<void> {
   const sequence = ++purchaseQuoteSequence
   const variant = selectedVariant.value
@@ -1326,43 +1350,51 @@ async function buySelectedNow() {
       <template v-if="product">
         <nav
           aria-label="面包屑"
-          class="mb-5 min-w-0 overflow-x-auto text-sm text-muted"
+          class="mb-6 min-w-0 overflow-x-auto text-xs sm:text-sm text-muted"
         >
-          <ol class="flex min-w-max items-center gap-2">
+          <ol class="flex min-w-max items-center gap-1.5 sm:gap-2">
             <li>
               <NuxtLink
                 to="/"
-                class="hover:text-primary"
+                class="transition-colors hover:text-primary"
               >
                 全部商品
               </NuxtLink>
             </li>
             <li
               v-if="primaryCategory"
-              class="flex items-center gap-2"
+              class="flex items-center gap-1.5 sm:gap-2"
             >
-              <span aria-hidden="true">/</span><NuxtLink
+              <span
+                aria-hidden="true"
+                class="text-muted/40"
+              >/</span>
+              <NuxtLink
                 :to="`/categories/${primaryCategory.id}`"
-                class="hover:text-primary"
+                class="transition-colors hover:text-primary"
               >
                 {{ primaryCategory.name }}
               </NuxtLink>
             </li>
-            <li class="flex items-center gap-2">
-              <span aria-hidden="true">/</span><span
-                class="max-w-[60vw] truncate text-highlighted"
+            <li class="flex items-center gap-1.5 sm:gap-2">
+              <span
+                aria-hidden="true"
+                class="text-muted/40"
+              >/</span>
+              <span
+                class="max-w-[48vw] truncate font-medium text-highlighted"
                 aria-current="page"
               >{{ product.name }}</span>
             </li>
           </ol>
         </nav>
 
-        <div class="grid min-w-0 gap-7 lg:grid-cols-[minmax(0,1.15fr)_minmax(20rem,0.85fr)] lg:gap-10">
+        <div class="grid min-w-0 gap-8 lg:grid-cols-[minmax(0,1.15fr)_minmax(21rem,0.85fr)] lg:gap-12 xl:gap-14">
           <section
             aria-label="商品图片"
-            class="min-w-0"
+            class="min-w-0 lg:sticky lg:top-20 lg:self-start"
           >
-            <div class="relative aspect-[4/3] overflow-hidden rounded-xl border border-default bg-muted sm:aspect-[5/4]">
+            <div class="relative flex aspect-square sm:aspect-[4/3] lg:aspect-square items-center justify-center overflow-hidden rounded-2xl border border-default/70 bg-elevated/40 p-3 shadow-xs backdrop-blur-xs transition-colors sm:p-5">
               <img
                 v-if="selectedImageItem && !imageFailed"
                 :src="selectedImageItem.url"
@@ -1371,31 +1403,32 @@ async function buySelectedNow() {
                 :height="selectedImageItem.height"
                 fetchpriority="high"
                 decoding="async"
-                class="h-full w-full object-contain"
+                class="h-full w-full object-contain transition-transform duration-300 ease-out"
                 @error="imageFailed = true"
               >
               <div
                 v-else
-                class="flex h-full items-center justify-center text-muted"
+                class="flex flex-col items-center justify-center gap-2 p-6 text-center text-muted"
                 aria-label="暂无可展示图片"
               >
                 <UIcon
-                  name="i-lucide-image"
-                  class="size-12"
+                  name="i-lucide-package"
+                  class="size-12 stroke-[1.2] opacity-40 sm:size-16"
                 />
+                <span class="text-xs text-muted/60">暂无可展示图片</span>
               </div>
             </div>
             <div
               v-if="galleryPath.length > 1"
-              class="mt-3 flex gap-2 overflow-x-auto pb-1"
+              class="mt-3.5 flex gap-2.5 overflow-x-auto pb-1.5 scroll-smooth"
               aria-label="选择商品图片"
             >
               <button
                 v-for="(image, index) in galleryPath"
                 :key="image.url"
                 type="button"
-                class="size-16 shrink-0 overflow-hidden rounded-lg border bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:size-20"
-                :class="selectedImage === index ? 'border-primary ring-2 ring-primary/30' : 'border-default'"
+                class="size-16 sm:size-18 shrink-0 overflow-hidden rounded-xl border p-1 transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                :class="selectedImage === index ? 'border-primary ring-2 ring-primary/25 bg-elevated shadow-xs' : 'border-default/60 hover:border-default hover:bg-muted/40 bg-muted/20 opacity-70 hover:opacity-100'"
                 :aria-label="`查看第 ${index + 1} 张商品图片`"
                 :aria-pressed="selectedImage === index"
                 @click="selectedImage = index; imageFailed = false"
@@ -1407,7 +1440,7 @@ async function buySelectedNow() {
                   height="80"
                   loading="lazy"
                   decoding="async"
-                  class="h-full w-full object-cover"
+                  class="h-full w-full rounded-lg object-cover"
                   @error="($event.target as HTMLImageElement).style.visibility = 'hidden'"
                 >
               </button>
@@ -1418,7 +1451,9 @@ async function buySelectedNow() {
             <div class="flex flex-wrap items-center gap-2">
               <UBadge
                 color="primary"
-                variant="soft"
+                variant="subtle"
+                size="sm"
+                class="rounded-full px-2.5 font-medium"
               >
                 {{ typeLabel }}
               </UBadge>
@@ -1426,23 +1461,25 @@ async function buySelectedNow() {
                 v-if="product.selectionStatus === 'none'"
                 color="neutral"
                 variant="soft"
+                size="sm"
+                class="rounded-full px-2.5"
               >
                 暂无可选规格
               </UBadge>
             </div>
-            <h1 class="mt-3 break-words text-2xl font-semibold leading-tight text-highlighted sm:text-3xl">
+            <h1 class="mt-3.5 break-words text-2xl font-semibold tracking-tight text-highlighted sm:text-3xl lg:text-3.5xl">
               {{ product.name }}
             </h1>
             <p
               v-if="product.description"
-              class="mt-3 whitespace-pre-line break-words text-sm leading-6 text-muted sm:text-base"
+              class="mt-3 whitespace-pre-line break-words text-sm leading-relaxed text-muted sm:text-base"
             >
               {{ product.description }}
             </p>
 
-            <div class="mt-5 rounded-xl border border-default bg-elevated p-4 sm:p-5">
+            <div class="mt-6 rounded-2xl border border-default/80 bg-elevated/70 p-5 shadow-xs backdrop-blur-xs sm:p-6">
               <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                <p class="text-2xl font-semibold tabular-nums text-primary sm:text-3xl">
+                <p class="text-3xl font-semibold tracking-tight tabular-nums text-primary sm:text-4xl">
                   <template v-if="selectedVariant">
                     ¥{{ selectedVariant.salePrice }}
                   </template>
@@ -1459,31 +1496,40 @@ async function buySelectedNow() {
                 </p>
                 <del
                   v-if="selectedVariant?.compareAtPrice"
-                  class="text-sm tabular-nums text-muted"
+                  class="ml-2 text-base font-normal tabular-nums text-muted"
                 >¥{{ selectedVariant.compareAtPrice }}</del>
               </div>
 
               <div
                 v-if="product.optionGroups.length"
-                class="mt-5 space-y-5"
+                class="mt-6 space-y-5"
               >
                 <fieldset
                   v-for="group in product.optionGroups"
                   :key="group.id"
                   class="min-w-0"
                 >
-                  <legend class="mb-2 text-sm font-medium text-highlighted">
-                    {{ group.name }}
+                  <legend class="mb-2.5 flex items-center justify-between text-sm font-medium text-highlighted">
+                    <span>{{ group.name }}</span>
+                    <span
+                      v-if="getSelectedOptionValueName(group.id)"
+                      class="text-xs font-normal text-muted"
+                    >
+                      已选：<span class="font-medium text-highlighted">{{ getSelectedOptionValueName(group.id) }}</span>
+                    </span>
                   </legend>
-                  <div class="flex flex-wrap gap-2">
+                  <div class="flex flex-wrap gap-2 sm:gap-2.5">
                     <button
                       v-for="value in group.values"
                       :key="value.id"
                       type="button"
-                      class="min-h-11 max-w-full rounded-lg border px-3 py-2 text-sm transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary motion-reduce:transition-none"
+                      class="min-h-11 max-w-full rounded-xl border px-3.5 py-2 text-sm font-medium transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary motion-reduce:transition-none"
                       :class="[
-                        selections[group.id] === value.id ? 'border-primary bg-primary/10 text-highlighted' : 'border-default bg-default text-highlighted hover:bg-muted',
-                        !optionHasVariant(group.id, value.id) ? 'cursor-not-allowed opacity-45' : '',
+                        selections[group.id] === value.id
+                          ? 'border-primary bg-primary/10 text-primary ring-1 ring-primary/40 shadow-xs'
+                          : optionHasVariant(group.id, value.id)
+                            ? 'border-default/80 bg-default text-highlighted hover:border-default hover:bg-muted/50'
+                            : 'border-dashed border-default/50 bg-muted/20 text-muted/50 cursor-not-allowed opacity-40 line-through',
                       ]"
                       :disabled="!optionHasVariant(group.id, value.id)"
                       :aria-pressed="selections[group.id] === value.id"
@@ -1505,6 +1551,8 @@ async function buySelectedNow() {
                   color="neutral"
                   variant="link"
                   size="sm"
+                  icon="i-lucide-rotate-ccw"
+                  class="p-0 text-xs text-muted hover:text-highlighted"
                   @click="Object.keys(selections).forEach(groupId => delete selections[groupId])"
                 >
                   清除规格选择
@@ -1517,34 +1565,40 @@ async function buySelectedNow() {
                 {{ selectedVariant ? '当前仅有一种规格。' : '暂无可选规格。' }}
               </div>
 
-              <div class="mt-5 border-t border-default pt-4">
-                <p class="text-sm font-medium text-highlighted">
-                  供货状态
-                </p>
-                <p
-                  class="mt-1 text-sm text-muted"
-                  aria-live="polite"
-                >
-                  {{ inventoryLabel(selectedVariant?.inventory) }}
-                </p>
+              <div class="mt-5 border-t border-default/70 pt-4.5">
+                <div class="flex items-center justify-between text-sm">
+                  <span class="font-medium text-highlighted">供货状态</span>
+                  <span
+                    class="inline-flex items-center gap-1.5 font-medium tabular-nums"
+                    :class="inventoryStatusClass"
+                    aria-live="polite"
+                  >
+                    <span
+                      class="size-2 rounded-full"
+                      :class="inventoryStatusDotClass"
+                      aria-hidden="true"
+                    />
+                    {{ inventoryLabel(selectedVariant?.inventory) }}
+                  </span>
+                </div>
               </div>
               <div
                 v-if="selectedVariant"
-                class="mt-4 grid gap-3"
+                class="mt-5 grid gap-4"
               >
                 <UFormField
                   label="购买数量"
                   name="quantity"
                   :hint="isEditingCartLine ? '数量以购物车当前购买行为准' : undefined"
                 >
-                  <div class="flex w-fit items-center rounded-lg border border-default">
+                  <div class="inline-flex items-center overflow-hidden rounded-xl border border-default/80 bg-default shadow-xs">
                     <UButton
                       type="button"
                       color="neutral"
                       variant="ghost"
                       icon="i-lucide-minus"
                       aria-label="减少数量"
-                      class="min-h-11 min-w-11 justify-center"
+                      class="min-h-11 min-w-11 justify-center rounded-none text-muted hover:bg-muted/60 hover:text-highlighted"
                       :disabled="isEditingCartLine || quantity <= 1 || shoppingCart.busy.value"
                       @click="quantity = Math.max(1, quantity - 1)"
                     />
@@ -1555,7 +1609,7 @@ async function buySelectedNow() {
                       max="99"
                       inputmode="numeric"
                       aria-label="购买数量"
-                      class="w-20 text-center tabular-nums"
+                      class="w-20 border-x border-default/60 text-center font-medium tabular-nums"
                       :disabled="isEditingCartLine || shoppingCart.busy.value"
                       @change="quantity = Math.min(99, Math.max(1, Math.trunc(quantity || 1)))"
                     />
@@ -1565,7 +1619,7 @@ async function buySelectedNow() {
                       variant="ghost"
                       icon="i-lucide-plus"
                       aria-label="增加数量"
-                      class="min-h-11 min-w-11 justify-center"
+                      class="min-h-11 min-w-11 justify-center rounded-none text-muted hover:bg-muted/60 hover:text-highlighted"
                       :disabled="isEditingCartLine || quantity >= 99 || shoppingCart.busy.value"
                       @click="quantity = Math.min(99, quantity + 1)"
                     />
@@ -1573,16 +1627,22 @@ async function buySelectedNow() {
                 </UFormField>
                 <section
                   v-if="purchaseForm?.required"
-                  class="min-w-0 rounded-xl border border-default bg-muted/20 p-4 sm:p-5"
+                  class="min-w-0 rounded-2xl border border-default/80 bg-muted/20 p-4 shadow-xs sm:p-5.5"
                   aria-labelledby="purchase-form-title"
                 >
                   <div class="mb-4">
-                    <h2
-                      id="purchase-form-title"
-                      class="text-base font-semibold text-highlighted"
-                    >
-                      {{ purchaseForm.templateName }} · 购买资料
-                    </h2>
+                    <div class="flex items-center gap-2">
+                      <UIcon
+                        name="i-lucide-clipboard-pen-line"
+                        class="size-4.5 shrink-0 text-primary"
+                      />
+                      <h2
+                        id="purchase-form-title"
+                        class="text-base font-semibold text-highlighted"
+                      >
+                        {{ purchaseForm.templateName }} · 购买资料
+                      </h2>
+                    </div>
                     <p class="mt-1 text-xs leading-5 text-muted">
                       这组填写内容对应当前购买行的全部 {{ quantity }} 件商品。请核对后再加入购物车或立即购买。
                     </p>
@@ -1591,7 +1651,7 @@ async function buySelectedNow() {
                     v-if="purchaseForm.status === 'paused'"
                     color="warning"
                     variant="soft"
-                    class="mb-4"
+                    class="mb-4 rounded-xl"
                     title="此填写商品已暂停新订单"
                     description="已有订单和履约不受影响。请勿继续创建新的购买订单。"
                   />
@@ -1605,10 +1665,18 @@ async function buySelectedNow() {
                   </p>
                   <div
                     v-if="purchaseDefinition && purchaseDraft && isEditingCartLine && isCustomer && !hasCartReplacementDraft"
-                    class="mb-4 rounded-lg border border-default bg-default p-4"
+                    class="mb-4 rounded-xl border border-default/80 bg-default p-4 shadow-xs"
                   >
-                    <p class="text-sm font-medium text-highlighted">安全编辑购物车资料</p>
-                    <p class="mt-1 text-sm leading-6 text-muted">
+                    <div class="flex items-center gap-2">
+                      <UIcon
+                        name="i-lucide-shield-check"
+                        class="size-4 shrink-0 text-primary"
+                      />
+                      <p class="text-sm font-medium text-highlighted">
+                        安全编辑购物车资料
+                      </p>
+                    </div>
+                    <p class="mt-1.5 text-xs sm:text-sm leading-relaxed text-muted">
                       先创建这行专属的编辑草稿。编辑过程中购物车仍保留最近一次有效资料；确认完整后才替换购买行。
                     </p>
                     <UButton
@@ -1616,7 +1684,7 @@ async function buySelectedNow() {
                       color="primary"
                       variant="soft"
                       icon="i-lucide-file-pen-line"
-                      class="mt-3 min-h-11 w-full justify-center"
+                      class="mt-3.5 min-h-11 w-full justify-center rounded-xl font-medium"
                       :disabled="purchaseFormBusy || cartEdit?.lineRevision === null || cartEdit?.expectedDraftRevision === null"
                       @click="startCartLineReplacementEdit"
                     >
@@ -1625,12 +1693,19 @@ async function buySelectedNow() {
                   </div>
                   <div
                     v-if="purchaseDefinition && !purchaseDraft && !purchaseFormBusy && !isEditingCartLine"
-                    class="mb-4 space-y-3 rounded-lg border border-default bg-default p-3 sm:p-4"
+                    class="mb-4 space-y-3.5 rounded-xl border border-default/80 bg-default p-3.5 shadow-xs sm:p-4.5"
                     aria-label="购买资料草稿恢复与创建"
                   >
-                    <div v-if="availablePurchaseDraftRecoveries.length" class="space-y-2">
-                      <p class="text-sm font-medium text-highlighted">恢复一组已有草稿</p>
-                      <p class="text-xs leading-5 text-muted">草稿归属和有效期会由服务器重新核验；不同账号请分别新建资料。</p>
+                    <div
+                      v-if="availablePurchaseDraftRecoveries.length"
+                      class="space-y-2.5"
+                    >
+                      <p class="text-sm font-medium text-highlighted">
+                        恢复一组已有草稿
+                      </p>
+                      <p class="text-xs leading-5 text-muted">
+                        草稿归属和有效期会由服务器重新核验；不同账号请分别新建资料。
+                      </p>
                       <div class="grid gap-2">
                         <UButton
                           v-for="candidate in availablePurchaseDraftRecoveries"
@@ -1638,7 +1713,8 @@ async function buySelectedNow() {
                           type="button"
                           color="neutral"
                           variant="outline"
-                          class="min-h-11 justify-start whitespace-normal text-left"
+                          icon="i-lucide-history"
+                          class="min-h-11 justify-start whitespace-normal rounded-xl text-left"
                           :disabled="purchaseFormBusy"
                           @click="recoverPurchaseDraft(candidate)"
                         >
@@ -1651,7 +1727,7 @@ async function buySelectedNow() {
                       color="primary"
                       variant="soft"
                       icon="i-lucide-file-plus-2"
-                      class="min-h-11 w-full justify-center"
+                      class="min-h-11 w-full justify-center rounded-xl font-medium"
                       :disabled="purchaseFormBusy"
                       @click="startAnotherPurchaseDraft"
                     >
@@ -1670,12 +1746,12 @@ async function buySelectedNow() {
                     @upload="uploadPurchaseImage"
                     @remove="removePurchaseImage"
                   />
-                  <div class="mt-4 flex flex-col gap-2 sm:flex-row">
+                  <div class="mt-4.5 flex flex-col gap-2.5 sm:flex-row">
                     <UButton
                       color="neutral"
                       variant="outline"
                       icon="i-lucide-save"
-                      class="min-h-11 justify-center"
+                      class="min-h-11 justify-center rounded-xl font-medium"
                       :loading="purchaseFormBusy"
                       :disabled="!purchaseDraft || !purchaseDraftDirty || purchaseFormBusy"
                       @click="savePurchaseValues()"
@@ -1686,7 +1762,7 @@ async function buySelectedNow() {
                       color="primary"
                       variant="soft"
                       icon="i-lucide-list-checks"
-                      class="min-h-11 justify-center"
+                      class="min-h-11 justify-center rounded-xl font-medium"
                       :loading="purchaseFormBusy"
                       :disabled="!purchaseDraft || purchaseFormBusy"
                       @click="validatePurchaseValues"
@@ -1697,7 +1773,7 @@ async function buySelectedNow() {
                       v-if="hasCartReplacementDraft && isCustomer"
                       color="neutral"
                       variant="ghost"
-                      class="min-h-11 justify-center"
+                      class="min-h-11 justify-center rounded-xl font-medium"
                       :disabled="purchaseFormBusy"
                       @click="cancelCartLineReplacementEdit"
                     >
@@ -1714,7 +1790,7 @@ async function buySelectedNow() {
                   </p>
                   <p
                     v-if="purchaseFormError"
-                    class="mt-2 text-sm text-error"
+                    class="mt-2 text-sm font-medium text-error"
                     role="alert"
                   >
                     {{ purchaseFormError }}
@@ -1722,7 +1798,7 @@ async function buySelectedNow() {
                 </section>
                 <p
                   v-else-if="purchaseFormError"
-                  class="text-sm text-error"
+                  class="text-sm font-medium text-error"
                   role="alert"
                 >
                   {{ purchaseFormError }}
@@ -1750,11 +1826,15 @@ async function buySelectedNow() {
                 <NuxtLink
                   v-if="selectedPurchaseQuote?.purchaseLimits.requiresLogin || (!isCustomer && (product.purchaseLimits.lifetime || product.purchaseLimits.rolling24Hours || selectedVariant.purchaseLimits.lifetime || selectedVariant.purchaseLimits.rolling24Hours))"
                   :to="purchaseLoginPath"
-                  class="inline-flex min-h-11 items-center text-sm font-medium text-primary underline underline-offset-2"
+                  class="inline-flex min-h-11 items-center gap-1.5 text-sm font-medium text-primary underline underline-offset-4 hover:opacity-85"
                 >
+                  <UIcon
+                    name="i-lucide-log-in"
+                    class="size-4"
+                  />
                   登录后继续购买
                 </NuxtLink>
-                <div class="grid gap-2 sm:grid-cols-2">
+                <div class="grid gap-2.5 sm:grid-cols-2">
                   <p
                     v-if="!shoppingCart.canAddToCart.value"
                     class="text-sm text-muted sm:col-span-2"
@@ -1773,6 +1853,8 @@ async function buySelectedNow() {
                     color="neutral"
                     variant="outline"
                     icon="i-lucide-shopping-cart"
+                    size="lg"
+                    class="min-h-12 w-full justify-center rounded-xl font-medium border-default/80 hover:bg-muted/60 transition-all text-highlighted"
                     :loading="shoppingCart.busy.value"
                     :disabled="!selectedVariant || !shoppingCart.canAddToCart.value || quantity < 1 || quantity > 99 || shoppingCart.busy.value || purchaseFormBusy || (purchaseForm?.required && !purchaseDraftComplete)"
                     @click="addSelectedToCart"
@@ -1782,6 +1864,8 @@ async function buySelectedNow() {
                   <UButton
                     color="primary"
                     icon="i-lucide-arrow-right"
+                    size="lg"
+                    class="min-h-12 w-full justify-center rounded-xl font-semibold shadow-xs hover:shadow-sm transition-all text-white"
                     :disabled="!selectedVariant || !shoppingCart.canAddToCart.value || quantity < 1 || quantity > 99 || shoppingCart.busy.value || purchaseFormBusy || purchaseQuoteBusy || (purchaseForm?.required && !purchaseDraftComplete) || (selectedPurchaseQuote !== null && !selectedPurchaseQuote.canPurchase)"
                     @click="buySelectedNow"
                   >
@@ -1790,14 +1874,14 @@ async function buySelectedNow() {
                 </div>
                 <p
                   v-if="cartFeedback || shoppingCart.errorMessage.value"
-                  class="text-sm text-warning"
+                  class="text-sm font-medium text-warning"
                   role="status"
                   aria-live="polite"
                 >
                   {{ cartFeedback || shoppingCart.errorMessage.value }}
                   <NuxtLink
                     to="/cart"
-                    class="ml-1 font-medium text-primary underline underline-offset-2"
+                    class="ml-1 font-semibold text-primary underline underline-offset-4"
                   >
                     查看购物车
                   </NuxtLink>
@@ -1809,28 +1893,32 @@ async function buySelectedNow() {
                 icon="i-lucide-info"
                 title="报价会在提交时重新检查"
                 description="商品、库存、填写模板和已配置的履约资格都会在结算事务中再次校验。可用的支付渠道以订单详情页实际显示为准。"
-                class="mt-5"
+                class="mt-5.5 rounded-xl border border-default/50 bg-muted/20 text-xs"
               />
             </div>
 
             <section
               v-if="product.attributes.length"
               aria-labelledby="product-attributes-title"
-              class="mt-6"
+              class="mt-8"
             >
               <h2
                 id="product-attributes-title"
-                class="text-base font-semibold text-highlighted"
+                class="flex items-center gap-2 text-base font-semibold text-highlighted"
               >
+                <UIcon
+                  name="i-lucide-list"
+                  class="size-4 text-muted"
+                />
                 商品信息
               </h2>
-              <dl class="mt-3 divide-y divide-default rounded-xl border border-default">
+              <dl class="mt-3 divide-y divide-default/70 overflow-hidden rounded-2xl border border-default/70 bg-elevated/50 shadow-xs">
                 <div
                   v-for="attribute in product.attributes"
                   :key="`${attribute.name}:${attribute.value}`"
-                  class="grid grid-cols-[minmax(5rem,0.7fr)_minmax(0,1.3fr)] gap-3 px-3 py-3 text-sm sm:px-4"
+                  class="grid grid-cols-[minmax(5.5rem,0.7fr)_minmax(0,1.3fr)] gap-3 px-4 py-3 text-sm sm:px-5"
                 >
-                  <dt class="break-words text-muted">
+                  <dt class="break-words font-medium text-muted">
                     {{ attribute.name }}
                   </dt>
                   <dd class="break-words text-highlighted">
@@ -1847,17 +1935,21 @@ async function buySelectedNow() {
             >
               <h2
                 id="product-categories-title"
-                class="text-sm font-medium text-highlighted"
+                class="text-sm font-medium text-muted"
               >
                 商品分类
               </h2>
-              <div class="mt-2 flex flex-wrap gap-2">
+              <div class="mt-2.5 flex flex-wrap gap-2">
                 <NuxtLink
                   v-for="category in product.categories"
                   :key="category.id"
                   :to="`/categories/${category.id}`"
-                  class="inline-flex min-h-10 items-center rounded-full border border-default px-3 text-sm text-muted hover:border-primary/40 hover:text-primary focus-visible:outline-2 focus-visible:outline-primary"
+                  class="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-default/70 bg-muted/30 px-3 text-xs font-medium text-muted transition-colors hover:border-primary/50 hover:bg-muted/70 hover:text-primary focus-visible:outline-2 focus-visible:outline-primary"
                 >
+                  <UIcon
+                    name="i-lucide-folder"
+                    class="size-3 opacity-60"
+                  />
                   {{ category.path.map(item => item.name).join(' / ') }}
                 </NuxtLink>
               </div>
@@ -1868,17 +1960,23 @@ async function buySelectedNow() {
         <section
           v-if="product.richContentHtml"
           aria-labelledby="product-description-title"
-          class="mt-10 border-t border-default pt-7 sm:mt-12 sm:pt-9"
+          class="mt-12 border-t border-default/70 pt-8 sm:mt-16 sm:pt-10"
         >
-          <h2
-            id="product-description-title"
-            class="text-xl font-semibold text-highlighted"
-          >
-            商品详情
-          </h2>
+          <div class="mb-5 flex items-center gap-2.5 sm:mb-6">
+            <div
+              class="size-2 rounded-full bg-primary"
+              aria-hidden="true"
+            />
+            <h2
+              id="product-description-title"
+              class="text-xl font-semibold tracking-tight text-highlighted sm:text-2xl"
+            >
+              商品详情
+            </h2>
+          </div>
           <!-- eslint-disable vue/no-v-html -- Public HTML comes only from the shared validated D5 JSON converter. -->
           <div
-            class="product-rich-content mt-5 min-w-0 max-w-4xl break-words text-base leading-7 text-default"
+            class="product-rich-content min-w-0 max-w-4xl break-words text-base leading-relaxed text-default"
             v-html="product.richContentHtml"
           />
           <!-- eslint-enable vue/no-v-html -->
@@ -1887,12 +1985,15 @@ async function buySelectedNow() {
 
       <div
         v-else-if="status === 'pending'"
-        class="grid min-h-[32rem] gap-6 lg:grid-cols-2"
+        class="grid min-h-[32rem] gap-8 lg:grid-cols-[minmax(0,1.15fr)_minmax(20rem,0.85fr)] lg:gap-12"
         aria-label="正在加载商品详情"
       >
-        <div class="aspect-[4/3] animate-pulse rounded-xl bg-muted motion-reduce:animate-none" />
-        <div class="space-y-4">
-          <div class="h-8 w-2/3 animate-pulse rounded bg-muted motion-reduce:animate-none" /><div class="h-24 animate-pulse rounded-xl bg-muted motion-reduce:animate-none" />
+        <div class="aspect-square animate-pulse rounded-2xl bg-muted/60 motion-reduce:animate-none sm:aspect-[4/3] lg:aspect-square" />
+        <div class="space-y-5">
+          <div class="h-6 w-24 animate-pulse rounded-full bg-muted/60 motion-reduce:animate-none" />
+          <div class="h-9 w-3/4 animate-pulse rounded-xl bg-muted/60 motion-reduce:animate-none" />
+          <div class="h-16 w-full animate-pulse rounded-xl bg-muted/60 motion-reduce:animate-none" />
+          <div class="h-64 w-full animate-pulse rounded-2xl bg-muted/40 motion-reduce:animate-none" />
         </div>
       </div>
       <UAlert
@@ -1902,6 +2003,7 @@ async function buySelectedNow() {
         title="商品暂时无法加载"
         description="请检查网络后重试。"
         :actions="[{ label: '重试', onClick: () => refresh() }]"
+        class="rounded-2xl"
       />
     </UContainer>
   </main>
@@ -1915,7 +2017,13 @@ async function buySelectedNow() {
 .product-rich-content img {
   max-width: 100%;
   height: auto;
-  border-radius: 0.75rem;
+  border-radius: 1rem;
+  margin-block: 1.5rem;
+  box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05);
+}
+
+.dark .product-rich-content img {
+  box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.35);
 }
 
 .product-rich-content p,
@@ -1924,7 +2032,21 @@ async function buySelectedNow() {
 .product-rich-content blockquote,
 .product-rich-content h2,
 .product-rich-content h3 {
-  margin-block: 1rem;
+  margin-block: 1.25rem;
+}
+
+.product-rich-content h2 {
+  font-size: 1.35rem;
+  font-weight: 600;
+  color: var(--ui-text-highlighted);
+  margin-top: 2rem;
+}
+
+.product-rich-content h3 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--ui-text-highlighted);
+  margin-top: 1.5rem;
 }
 
 .product-rich-content ul,
@@ -1938,11 +2060,18 @@ async function buySelectedNow() {
   border-inline-start: 3px solid var(--ui-primary);
   padding-inline-start: 1rem;
   color: var(--ui-text-muted);
+  font-style: italic;
+  margin-block: 1.25rem;
 }
 
 .product-rich-content a {
   color: var(--ui-primary);
   text-decoration: underline;
-  text-underline-offset: 0.2em;
+  text-underline-offset: 0.25em;
+  transition: opacity 0.15s ease;
+}
+
+.product-rich-content a:hover {
+  opacity: 0.8;
 }
 </style>

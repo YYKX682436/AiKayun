@@ -104,13 +104,13 @@ watch(() => props.disabled, (disabled) => { if (!disabled) uploading.value = fal
     />
     <div
       v-else
-      class="space-y-3 rounded-xl border border-default bg-muted/20 p-3"
+      class="space-y-3 rounded-xl border border-default/70 bg-muted/20 p-3.5 shadow-xs"
     >
-      <div class="grid grid-cols-2 gap-2 sm:grid-cols-3">
+      <div class="grid grid-cols-2 gap-2.5 sm:grid-cols-3">
         <figure
           v-for="attachment in fieldAttachments"
           :key="attachment.id"
-          class="relative overflow-hidden rounded-lg border border-default bg-default"
+          class="relative overflow-hidden rounded-xl border border-default bg-default shadow-xs"
         >
           <img
             :src="attachment.url"
@@ -126,30 +126,30 @@ watch(() => props.disabled, (disabled) => { if (!disabled) uploading.value = fal
             size="xs"
             icon="i-lucide-x"
             :aria-label="`删除${field.label}图片`"
-            class="absolute right-1 top-1 min-h-8 min-w-8 justify-center"
+            class="absolute right-1.5 top-1.5 min-h-7 min-w-7 justify-center rounded-lg"
             :disabled="disabled"
             @click="emit('remove', attachment.id)"
           />
-          <figcaption class="px-2 py-1 text-xs text-muted">
+          <figcaption class="px-2.5 py-1 text-xs text-muted">
             {{ Math.ceil(attachment.byteSize / 1024) }} KB
           </figcaption>
         </figure>
         <figure
           v-if="localPreview"
-          class="overflow-hidden rounded-lg border border-primary bg-default"
+          class="overflow-hidden rounded-xl border border-primary bg-default shadow-xs"
         >
           <img
             :src="localPreview"
             :alt="`${field.label}待上传预览`"
             class="aspect-square w-full object-cover"
           >
-          <figcaption class="px-2 py-1 text-xs text-primary">
+          <figcaption class="px-2.5 py-1 text-xs text-primary">
             待上传：{{ selectedFile?.name }}
           </figcaption>
         </figure>
       </div>
-      <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
-        <label class="inline-flex min-h-11 cursor-pointer items-center justify-center gap-2 rounded-lg border border-default bg-default px-3 text-sm font-medium text-highlighted hover:border-primary focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary">
+      <div class="flex flex-col gap-2.5 sm:flex-row sm:items-center">
+        <label class="inline-flex min-h-11 cursor-pointer items-center justify-center gap-2 rounded-xl border border-default bg-default px-3.5 text-sm font-medium text-highlighted shadow-xs hover:border-primary focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-primary">
           <UIcon
             name="i-lucide-image-plus"
             aria-hidden="true"
@@ -170,7 +170,7 @@ watch(() => props.disabled, (disabled) => { if (!disabled) uploading.value = fal
           color="primary"
           variant="soft"
           icon="i-lucide-upload"
-          class="min-h-11 justify-center"
+          class="min-h-11 justify-center rounded-xl font-medium"
           :loading="uploading"
           :disabled="disabled || !selectedFile"
           @click="startUpload"

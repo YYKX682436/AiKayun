@@ -55,7 +55,7 @@ const exceeded = computed(() => Boolean(props.purchaseLimits?.product.exceeded |
 <template>
   <div
     v-if="lines.length || requiresLogin"
-    class="rounded-lg border border-warning/30 bg-warning/5 p-3 text-sm leading-6"
+    class="rounded-xl border border-warning/30 bg-warning/5 p-3.5 text-sm leading-6 shadow-xs"
     :role="exceeded || requiresLogin ? 'status' : undefined"
   >
     <ul
