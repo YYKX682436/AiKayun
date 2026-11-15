@@ -45,10 +45,9 @@ const desktopItems = computed<NavigationMenuItem[]>(() => {
   />
 
   <UButton
-    v-if="categories.length"
     color="neutral"
     variant="ghost"
-    icon="i-lucide-list-tree"
+    icon="i-lucide-menu"
     aria-label="浏览商品分类"
     class="min-h-11 min-w-9 px-1.5 xl:hidden"
     @click="drawerOpen = true"
@@ -56,29 +55,34 @@ const desktopItems = computed<NavigationMenuItem[]>(() => {
 
   <UDrawer
     v-model:open="drawerOpen"
-    title="商品分类"
-    description="按分类浏览店铺商品与快捷服务。"
+    title="商城菜单"
+    description="浏览店铺商品与快捷服务。"
     direction="right"
     :handle="false"
-    :ui="{ content: 'w-[min(22rem,90vw)]', body: 'p-3' }"
+    :ui="{ content: 'w-[min(22rem,90vw)]', body: 'p-4 flex flex-col gap-5 overflow-y-auto' }"
   >
     <template #body>
-      <nav aria-label="商品分类">
-        <NuxtLink
-          to="/"
-          class="mb-2 flex min-h-11 items-center rounded-lg px-3 font-medium text-highlighted hover:bg-muted"
-          @click="drawerOpen = false"
-        >
-          全部商品
-        </NuxtLink>
-        <StorefrontCategoryTreeLinks
-          :categories="roots"
-          :current-id="route.params.id?.toString()"
-          @navigate="drawerOpen = false"
-        />
-      </nav>
+      <div>
+        <p class="px-3 pb-1 text-xs font-medium text-dimmed">商品浏览</p>
+        <nav aria-label="商品导航">
+          <NuxtLink
+            to="/"
+            class="mb-1 flex min-h-11 items-center gap-2.5 rounded-lg px-3 font-medium text-highlighted transition-colors hover:bg-muted"
+            @click="drawerOpen = false"
+          >
+            <UIcon name="i-lucide-package" class="size-4.5 text-muted" />
+            <span>全部商品</span>
+          </NuxtLink>
+          <StorefrontCategoryTreeLinks
+            v-if="roots.length"
+            :categories="roots"
+            :current-id="route.params.id?.toString()"
+            @navigate="drawerOpen = false"
+          />
+        </nav>
+      </div>
 
-      <div class="mt-5 border-t border-default/70 pt-4">
+      <div class="border-t border-default/70 pt-4">
         <p class="px-3 pb-1 text-xs font-medium text-dimmed">商城服务</p>
         <nav aria-label="商城快捷导航" class="space-y-0.5">
           <NuxtLink
@@ -108,6 +112,13 @@ const desktopItems = computed<NavigationMenuItem[]>(() => {
             <span>联系客服</span>
           </NuxtLink>
         </nav>
+      </div>
+
+      <div class="mt-auto border-t border-default/70 pt-4">
+        <p class="px-3 pb-2 text-xs font-medium text-dimmed">外观设置</p>
+        <div class="px-1">
+          <ThemeModeSelect class="w-full" />
+        </div>
       </div>
     </template>
   </UDrawer>

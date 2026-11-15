@@ -54,7 +54,16 @@ const sampleProducts = [
 
 function page(url) {
   const pageNumber = Number(url.searchParams.get('page') ?? 1)
-  return { items: pageNumber === 1 ? sampleProducts : [], page: pageNumber, pageSize: 24, total: 25, totalPages: 2 }
+  const pageSize = 24
+  const total = sampleProducts.length
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  return {
+    items: pageNumber === 1 ? sampleProducts : [],
+    page: pageNumber,
+    pageSize,
+    total,
+    totalPages,
+  }
 }
 
 function category() {
@@ -116,8 +125,33 @@ const server = createServer(async (request, response) => {
     }))
     return
   }
+  if (url.pathname === '/api/v1/customer/session') {
+    const cookie = request.headers.cookie ?? ''
+    if (cookie.includes('aikayun_customer_session=mock-test-session') || url.searchParams.get('mock_customer') === 'true') {
+      response.writeHead(200).end(JSON.stringify({
+        data: {
+          customer: {
+            id: '550e8400-e29b-41d4-a716-446655440099',
+            username: '测试顾客',
+            email: 'customer@example.test',
+            phone: null,
+            status: 'active',
+          },
+          wallet: {
+            balance: '688.00',
+            currency: 'CNY',
+          },
+        },
+      }))
+      return
+    }
+    response.writeHead(401).end(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: 'No session' } }))
+    return
+  }
   if (url.pathname === '/api/v1/public/categories') {
-    response.writeHead(200).end(JSON.stringify({ data: { categories: [category().category] } }))
+    const cookie = request.headers.cookie ?? ''
+    const isEmpty = cookie.includes('mock_empty_categories=true') || url.searchParams.get('empty') === 'true'
+    response.writeHead(200).end(JSON.stringify({ data: { categories: isEmpty ? [] : [category().category] } }))
     return
   }
   if (url.pathname === '/api/v1/public/storefront/support') {
@@ -143,7 +177,20 @@ const server = createServer(async (request, response) => {
     return
   }
   if (url.pathname === '/api/v1/public/search') {
-    response.writeHead(200).end(JSON.stringify({ data: page(url) }))
+    const q = (url.searchParams.get('q') ?? '').trim()
+    const pageNumber = Number(url.searchParams.get('page') ?? 1)
+    const matched = q ? sampleProducts.filter(p => p.name.includes(q) || p.description?.includes(q)) : sampleProducts
+    const total = matched.length
+    const totalPages = Math.max(1, Math.ceil(total / 24))
+    response.writeHead(200).end(JSON.stringify({
+      data: {
+        items: pageNumber === 1 ? matched : [],
+        page: pageNumber,
+        pageSize: 24,
+        total,
+        totalPages,
+      },
+    }))
     return
   }
   if (url.pathname === `/api/v1/public/products/${productId}`) {

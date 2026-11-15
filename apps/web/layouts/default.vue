@@ -43,7 +43,7 @@ onMounted(() => {
     </NuxtLink>
 
     <header class="sticky top-0 z-40 border-b border-default/70 bg-elevated/80 backdrop-blur-md storefront-glass-header transition-colors">
-      <UContainer class="flex h-15 items-center justify-between gap-x-2 py-2 sm:h-16 sm:gap-x-3">
+      <UContainer class="flex h-15 items-center justify-between gap-x-2 px-3 sm:px-6 lg:px-8 py-2 sm:h-16 sm:gap-x-3">
         <NuxtLink
           to="/"
           class="group flex min-w-0 shrink items-center gap-2 rounded-lg focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary sm:gap-2.5"
@@ -114,7 +114,7 @@ onMounted(() => {
               aria-hidden="true"
             />
           </NuxtLink>
-          <ThemeModeSelect />
+          <ThemeModeSelect class="hidden sm:inline-flex" />
           <NuxtLink
             :to="customerApi.session.value ? '/account' : '/login'"
             class="flex min-h-11 min-w-9 items-center justify-center gap-1.5 rounded-lg px-1.5 text-sm font-medium text-muted transition-colors hover:bg-muted/70 hover:text-highlighted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary sm:min-w-10 sm:px-3"
