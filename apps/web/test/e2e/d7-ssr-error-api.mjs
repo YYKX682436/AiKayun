@@ -250,18 +250,34 @@ const outOfStockProduct = {
   attributes: [],
 }
 
-const mockDrafts = new Map([
-  ['550e8400-e29b-41d4-a716-446655440081', {
-    id: '550e8400-e29b-41d4-a716-446655440081',
-    templateVersionId: '550e8400-e29b-41d4-a716-4466554400d2',
-    revision: 1,
-    values: { '550e8400-e29b-41d4-a716-4466554400f1': 'shop.aikayun.top', '550e8400-e29b-41d4-a716-4466554400f2': '550e8400-e29b-41d4-a716-4466554400e2' },
-    attachments: [],
-    expiresAt: new Date(Date.now() + 86400000).toISOString(),
-    updatedAt: new Date().toISOString(),
-    templateChanged: false,
-  }],
-])
+function checkDraftCompleteness(values) {
+  const domain = String(values?.['550e8400-e29b-41d4-a716-4466554400f1'] ?? '').trim()
+  const env = String(values?.['550e8400-e29b-41d4-a716-4466554400f2'] ?? '').trim()
+  const incompleteFieldIds = []
+  if (!domain) incompleteFieldIds.push('550e8400-e29b-41d4-a716-4466554400f1')
+  if (!env) incompleteFieldIds.push('550e8400-e29b-41d4-a716-4466554400f2')
+  return {
+    complete: incompleteFieldIds.length === 0,
+    incompleteFieldIds,
+  }
+}
+
+function initialDrafts() {
+  return new Map([
+    ['550e8400-e29b-41d4-a716-446655440081', {
+      id: '550e8400-e29b-41d4-a716-446655440081',
+      templateVersionId: '550e8400-e29b-41d4-a716-4466554400d2',
+      revision: 1,
+      values: { '550e8400-e29b-41d4-a716-4466554400f1': 'shop.aikayun.top', '550e8400-e29b-41d4-a716-4466554400f2': '550e8400-e29b-41d4-a716-4466554400e2' },
+      attachments: [],
+      expiresAt: new Date(Date.now() + 86400000).toISOString(),
+      updatedAt: new Date().toISOString(),
+      templateChanged: false,
+    }],
+  ])
+}
+
+let mockDrafts = initialDrafts()
 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url ?? '/', 'http://127.0.0.1')
@@ -279,6 +295,7 @@ const server = createServer(async (request, response) => {
   }
   if (url.pathname === '/__test/reset') {
     brokenPaths.clear()
+    mockDrafts = initialDrafts()
     response.writeHead(200).end('{"ok":true}')
     return
   }
@@ -460,37 +477,73 @@ const server = createServer(async (request, response) => {
     const parts = url.pathname.slice('/api/v1/storefront/purchase-drafts/'.length).split('/')
     const draftId = decodeURIComponent(parts[0])
     const action = parts[1]
-    const current = mockDrafts.get(draftId) ?? mockDrafts.get('550e8400-e29b-41d4-a716-446655440081')
-    if (action === 'validate') {
-      response.writeHead(200).end(JSON.stringify({ data: { revision: current.revision, complete: true, incompleteFieldIds: [] } }))
+    let current = mockDrafts.get(draftId)
+    if (!current) {
+      current = {
+        id: draftId,
+        templateVersionId: '550e8400-e29b-41d4-a716-4466554400d2',
+        revision: 1,
+        values: {},
+        attachments: [],
+        expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        updatedAt: new Date().toISOString(),
+        templateChanged: false,
+      }
+      mockDrafts.set(draftId, current)
+    }
+
+    if (action === 'validate' && request.method === 'POST') {
+      const status = checkDraftCompleteness(current.values)
+      response.writeHead(200).end(JSON.stringify({
+        data: {
+          revision: current.revision,
+          complete: status.complete,
+          incompleteFieldIds: status.incompleteFieldIds,
+        },
+      }))
       return
     }
-    if (request.method === 'PATCH') {
+
+    if (request.method === 'PUT' || request.method === 'PATCH') {
       let body = ''
       for await (const chunk of request) body += chunk
       try {
         const parsed = JSON.parse(body)
-        if (parsed.values) current.values = { ...current.values, ...parsed.values }
+        if (parsed.values) current.values = { ...(parsed.values ?? {}) }
         current.revision++
         current.updatedAt = new Date().toISOString()
       } catch (error) {
         void error
       }
+      const status = checkDraftCompleteness(current.values)
+      response.writeHead(200).end(JSON.stringify({
+        data: {
+          revision: current.revision,
+          complete: status.complete,
+          incompleteFieldIds: status.incompleteFieldIds,
+        },
+      }))
+      return
+    }
+
+    if (request.method === 'GET') {
       response.writeHead(200).end(JSON.stringify({ data: current }))
       return
     }
-    response.writeHead(200).end(JSON.stringify({ data: current }))
-    return
   }
   if (url.pathname.startsWith('/api/v1/storefront/skus/') && url.pathname.endsWith('/purchase-form')) {
     response.writeHead(200).end(JSON.stringify({ data: { templateId: null, templateName: '', templateVersionId: '', required: false, status: 'active', definition: { fields: [] } } }))
     return
   }
-  if (url.pathname === '/api/v1/customer/cart/quote') {
+  if (url.pathname === '/api/v1/checkout/quote' || url.pathname === '/api/v1/customer/cart/quote') {
     response.writeHead(200).end(JSON.stringify({
       data: {
         items: [
+          { skuId: '550e8400-e29b-41d4-a716-446655440003', canPurchase: true, purchaseLimits: { product: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, requiresLogin: false } },
           { skuId: '550e8400-e29b-41d4-a716-4466554400a1', canPurchase: true, purchaseLimits: { product: { perOrderLimit: 5, lifetimeLimit: 10, rolling24HourLimit: null, lifetimePurchased: 0, rolling24HoursPurchased: 0, maxAvailable: 5, exceeded: false }, sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, requiresLogin: false } },
+          { skuId: '550e8400-e29b-41d4-a716-4466554400a2', canPurchase: true, purchaseLimits: { product: { perOrderLimit: 5, lifetimeLimit: 10, rolling24HourLimit: null, lifetimePurchased: 0, rolling24HoursPurchased: 0, maxAvailable: 5, exceeded: false }, sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, requiresLogin: false } },
+          { skuId: '550e8400-e29b-41d4-a716-4466554400a3', canPurchase: true, purchaseLimits: { product: { perOrderLimit: 5, lifetimeLimit: 10, rolling24HourLimit: null, lifetimePurchased: 0, rolling24HoursPurchased: 0, maxAvailable: 5, exceeded: false }, sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, requiresLogin: false } },
+          { skuId: '550e8400-e29b-41d4-a716-4466554400b1', canPurchase: true, purchaseLimits: { product: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: 0, rolling24HoursPurchased: 0, maxAvailable: null, exceeded: false }, sku: { perOrderLimit: null, lifetimeLimit: null, rolling24HourLimit: null, lifetimePurchased: null, rolling24HoursPurchased: null, maxAvailable: null, exceeded: false }, requiresLogin: false } },
         ],
       },
     }))

@@ -918,6 +918,8 @@ async function savePurchaseValues(
     if (!complete && !editingReplacement) {
       setIncompleteErrors(saved.incompleteFieldIds)
       purchaseFormMessage.value = `已保存部分内容。${purchaseFormMessage.value}`
+    } else if (complete && !editingReplacement) {
+      purchaseFormErrors.value = {}
     } else if (!complete && editingReplacement) {
       const validation = normalizePurchaseFormAnswers(purchaseDefinition.value!, displayed.values, {
         requireComplete: true,
@@ -994,6 +996,7 @@ async function validatePurchaseValues(): Promise<boolean> {
     if (cartEdit.value && !await attachValidatedDraftToCart(draft, currentContext)) return false
     if (!purchasePageContextIsCurrent(currentContext)) return false
     purchaseFormErrors.value = {}
+    purchaseFormError.value = ''
     purchaseFormMessage.value = '填写校验通过。'
     await refreshPurchaseQuote()
     if (!purchasePageContextIsCurrent(currentContext, false)) return false

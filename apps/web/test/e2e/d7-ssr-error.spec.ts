@@ -179,6 +179,21 @@ test('product detail page visual, multi-spec SKU selection, purchase form and re
     copyFileSync(destRepo, destArtifact)
   }
 
+  async function takeCleanFullScreenshot(screenshotPath: string, filename: string): Promise<void> {
+    await page.evaluate(() => {
+      window.scrollTo(0, 0)
+      const header = document.querySelector('header')
+      if (header) header.style.position = 'relative'
+    })
+    await page.waitForTimeout(100)
+    await page.screenshot({ path: screenshotPath, fullPage: true, animations: 'disabled' })
+    await page.evaluate(() => {
+      const header = document.querySelector('header')
+      if (header) header.style.position = ''
+    })
+    saveShot(filename)
+  }
+
   // 1. Multi-spec product detail page
   await page.setViewportSize({ width: 1440, height: 900 })
   await page.goto(`/products/${multiSpecProductId}`)
@@ -234,38 +249,37 @@ test('product detail page visual, multi-spec SKU selection, purchase form and re
 
   // Desktop Light Screenshot
   const desktopLightPath = resolve(screenshotsDir, 'product-detail-desktop-light.png')
-  await page.screenshot({ path: desktopLightPath, fullPage: true })
-  saveShot('product-detail-desktop-light.png')
+  await takeCleanFullScreenshot(desktopLightPath, 'product-detail-desktop-light.png')
 
   // Desktop Dark Screenshot
   await page.evaluate(() => {
     document.documentElement.classList.remove('light')
     document.documentElement.classList.add('dark')
   })
+  await page.waitForTimeout(200)
   const desktopDarkPath = resolve(screenshotsDir, 'product-detail-desktop-dark.png')
-  await page.screenshot({ path: desktopDarkPath, fullPage: true })
-  saveShot('product-detail-desktop-dark.png')
+  await takeCleanFullScreenshot(desktopDarkPath, 'product-detail-desktop-dark.png')
 
   // Mobile Dark Screenshot (390x844)
   await page.setViewportSize({ width: 390, height: 844 })
+  await page.waitForTimeout(200)
   const mobileDarkPath = resolve(screenshotsDir, 'product-detail-mobile-dark.png')
-  await page.screenshot({ path: mobileDarkPath, fullPage: true })
-  saveShot('product-detail-mobile-dark.png')
+  await takeCleanFullScreenshot(mobileDarkPath, 'product-detail-mobile-dark.png')
 
   // Mobile Light Screenshot (390x844)
   await page.evaluate(() => {
     document.documentElement.classList.remove('dark')
     document.documentElement.classList.add('light')
   })
+  await page.waitForTimeout(300)
   const mobileLightPath = resolve(screenshotsDir, 'product-detail-mobile-light.png')
-  await page.screenshot({ path: mobileLightPath, fullPage: true })
-  saveShot('product-detail-mobile-light.png')
+  await takeCleanFullScreenshot(mobileLightPath, 'product-detail-mobile-light.png')
 
   // Mobile 320px Light Screenshot
   await page.setViewportSize({ width: 320, height: 640 })
+  await page.waitForTimeout(200)
   const mobile320Path = resolve(screenshotsDir, 'product-detail-mobile-320px-light.png')
-  await page.screenshot({ path: mobile320Path, fullPage: true })
-  saveShot('product-detail-mobile-320px-light.png')
+  await takeCleanFullScreenshot(mobile320Path, 'product-detail-mobile-320px-light.png')
 
   // 2. Product with purchase form
   await page.setViewportSize({ width: 1440, height: 900 })
@@ -278,15 +292,40 @@ test('product detail page visual, multi-spec SKU selection, purchase form and re
   // Click create new draft
   await page.getByRole('button', { name: '新建一组购买资料' }).click()
   await expect(page.getByLabel('待部署主域名')).toBeVisible()
+
+  // Partially fill: only fill domain, omit environment
   await page.getByLabel('待部署主域名').fill('shop.aiove.top')
-  await expect(page.getByRole('button', { name: '保存填写内容' })).toBeEnabled()
-  await page.getByRole('button', { name: '保存填写内容' }).click()
   await expect(page.getByRole('button', { name: '校验完整性' })).toBeEnabled()
   await page.getByRole('button', { name: '校验完整性' }).click()
 
+  // Validate fails and clearly indicates missing field
+  await expect(page.getByText('还需填写：目标服务器环境')).toBeVisible()
+  await expect(page.getByText('请填写此项。')).toBeVisible()
+  await expect(page.getByText('填写校验通过。')).toBeHidden()
+
+  // Complete remaining required field
+  await page.getByRole('combobox', { name: '目标服务器环境' }).click()
+  await page.getByRole('option', { name: 'Caddy' }).click()
+  await expect(page.getByRole('option', { name: 'Caddy' })).toBeHidden()
+
+  // Save draft and verify save success
+  await expect(page.getByRole('button', { name: '保存填写内容' })).toBeEnabled()
+  await page.getByRole('button', { name: '保存填写内容' }).click()
+  await expect(page.getByText('已保存，填写资料完整。')).toBeVisible()
+
+  // Validate completeness and verify success
+  await expect(page.getByRole('button', { name: '校验完整性' })).toBeEnabled()
+  await page.getByRole('button', { name: '校验完整性' }).click()
+  await expect(page.getByText('填写校验通过。')).toBeVisible()
+
+  // Assert no lingering runtime or form errors
+  await expect(page.locator('[role="alert"]')).toBeHidden()
+  await expect(page.getByText(/Cannot read properties/)).toBeHidden()
+  await expect(page.getByText('请检查填写内容是否正确，再重试。')).toBeHidden()
+  await expect(page.getByText('请填写此项。')).toBeHidden()
+
   const formDesktopPath = resolve(screenshotsDir, 'product-detail-form-desktop-light.png')
-  await page.screenshot({ path: formDesktopPath, fullPage: true })
-  saveShot('product-detail-form-desktop-light.png')
+  await takeCleanFullScreenshot(formDesktopPath, 'product-detail-form-desktop-light.png')
 
   // 3. Product without cover and out of stock
   await page.goto(`/products/${outOfStockProductId}`)
@@ -297,6 +336,5 @@ test('product detail page visual, multi-spec SKU selection, purchase form and re
   await expect(page.getByText('暂时缺货')).toBeVisible()
 
   const emptyCoverPath = resolve(screenshotsDir, 'product-detail-empty-cover-light.png')
-  await page.screenshot({ path: emptyCoverPath, fullPage: true })
-  saveShot('product-detail-empty-cover-light.png')
+  await takeCleanFullScreenshot(emptyCoverPath, 'product-detail-empty-cover-light.png')
 })
