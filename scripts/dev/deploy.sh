@@ -457,6 +457,8 @@ case "${1:-help}" in
     api_tag="aikayun-api:internal-dev-${ver}"
     sync_source
     build_api "$api_tag"
+    update_compose_override "" "$api_tag"
+    db_migrate
     build_web "$web_tag"
     update_compose_override "$web_tag" "$api_tag"
     deploy_services api web
