@@ -128,7 +128,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main id="main-content" class="flex-1 pb-16">
+  <main
+    id="main-content"
+    class="flex-1 pb-16"
+  >
     <UContainer class="pt-6 sm:pt-8 md:pt-10">
       <div class="mb-5 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2 border-b border-default/50 pb-3 sm:mb-6">
         <div>
@@ -145,8 +148,8 @@ onBeforeUnmount(() => {
         </p>
       </div>
 
-      <!-- 搜索与筛选控制栏：Apple 风格极简一体化控制栏 -->
-      <div class="mb-6 rounded-2xl border border-default/70 bg-elevated/70 p-2.5 shadow-xs backdrop-blur-xs sm:p-3.5">
+      <!-- 搜索与筛选控制栏：Liquid Glass 极简一体化控制栏 -->
+      <div class="storefront-glass-panel mb-6 rounded-2xl p-2.5 sm:p-3.5">
         <div class="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-[minmax(16rem,2fr)_repeat(3,minmax(8.5rem,1fr))]">
           <div class="relative sm:col-span-2 lg:col-span-1">
             <UIcon
@@ -159,7 +162,7 @@ onBeforeUnmount(() => {
               placeholder="搜索商品名称或描述"
               aria-label="搜索商品名称或描述"
               autocomplete="off"
-              class="h-10 w-full rounded-xl border border-default/80 bg-default/60 py-2 pl-10 pr-3 text-sm text-highlighted transition-colors placeholder:text-dimmed focus:bg-default focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none"
+              class="h-10 w-full rounded-xl border border-default/80 bg-default/60 py-2 pl-10 pr-3 text-sm text-highlighted transition-all placeholder:text-dimmed focus:border-primary focus:bg-default focus:ring-1 focus:ring-primary/20 focus-visible:outline-none motion-reduce:transition-none"
               @input="onSearchInput(($event.target as HTMLInputElement).value)"
             >
           </div>

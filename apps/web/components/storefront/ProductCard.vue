@@ -57,7 +57,7 @@ const priceLabel = computed(() => {
           color="neutral"
           variant="subtle"
           size="xs"
-          class="bg-elevated/85 backdrop-blur-xs text-[11px] font-medium shadow-xs"
+          class="border border-default/50 bg-elevated/85 text-[11px] font-medium shadow-2xs backdrop-blur-sm"
         >
           {{ typeLabels[product.productType] }}
         </UBadge>

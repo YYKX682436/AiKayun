@@ -530,3 +530,145 @@ test('shopping cart and checkout visual hierarchy, stepper, pricing and responsi
   const checkoutWithFormPath = resolve(screenshotsDir, 'checkout-with-form-desktop-light.png')
   await takeCleanFullScreenshot(checkoutWithFormPath, 'checkout-with-form-desktop-light.png')
 })
+
+test('storefront Liquid Glass header, mobile drawer, search panel and responsive non-overflow audit', async ({ page }) => {
+  mkdirSync(screenshotsDir, { recursive: true })
+  mkdirSync(artifactDir, { recursive: true })
+
+  function saveShot(filename: string): void {
+    const destRepo = resolve(screenshotsDir, filename)
+    const destArtifact = resolve(artifactDir, filename)
+    try {
+      copyFileSync(destRepo, destArtifact)
+    } catch {
+      // ignore
+    }
+  }
+
+  async function takeCleanFullScreenshot(screenshotPath: string, filename: string): Promise<void> {
+    await page.evaluate(() => {
+      window.scrollTo(0, 0)
+      const header = document.querySelector('header')
+      if (header) header.style.position = 'relative'
+    })
+    await page.waitForTimeout(100)
+    await page.screenshot({ path: screenshotPath, fullPage: true, animations: 'disabled' })
+    await page.evaluate(() => {
+      const header = document.querySelector('header')
+      if (header) header.style.position = ''
+    })
+    saveShot(filename)
+  }
+
+  async function assertNoHorizontalOverflow(_viewportWidth: number): Promise<void> {
+    const { scrollWidth, clientWidth } = await page.evaluate(() => ({
+      scrollWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+    }))
+    expect(scrollWidth).toBeLessThanOrEqual(clientWidth + 1) // allow 1px rounding threshold
+  }
+
+  // 1. Homepage 1440px Light Mode
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/')
+  await expect(page.locator('[data-storefront-ready="true"]')).toBeVisible()
+  await expect(page.locator('header.storefront-glass-header')).toBeVisible()
+  await expect(page.getByRole('heading', { name: '全部商品' })).toBeVisible()
+  await assertNoHorizontalOverflow(1440)
+
+  const homeDesktopLightPath = resolve(screenshotsDir, 'storefront-desktop-light.png')
+  await takeCleanFullScreenshot(homeDesktopLightPath, 'storefront-desktop-light.png')
+
+  // Homepage 1440px Dark Mode
+  await page.evaluate(() => {
+    document.documentElement.classList.remove('light')
+    document.documentElement.classList.add('dark')
+  })
+  await page.waitForTimeout(200)
+  const homeDesktopDarkPath = resolve(screenshotsDir, 'storefront-desktop-dark.png')
+  await takeCleanFullScreenshot(homeDesktopDarkPath, 'storefront-desktop-dark.png')
+
+  // 2. Homepage Mobile (390px) Dark & Light
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.waitForTimeout(200)
+  await assertNoHorizontalOverflow(390)
+  const homeMobileDarkPath = resolve(screenshotsDir, 'storefront-mobile-dark.png')
+  await takeCleanFullScreenshot(homeMobileDarkPath, 'storefront-mobile-dark.png')
+
+  await page.evaluate(() => {
+    document.documentElement.classList.remove('dark')
+    document.documentElement.classList.add('light')
+  })
+  await page.waitForTimeout(200)
+  await assertNoHorizontalOverflow(390)
+  const homeMobileLightPath = resolve(screenshotsDir, 'storefront-mobile-light.png')
+  await takeCleanFullScreenshot(homeMobileLightPath, 'storefront-mobile-light.png')
+
+  // 3. Mobile Drawer with Liquid Glass质感
+  const menuBtn = page.getByRole('button', { name: '浏览商品分类' })
+  await expect(menuBtn).toBeVisible()
+  await menuBtn.click()
+
+  const drawerContent = page.locator('.storefront-glass-drawer')
+  await expect(drawerContent).toBeVisible()
+  await expect(page.locator('.storefront-drawer-overlay')).toBeVisible()
+  await expect(page.getByRole('heading', { name: '商城菜单' })).toBeVisible()
+  await expect(page.getByRole('link', { name: '全部商品' })).toBeVisible()
+
+  // Capture Mobile Drawer Screenshot
+  const drawerPath = resolve(screenshotsDir, 'storefront-mobile-drawer.png')
+  await page.screenshot({ path: drawerPath, animations: 'disabled' })
+  saveShot('storefront-mobile-drawer.png')
+
+  // Close Drawer
+  const closeBtn = page.getByRole('button', { name: '关闭' })
+  if (await closeBtn.isVisible()) {
+    await closeBtn.click()
+  } else {
+    await page.keyboard.press('Escape')
+  }
+  await expect(drawerContent).toBeHidden()
+
+  // 4. Homepage Mobile (320px)
+  await page.setViewportSize({ width: 320, height: 640 })
+  await page.waitForTimeout(200)
+  await assertNoHorizontalOverflow(320)
+  const homeMobile320Path = resolve(screenshotsDir, 'storefront-mobile-320px-light.png')
+  await takeCleanFullScreenshot(homeMobile320Path, 'storefront-mobile-320px-light.png')
+
+  // 5. Search Page with storefront-glass-panel
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/search')
+  await expect(page.locator('[data-storefront-ready="true"]')).toBeVisible()
+  await expect(page.locator('.storefront-glass-panel')).toBeVisible()
+  await expect(page.getByRole('searchbox', { name: '搜索商品名称或描述' })).toBeVisible()
+  await assertNoHorizontalOverflow(1440)
+
+  const searchDesktopLightPath = resolve(screenshotsDir, 'storefront-search-desktop-light.png')
+  await takeCleanFullScreenshot(searchDesktopLightPath, 'storefront-search-desktop-light.png')
+
+  // Search Desktop Dark
+  await page.evaluate(() => {
+    document.documentElement.classList.remove('light')
+    document.documentElement.classList.add('dark')
+  })
+  await page.waitForTimeout(200)
+  const searchDesktopDarkPath = resolve(screenshotsDir, 'storefront-search-desktop-dark.png')
+  await takeCleanFullScreenshot(searchDesktopDarkPath, 'storefront-search-desktop-dark.png')
+
+  // Search Mobile Light (390px)
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.evaluate(() => {
+    document.documentElement.classList.remove('dark')
+    document.documentElement.classList.add('light')
+  })
+  await page.waitForTimeout(200)
+  await assertNoHorizontalOverflow(390)
+  const searchMobileLightPath = resolve(screenshotsDir, 'storefront-search-mobile-light.png')
+  await takeCleanFullScreenshot(searchMobileLightPath, 'storefront-search-mobile-light.png')
+
+  // Search Mobile 320px overflow check
+  await page.setViewportSize({ width: 320, height: 640 })
+  await page.waitForTimeout(100)
+  await assertNoHorizontalOverflow(320)
+})

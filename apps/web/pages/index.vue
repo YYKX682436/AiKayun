@@ -59,7 +59,10 @@ useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
 </script>
 
 <template>
-  <main id="main-content" class="flex-1 pb-16">
+  <main
+    id="main-content"
+    class="flex-1 pb-16"
+  >
     <UContainer class="pt-6 sm:pt-8 md:pt-10">
       <!-- 推荐精选专区 (仅在第一页且有推荐商品时优雅呈现) -->
       <section
@@ -69,7 +72,10 @@ useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
       >
         <div class="mb-4 flex items-center justify-between gap-3 sm:mb-5">
           <div class="flex items-center gap-2">
-            <span class="inline-flex size-2 rounded-full bg-primary" aria-hidden="true" />
+            <span
+              class="inline-flex size-2 rounded-full bg-primary"
+              aria-hidden="true"
+            />
             <h2
               id="featured-products-title"
               class="text-lg font-semibold tracking-tight text-highlighted sm:text-xl md:text-2xl"
@@ -78,7 +84,10 @@ useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
             </h2>
           </div>
         </div>
-        <StorefrontProductGrid :products="featuredProducts" :priority-first="true" />
+        <StorefrontProductGrid
+          :products="featuredProducts"
+          :priority-first="true"
+        />
       </section>
 
       <!-- 全部商品分区 (核心浏览与选购) -->
@@ -133,7 +142,10 @@ useHead(() => ({ link: [{ rel: 'canonical', href: canonical.value }] }))
         </div>
 
         <template v-else-if="data && products.length">
-          <StorefrontProductGrid :products="products" :priority-first="!featuredProducts.length" />
+          <StorefrontProductGrid
+            :products="products"
+            :priority-first="!featuredProducts.length"
+          />
           <StorefrontPagination
             v-if="data.totalPages > 1"
             :page="data.page"

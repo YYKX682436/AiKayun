@@ -59,18 +59,27 @@ const desktopItems = computed<NavigationMenuItem[]>(() => {
     description="浏览店铺商品与快捷服务。"
     direction="right"
     :handle="false"
-    :ui="{ content: 'w-[min(22rem,90vw)]', body: 'p-4 flex flex-col gap-5 overflow-y-auto' }"
+    :ui="{
+      overlay: 'storefront-drawer-overlay',
+      content: 'storefront-glass-drawer ring-0 w-[min(22rem,90vw)]',
+      body: 'p-4 flex flex-col gap-5 overflow-y-auto',
+    }"
   >
     <template #body>
       <div>
-        <p class="px-3 pb-1 text-xs font-medium text-dimmed">商品浏览</p>
+        <p class="px-3 pb-1 text-xs font-medium text-dimmed">
+          商品浏览
+        </p>
         <nav aria-label="商品导航">
           <NuxtLink
             to="/"
             class="mb-1 flex min-h-11 items-center gap-2.5 rounded-lg px-3 font-medium text-highlighted transition-colors hover:bg-muted"
             @click="drawerOpen = false"
           >
-            <UIcon name="i-lucide-package" class="size-4.5 text-muted" />
+            <UIcon
+              name="i-lucide-package"
+              class="size-4.5 text-muted"
+            />
             <span>全部商品</span>
           </NuxtLink>
           <StorefrontCategoryTreeLinks
@@ -83,14 +92,22 @@ const desktopItems = computed<NavigationMenuItem[]>(() => {
       </div>
 
       <div class="border-t border-default/70 pt-4">
-        <p class="px-3 pb-1 text-xs font-medium text-dimmed">商城服务</p>
-        <nav aria-label="商城快捷导航" class="space-y-0.5">
+        <p class="px-3 pb-1 text-xs font-medium text-dimmed">
+          商城服务
+        </p>
+        <nav
+          aria-label="商城快捷导航"
+          class="space-y-0.5"
+        >
           <NuxtLink
             to="/orders"
             class="flex min-h-11 items-center gap-2.5 rounded-lg px-3 text-sm font-medium text-highlighted transition-colors hover:bg-muted"
             @click="drawerOpen = false"
           >
-            <UIcon name="i-lucide-receipt-text" class="size-4.5 text-muted" />
+            <UIcon
+              name="i-lucide-receipt-text"
+              class="size-4.5 text-muted"
+            />
             <span>我的订单</span>
           </NuxtLink>
           <NuxtLink
@@ -99,7 +116,10 @@ const desktopItems = computed<NavigationMenuItem[]>(() => {
             class="flex min-h-11 items-center gap-2.5 rounded-lg px-3 text-sm font-medium text-highlighted transition-colors hover:bg-muted"
             @click="drawerOpen = false"
           >
-            <UIcon name="i-lucide-wallet" class="size-4.5 text-muted" />
+            <UIcon
+              name="i-lucide-wallet"
+              class="size-4.5 text-muted"
+            />
             <span>我的钱包</span>
           </NuxtLink>
           <NuxtLink
@@ -108,14 +128,19 @@ const desktopItems = computed<NavigationMenuItem[]>(() => {
             class="flex min-h-11 items-center gap-2.5 rounded-lg px-3 text-sm font-medium text-highlighted transition-colors hover:bg-muted"
             @click="drawerOpen = false"
           >
-            <UIcon name="i-lucide-headset" class="size-4.5 text-muted" />
+            <UIcon
+              name="i-lucide-headset"
+              class="size-4.5 text-muted"
+            />
             <span>联系客服</span>
           </NuxtLink>
         </nav>
       </div>
 
       <div class="mt-auto border-t border-default/70 pt-4">
-        <p class="px-3 pb-2 text-xs font-medium text-dimmed">外观设置</p>
+        <p class="px-3 pb-2 text-xs font-medium text-dimmed">
+          外观设置
+        </p>
         <div class="px-1">
           <ThemeModeSelect class="w-full" />
         </div>

@@ -42,7 +42,7 @@ onMounted(() => {
       跳转到主要内容
     </NuxtLink>
 
-    <header class="sticky top-0 z-40 border-b border-default/70 bg-elevated/80 backdrop-blur-md storefront-glass-header transition-colors">
+    <header class="sticky top-0 z-40 storefront-glass-header transition-colors">
       <UContainer class="flex h-15 items-center justify-between gap-x-2 px-3 sm:px-6 lg:px-8 py-2 sm:h-16 sm:gap-x-3">
         <NuxtLink
           to="/"
