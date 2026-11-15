@@ -44,7 +44,12 @@ export interface NewObligationGateOptions {
   pendingKeyRoot: string
   trustStoreRoot: string
   /** Only real cryptographic fixtures, restricted to isolated test processes. */
-  test?: { releaseConfig: TrustedReleaseLicenseConfig; trustStore: TrustBundleStore; testTls?: TestLicenseTlsOptions }
+  test?: {
+    releaseConfig: TrustedReleaseLicenseConfig
+    trustStore: TrustBundleStore
+    testTls?: TestLicenseTlsOptions
+    onTrustedTimeTestOverride?: () => { databaseTimeMs: number; signedTimeMs?: number | null; ignoreProcessAnchor?: boolean } | undefined
+  }
 }
 
 const unavailable = (): NewObligationDetails => Object.freeze({ status: 'unavailable', allowedUntil: null, retryable: true })
@@ -78,6 +83,7 @@ export function createNewObligationGate(options: NewObligationGateOptions): NewO
       db: options.db, pool: options.pool, identityRoot: options.identityRoot,
       pendingKeyRoot: options.pendingKeyRoot, releaseConfig: config, trustStore: store,
       ...(options.test?.testTls === undefined ? {} : { testTls: options.test.testTls }),
+      ...(options.test?.onTrustedTimeTestOverride === undefined ? {} : { onTrustedTimeTestOverride: options.test.onTrustedTimeTestOverride }),
     })
   })().catch(() => null)
   return Object.freeze({

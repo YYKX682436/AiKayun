@@ -45,15 +45,29 @@ interface TrustTransactionScope {
   closed?: boolean;
   directory?: string;
   release?: () => Promise<void>;
+  obligationWatermarkAdvance?: () => Promise<void>;
 }
 const transactionScope = new AsyncLocalStorage<TrustTransactionScope>();
+
+export function registerTrustTransactionObligationAdvance(callback: () => Promise<void>): void {
+  const scope = transactionScope.getStore();
+  if (scope && !scope.closed) {
+    scope.obligationWatermarkAdvance = callback;
+  }
+}
 
 /** The scope starts without a file lock. Admission acquires it after its DB locks. */
 export async function withTrustTransactionScope<T>(work: () => Promise<T>): Promise<T> {
   if (transactionScope.getStore()) throw new Error('Nested trust transaction scopes are not supported');
   const scope: TrustTransactionScope = {};
   return transactionScope.run(scope, async () => {
-    try { return await work(); } finally {
+    try {
+      const result = await work();
+      if (scope.obligationWatermarkAdvance) {
+        await scope.obligationWatermarkAdvance();
+      }
+      return result;
+    } finally {
       scope.closed = true;
       const release = scope.release;
       delete scope.release;

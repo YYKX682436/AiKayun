@@ -95,14 +95,33 @@ async function fsyncDirectory(directory: string): Promise<void> {
   try { await handle.sync() } finally { await handle.close() }
 }
 
+const watermarkFileQueues = new Map<string, Promise<void>>()
+
 /** Caller must hold the instance_license_state singleton row lock across this file update and DB write. */
 export async function advanceTrustedTimeWatermarkFile(
   directory: string,
   identity: TimeWatermarkIdentity,
   highWaterMs: number,
 ): Promise<void> {
-  if (!validHighWater(highWaterMs)) throw new Error('time_watermark_value_invalid')
   const root = resolve(directory)
+  const queue = watermarkFileQueues.get(root) ?? Promise.resolve()
+  let resolveCurrent!: () => void
+  const currentPromise = new Promise<void>((res) => { resolveCurrent = res })
+  watermarkFileQueues.set(root, queue.then(() => currentPromise).catch(() => currentPromise))
+  try {
+    await queue
+    await advanceTrustedTimeWatermarkFileInternal(root, identity, highWaterMs)
+  } finally {
+    resolveCurrent()
+  }
+}
+
+async function advanceTrustedTimeWatermarkFileInternal(
+  root: string,
+  identity: TimeWatermarkIdentity,
+  highWaterMs: number,
+): Promise<void> {
+  if (!validHighWater(highWaterMs)) throw new Error('time_watermark_value_invalid')
   await validateRoot(root)
   const path = join(root, fileName)
   const temporaryPath = join(root, temporaryName)

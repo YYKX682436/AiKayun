@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
@@ -4158,6 +4158,202 @@ describe('purchase limit acceptance on PostgreSQL', () => {
     const conflict2 = await createOrder([{ skuId: catalog2.skuId, quantity: 2 }], quote2.json().data.quoteToken, customer2, key2)
     expect(conflict2.statusCode).toBe(409)
     expect(conflict2.json().error.code).toBe('ORDER_IDEMPOTENCY_CONFLICT')
+  })
+  it('rejects new obligation admission immediately when stored credential ciphertext is corrupted, without stale cache reuse', async () => {
+    const gate = createNewObligationGate({
+      db, pool: licensePool, identityRoot: appConfig.identityRoot,
+      pendingKeyRoot: appConfig.licensePendingKeyRoot,
+      trustStoreRoot: appConfig.licenseTrustStoreRoot,
+      test: { releaseConfig: licenseFixture.options.releaseConfig, trustStore: licenseFixture.options.trustStore, pool: licensePool },
+    })
+
+    // 1. Initial admission succeeds
+    await gate.withTransactionScope(async () => {
+      await db.transaction().execute(async (trx) => {
+        await gate.assertNewObligationAllowed(trx, 'create_order')
+      })
+    })
+
+    // 2. Corrupt encrypted_credential_jws in the database without altering fingerprint metadata
+    const originalRow = await db.selectFrom('instance_license_state')
+      .select(['encrypted_credential_jws'])
+      .where('singleton', '=', true)
+      .executeTakeFirstOrThrow()
+    const originalEncrypted = originalRow.encrypted_credential_jws
+
+    try {
+      await db.updateTable('instance_license_state')
+        .set({ encrypted_credential_jws: Buffer.from('corrupted_ciphertext_tampered_payload_12345678') })
+        .where('singleton', '=', true)
+        .execute()
+
+      // 3. Subsequent admission must fail immediately because evidence cache is deleted and evidence is re-verified
+      await expect(
+        gate.withTransactionScope(async () => {
+          await db.transaction().execute(async (trx) => {
+            await gate.assertNewObligationAllowed(trx, 'create_order')
+          })
+        }),
+      ).rejects.toBeInstanceOf(LicenseNewObligationError)
+
+      // Also verify create_top_up is rejected
+      await expect(
+        gate.withTransactionScope(async () => {
+          await db.transaction().execute(async (trx) => {
+            await gate.assertNewObligationAllowed(trx, 'create_top_up')
+          })
+        }),
+      ).rejects.toBeInstanceOf(LicenseNewObligationError)
+
+      const diagnostic = await gate.getDiagnostic()
+      expect(diagnostic.status).toBe('invalid_credential')
+    } finally {
+      // Restore valid credential ciphertext
+      await db.updateTable('instance_license_state')
+        .set({ encrypted_credential_jws: originalEncrypted })
+        .where('singleton', '=', true)
+        .execute()
+    }
+
+    // After restoring valid ciphertext, admission succeeds again
+    await gate.withTransactionScope(async () => {
+      await db.transaction().execute(async (trx) => {
+        await gate.assertNewObligationAllowed(trx, 'create_order')
+      })
+    })
+  })
+  it('advances durable trusted-time watermark upon obligation commit and rejects rolled-back clock across process restart', async () => {
+    // 1. Establish initial valid state at T1
+    const currentRow = await db.selectFrom('instance_license_state')
+      .select(['trusted_time_high_water_ms'])
+      .where('singleton', '=', true)
+      .executeTakeFirstOrThrow()
+    const watermarkFilePath = join(appConfig.licensePendingKeyRoot, 'license-time-watermark.json')
+    let originalWatermarkFile: string | null = null
+    try {
+      originalWatermarkFile = await readFile(watermarkFilePath, 'utf8')
+    } catch {
+      originalWatermarkFile = null
+    }
+
+    try {
+      const t1 = Math.max(
+        currentRow.trusted_time_high_water_ms ? Number(currentRow.trusted_time_high_water_ms) : 0,
+        Date.now(),
+      ) + 10_000
+
+      let simulatedClockMs = t1
+      const gate1 = createNewObligationGate({
+        db, pool: licensePool, identityRoot: appConfig.identityRoot,
+        pendingKeyRoot: appConfig.licensePendingKeyRoot,
+        trustStoreRoot: appConfig.licenseTrustStoreRoot,
+        test: {
+          releaseConfig: licenseFixture.options.releaseConfig,
+          trustStore: licenseFixture.options.trustStore,
+          pool: licensePool,
+          onTrustedTimeTestOverride: () => ({ databaseTimeMs: simulatedClockMs, ignoreProcessAnchor: true }),
+        },
+      })
+
+      // Obligation at T1 advances watermark to at least T1
+      await gate1.withTransactionScope(async () => {
+        await db.transaction().execute(async (trx) => {
+          await gate1.assertNewObligationAllowed(trx, 'create_order')
+        })
+      })
+
+      const afterT1Row = await db.selectFrom('instance_license_state')
+        .select(['trusted_time_high_water_ms'])
+        .where('singleton', '=', true)
+        .executeTakeFirstOrThrow()
+      expect(Number(afterT1Row.trusted_time_high_water_ms)).toBeGreaterThanOrEqual(t1)
+
+      // 2. Advance time to T2 = T1 + 120,000ms and commit new business obligation
+      const t2 = t1 + 120_000
+      simulatedClockMs = t2
+
+      await gate1.withTransactionScope(async () => {
+        await db.transaction().execute(async (trx) => {
+          await gate1.assertNewObligationAllowed(trx, 'create_order')
+        })
+      })
+
+      const afterT2Row = await db.selectFrom('instance_license_state')
+        .select(['trusted_time_high_water_ms'])
+        .where('singleton', '=', true)
+        .executeTakeFirstOrThrow()
+      expect(Number(afterT2Row.trusted_time_high_water_ms)).toBeGreaterThanOrEqual(t2)
+
+      // 3. Simulate API restart by creating a new gate instance
+      // 4. Rollback clock to between T1 and T2, exceeding tolerance (e.g. T1 + 10,000ms < T2 - 60,000ms)
+      const tRollback = t1 + 10_000
+      simulatedClockMs = tRollback
+
+      const restartedGate = createNewObligationGate({
+        db, pool: licensePool, identityRoot: appConfig.identityRoot,
+        pendingKeyRoot: appConfig.licensePendingKeyRoot,
+        trustStoreRoot: appConfig.licenseTrustStoreRoot,
+        test: {
+          releaseConfig: licenseFixture.options.releaseConfig,
+          trustStore: licenseFixture.options.trustStore,
+          pool: licensePool,
+          onTrustedTimeTestOverride: () => ({ databaseTimeMs: simulatedClockMs, ignoreProcessAnchor: true }),
+        },
+      })
+
+      // 5. Confirm new admission is strictly rejected and never wrongfully admitted
+      await expect(
+        restartedGate.withTransactionScope(async () => {
+          await db.transaction().execute(async (trx) => {
+            await restartedGate.assertNewObligationAllowed(trx, 'create_order')
+          })
+        }),
+      ).rejects.toMatchObject({
+        name: 'LicenseNewObligationError',
+        code: 'LICENSE_NEW_OBLIGATION_BLOCKED',
+        statusCode: 403,
+        details: expect.objectContaining({ status: 'clock_suspect' }),
+      })
+
+      await expect(
+        restartedGate.withTransactionScope(async () => {
+          await db.transaction().execute(async (trx) => {
+            await restartedGate.assertNewObligationAllowed(trx, 'create_top_up')
+          })
+        }),
+      ).rejects.toMatchObject({
+        name: 'LicenseNewObligationError',
+        code: 'LICENSE_NEW_OBLIGATION_BLOCKED',
+        statusCode: 403,
+        details: expect.objectContaining({ status: 'clock_suspect' }),
+      })
+
+      const diagnostic = await restartedGate.getDiagnostic()
+      expect(diagnostic.status).toBe('clock_suspect')
+
+      // Restoring the clock forward to T3 (>= T2) allows obligations again
+      const t3 = t2 + 5_000
+      simulatedClockMs = t3
+
+      await restartedGate.withTransactionScope(async () => {
+        await db.transaction().execute(async (trx) => {
+          await restartedGate.assertNewObligationAllowed(trx, 'create_order')
+        })
+      })
+    } finally {
+      if (originalWatermarkFile !== null) {
+        await writeFile(watermarkFilePath, originalWatermarkFile, 'utf8')
+      }
+      await sql`ALTER TABLE instance_license_state DISABLE TRIGGER instance_license_time_watermark_guard`.execute(db)
+      try {
+        await db.updateTable('instance_license_state')
+          .set({ trusted_time_high_water_ms: currentRow.trusted_time_high_water_ms })
+          .where('singleton', '=', true)
+          .execute()
+      } finally {
+        await sql`ALTER TABLE instance_license_state ENABLE TRIGGER instance_license_time_watermark_guard`.execute(db)
+      }
+    }
   })
   it('preserves an existing order and idempotency after the frozen center revocation is projected', async () => {
     const admin = await createAdmin()
