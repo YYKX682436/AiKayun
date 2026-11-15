@@ -49,6 +49,7 @@ export interface NewObligationGateOptions {
     trustStore: TrustBundleStore
     testTls?: TestLicenseTlsOptions
     onTrustedTimeTestOverride?: () => { databaseTimeMs: number; signedTimeMs?: number | null; ignoreProcessAnchor?: boolean } | undefined
+    onWatermarkPersistenceTestFault?: () => void | Promise<void>
   }
 }
 
@@ -84,6 +85,7 @@ export function createNewObligationGate(options: NewObligationGateOptions): NewO
       pendingKeyRoot: options.pendingKeyRoot, releaseConfig: config, trustStore: store,
       ...(options.test?.testTls === undefined ? {} : { testTls: options.test.testTls }),
       ...(options.test?.onTrustedTimeTestOverride === undefined ? {} : { onTrustedTimeTestOverride: options.test.onTrustedTimeTestOverride }),
+      ...(options.test?.onWatermarkPersistenceTestFault === undefined ? {} : { onWatermarkPersistenceTestFault: options.test.onWatermarkPersistenceTestFault }),
     })
   })().catch(() => null)
   return Object.freeze({

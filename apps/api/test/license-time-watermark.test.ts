@@ -1,4 +1,5 @@
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -6,6 +7,7 @@ import {
   advanceTrustedTimeWatermarkFile,
   readTrustedTimeWatermark,
   trustedTimeWatermarkFileName,
+  trustedTimeWatermarkLockFileName,
 } from '../src/licensing/trusted-time-watermark.js'
 
 const roots = new Set<string>()
@@ -68,5 +70,63 @@ describe('license trusted-time watermark file', () => {
     expect(await readTrustedTimeWatermark(directory, identity)).toMatchObject({
       status: 'valid', record: { high_water_ms: 1_800_000_000_234 },
     })
+  })
+
+  it('serializes concurrent in-process writes monotonically without lowering the watermark', async () => {
+    const directory = await root()
+    const timestamps = [100, 500, 200, 800, 300, 700, 950, 400, 600]
+    await Promise.all(timestamps.map(ts => advanceTrustedTimeWatermarkFile(directory, identity, 1_800_000_000_000 + ts)))
+    const result = await readTrustedTimeWatermark(directory, identity)
+    expect(result).toMatchObject({
+      status: 'valid',
+      record: { high_water_ms: 1_800_000_000_950 },
+    })
+  })
+
+  it('serializes concurrent cross-process writes with kernel file lock, avoiding temp file conflict or rollback', async () => {
+    const directory = await root()
+    const timestamps = [150, 450, 300, 900, 600, 750]
+    const childScript = [
+      "import { advanceTrustedTimeWatermarkFile } from './src/licensing/trusted-time-watermark.js'",
+      "const { WATERMARK_DIR, WATERMARK_DB_ID, WATERMARK_INST_ID, WATERMARK_JKT, WATERMARK_TS } = process.env",
+      "await advanceTrustedTimeWatermarkFile(WATERMARK_DIR, { databaseId: WATERMARK_DB_ID, instanceId: WATERMARK_INST_ID, identityJkt: WATERMARK_JKT }, Number(WATERMARK_TS))",
+    ].join('\n')
+
+    const children = timestamps.map(ts => {
+      return new Promise<void>((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          ['--import', 'tsx', '-e', childScript],
+          {
+            cwd: join(import.meta.dirname, '..'),
+            env: {
+              ...process.env,
+              WATERMARK_DIR: directory,
+              WATERMARK_DB_ID: identity.databaseId,
+              WATERMARK_INST_ID: identity.instanceId,
+              WATERMARK_JKT: identity.identityJkt,
+              WATERMARK_TS: String(1_800_000_000_000 + ts),
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        )
+        let stderr = ''
+        child.stderr?.on('data', d => { stderr += d.toString() })
+        child.on('exit', (code, signal) => {
+          if (code === 0 && signal === null) resolve()
+          else reject(new Error(`Child process failed (code ${code}, signal ${signal}): ${stderr}`))
+        })
+        child.on('error', reject)
+      })
+    })
+
+    await Promise.all(children)
+
+    const final = await readTrustedTimeWatermark(directory, identity)
+    expect(final).toMatchObject({
+      status: 'valid',
+      record: { high_water_ms: 1_800_000_000_900 },
+    })
+    expect(await readFile(join(directory, '.license-time-watermark.tmp')).catch(() => null)).toBeNull()
   })
 })

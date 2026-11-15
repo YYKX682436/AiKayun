@@ -49,6 +49,8 @@ export interface LicenseStateProjectionOptions extends LicenseOperationRecoveryC
     signedTimeMs?: number | null
     ignoreProcessAnchor?: boolean
   } | undefined
+  /** Fault injection for testing watermark persistence failure before commit. */
+  readonly onWatermarkPersistenceTestFault?: () => void | Promise<void>
 }
 
 export interface LicenseStateProjectionResult {
@@ -609,7 +611,8 @@ async function applyCandidate(input: {
 }
 
 export function createLicenseStateProjectionClient(options: LicenseStateProjectionOptions) {
-  if ((options.onProjectionTestCheckpoint || options.onTrustedTimeTestOverride) && process.env.NODE_ENV !== 'test') {
+  if ((options.onProjectionTestCheckpoint || options.onTrustedTimeTestOverride || options.onWatermarkPersistenceTestFault) &&
+    process.env.NODE_ENV !== 'test') {
     throw new Error('License projection fault injection is restricted to isolated tests')
   }
   const checkpoint = async (stage: LicenseProjectionCheckpoint) => options.onProjectionTestCheckpoint?.(stage)
@@ -849,8 +852,19 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
     }
     const offline = getTrustedCenterContactState() === 'unavailable'
     if (admission) {
+      if (options.onWatermarkPersistenceTestFault) {
+        await options.onWatermarkPersistenceTestFault()
+      }
+      // 1. Durably advance the watermark file on disk with fsync BEFORE granting admission.
+      // If this fails (e.g. disk I/O error), it throws here, aborting the caller's transaction
+      // and preventing the business obligation from committing.
+      await advanceTrustedTimeWatermarkFile(options.pendingKeyRoot, localIdentity, decisionTimeMs)
+
+      // 2. Register post-commit DB watermark advancement.
+      // Once the business transaction successfully commits and releases its FOR SHARE lock,
+      // the singleton DB row is updated in a short dedicated transaction.
       registerTrustTransactionObligationAdvance(async () => {
-        await advanceDurableWatermark(time.trustedTimeMs, localIdentity)
+        await advanceDatabaseWatermark(decisionTimeMs, localIdentity)
       })
     }
     return Object.freeze({
@@ -881,12 +895,7 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
     }
   }
 
-  const advanceDurableWatermark = async (timeMs: number, identity: TimeWatermarkIdentity) => {
-    // 1. Advance the durable watermark file on disk first with fsync.
-    // This requires no PostgreSQL lock and guarantees anti-rollback across process restarts immediately.
-    await advanceTrustedTimeWatermarkFile(options.pendingKeyRoot, identity, timeMs)
-
-    // 2. Advance the DB column in a short dedicated transaction.
+  const advanceDatabaseWatermark = async (timeMs: number, identity: TimeWatermarkIdentity) => {
     try {
       await options.db.transaction().execute(async (tx) => {
         // Use a short lock timeout so if another transaction is holding FOR SHARE on instance_license_state,
@@ -914,12 +923,19 @@ export function createLicenseStateProjectionClient(options: LicenseStateProjecti
         // is guaranteed.
         return
       }
-      throw error
+      // Non-fatal if DB advance fails after commit because the durable file on disk
+      // was already fsynced before commit, satisfying the durable anti-rollback invariant.
     }
+  }
+
+  const advanceDurableWatermark = async (timeMs: number, identity: TimeWatermarkIdentity) => {
+    await advanceTrustedTimeWatermarkFile(options.pendingKeyRoot, identity, timeMs)
+    await advanceDatabaseWatermark(timeMs, identity)
   }
 
   return Object.freeze({
     advanceDurableWatermark,
+    advanceDatabaseWatermark,
     getLicenseSnapshot,
     getLicenseSnapshotInTransaction,
     /** Narrow, fail-closed eligibility to seek fresh evidence; never grants a license. */

@@ -4355,6 +4355,228 @@ describe('purchase limit acceptance on PostgreSQL', () => {
       }
     }
   })
+  it('aborts transaction and leaves no committed order when trusted-time watermark persistence fails before commit', async () => {
+    let faultTriggered = false
+    const faultKey = randomUUID()
+    const faultGate = createNewObligationGate({
+      db,
+      pool: licensePool,
+      identityRoot: appConfig.identityRoot,
+      pendingKeyRoot: appConfig.licensePendingKeyRoot,
+      trustStoreRoot: appConfig.licenseTrustStoreRoot,
+      test: {
+        releaseConfig: licenseFixture.options.releaseConfig,
+        trustStore: licenseFixture.options.trustStore,
+        pool: licensePool,
+        onWatermarkPersistenceTestFault: () => {
+          faultTriggered = true
+          throw new Error('simulated_watermark_disk_io_failure_before_commit')
+        },
+      },
+    })
+
+    const initialOrderCount = (await db.selectFrom('orders').select('id').where('idempotency_key', '=', faultKey).execute()).length
+    expect(initialOrderCount).toBe(0)
+
+    await expect(
+      faultGate.withTransactionScope(async () => {
+        await db.transaction().execute(async (trx) => {
+          await faultGate.assertNewObligationAllowed(trx, 'create_order')
+          // If admission had mistakenly continued, this order would be inserted:
+          await trx.insertInto('orders').values({
+            id: randomUUID(),
+            idempotency_key: faultKey,
+            request_sha256: digest,
+            total_amount: '10.00',
+            unpaid_expires_at: new Date(Date.now() + 60_000),
+            history_hidden_at: null,
+            history_hidden_by_admin_id: null,
+            status: 'unpaid',
+            customer_id: null,
+            guest_order_session_id: null,
+            payment_channel_id: null,
+            payment_method: null,
+            paid_at: null,
+            cancelled_at: null,
+            cancel_reason: null,
+          }).execute()
+        })
+      }),
+    ).rejects.toMatchObject({
+      name: 'LicenseNewObligationError',
+      code: 'LICENSE_STATE_UNAVAILABLE',
+      statusCode: 503,
+    })
+
+    expect(faultTriggered).toBe(true)
+
+    // The order transaction was aborted and rolled back: zero orders inserted with this idempotency key
+    const committedOrders = await db.selectFrom('orders').select('id').where('idempotency_key', '=', faultKey).execute()
+    expect(committedOrders).toHaveLength(0)
+  })
+  it('preserves anti-rollback guarantee when simulated crash occurs either before or after business commit', async () => {
+    const currentRow = await db.selectFrom('instance_license_state')
+      .select(['trusted_time_high_water_ms'])
+      .where('singleton', '=', true)
+      .executeTakeFirstOrThrow()
+    const watermarkFilePath = join(appConfig.licensePendingKeyRoot, 'license-time-watermark.json')
+    let originalWatermarkFile: string | null = null
+    try {
+      originalWatermarkFile = await readFile(watermarkFilePath, 'utf8')
+    } catch {
+      originalWatermarkFile = null
+    }
+
+    try {
+      const baseTime = Math.max(
+        currentRow.trusted_time_high_water_ms ? Number(currentRow.trusted_time_high_water_ms) : 0,
+        Date.now(),
+      ) + 20_000
+
+      // --- Scenario A: Process / transaction aborts before business commit ---
+      // In this scenario, watermark file on disk is written during admission check (at tA),
+      // but the business transaction rolls back (simulating process crash / error before commit).
+      // Requirement: "允许事务最终回滚后时间水位保守地保持前进。"
+      const tA = baseTime + 100_000
+      let simulatedClockMs = tA
+
+      const gateA = createNewObligationGate({
+        db, pool: licensePool, identityRoot: appConfig.identityRoot,
+        pendingKeyRoot: appConfig.licensePendingKeyRoot,
+        trustStoreRoot: appConfig.licenseTrustStoreRoot,
+        test: {
+          releaseConfig: licenseFixture.options.releaseConfig,
+          trustStore: licenseFixture.options.trustStore,
+          pool: licensePool,
+          onTrustedTimeTestOverride: () => ({ databaseTimeMs: simulatedClockMs, ignoreProcessAnchor: true }),
+        },
+      })
+
+      // Transaction starts, passes admission (persisting watermark file to disk at tA),
+      // then throws/crashes before commit.
+      await expect(
+        gateA.withTransactionScope(async () => {
+          await db.transaction().execute(async (trx) => {
+            await gateA.assertNewObligationAllowed(trx, 'create_order')
+            throw new Error('simulated_crash_before_commit')
+          })
+        }),
+      ).rejects.toThrow('simulated_crash_before_commit')
+
+      // Verify disk watermark is already at least tA
+      const watermarkContentA = JSON.parse(await readFile(watermarkFilePath, 'utf8')) as { high_water_ms: number }
+      expect(Number(watermarkContentA.high_water_ms)).toBeGreaterThanOrEqual(tA)
+
+      // Now simulate API restart with clock rolled back to before tA (e.g. baseTime + 5_000 < tA - 60_000)
+      simulatedClockMs = baseTime + 5_000
+      const restartedGateA = createNewObligationGate({
+        db, pool: licensePool, identityRoot: appConfig.identityRoot,
+        pendingKeyRoot: appConfig.licensePendingKeyRoot,
+        trustStoreRoot: appConfig.licenseTrustStoreRoot,
+        test: {
+          releaseConfig: licenseFixture.options.releaseConfig,
+          trustStore: licenseFixture.options.trustStore,
+          pool: licensePool,
+          onTrustedTimeTestOverride: () => ({ databaseTimeMs: simulatedClockMs, ignoreProcessAnchor: true }),
+        },
+      })
+
+      // Admission must be blocked due to clock rollback detected from the persisted disk watermark!
+      await expect(
+        restartedGateA.withTransactionScope(async () => {
+          await db.transaction().execute(async (trx) => {
+            await restartedGateA.assertNewObligationAllowed(trx, 'create_order')
+          })
+        }),
+      ).rejects.toMatchObject({
+        name: 'LicenseNewObligationError',
+        code: 'LICENSE_NEW_OBLIGATION_BLOCKED',
+        statusCode: 403,
+        details: expect.objectContaining({ status: 'clock_suspect' }),
+      })
+
+      // --- Scenario B: Crash occurs immediately after business commit, before post-commit DB update ---
+      // In this scenario, business transaction committed at tB. Watermark file is fsynced at tB.
+      // But process died before `advanceDatabaseWatermark` updated `instance_license_state.trusted_time_high_water_ms`.
+      // We simulate this by resetting the DB row back to baseTime, while leaving disk file at tB.
+      const tB = tA + 200_000
+      simulatedClockMs = tB
+
+      const gateB = createNewObligationGate({
+        db, pool: licensePool, identityRoot: appConfig.identityRoot,
+        pendingKeyRoot: appConfig.licensePendingKeyRoot,
+        trustStoreRoot: appConfig.licenseTrustStoreRoot,
+        test: {
+          releaseConfig: licenseFixture.options.releaseConfig,
+          trustStore: licenseFixture.options.trustStore,
+          pool: licensePool,
+          onTrustedTimeTestOverride: () => ({ databaseTimeMs: simulatedClockMs, ignoreProcessAnchor: true }),
+        },
+      })
+
+      await gateB.withTransactionScope(async () => {
+        await db.transaction().execute(async (trx) => {
+          await gateB.assertNewObligationAllowed(trx, 'create_order')
+        })
+      })
+
+      // Verify file is at least tB
+      const watermarkContentB = JSON.parse(await readFile(watermarkFilePath, 'utf8')) as { high_water_ms: number }
+      expect(Number(watermarkContentB.high_water_ms)).toBeGreaterThanOrEqual(tB)
+
+      // Simulate crash right after commit by rewinding the DB column to baseTime (file remains at tB)
+      await sql`ALTER TABLE instance_license_state DISABLE TRIGGER instance_license_time_watermark_guard`.execute(db)
+      try {
+        await db.updateTable('instance_license_state')
+          .set({ trusted_time_high_water_ms: String(baseTime) })
+          .where('singleton', '=', true)
+          .execute()
+      } finally {
+        await sql`ALTER TABLE instance_license_state ENABLE TRIGGER instance_license_time_watermark_guard`.execute(db)
+      }
+
+      // API restarts after crash with clock rolled back to (tB - 120_000)
+      simulatedClockMs = tB - 120_000
+      const restartedGateB = createNewObligationGate({
+        db, pool: licensePool, identityRoot: appConfig.identityRoot,
+        pendingKeyRoot: appConfig.licensePendingKeyRoot,
+        trustStoreRoot: appConfig.licenseTrustStoreRoot,
+        test: {
+          releaseConfig: licenseFixture.options.releaseConfig,
+          trustStore: licenseFixture.options.trustStore,
+          pool: licensePool,
+          onTrustedTimeTestOverride: () => ({ databaseTimeMs: simulatedClockMs, ignoreProcessAnchor: true }),
+        },
+      })
+
+      // Even though DB column was rewound/stale, disk file preserved tB, so clock rollback is rejected!
+      await expect(
+        restartedGateB.withTransactionScope(async () => {
+          await db.transaction().execute(async (trx) => {
+            await restartedGateB.assertNewObligationAllowed(trx, 'create_order')
+          })
+        }),
+      ).rejects.toMatchObject({
+        name: 'LicenseNewObligationError',
+        code: 'LICENSE_NEW_OBLIGATION_BLOCKED',
+        statusCode: 403,
+        details: expect.objectContaining({ status: 'clock_suspect' }),
+      })
+    } finally {
+      if (originalWatermarkFile !== null) {
+        await writeFile(watermarkFilePath, originalWatermarkFile, 'utf8')
+      }
+      await sql`ALTER TABLE instance_license_state DISABLE TRIGGER instance_license_time_watermark_guard`.execute(db)
+      try {
+        await db.updateTable('instance_license_state')
+          .set({ trusted_time_high_water_ms: currentRow.trusted_time_high_water_ms })
+          .where('singleton', '=', true)
+          .execute()
+      } finally {
+        await sql`ALTER TABLE instance_license_state ENABLE TRIGGER instance_license_time_watermark_guard`.execute(db)
+      }
+    }
+  })
   it('preserves an existing order and idempotency after the frozen center revocation is projected', async () => {
     const admin = await createAdmin()
     const customer = await createCustomer()

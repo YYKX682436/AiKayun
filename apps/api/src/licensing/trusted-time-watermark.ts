@@ -2,6 +2,7 @@ import { constants as fsConstants } from 'node:fs'
 import { lstat, open, rename, unlink } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { parseStrictJson } from './strict-json.js'
+import { acquireKernelFileLock } from './trust/kernel-file-lock.js'
 
 const fileName = 'license-time-watermark.json'
 const temporaryName = '.license-time-watermark.tmp'
@@ -52,42 +53,48 @@ export async function readTrustedTimeWatermark(
   const root = resolve(directory)
   await validateRoot(root)
   const path = join(root, fileName)
-  let before
-  try {
-    before = await lstat(path)
-  } catch (error) {
-    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return { status: 'missing' }
-    throw error
-  }
-  if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || (before.mode & 0o777) !== 0o600 ||
-    (currentUid() !== undefined && before.uid !== currentUid()) || before.size > 2048) return { status: 'corrupt' }
-  const handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
-  let bytes: Buffer
-  try {
-    const after = await handle.stat()
-    if (!after.isFile() || after.nlink !== 1 || (after.mode & 0o777) !== 0o600 ||
-      (currentUid() !== undefined && after.uid !== currentUid()) || before.dev !== after.dev || before.ino !== after.ino ||
-      after.size > 2048) return { status: 'corrupt' }
-    bytes = await handle.readFile()
-  } finally {
-    await handle.close()
-  }
-  try {
-    const parsed = parseStrictJson(bytes) as Record<string, unknown>
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
-      Object.keys(parsed).sort().join(',') !== 'database_id,high_water_ms,identity_jkt,instance_id,schema' ||
-      parsed.schema !== 1 || !validHighWater(parsed.high_water_ms)) return { status: 'corrupt' }
-    const identity = safeIdentity(parsed)
-    if (!identity || identity.databaseId !== expectedIdentity.databaseId ||
-      identity.instanceId !== expectedIdentity.instanceId || identity.identityJkt !== expectedIdentity.identityJkt) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let before
+    try {
+      before = await lstat(path)
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return { status: 'missing' }
+      throw error
+    }
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || (before.mode & 0o777) !== 0o600 ||
+      (currentUid() !== undefined && before.uid !== currentUid()) || before.size > 2048) return { status: 'corrupt' }
+    const handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+    let bytes: Buffer
+    try {
+      const after = await handle.stat()
+      if (!after.isFile() || after.nlink !== 1 || (after.mode & 0o777) !== 0o600 ||
+        (currentUid() !== undefined && after.uid !== currentUid()) || before.dev !== after.dev || before.ino !== after.ino ||
+        after.size > 2048) {
+        if (before.ino !== after.ino && attempt < 2) continue
+        return { status: 'corrupt' }
+      }
+      bytes = await handle.readFile()
+    } finally {
+      await handle.close()
+    }
+    try {
+      const parsed = parseStrictJson(bytes) as Record<string, unknown>
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+        Object.keys(parsed).sort().join(',') !== 'database_id,high_water_ms,identity_jkt,instance_id,schema' ||
+        parsed.schema !== 1 || !validHighWater(parsed.high_water_ms)) return { status: 'corrupt' }
+      const identity = safeIdentity(parsed)
+      if (!identity || identity.databaseId !== expectedIdentity.databaseId ||
+        identity.instanceId !== expectedIdentity.instanceId || identity.identityJkt !== expectedIdentity.identityJkt) {
+        return { status: 'corrupt' }
+      }
+      return { status: 'valid', record: {
+        schema: 1, ...identity, high_water_ms: parsed.high_water_ms,
+      } }
+    } catch {
       return { status: 'corrupt' }
     }
-    return { status: 'valid', record: {
-      schema: 1, ...identity, high_water_ms: parsed.high_water_ms,
-    } }
-  } catch {
-    return { status: 'corrupt' }
   }
+  return { status: 'corrupt' }
 }
 
 async function fsyncDirectory(directory: string): Promise<void> {
@@ -97,7 +104,9 @@ async function fsyncDirectory(directory: string): Promise<void> {
 
 const watermarkFileQueues = new Map<string, Promise<void>>()
 
-/** Caller must hold the instance_license_state singleton row lock across this file update and DB write. */
+export const trustedTimeWatermarkLockFileName = '.license-time-watermark.lock'
+
+/** Coordinates watermark file updates across processes using kernel file lock and in-process queue. */
 export async function advanceTrustedTimeWatermarkFile(
   directory: string,
   identity: TimeWatermarkIdentity,
@@ -110,7 +119,12 @@ export async function advanceTrustedTimeWatermarkFile(
   watermarkFileQueues.set(root, queue.then(() => currentPromise).catch(() => currentPromise))
   try {
     await queue
-    await advanceTrustedTimeWatermarkFileInternal(root, identity, highWaterMs)
+    const releaseLock = await acquireKernelFileLock(root, trustedTimeWatermarkLockFileName)
+    try {
+      await advanceTrustedTimeWatermarkFileInternal(root, identity, highWaterMs)
+    } finally {
+      await releaseLock()
+    }
   } finally {
     resolveCurrent()
   }
