@@ -25,7 +25,7 @@ function readSelections(): StoredSelection[] {
 }
 
 export function saveCheckoutSelection(items: CheckoutRequestLineV2[]): string {
-  if (!import.meta.client) return '/products'
+  if (!import.meta.client) return '/'
   const sharedId = readSharedSelectionId(items)
   if (sharedId) return `/checkout?intent=${encodeURIComponent(sharedId)}`
   const fingerprint = selectionFingerprint(items)
@@ -40,7 +40,7 @@ export function saveCheckoutSelection(items: CheckoutRequestLineV2[]): string {
 
 /** Create a new opaque selection after an explicit ownership transition. */
 export function saveFreshCheckoutSelection(items: CheckoutRequestLineV2[]): string {
-  if (!import.meta.client) return '/products'
+  if (!import.meta.client) return '/'
   const fingerprint = selectionFingerprint(items)
   const selections = readSelections()
   const id = crypto.randomUUID()

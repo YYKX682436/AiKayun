@@ -131,7 +131,7 @@ function statusLabel(item: CheckoutQuoteItem): string {
 }
 
 function purchaseEditPath(item: CheckoutQuoteItem): string {
-  if (!item.productId) return '/products'
+  if (!item.productId) return '/'
   const query = new URLSearchParams({ skuId: item.skuId, quantity: String(item.quantity) })
   if (item.draftId) query.set('draftId', item.draftId)
   return `/products/${encodeURIComponent(item.productId)}?${query.toString()}`
@@ -140,7 +140,7 @@ function purchaseEditPath(item: CheckoutQuoteItem): string {
 const backToProductPath = computed(() => {
   const item = quote.value?.items[0]
   if (item) return purchaseEditPath(item)
-  return '/products'
+  return '/'
 })
 
 function cloneSelection(selection: CheckoutSelection | null): CheckoutSelection | null {
