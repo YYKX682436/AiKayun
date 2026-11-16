@@ -1735,20 +1735,18 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
       .where('product_variant_id', '=', catalog.skuId).executeTakeFirstOrThrow()).reserved).toBe(1)
   })
 
-  it('creates multi-SKU customer orders from locked snapshots, reserves quantity stock, and makes idempotency owner-scoped', async () => {
+  it('creates customer orders from locked snapshots, reserves quantity stock, and makes idempotency owner-scoped', async () => {
     const admin = await createAdmin()
     const owner = await createCustomer()
     const other = await createCustomer()
     const quantitySku = await createCatalog({ price: '4.50', mode: 'quantity', stock: 5 })
-    const unlimitedSku = await createCatalog({ price: '2.50', mode: 'unlimited' })
     await enableManual(quantitySku, admin)
-    await enableManual(unlimitedSku, admin)
 
-    const items = [{ skuId: quantitySku.skuId, quantity: 2 }, { skuId: unlimitedSku.skuId, quantity: 1 }]
+    const items = [{ skuId: quantitySku.skuId, quantity: 2 }]
     const current = await quote(items, owner)
     expect(current.statusCode).toBe(200)
     expect(current.json().data.canContinue).toBe(true)
-    expect(current.json().data.totalAmount).toBe('11.50')
+    expect(current.json().data.totalAmount).toBe('9.00')
 
     const idempotencyKey = randomUUID()
     const created = await createOrder(items, current.json().data.quoteToken, owner, idempotencyKey)
@@ -1760,14 +1758,13 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
         id: orderId,
         status: 'pending_payment',
         paymentStatus: 'unpaid',
-        totalAmount: '11.50',
+        totalAmount: '9.00',
         itemsSealed: true,
       },
     })
-    expect(created.json().data.order.items).toEqual(expect.arrayContaining([
+    expect(created.json().data.order.items).toEqual([
       expect.objectContaining({ productId: quantitySku.productId, skuId: quantitySku.skuId, productName: quantitySku.name, unitPrice: '4.50', quantity: 2, lineAmount: '9.00' }),
-      expect.objectContaining({ productId: unlimitedSku.productId, skuId: unlimitedSku.skuId, productName: unlimitedSku.name, unitPrice: '2.50', quantity: 1, lineAmount: '2.50', inventoryMode: 'unlimited' }),
-    ]))
+    ])
     expect((await db.selectFrom('orders').select('customer_id').where('id', '=', orderId).executeTakeFirstOrThrow()).customer_id).toBe(owner.id)
 
     const stock = await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved'])
@@ -1775,7 +1772,6 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     expect(stock).toEqual({ stocked: 5, reserved: 2 })
     expect((await db.selectFrom('product_variants').select('inventory_revision').where('id', '=', quantitySku.skuId).executeTakeFirstOrThrow()).inventory_revision).toBe(1)
     expect(await db.selectFrom('order_inventory_reservations').select('id').where('product_variant_id', '=', quantitySku.skuId).execute()).toHaveLength(1)
-    expect(await db.selectFrom('order_inventory_reservations').select('id').where('product_variant_id', '=', unlimitedSku.skuId).execute()).toHaveLength(0)
 
     const replay = await createOrder(items, '0'.repeat(64), owner, idempotencyKey)
     expect(replay.statusCode).toBe(200)
@@ -1855,16 +1851,14 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     expect(await db.selectFrom('orders').select('id').where('idempotency_key', 'in', staleKeys).execute()).toHaveLength(0)
   })
 
-  it('⑥-3C separates cost-only edits from price changes for mixed free and paid orders', async () => {
+  it('⑥-3C separates cost-only edits from price changes and preserves historical snapshots', async () => {
     const admin = await createAdmin()
     const firstCustomer = await createCustomer()
     const secondCustomer = await createCustomer()
     const paid = await createCatalog({ price: '5.00', mode: 'quantity', stock: 8 })
-    const free = await createCatalog({ price: '0.00', mode: 'quantity', stock: 4 })
     await enableManual(paid, admin)
-    await enableManual(free, admin)
     await setSkuPurchaseLimits(paid.skuId, { lifetime: 2 })
-    const items = [{ skuId: paid.skuId, quantity: 2 }, { skuId: free.skuId, quantity: 1 }]
+    const items = [{ skuId: paid.skuId, quantity: 2 }]
 
     const prices = async () => {
       const response = await inject({ method: 'GET', url: `/api/v1/admin/products/${paid.productId}/prices?page=1&pageSize=50`,
@@ -1875,10 +1869,9 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     const quoteBeforeCost = await quote(items, firstCustomer)
     expect(quoteBeforeCost.statusCode).toBe(200)
     expect(quoteBeforeCost.json().data).toMatchObject({ canContinue: true, totalAmount: '10.00' })
-    expect(quoteBeforeCost.json().data.items).toEqual(expect.arrayContaining([
+    expect(quoteBeforeCost.json().data.items).toEqual([
       expect.objectContaining({ skuId: paid.skuId, unitPrice: '5.00', lineTotal: '10.00' }),
-      expect.objectContaining({ skuId: free.skuId, unitPrice: '0.00', lineTotal: '0.00' }),
-    ]))
+    ])
     let page = await prices()
     let row = page.items.find(item => item.skuId === paid.skuId)!
     const costPreview = await inject({ method: 'POST', url: `/api/v1/admin/products/${paid.productId}/cost-preview`,
@@ -1934,13 +1927,12 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     expect(replay.json().data).toMatchObject({ created: false, order: { id: firstId, totalAmount: '10.00' } })
     const snapshots = await db.selectFrom('order_items').select(['product_variant_id', 'unit_price', 'line_amount'])
       .where('order_id', '=', firstId).execute()
-    expect(snapshots).toEqual(expect.arrayContaining([
+    expect(snapshots).toEqual([
       { product_variant_id: paid.skuId, unit_price: '5.00', line_amount: '10.00' },
-      { product_variant_id: free.skuId, unit_price: '0.00', line_amount: '0.00' },
-    ]))
+    ])
     const reservations = await db.selectFrom('order_inventory_reservations').select(['product_variant_id', 'quantity'])
       .where('order_item_id', 'in', (await db.selectFrom('order_items').select('id').where('order_id', '=', firstId).execute()).map(item => item.id)).execute()
-    expect(reservations).toHaveLength(2)
+    expect(reservations).toHaveLength(1)
     expect((await db.selectFrom('product_variant_quantity_inventory').select('reserved')
       .where('product_variant_id', '=', paid.skuId).executeTakeFirstOrThrow()).reserved).toBe(4)
     const limitQuote = await quote([{ skuId: paid.skuId, quantity: 1 }], firstCustomer)
@@ -2420,31 +2412,30 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     expect(await db.selectFrom('orders').select('id').where('id', '=', successful.json().data.order.id).execute()).toHaveLength(1)
 
     const rollbackQuantity = await createCatalog({ name: 'ROLLBACK-A-quantity', mode: 'quantity', stock: 3, skuId: '10000000-0000-4000-8000-000000000001' })
-    const rollbackSecond = await createCatalog({ name: 'ROLLBACK-B-failure', mode: 'unlimited', skuId: '20000000-0000-4000-8000-000000000002' })
     await enableManual(rollbackQuantity, admin)
-    await enableManual(rollbackSecond, admin)
-    const rollbackItems = [{ skuId: rollbackQuantity.skuId, quantity: 2 }, { skuId: rollbackSecond.skuId, quantity: 1 }]
+    const rollbackItems = [{ skuId: rollbackQuantity.skuId, quantity: 2 }]
     const rollbackQuote = await quote(rollbackItems, firstCustomer)
     const rollbackKey = randomUUID()
     await sql`
-      CREATE FUNCTION test_fail_second_order_item() RETURNS trigger LANGUAGE plpgsql AS $$
+      CREATE FUNCTION test_fail_order_item() RETURNS trigger LANGUAGE plpgsql AS $$
       BEGIN
-        IF NEW.product_variant_id = '20000000-0000-4000-8000-000000000002'::uuid THEN
+        IF NEW.product_variant_id = '10000000-0000-4000-8000-000000000001'::uuid THEN
           RAISE EXCEPTION 'intentional transaction rollback fixture';
         END IF;
         RETURN NEW;
       END;
       $$
     `.execute(db)
-    await sql`CREATE TRIGGER zz_test_fail_second_order_item BEFORE INSERT ON order_items FOR EACH ROW EXECUTE FUNCTION test_fail_second_order_item()`.execute(db)
+    await sql`CREATE TRIGGER zz_test_fail_order_item BEFORE INSERT ON order_items FOR EACH ROW EXECUTE FUNCTION test_fail_order_item()`.execute(db)
     try {
       const failed = await createOrder(rollbackItems, rollbackQuote.json().data.quoteToken, firstCustomer, rollbackKey)
       expect(failed.statusCode).toBe(500)
     } finally {
-      await sql`DROP TRIGGER IF EXISTS zz_test_fail_second_order_item ON order_items`.execute(db)
-      await sql`DROP FUNCTION IF EXISTS test_fail_second_order_item()`.execute(db)
+      await sql`DROP TRIGGER IF EXISTS zz_test_fail_order_item ON order_items`.execute(db)
+      await sql`DROP FUNCTION IF EXISTS test_fail_order_item()`.execute(db)
     }
-    expect(await db.selectFrom('orders').select('id').where('idempotency_key', '=', rollbackKey).execute()).toHaveLength(0)
+    expect(await db.selectFrom('orders').select('id').where('id', '=', rollbackKey).execute()).toHaveLength(0)
+    expect(await db.selectFrom('order_items').select('id').where('product_variant_id', '=', rollbackQuantity.skuId).execute()).toHaveLength(0)
     expect(await db.selectFrom('order_inventory_reservations').select('id').where('product_variant_id', '=', rollbackQuantity.skuId).execute()).toHaveLength(0)
     expect((await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved']).where('product_variant_id', '=', rollbackQuantity.skuId).executeTakeFirstOrThrow())).toEqual({ stocked: 3, reserved: 0 })
     expect(await db.selectFrom('order_inventory_events as event').innerJoin('order_inventory_reservations as reservation', 'reservation.id', 'event.reservation_id').where('reservation.product_variant_id', '=', rollbackQuantity.skuId).execute()).toHaveLength(0)

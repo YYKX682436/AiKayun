@@ -102,7 +102,7 @@ async function installSelection(page: Page, skuId: string) {
   return `/checkout?intent=${selectionId}`
 }
 
-test('concurrent initial v2 and legacy guest checkout bind lost-acknowledgment recovery to the actual cookie owner', async ({ page }) => {
+test('concurrent initial guest checkouts bind lost-acknowledgment recovery to the actual cookie owner', async ({ page }) => {
   test.setTimeout(150_000)
   const context = page.context()
   const second = await context.newPage()
@@ -116,13 +116,14 @@ test('concurrent initial v2 and legacy guest checkout bind lost-acknowledgment r
   let bSessionId = ''
   let lateSecondSession = false
   const keys: string[] = []
-  const legacyKeys: string[] = []
+  const secondKeys: string[] = []
   let committedOrderId = ''
   const cleanup: FixtureCleanup = {}
   try {
     const { product } = await setupProduct(page, cleanup)
     const checkoutUrl = await installSelection(page, product.variants[0]!.id)
     await page.goto(checkoutUrl)
+    await second.goto('/')
     const secondCheckoutUrl = await installSelection(second, product.variants[0]!.id)
     await second.goto(secondCheckoutUrl)
     await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
@@ -162,7 +163,7 @@ test('concurrent initial v2 and legacy guest checkout bind lost-acknowledgment r
       await route.abort('failed')
     })
     await second.route('**/api/v1/checkout/orders', async (route) => {
-      legacyKeys.push((route.request().postDataJSON() as { idempotencyKey: string }).idempotencyKey)
+      secondKeys.push((route.request().postDataJSON() as { idempotencyKey: string }).idempotencyKey)
       await route.abort('failed')
     })
     await page.getByRole('button', { name: '提交订单' }).click()
@@ -206,9 +207,9 @@ test('concurrent initial v2 and legacy guest checkout bind lost-acknowledgment r
     expect(keys).toEqual([pending[0]!.idempotencyKey, pending[0]!.idempotencyKey])
     expect(databaseState(pending[0]!.idempotencyKey)).toEqual(beforeReplay)
     await expect(second.getByRole('alert').filter({ hasText: '服务暂时无法处理此请求' })).toBeVisible()
-    expect(legacyKeys).toHaveLength(1)
+    expect(secondKeys).toHaveLength(1)
     const secondPending = JSON.parse(await second.evaluate(key => localStorage.getItem(key), intentKey) ?? '[]') as Array<{ ownerId: string; idempotencyKey: string }>
-    expect(secondPending.find(i => i.idempotencyKey === legacyKeys[0])?.ownerId).toBe(`guest:${currentSessionId}`)
+    expect(secondPending.find(i => i.idempotencyKey === secondKeys[0])?.ownerId).toBe(`guest:${currentSessionId}`)
     // A newly created key also retains its real owner after a network
     // failure. A later genuine guest session cannot reuse that key as its own.
     await context.clearCookies({ name: guestCookieName })
@@ -219,8 +220,8 @@ test('concurrent initial v2 and legacy guest checkout bind lost-acknowledgment r
     expect(((await changedSession.json()) as SessionResponse).data.sessionId).not.toBe(currentSessionId)
     await second.getByRole('button', { name: '提交订单' }).click()
     await expect(second.getByRole('alert').filter({ hasText: '已有其他账户或游客会话的未确认订单' })).toBeVisible()
-    expect(legacyKeys).toHaveLength(1)
-    expect(databaseState(legacyKeys[0]!)).toEqual({ orders: [], reservations: [] })
+    expect(secondKeys).toHaveLength(1)
+    expect(databaseState(secondKeys[0]!)).toEqual({ orders: [], reservations: [] })
   } finally {
     aSessionRelease.open(); bSessionRelease.open(); orderProbeRelease.open()
     try {
