@@ -2434,7 +2434,7 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
       await sql`DROP TRIGGER IF EXISTS zz_test_fail_order_item ON order_items`.execute(db)
       await sql`DROP FUNCTION IF EXISTS test_fail_order_item()`.execute(db)
     }
-    expect(await db.selectFrom('orders').select('id').where('id', '=', rollbackKey).execute()).toHaveLength(0)
+    expect(await db.selectFrom('orders').select('id').where('idempotency_key', '=', rollbackKey).execute()).toHaveLength(0)
     expect(await db.selectFrom('order_items').select('id').where('product_variant_id', '=', rollbackQuantity.skuId).execute()).toHaveLength(0)
     expect(await db.selectFrom('order_inventory_reservations').select('id').where('product_variant_id', '=', rollbackQuantity.skuId).execute()).toHaveLength(0)
     expect((await db.selectFrom('product_variant_quantity_inventory').select(['stocked', 'reserved']).where('product_variant_id', '=', rollbackQuantity.skuId).executeTakeFirstOrThrow())).toEqual({ stocked: 3, reserved: 0 })
