@@ -4,7 +4,10 @@ const baseURL = 'http://127.0.0.1:3120'
 
 export default defineConfig({
   testDir: './test/e2e',
-  testMatch: '**/dev-preview.spec.ts',
+  testMatch: [
+    '**/dev-preview.spec.ts',
+    '**/modern-web-audits.spec.ts',
+  ],
   fullyParallel: false,
   workers: 1,
   forbidOnly: Boolean(process.env.CI),
@@ -25,6 +28,7 @@ export default defineConfig({
       NODE_ENV: 'development',
       NUXT_PUBLIC_SITE_URL: baseURL,
       AIKAYUN_E2E_BUILD_DIR: '.nuxt/dev-preview',
+      NUXT_API_INTERNAL_URL: 'http://127.0.0.1:3121',
     },
   }],
 })

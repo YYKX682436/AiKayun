@@ -20,6 +20,9 @@ watch(() => props.logoUrl, () => {
       v-if="logoUrl && !logoFailed"
       :src="logoUrl"
       alt=""
+      width="36"
+      height="36"
+      decoding="async"
       class="size-full object-contain"
       @error="logoFailed = true"
     >

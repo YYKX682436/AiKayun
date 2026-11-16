@@ -2948,6 +2948,7 @@ onUnmounted(() => {
                       :alt="`商品图片 ${index + 1}`"
                       class="aspect-square w-full bg-muted object-cover"
                       loading="lazy"
+                      decoding="async"
                     >
                     <div class="flex min-h-11 items-center justify-between gap-2 px-2">
                       <span class="truncate text-xs font-medium text-highlighted">{{ index === 0 ? '封面' : `图片 ${index + 1}` }}</span>
@@ -5993,6 +5994,7 @@ onUnmounted(() => {
                       alt="商品图片预览"
                       class="aspect-square w-full bg-muted object-cover"
                       loading="lazy"
+                      decoding="async"
                     >
                     <div class="p-2">
                       <p class="truncate font-mono text-xs text-highlighted">

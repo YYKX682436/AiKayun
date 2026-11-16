@@ -574,7 +574,7 @@ function formatDate(value: string): string {
             aria-label="报价商品"
           >
             <li
-              v-for="(item, index) in quote.items"
+              v-for="item in quote.items"
               :key="item.lineId ?? item.skuId"
               class="rounded-2xl border border-default/70 bg-elevated/70 p-4 shadow-xs backdrop-blur-xs transition-all hover:border-default sm:p-5"
             >

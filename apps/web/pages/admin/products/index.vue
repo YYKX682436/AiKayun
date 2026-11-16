@@ -458,7 +458,7 @@ async function copyProduct(product: ProductListItem) {
             v-for="tab in quickStatusTabs"
             :key="tab.value"
             type="button"
-            class="inline-flex items-center justify-center gap-1.5 min-h-[44px] px-3.5 py-2 sm:min-h-9 sm:px-3 sm:py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-all shrink-0 cursor-pointer"
+            class="inline-flex items-center justify-center gap-1.5 min-h-[44px] px-3.5 py-2 pointer-coarse:min-h-[44px] pointer-coarse:px-3.5 pointer-coarse:py-2 [@media(pointer:fine)]:sm:min-h-9 [@media(pointer:fine)]:sm:px-3 [@media(pointer:fine)]:sm:py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-all shrink-0 cursor-pointer"
             :class="currentStatusTab === tab.value
               ? 'bg-primary text-white shadow-xs font-semibold'
               : 'bg-elevated text-muted hover:text-highlighted border border-default hover:bg-muted/10'"
@@ -732,6 +732,9 @@ async function copyProduct(product: ProductListItem) {
                   v-if="row.original.coverImage"
                   :src="row.original.coverImage.thumbnailUrl"
                   alt=""
+                  width="44"
+                  height="44"
+                  decoding="async"
                   class="size-full object-cover"
                   loading="lazy"
                 >
@@ -908,6 +911,9 @@ async function copyProduct(product: ProductListItem) {
                   v-if="product.coverImage"
                   :src="product.coverImage.cardUrl"
                   alt=""
+                  width="56"
+                  height="56"
+                  decoding="async"
                   class="size-full object-cover"
                   loading="lazy"
                 >

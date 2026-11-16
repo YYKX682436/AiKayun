@@ -22,6 +22,7 @@ export default defineConfig({
   testIgnore: [
     '**/brand-alt.spec.ts',
     '**/dev-preview.spec.ts',
+    '**/modern-web-audits.spec.ts',
     '**/production-brand-runtime.spec.ts',
     '**/d7-ssr-error.spec.ts',
   ],

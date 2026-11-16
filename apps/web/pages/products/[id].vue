@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { toRaw } from 'vue'
 import {
-  normalizePurchaseFormAnswers,
   validatePurchaseFormDefinition,
   type ApiSuccess,
   type CheckoutQuote,

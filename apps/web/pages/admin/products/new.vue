@@ -116,11 +116,23 @@ async function createProduct() {
   }
 }
 
+const productTypeButtons = ref<Record<string, HTMLButtonElement | null>>({})
+
+function selectProductTypeByIndex(index: number) {
+  if (restoring.value || busy.value || Boolean(productId.value) || requestUncertain.value) return
+  const target = productTypeItems[index]
+  if (!target) return
+  productType.value = target.value as ProductDetail['productType']
+  void nextTick(() => {
+    productTypeButtons.value[target.value]?.focus()
+  })
+}
+
 function selectNextProductType(direction: number) {
   if (restoring.value || busy.value || Boolean(productId.value) || requestUncertain.value) return
   const currentIndex = productTypeItems.findIndex(item => item.value === productType.value)
   const nextIndex = (currentIndex + direction + productTypeItems.length) % productTypeItems.length
-  productType.value = productTypeItems[nextIndex]!.value as ProductDetail['productType']
+  selectProductTypeByIndex(nextIndex)
 }
 
 function startFresh() {
@@ -334,6 +346,7 @@ function startFresh() {
                 <button
                   v-for="item in productTypeItems"
                   :key="item.value"
+                  :ref="(el) => { if (el) productTypeButtons[item.value] = el as HTMLButtonElement }"
                   type="button"
                   role="radio"
                   :aria-checked="productType === item.value"
@@ -351,6 +364,8 @@ function startFresh() {
                   @keydown.arrow-down.prevent="selectNextProductType(1)"
                   @keydown.arrow-left.prevent="selectNextProductType(-1)"
                   @keydown.arrow-up.prevent="selectNextProductType(-1)"
+                  @keydown.home.prevent="selectProductTypeByIndex(0)"
+                  @keydown.end.prevent="selectProductTypeByIndex(productTypeItems.length - 1)"
                 >
                   <div class="flex items-center justify-between w-full mb-1.5">
                     <div class="flex items-center gap-2">

@@ -102,24 +102,41 @@ input {
   --ui-radius: 0.5rem;
   --ui-header-height: 3.5rem;
   scroll-behavior: smooth;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ui-color-neutral-300) transparent;
 }
 
-[data-aikayun-area="admin"] ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+.dark[data-aikayun-area="admin"] {
+  scrollbar-color: var(--ui-color-neutral-700) transparent;
 }
 
-[data-aikayun-area="admin"] ::-webkit-scrollbar-track {
-  background: transparent;
+@supports not (scrollbar-color: auto) {
+  [data-aikayun-area="admin"] ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  [data-aikayun-area="admin"] ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  [data-aikayun-area="admin"] ::-webkit-scrollbar-thumb {
+    background: var(--ui-color-neutral-300);
+    border-radius: 3px;
+  }
+
+  .dark[data-aikayun-area="admin"] ::-webkit-scrollbar-thumb {
+    background: var(--ui-color-neutral-700);
+  }
 }
 
-[data-aikayun-area="admin"] ::-webkit-scrollbar-thumb {
-  background: var(--ui-color-neutral-300);
-  border-radius: 3px;
+/* Modern web standard scrollbar-width utility */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
-
-.dark[data-aikayun-area="admin"] ::-webkit-scrollbar-thumb {
-  background: var(--ui-color-neutral-700);
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
 [data-aikayun-area="admin"] table tbody tr {
