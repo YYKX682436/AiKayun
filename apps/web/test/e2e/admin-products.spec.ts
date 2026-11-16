@@ -52,7 +52,7 @@ test('商品创建后的继续编辑链接可在首次导航等待鉴权时使�
   await page.goto('/admin/products/new')
   const productName = `导航门闩 ${randomUUID().slice(0, 8)}`
   await page.getByLabel('商品名称').fill(productName)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('15.00')
   let release!: () => void
   let arrived!: () => void
   const gate = new Promise<void>(resolve => { release = resolve })
@@ -99,7 +99,7 @@ async function runPricingRuleFlow(
   await page.goto('/admin/products/new')
   await expect(page.getByLabel('商品名称')).toBeEnabled()
   await page.getByLabel('商品名称').fill(productName)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('15.00')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
 
@@ -214,7 +214,7 @@ test('成本预览迟到时释放加载状态，确认进行中保留当前目�
   await signIn(page)
   await page.goto('/admin/products/new')
   await page.getByLabel('商品名称').fill(`D6-3B 成本响应隔离 ${randomUUID().slice(0, 8)}`)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('15.00')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
 
@@ -277,7 +277,7 @@ test('成本确认提交成功但响应丢失时提示结果未知并保留输�
   await signIn(page)
   await page.goto('/admin/products/new')
   await page.getByLabel('商品名称').fill(`D6-3C 成本结果未知 ${randomUUID().slice(0, 8)}`)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('15.00')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
   const productId = page.url().split('/').at(-1)!
@@ -353,7 +353,7 @@ test('未保存的规则不能预览旧建议，确认内容绑定当前 SKU 与
   await page.goto('/admin/products/new')
   await expect(page.getByLabel('商品名称')).toBeEnabled()
   await page.getByLabel('商品名称').fill(productName)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('15.00')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
 
@@ -433,7 +433,7 @@ test('规则保存采用服务端规范化值，恢复历史后不会把旧草�
   await page.goto('/admin/products/new')
   await expect(page.getByLabel('商品名称')).toBeEnabled()
   await page.getByLabel('商品名称').fill(productName)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('15.00')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
   const productId = page.url().split('/').at(-1)!
@@ -486,7 +486,7 @@ test('保存响应迟到时保留请求期间的新编辑及其未保存状态',
   const productName = `D6-3A R1 保存竞态 ${randomUUID().slice(0, 8)}`
   await page.goto('/admin/products/new')
   await page.getByLabel('商品名称').fill(productName)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('15.00')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
   const pricing = page.locator('#pricing-rules')
@@ -532,7 +532,7 @@ test('策略历史切换 SKU 后立即隔离旧数据并忽略迟到的 A 历史
   await page.goto('/admin/products/new')
   await expect(page.getByLabel('商品名称')).toBeEnabled()
   await page.getByLabel('商品名称').fill(productName)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('15.00')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
   const productId = page.url().split('/').at(-1)!
@@ -616,7 +616,7 @@ test('商品 A 的迟到规则读取不能接管当前商品 B 的编辑状态',
     await page.goto('/admin/products/new')
     await expect(page.getByLabel('商品名称')).toBeEnabled()
     await page.getByLabel('商品名称').fill(name)
-    await page.getByLabel('默认 SKU 销售价（人民币）').fill('15.00')
+    await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('15.00')
     await page.getByRole('button', { name: '保存为草稿' }).click()
     await continueToCreatedProduct(page)
     const productId = page.url().split('/').at(-1)!
@@ -665,7 +665,7 @@ test('商品 A 的迟到成本预览不能接管商品 B', async ({ page }) => {
   const makeDraft = async (name: string, price: string) => {
     await page.goto('/admin/products/new')
     await page.getByLabel('商品名称').fill(name)
-    await page.getByLabel('默认 SKU 销售价（人民币）').fill(price)
+    await page.getByLabel(/初始售价|默认 SKU 销售价/).fill(price)
     await page.getByRole('button', { name: '保存为草稿' }).click()
     await continueToCreatedProduct(page)
     return page.url().split('/').at(-1)!
@@ -720,7 +720,7 @@ test('商品 A 的迟到调价确认不能接管商品 B 的后台状态', async
   const makeDraft = async (name: string, salePrice: string) => {
     await page.goto('/admin/products/new')
     await page.getByLabel('商品名称').fill(name)
-    await page.getByLabel('默认 SKU 销售价（人民币）').fill(salePrice)
+    await page.getByLabel(/初始售价|默认 SKU 销售价/).fill(salePrice)
     await page.getByRole('button', { name: '保存为草稿' }).click()
     await continueToCreatedProduct(page)
     return page.url().split('/').at(-1)!
@@ -802,7 +802,7 @@ test('admin manages a real product through category, SKU, price, media, rich tex
   await page.goto('/admin/products/new')
   await expect(page.getByLabel('商品名称')).toBeEnabled()
   await page.getByLabel('商品名称').fill(productName)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('18.90')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('18.90')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
   await expect(page.getByRole('heading', { level: 1, name: productName })).toBeVisible()
@@ -1085,7 +1085,7 @@ test('blocks permanent deletion when inventory history exists and preserves the 
   await page.goto('/admin/products/new')
   await expect(page.getByLabel('商品名称')).toBeEnabled()
   await page.getByLabel('商品名称').fill(productName)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('9.90')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('9.90')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
 
@@ -1126,7 +1126,7 @@ test('rechecks inventory changed during SKU editing and preserves the local matr
   await page.goto('/admin/products/new')
   await expect(page.getByLabel('商品名称')).toBeEnabled()
   await page.getByLabel('商品名称').fill(productName)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('12.90')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('12.90')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
   const productId = page.url().split('/').at(-1)!
@@ -1198,7 +1198,7 @@ test('protects SSR, resolves an independent-context revision conflict, and stays
   await expect(page.getByLabel('商品名称')).toBeEnabled()
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
   await page.getByLabel('商品名称').fill(productName)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('9.90')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('9.90')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
@@ -1270,7 +1270,7 @@ test('category UI reorders duplicate ranks, moves levels, toggles visibility and
   await page.goto('/admin/products/new')
   await expect(page.getByLabel('商品名称')).toBeEnabled()
   await page.getByLabel('商品名称').fill(`D6 分类验收商品 ${randomUUID().slice(0, 8)}`)
-  await page.getByLabel('默认 SKU 销售价（人民币）').fill('6.80')
+  await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('6.80')
   await page.getByRole('button', { name: '保存为草稿' }).click()
   await continueToCreatedProduct(page)
 
@@ -1363,7 +1363,7 @@ test('media sharing blocks physical deletion and preserves another product after
     await page.goto('/admin/products/new')
     await expect(page.getByLabel('商品名称')).toBeEnabled({ timeout: 10_000 })
     await page.getByLabel('商品名称').fill(name)
-    await page.getByLabel('默认 SKU 销售价（人民币）').fill('3.50')
+    await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('3.50')
     await page.getByRole('button', { name: '保存为草稿' }).click()
     await continueToCreatedProduct(page)
     return page.url().split('/').at(-1)!
@@ -1425,7 +1425,7 @@ test('product list issues one initial request and ignores out-of-order search, f
     await page.goto('/admin/products/new')
     await expect(page.getByLabel('商品名称')).toBeEnabled()
     await page.getByLabel('商品名称').fill(name)
-    await page.getByLabel('默认 SKU 销售价（人民币）').fill('2.00')
+    await page.getByLabel(/初始售价|默认 SKU 销售价/).fill('2.00')
     await page.getByRole('button', { name: '保存为草稿' }).click()
     await continueToCreatedProduct(page)
   }
@@ -1504,8 +1504,7 @@ test('product list issues one initial request and ignores out-of-order search, f
     await route.continue()
   }
   await page.route('**/api/v1/admin/products?*', holdOldFilter)
-  await page.getByRole('combobox', { name: '商品状态筛选' }).click()
-  await page.getByRole('option', { name: '草稿', exact: true }).click()
+  await page.getByRole('button', { name: '草稿', exact: true }).click()
   await oldFilterReady
   await page.getByRole('combobox', { name: '商品排序方式' }).click()
   await page.getByRole('option', { name: '最新创建', exact: true }).click()

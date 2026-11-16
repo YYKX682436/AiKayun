@@ -116,6 +116,13 @@ async function createProduct() {
   }
 }
 
+function selectNextProductType(direction: number) {
+  if (restoring.value || busy.value || Boolean(productId.value) || requestUncertain.value) return
+  const currentIndex = productTypeItems.findIndex(item => item.value === productType.value)
+  const nextIndex = (currentIndex + direction + productTypeItems.length) % productTypeItems.length
+  productType.value = productTypeItems[nextIndex]!.value as ProductDetail['productType']
+}
+
 function startFresh() {
   if (!window.confirm('确认放弃当前未保存的草稿并重新填写？')) return
   sessionStorage.removeItem(storageKey)
@@ -312,25 +319,38 @@ function startFresh() {
               />
             </UFormField>
 
-            <!-- 商品性质（提供直观卡片选择与下拉联动，保证无障碍与兼容性） -->
+            <!-- 商品性质（直观卡片选择） -->
             <UFormField
               label="商品性质"
               name="productType"
               required
               help="商品性质决定了后续的库存交付模式（如卡密自动发货、文件下载或物流发货）。"
             >
-              <!-- 交互式性质卡片 -->
-              <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-2">
+              <div
+                role="radiogroup"
+                aria-label="商品性质"
+                class="grid grid-cols-1 sm:grid-cols-3 gap-3"
+              >
                 <button
                   v-for="item in productTypeItems"
                   :key="item.value"
                   type="button"
-                  class="flex flex-col text-left p-3.5 rounded-xl border transition-all text-xs cursor-pointer"
+                  role="radio"
+                  :aria-checked="productType === item.value"
+                  :tabindex="productType === item.value ? 0 : -1"
+                  :aria-label="`${item.label}：${item.description}`"
+                  class="flex flex-col text-left p-3.5 rounded-xl border transition-all text-xs cursor-pointer focus-visible:outline-2 focus-visible:outline-primary"
                   :class="productType === item.value
                     ? 'border-primary bg-primary/5 ring-1 ring-primary shadow-2xs'
                     : 'border-default bg-elevated hover:bg-muted/10 opacity-80'"
                   :disabled="restoring || busy || Boolean(productId) || requestUncertain"
                   @click="productType = item.value as any"
+                  @keydown.space.prevent="productType = item.value as any"
+                  @keydown.enter.prevent="productType = item.value as any"
+                  @keydown.arrow-right.prevent="selectNextProductType(1)"
+                  @keydown.arrow-down.prevent="selectNextProductType(1)"
+                  @keydown.arrow-left.prevent="selectNextProductType(-1)"
+                  @keydown.arrow-up.prevent="selectNextProductType(-1)"
                 >
                   <div class="flex items-center justify-between w-full mb-1.5">
                     <div class="flex items-center gap-2">
@@ -357,25 +377,15 @@ function startFresh() {
                   </p>
                 </button>
               </div>
-
-              <!-- 原生下拉选择（支持自动化测试与无障碍定位） -->
-              <USelect
-                v-model="productType"
-                :items="productTypeItems"
-                size="md"
-                class="w-full sm:w-60"
-                aria-label="商品性质"
-                :disabled="restoring || busy || Boolean(productId) || requestUncertain"
-              />
             </UFormField>
 
-            <!-- 默认 SKU 销售价 -->
+            <!-- 初始售价 -->
             <UFormField
-              label="默认 SKU 销售价（人民币）"
+              label="初始售价"
               name="salePrice"
               required
               hint="元（保留最多两位小数）"
-              help="创建商品的初始默认销售价格。如需设置多规格不同价格，创建后可在编辑页分别指定。"
+              help="创建商品的初始销售价格。如需设置多规格不同价格，创建后可在编辑页分别指定。"
             >
               <div class="relative w-full sm:max-w-xs">
                 <UInput
@@ -384,6 +394,7 @@ function startFresh() {
                   size="lg"
                   inputmode="decimal"
                   placeholder="29.90"
+                  aria-label="初始售价"
                   :disabled="restoring || busy || Boolean(productId) || requestUncertain"
                   required
                 >

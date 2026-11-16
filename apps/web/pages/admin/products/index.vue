@@ -86,9 +86,9 @@ const statusItems = [
 ]
 
 const quickStatusTabs = [
-  { label: '全部商品', value: allFilterValue, icon: 'i-lucide-boxes' },
+  { label: '全部', value: allFilterValue, icon: 'i-lucide-boxes' },
   { label: '销售中', value: 'active', icon: 'i-lucide-play-circle' },
-  { label: '草稿箱', value: 'draft', icon: 'i-lucide-file-edit' },
+  { label: '草稿', value: 'draft', icon: 'i-lucide-file-edit' },
   { label: '已暂停', value: 'paused', icon: 'i-lucide-pause-circle' },
   { label: '已归档', value: 'archived', icon: 'i-lucide-archive' },
 ]
@@ -458,7 +458,7 @@ async function copyProduct(product: ProductListItem) {
             v-for="tab in quickStatusTabs"
             :key="tab.value"
             type="button"
-            class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-all shrink-0 cursor-pointer"
+            class="inline-flex items-center justify-center gap-1.5 min-h-[44px] px-3.5 py-2 sm:min-h-9 sm:px-3 sm:py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-all shrink-0 cursor-pointer"
             :class="currentStatusTab === tab.value
               ? 'bg-primary text-white shadow-xs font-semibold'
               : 'bg-elevated text-muted hover:text-highlighted border border-default hover:bg-muted/10'"
@@ -479,7 +479,7 @@ async function copyProduct(product: ProductListItem) {
         >
           <div class="grid grid-cols-2 gap-2.5 sm:grid-cols-2 lg:grid-cols-12 items-center">
             <!-- 搜索框 -->
-            <div class="col-span-2 lg:col-span-4">
+            <div class="col-span-2 lg:col-span-6">
               <UInput
                 v-model="searchInput"
                 aria-label="搜索商品"
@@ -504,18 +504,6 @@ async function copyProduct(product: ProductListItem) {
                   />
                 </template>
               </UInput>
-            </div>
-
-            <!-- 状态下拉 (保留原有 aria-label 兼容自动化) -->
-            <div class="col-span-1 lg:col-span-2">
-              <USelect
-                :model-value="status || allFilterValue"
-                :items="statusItems"
-                class="w-full"
-                size="md"
-                aria-label="商品状态筛选"
-                @update:model-value="value => updateQuery({ status: String(value) === allFilterValue ? '' : String(value), page: 1 })"
-              />
             </div>
 
             <!-- 分类下拉 -->
@@ -543,7 +531,7 @@ async function copyProduct(product: ProductListItem) {
             </div>
 
             <!-- 排序下拉 -->
-            <div class="col-span-1 lg:col-span-2">
+            <div class="col-span-2 sm:col-span-1 lg:col-span-2">
               <USelect
                 :model-value="sortValue"
                 :items="sortItems"
@@ -999,10 +987,10 @@ async function copyProduct(product: ProductListItem) {
               <div class="flex items-center gap-2">
                 <UButton
                   :to="`/admin/products/${product.id}`"
-                  size="sm"
+                  size="md"
                   color="primary"
                   variant="subtle"
-                  class="font-medium min-h-8"
+                  class="font-medium min-h-[44px] px-3.5 inline-flex items-center justify-center text-xs"
                 >
                   编辑商品
                 </UButton>
@@ -1011,8 +999,8 @@ async function copyProduct(product: ProductListItem) {
                     icon="i-lucide-ellipsis"
                     color="neutral"
                     variant="outline"
-                    size="sm"
-                    class="min-h-8 min-w-8"
+                    size="md"
+                    class="min-h-[44px] min-w-[44px] inline-flex items-center justify-center"
                     :loading="busyId === product.id"
                     :aria-label="`更多操作：${product.name}`"
                   />
