@@ -199,12 +199,12 @@ export function useCustomerApi() {
     const current = readIdentityRevision()
     if (!current.ok) {
       if (requiresCurrentSessionProbe(path)) {
-        throw new CustomerApiError(0, 'CROSS_TAB_SYNC_UNAVAILABLE', '浏览器无法安全确认购物车归属，请检查本地存储后重试。')
+        throw new CustomerApiError(0, 'CROSS_TAB_SYNC_UNAVAILABLE', '浏览器无法安全确认会话归属，请检查本地存储后重试。')
       }
       return
     }
     if (requiresCurrentSessionProbe(path) && !identityRevisionStorageAvailable.value) {
-      throw new CustomerApiError(0, 'CROSS_TAB_SYNC_UNAVAILABLE', '浏览器无法保存身份变更标记，购物车操作已暂停以保护账户数据。')
+      throw new CustomerApiError(0, 'CROSS_TAB_SYNC_UNAVAILABLE', '浏览器无法保存身份变更标记，结算操作已暂停以保护账户数据。')
     }
     if (!identityRevisionReady.value) {
       identityRevision.value = current.value
@@ -230,7 +230,7 @@ export function useCustomerApi() {
       else void refreshSession(true)
       throw new CustomerApiError(0, 'STALE_IDENTITY', path === customerPasswordPath
         ? '登录状态已变化，请确认当前账户后重试。'
-        : '服务端登录身份已变化，请重新同步购物车。')
+        : '服务端登录身份已变化，请重新核对结算信息。')
     }
     return current.data
   }
@@ -247,7 +247,7 @@ export function useCustomerApi() {
     const locks = navigator.locks
     if (!locks) {
       if (identitySensitivePath(path)) {
-        throw new CustomerApiError(0, 'CROSS_TAB_SYNC_UNAVAILABLE', '当前浏览器不支持安全的跨标签购物车同步。')
+        throw new CustomerApiError(0, 'CROSS_TAB_SYNC_UNAVAILABLE', '当前浏览器不支持安全的跨标签结算同步。')
       }
       return dispatch()
     }

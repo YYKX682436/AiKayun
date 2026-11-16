@@ -904,9 +904,10 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
       cookie: `aikayun_customer_session=${buyer.token}; ${buyerCsrfCookie}`,
       'x-csrf-token': buyerCsrf,
     }
+    const beforeLine = { lineId: randomUUID(), skuId: catalog.skuId, quantity: 1 }
     const quoteBefore = await inject({
       method: 'POST', url: '/api/v1/checkout/quote', headers: buyerHeaders,
-      payload: { items: [{ skuId: catalog.skuId, quantity: 1 }] },
+      payload: { version: 2, items: [beforeLine] },
     })
     expect(quoteBefore.statusCode, JSON.stringify(quoteBefore.json())).toBe(200)
     expect(quoteBefore.json().data.canContinue).toBe(true)
@@ -948,9 +949,10 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     expect(JSON.stringify(publicAfter.json().data)).not.toContain('purchaseForm')
     expect((await inject({ method: 'GET', url: `/api/v1/public/purchase-form-templates/${version.id}` })).statusCode).toBe(404)
     expect((await inject({ method: 'POST', url: '/api/v1/customer/purchase-drafts', payload: { templateVersionId: version.id } })).statusCode).toBe(404)
+    const afterLine = { lineId: randomUUID(), skuId: catalog.skuId, quantity: 1 }
     const quoteAfter = await inject({
       method: 'POST', url: '/api/v1/checkout/quote', headers: buyerHeaders,
-      payload: { items: [{ skuId: catalog.skuId, quantity: 1 }] },
+      payload: { version: 2, items: [afterLine] },
     })
     expect(quoteAfter.statusCode).toBe(200)
     expect(quoteAfter.json().data.canContinue).toBe(true)
@@ -959,7 +961,7 @@ describe('⑥-2A preparation and private draft foundations on PostgreSQL', () =>
     expect(quoteAfter.json().data.items[0].lineTotal).toBe(quoteBefore.json().data.items[0].lineTotal)
     const order = await inject({
       method: 'POST', url: '/api/v1/checkout/orders', headers: buyerHeaders,
-      payload: { idempotencyKey: randomUUID(), quoteToken: quoteAfter.json().data.quoteToken, items: [{ skuId: catalog.skuId, quantity: 1 }] },
+      payload: { version: 2, idempotencyKey: randomUUID(), quoteToken: quoteAfter.json().data.quoteToken, items: [afterLine] },
     })
     expect(order.statusCode, JSON.stringify(order.json())).toBe(201)
   }, 45_000)

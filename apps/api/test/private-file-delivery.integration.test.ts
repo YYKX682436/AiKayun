@@ -170,30 +170,32 @@ async function setReadiness(catalog: Catalog, admin: Admin, expectedRevision: nu
 }
 
 async function order(catalog: Catalog, customer: Customer, quantity: number) {
-  const items = [{ skuId: catalog.skuId, quantity }]
+  const lineId = randomUUID()
+  const items = [{ lineId, skuId: catalog.skuId, quantity }]
   const quote = await inject({
     method: 'POST', url: '/api/v1/checkout/quote',
     headers: { origin, cookie: `${customer.cookie}; ${customer.csrfCookie}`, 'x-csrf-token': customer.csrfToken },
-    payload: { items },
+    payload: { version: 2, items },
   })
   expect(quote.statusCode).toBe(200)
   expect(quote.json().data.canContinue).toBe(true)
   return inject({
     method: 'POST', url: '/api/v1/checkout/orders',
     headers: { origin, cookie: `${customer.cookie}; ${customer.csrfCookie}`, 'x-csrf-token': customer.csrfToken },
-    payload: { idempotencyKey: randomUUID(), quoteToken: quote.json().data.quoteToken, items },
+    payload: { version: 2, idempotencyKey: randomUUID(), quoteToken: quote.json().data.quoteToken, items },
   })
 }
 
 async function guestOrder(catalog: Catalog, guest: Awaited<ReturnType<typeof createGuest>>, quantity: number) {
-  const items = [{ skuId: catalog.skuId, quantity }]
+  const lineId = randomUUID()
+  const items = [{ lineId, skuId: catalog.skuId, quantity }]
   const headers = { origin, cookie: `${guest.cookie}; ${guest.csrfCookie}`, 'x-csrf-token': guest.csrfToken }
-  const quote = await inject({ method: 'POST', url: '/api/v1/checkout/quote', headers, payload: { items } })
+  const quote = await inject({ method: 'POST', url: '/api/v1/checkout/quote', headers, payload: { version: 2, items } })
   expect(quote.statusCode).toBe(200)
   expect(quote.json().data.canContinue).toBe(true)
   return inject({
     method: 'POST', url: '/api/v1/checkout/orders', headers,
-    payload: { idempotencyKey: randomUUID(), quoteToken: quote.json().data.quoteToken, items },
+    payload: { version: 2, idempotencyKey: randomUUID(), quoteToken: quote.json().data.quoteToken, items },
   })
 }
 
@@ -275,10 +277,11 @@ describe('private-file delivery on real PostgreSQL and filesystem', () => {
       versionNumber: 1, fileSizeBytes: v1Bytes.length, sha256: createHash('sha256').update(v1Bytes).digest('hex'),
     })
 
+    const lineId = randomUUID()
     const oldQuote = await inject({
       method: 'POST', url: '/api/v1/checkout/quote',
       headers: { origin, cookie: `${customer.cookie}; ${customer.csrfCookie}`, 'x-csrf-token': customer.csrfToken },
-      payload: { items: [{ skuId: catalog.skuId, quantity: 2 }] },
+      payload: { version: 2, items: [{ lineId, skuId: catalog.skuId, quantity: 2 }] },
     })
     expect(oldQuote.json().data.canContinue).toBe(false)
 
@@ -297,7 +300,7 @@ describe('private-file delivery on real PostgreSQL and filesystem', () => {
     const staleCheckout = await inject({
       method: 'POST', url: '/api/v1/checkout/orders',
       headers: { origin, cookie: `${customer.cookie}; ${customer.csrfCookie}`, 'x-csrf-token': customer.csrfToken },
-      payload: { idempotencyKey: randomUUID(), quoteToken: oldQuote.json().data.quoteToken, items: [{ skuId: catalog.skuId, quantity: 2 }] },
+      payload: { version: 2, idempotencyKey: randomUUID(), quoteToken: oldQuote.json().data.quoteToken, items: [{ lineId, skuId: catalog.skuId, quantity: 2 }] },
     })
     expect(staleCheckout.statusCode).toBe(409)
     expect(staleCheckout.json().error.code).toBe('CHECKOUT_QUOTE_CHANGED')
@@ -441,7 +444,8 @@ describe('private-file delivery on real PostgreSQL and filesystem', () => {
     const saved = await saveFile(catalog, admin, 'missing-after-enable.txt', Buffer.from('available while quoted'))
     expect((await setReadiness(catalog, admin, saved.configurationRevision, true)).statusCode).toBe(200)
     const quoteHeaders = { origin, cookie: `${customer.cookie}; ${customer.csrfCookie}`, 'x-csrf-token': customer.csrfToken }
-    const quoteBody = { items: [{ skuId: catalog.skuId, quantity: 1 }] }
+    const quoteLine = { lineId: randomUUID(), skuId: catalog.skuId, quantity: 1 }
+    const quoteBody = { version: 2, items: [quoteLine] }
     const earlierQuote = await inject({ method: 'POST', url: '/api/v1/checkout/quote', headers: quoteHeaders, payload: quoteBody })
     expect(earlierQuote.statusCode).toBe(200)
     expect(earlierQuote.json().data.canContinue).toBe(true)
@@ -452,7 +456,7 @@ describe('private-file delivery on real PostgreSQL and filesystem', () => {
 
     const staleOrder = await inject({
       method: 'POST', url: '/api/v1/checkout/orders', headers: quoteHeaders,
-      payload: { idempotencyKey: randomUUID(), quoteToken: earlierQuote.json().data.quoteToken, ...quoteBody },
+      payload: { version: 2, idempotencyKey: randomUUID(), quoteToken: earlierQuote.json().data.quoteToken, items: [quoteLine] },
     })
     expect(staleOrder.statusCode).toBe(409)
     expect(staleOrder.json().error.code).toBe('CHECKOUT_QUOTE_CHANGED')

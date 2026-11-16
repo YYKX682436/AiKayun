@@ -729,7 +729,7 @@ export async function claimGuestPurchaseDraftsInTransaction(
     if (draft.status !== 'active' || draft.expires_at <= now) throw draftNotFound()
     const expectedRevision = expectedRevisions.get(draft.id.toLowerCase())
     if (expectedRevision !== undefined && draft.revision !== expectedRevision) {
-      throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '指定填写草稿已变化，请重新确认并合并购物车。')
+      throw new PurchaseDraftServiceError(409, 'PURCHASE_DRAFT_REVISION_CONFLICT', '指定填写草稿已变化，请重新确认购买资料。')
     }
     if (draft.customer_id === customerOwner.customerId && draft.guest_order_session_id === null
       && draft.claimed_from_guest_order_session_id === guestSession.id) {

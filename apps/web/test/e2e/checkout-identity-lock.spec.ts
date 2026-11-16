@@ -48,7 +48,7 @@ test('checkout and a same-SPA profile save complete when CSRF renewal queues beh
   let csrfRequests = 0
   let orderRequests = 0
   let profileRequests = 0
-  await page.goto('/cart')
+  await page.goto('/')
   await context.addCookies([{
     name: 'aikayun_admin_session', value: createBrowserAdminSession(),
     url: new URL(page.url()).origin, httpOnly: true, sameSite: 'Lax',

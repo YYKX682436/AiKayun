@@ -213,7 +213,7 @@ function attachSelectionId(
   for (const id of ids) {
     const existing = exactIntent(intents, id)
     if (existing && existing !== intent && existing !== rejected) {
-      throw new Error('结算选择身份已被占用，请返回购物车重试。')
+      throw new Error('结算选择身份已被占用，请返回商品页重试。')
     }
   }
   const primary = intent.selectionId ?? ids[0] ?? null
@@ -238,7 +238,7 @@ export async function findOrderIntentV2(
     const fingerprint = v2SelectionFingerprint(items)
     const exact = checkOwner(exactIntent(intents, selectionId), ownerId)
     if (exact) {
-      if (exact.fingerprint !== fingerprint) throw new Error('结算选择已变化，请返回购物车重新选择。')
+      if (exact.fingerprint !== fingerprint) throw new Error('结算选择已变化，请返回商品页重新选择。')
       return exact
     }
     const pending = checkOwner(intents.find(intent => intent.state === 'pending'
@@ -269,7 +269,7 @@ export async function prepareOrderIntentV2(
     const { raw, intents } = readMigrated()
     const fingerprint = v2SelectionFingerprint(items)
     const exact = checkOwner(exactIntent(intents, selectionId), ownerId)
-    if (exact && exact.fingerprint !== fingerprint) throw new Error('结算选择已变化，请返回购物车重新选择。')
+    if (exact && exact.fingerprint !== fingerprint) throw new Error('结算选择已变化，请返回商品页重新选择。')
     if (exact?.state === 'completed') return exact
     const pending = checkOwner(intents.find(intent => intent.state === 'pending'
       && intent.fingerprint === fingerprint) ?? null, ownerId)

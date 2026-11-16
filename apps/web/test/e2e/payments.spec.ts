@@ -78,12 +78,13 @@ async function registerCustomer(page: Page, username: string): Promise<void> {
   await expect(page.getByRole('button', { name: '退出登录' })).toBeEnabled()
 }
 
-async function addProductToCart(page: Page, product: Product, quantity = 1): Promise<void> {
+async function buyProductNow(page: Page, product: Product, quantity = 1): Promise<void> {
   await page.goto(`/products/${product.id}`)
   await expectClientMounted(page, '[data-storefront-ready="true"]')
   await page.getByLabel('购买数量').fill(String(quantity))
-  await page.getByRole('button', { name: '加入购物车' }).click()
-  await expect(page.getByRole('status')).toContainText('已加入购物车。')
+  await page.getByRole('button', { name: '立即购买' }).click()
+  await expect(page).toHaveURL(/\/checkout/u)
+  await expect(page.getByRole('heading', { name: '确认订单' })).toBeVisible()
 }
 
 async function noHorizontalOverflow(page: Page, width: number): Promise<void> {
@@ -135,10 +136,7 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
 
     const product = await createProduct(page, productName)
     await registerCustomer(page, username)
-    await addProductToCart(page, product)
-    await page.goto('/cart')
-    await expectClientMounted(page, '[data-storefront-ready="true"]')
-    await page.getByRole('link', { name: '查看结算报价' }).click()
+    await buyProductNow(page, product)
     await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
     const checkoutBlocked = async (route: import('@playwright/test').Route) => await route.fulfill({
       status: 403, json: { error: { code: 'LICENSE_NEW_OBLIGATION_BLOCKED', message: '店铺暂停新订单。',
@@ -329,13 +327,7 @@ test('creates a channel in the admin UI and confirms real payment evidence in a 
     expect(nextItems).toMatchObject([{ amount: '2.00', status: 'pending' }, { id: acceptedTopUpId, status: 'succeeded' }])
     expect(nextItems[0].id).not.toBe(acceptedTopUpId)
 
-    await page.goto('/cart')
-    await page.getByRole('button', { name: '清空购物车' }).click()
-    await expect(page.getByRole('heading', { name: '购物车还是空的' })).toBeVisible()
-    await addProductToCart(page, product, 2)
-    await page.goto('/cart')
-    await expectClientMounted(page, '[data-storefront-ready="true"]')
-    await page.getByRole('link', { name: '查看结算报价' }).click()
+    await buyProductNow(page, product, 2)
     await page.getByRole('button', { name: '提交订单' }).click()
     await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
     const comboOrderId = page.url().split('/').at(-1)!
@@ -420,9 +412,7 @@ test('customer requests a full refund and an administrator approves it without c
 
     const product = await createProduct(page, productName)
     await registerCustomer(page, username)
-    await addProductToCart(page, product)
-    await page.goto('/cart')
-    await page.getByRole('link', { name: '查看结算报价' }).click()
+    await buyProductNow(page, product)
     await page.getByRole('button', { name: '提交订单' }).click()
     await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
     const orderId = page.url().split('/').at(-1)!

@@ -119,13 +119,14 @@ async function registerCustomer(page: Page, username: string): Promise<void> {
   await expect(page.getByRole('heading', { name: '个人账户' })).toBeVisible()
 }
 
-async function addProductToCart(page: Page, product: Product): Promise<void> {
+async function buyProductNow(page: Page, product: Product, quantity = '1'): Promise<void> {
   await page.goto(`/products/${product.id}`)
   await expectClientMounted(page, '[data-storefront-ready="true"]')
   await expect(page.getByRole('heading', { name: product.name })).toBeVisible()
-  await page.getByLabel('购买数量').fill('1')
-  await page.getByRole('button', { name: '加入购物车' }).click()
-  await expect(page.getByRole('status')).toContainText('已加入购物车。')
+  await page.getByLabel('购买数量').fill(quantity)
+  await page.getByRole('button', { name: '立即购买' }).click()
+  await expect(page).toHaveURL(/\/checkout/u)
+  await expect(page.getByRole('heading', { name: '确认订单' })).toBeVisible()
 }
 
 test('creates a zero-value order, completes actual private delivery, and cancels a positive unpaid order', async ({ page }) => {
@@ -144,11 +145,7 @@ test('creates a zero-value order, completes actual private delivery, and cancels
   await enableManualDeliveryInAdmin(page, paidProduct)
 
   await registerCustomer(page, username)
-  await addProductToCart(page, zeroProduct)
-  await page.goto('/cart')
-  await expect(page.getByRole('heading', { name: zeroName })).toBeVisible()
-  await page.getByRole('link', { name: '查看结算报价' }).click()
-  await expect(page.getByRole('heading', { name: '确认订单' })).toBeVisible()
+  await buyProductNow(page, zeroProduct)
   await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
   await page.getByRole('button', { name: '提交订单' }).click()
   await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
@@ -183,17 +180,9 @@ test('creates a zero-value order, completes actual private delivery, and cancels
   await page.reload()
   await expect(page.getByText('E2E-REAL-DIGITAL-DELIVERY-2026')).toBeVisible()
 
-  await page.goto('/cart')
-  if (await page.getByRole('button', { name: '清空购物车' }).isVisible()) {
-    await page.getByRole('button', { name: '清空购物车' }).click()
-  }
-  await addProductToCart(page, paidProduct)
+  await buyProductNow(page, paidProduct)
   await expect(page.getByText('¥8.80', { exact: true }).first()).toBeVisible()
-  await page.goto('/cart')
-  await expect(page.getByText('¥8.80', { exact: true }).first()).toBeVisible()
-  await page.getByRole('link', { name: '查看结算报价' }).click()
   await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
-  await expect(page.getByText('¥8.80', { exact: true }).first()).toBeVisible()
   const prices = await page.request.get(`/api/v1/admin/products/${paidProduct.id}/prices`)
   const pricePage = (await prices.json()).data as { productRevision: number; items: Array<{ skuId: string; skuRevision: number }> }
   const changedPrice = await page.request.patch(`/api/v1/admin/products/${paidProduct.id}/variants/${pricePage.items[0]!.skuId}/prices`, {
@@ -307,9 +296,7 @@ test('configures and safely delivers an encrypted fixed Markdown version through
   await expect(editor.getByText('自动交付已启用', { exact: true })).toBeVisible()
 
   await registerCustomer(page, username)
-  await addProductToCart(page, product)
-  await page.goto('/cart')
-  await page.getByRole('link', { name: '查看结算报价' }).click()
+  await buyProductNow(page, product)
   await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
   await page.getByRole('button', { name: '提交订单' }).click()
   await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)
@@ -376,9 +363,7 @@ test('imports a per-SKU code pool in the admin UI and shows only the completed c
   await expect(pool.getByText('新订单自动发货已启用')).toBeVisible()
 
   await registerCustomer(page, username)
-  await addProductToCart(page, product)
-  await page.goto('/cart')
-  await page.getByRole('link', { name: '查看结算报价' }).click()
+  await buyProductNow(page, product)
   await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
   await page.getByRole('button', { name: '提交订单' }).click()
   await expect(page).toHaveURL(/\/orders\/[0-9a-f-]+$/iu)

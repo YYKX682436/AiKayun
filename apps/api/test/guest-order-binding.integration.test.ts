@@ -62,13 +62,14 @@ async function catalog() {
   return skuId
 }
 
-async function requestBody(skuId: string, headers: Record<string, string>, version: 1 | 2) {
-  const items = version === 2 ? [{ lineId: randomUUID(), skuId, quantity: 1 }] : [{ skuId, quantity: 1 }]
+async function requestBody(skuId: string, headers: Record<string, string>) {
+  const lineId = randomUUID()
+  const items = [{ lineId, skuId, quantity: 1 }]
   const result = await inject({ method: 'POST', url: '/api/v1/checkout/quote', headers,
-    payload: { ...(version === 2 ? { version: 2 } : {}), items } })
+    payload: { version: 2, items } })
   expect(result.statusCode).toBe(200)
   expect(result.json().data.canContinue).toBe(true)
-  return { ...(version === 2 ? { version: 2 } : {}), idempotencyKey: randomUUID(), quoteToken: result.json().data.quoteToken as string, items }
+  return { version: 2, idempotencyKey: randomUUID(), quoteToken: result.json().data.quoteToken as string, items }
 }
 
 async function state(key: string) {
@@ -104,11 +105,11 @@ afterAll(async () => {
 })
 
 describe('⑥-2B R1 guest order subject binding', () => {
-  it.each([1, 2] as const)('rejects a real different guest cookie before any v%s order or stock reservation', async version => {
+  it('rejects a real different guest cookie before any order or stock reservation', async () => {
     const first = await guest()
     const second = await guest()
     const skuId = await catalog()
-    const body = await requestBody(skuId, first.headers, version)
+    const body = await requestBody(skuId, first.headers)
     const response = await inject({ method: 'POST', url: '/api/v1/checkout/orders',
       headers: { ...second.headers, [bindingHeader]: first.id }, payload: body })
     expect({ status: response.statusCode, code: response.json().error?.code, ...await state(body.idempotencyKey) })
@@ -124,7 +125,7 @@ describe('⑥-2B R1 guest order subject binding', () => {
     expect(registered.statusCode).toBe(201)
     const customerHeaders = { ...original.headers,
       cookie: `${original.headers.cookie}; ${cookieFrom(registered, 'aikayun_customer_session')}` }
-    const customerBody = await requestBody(skuId, customerHeaders, 2)
+    const customerBody = await requestBody(skuId, customerHeaders)
     const response = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: {
       ...customerHeaders, [bindingHeader]: original.id,
     }, payload: customerBody })
@@ -132,10 +133,10 @@ describe('⑥-2B R1 guest order subject binding', () => {
       .toEqual({ status: 409, code: 'GUEST_SESSION_CHANGED', orders: [], reservations: [] })
   })
 
-  it.each([1, 2] as const)('replays an old v%s body and key with the matching subject header without reinterpreting its quote', async version => {
+  it('replays an idempotent body and key with the matching subject header without reinterpreting its quote', async () => {
     const original = await guest()
     const skuId = await catalog()
-    const body = await requestBody(skuId, original.headers, version)
+    const body = await requestBody(skuId, original.headers)
     const first = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: original.headers, payload: body })
     expect(first.statusCode).toBe(201)
     const saved = await state(body.idempotencyKey)

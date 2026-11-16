@@ -218,14 +218,23 @@ async function setApiReadiness(catalog: Catalog, admin: Admin, enabled: boolean)
   })
 }
 
-async function quote(customer: Customer, catalog: Catalog, quantity: number) {
-  return await inject({
+const testQuoteLineIds = new Map<string, string>()
+
+async function quote(customer: Customer, catalog: Catalog, quantity: number, explicitLineId?: string) {
+  const lineId = explicitLineId ?? randomUUID()
+  const response = await inject({
     method: 'POST', url: '/api/v1/checkout/quote', headers: customerHeaders(customer),
-    payload: { items: [{ skuId: catalog.skuId, quantity }] },
+    payload: { version: 2, items: [{ lineId, skuId: catalog.skuId, quantity }] },
   })
+  if (response.statusCode === 200) {
+    const token = response.json().data?.quoteToken
+    if (token) testQuoteLineIds.set(token, lineId)
+  }
+  return response
 }
 
 async function createGuestOrder(guest: Awaited<ReturnType<typeof createGuest>>, catalog: Catalog, quantity: number) {
+  const lineId = randomUUID()
   const headers = {
     origin,
     cookie: `${guest.cookie}; ${guest.csrfCookie}`,
@@ -233,29 +242,35 @@ async function createGuestOrder(guest: Awaited<ReturnType<typeof createGuest>>, 
   }
   const quoteResponse = await inject({
     method: 'POST', url: '/api/v1/checkout/quote', headers,
-    payload: { items: [{ skuId: catalog.skuId, quantity }] },
+    payload: { version: 2, items: [{ lineId, skuId: catalog.skuId, quantity }] },
   })
   expect(quoteResponse.statusCode, quoteResponse.body).toBe(200)
   expect(quoteResponse.json().data.canContinue, quoteResponse.body).toBe(true)
   return await inject({
     method: 'POST', url: '/api/v1/checkout/orders', headers,
     payload: {
+      version: 2,
       idempotencyKey: randomUUID(), quoteToken: quoteResponse.json().data.quoteToken,
-      items: [{ skuId: catalog.skuId, quantity }],
+      items: [{ lineId, skuId: catalog.skuId, quantity }],
     },
   })
 }
 
 async function createOrder(customer: Customer, catalog: Catalog, quantity: number, token?: string) {
-  const quoteResponse = token ? undefined : await quote(customer, catalog, quantity)
-  if (quoteResponse) {
+  let lineId = randomUUID()
+  let quoteToken: string
+  if (token) {
+    quoteToken = token
+    lineId = testQuoteLineIds.get(token) ?? lineId
+  } else {
+    const quoteResponse = await quote(customer, catalog, quantity, lineId)
     expect(quoteResponse.statusCode, quoteResponse.body).toBe(200)
     expect(quoteResponse.json().data.canContinue, quoteResponse.body).toBe(true)
+    quoteToken = quoteResponse.json().data.quoteToken as string
   }
-  const quoteToken = token ?? quoteResponse!.json().data.quoteToken as string
   return await inject({
     method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders(customer),
-    payload: { idempotencyKey: randomUUID(), quoteToken, items: [{ skuId: catalog.skuId, quantity }] },
+    payload: { version: 2, idempotencyKey: randomUUID(), quoteToken, items: [{ lineId, skuId: catalog.skuId, quantity }] },
   })
 }
 
@@ -1280,120 +1295,7 @@ describe('⑤-5 real SIGKILL and cross-module database acceptance', () => {
 })
 
 
-describe('⑤-5 mixed digital orders and transactional rollback', () => {
-  for (const inventoryMode of ['quantity', 'unlimited'] as const) {
-    it(`completes all six methods in one ${inventoryMode} order, retains refund history and reconciles every unit`, async () => {
-      supplierFixture.reset()
-      const admin = await createAdmin()
-      const customer = await createCustomer()
-      const supplier = await createSupplier(admin)
-      const catalogs = new Map<string, Catalog>()
-      for (const method of ['manual', 'code_pool', 'fixed_content', 'link', 'file', 'api']) {
-        const catalog = await createCatalog('1.00', method === 'code_pool' ? 'quantity' : inventoryMode, 0)
-        catalogs.set(method, catalog)
-        if (catalog.mode === 'quantity' && method !== 'code_pool') {
-          const sku = await db.selectFrom('product_variants').select('inventory_revision').where('id', '=', catalog.skuId).executeTakeFirstOrThrow()
-          const replenished = await inject({ method: 'POST', url: `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/inventory/adjustments`,
-            headers: adminHeaders(admin), payload: { operationId: randomUUID(), expectedInventoryRevision: sku.inventory_revision,
-              action: 'increase', quantity: 5, reason: 'isolated phase55 opening stock' } })
-          expect(replenished.statusCode, replenished.body).toBe(201)
-        }
-        if (method === 'manual') await db.updateTable('product_variant_fulfillment').set({ manual_delivery_ready: true }).where('product_variant_id', '=', catalog.skuId).execute()
-        else if (method === 'code_pool') await configurePool(catalog, admin)
-        else if (method === 'fixed_content' || method === 'link') await configureFixed(catalog, admin, method)
-        else if (method === 'api') {
-          await saveApiVersion(catalog, admin, supplier, { productId: `mixed-${randomUUID()}` })
-          expect((await setApiReadiness(catalog, admin, true)).statusCode).toBe(200)
-        } else {
-          const root = `/api/v1/admin/products/${catalog.productId}/variants/${catalog.skuId}/private-files`
-          const boundary = `phase55-${randomUUID()}`
-          const upload = await inject({ method: 'POST', url: `${root}/uploads`, headers: { ...adminHeaders(admin), 'content-type': `multipart/form-data; boundary=${boundary}` },
-            payload: Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="mixed.txt"\r\nContent-Type: text/plain\r\n\r\nprivate mixed file\r\n--${boundary}--\r\n`) })
-          expect(upload.statusCode, upload.body).toBe(201)
-          const current = await inject({ method: 'GET', url: root, headers: { cookie: admin.cookie } })
-          const saved = await inject({ method: 'POST', url: `${root}/versions`, headers: adminHeaders(admin), payload: {
-            expectedRevision: current.json().data.configurationRevision, uploadId: upload.json().data.uploadId, displayFilename: 'mixed.txt' } })
-          expect(saved.statusCode, saved.body).toBe(200)
-          const ready = await inject({ method: 'PUT', url: `${root}/readiness`, headers: adminHeaders(admin),
-            payload: { expectedRevision: saved.json().data.configurationRevision, enabled: true } })
-          expect(ready.statusCode, ready.body).toBe(200)
-        }
-      }
-      const items = [...catalogs.values()].map(catalog => ({ skuId: catalog.skuId, quantity: 2 }))
-      const quoted = await inject({ method: 'POST', url: '/api/v1/checkout/quote', headers: customerHeaders(customer), payload: { items } })
-      expect(quoted.json().data.canContinue, quoted.body).toBe(true)
-      const created = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders(customer),
-        payload: { idempotencyKey: randomUUID(), quoteToken: quoted.json().data.quoteToken, items } })
-      expect(created.statusCode, created.body).toBe(201)
-      const orderId = created.json().data.order.id as string
-      const skuIds = items.map(item => item.skuId)
-      expect(await reconcileSkus(skuIds)).toEqual([])
-      await runDigitalDeliveryRecoveryPass(db, config)
-      expect(supplierFixture.stats().executions).toBe(0)
-      const payment = await createPayment(orderId, customer)
-      const attemptId = payment.json().data.attempt.id as string
-      const merchantNo = (await db.selectFrom('payment_attempts').select('merchant_order_no').where('id', '=', attemptId).executeTakeFirstOrThrow()).merchant_order_no!
-      expect((await inject({ method: 'GET', url: callbackUrl(paymentFixture.setPaid(merchantNo)) })).body).toBe('success')
-      // Two independent API instances and two workers share the same database.
-      const otherDb = createDatabase()
-      const otherApp = await createApp({ db: otherDb, config, logger: false })
-      try {
-        for (let round = 0; round < 10; round++) {
-          await Promise.all([runDigitalDeliveryRecoveryPass(db, config), runDigitalDeliveryRecoveryPass(otherDb, config)])
-          const remaining = await db.selectFrom('order_items').select('id').where('order_id', '=', orderId)
-            .where('fulfillment_method_snapshot', '<>', 'manual').where('fulfilled_quantity', '<', 2).execute()
-          if (!remaining.length) break
-        }
-        const partial = await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie } })
-        expect(partial.json().data.status).toBe('processing')
-        expect(partial.json().data.items.filter((item: { fulfillmentMethod: string }) => item.fulfillmentMethod !== 'manual')
-          .every((item: { fulfilledQuantity: number }) => item.fulfilledQuantity === 2), partial.body).toBe(true)
-        const manualItem = partial.json().data.items.find((item: { fulfillmentMethod: string }) => item.fulfillmentMethod === 'manual')
-        const path = `/api/v1/admin/orders/${orderId}/items/${manualItem.id}/fulfillments`
-        const firstBody = { operationId: randomUUID(), deliveries: [{ content: 'mixed manual first unit' }] }
-        expect((await inject({ method: 'POST', url: path, headers: adminHeaders(admin), payload: firstBody })).json().data.order.status).toBe('processing')
-        expect((await otherApp.inject({ method: 'POST', url: path, headers: adminHeaders(admin), payload: firstBody })).json().data.repeated).toBe(true)
-        expect(await reconcileSkus(skuIds)).toEqual([])
-        const complete = await inject({ method: 'POST', url: path, headers: adminHeaders(admin),
-          payload: { operationId: randomUUID(), deliveries: [{ content: 'mixed manual second unit' }] } })
-        expect(complete.json().data.order.status).toBe('completed')
-        const histories = await db.selectFrom('order_item_fulfillment_deliveries as delivery')
-          .innerJoin('order_item_fulfillment_attempts as attempt', 'attempt.id', 'delivery.fulfillment_attempt_id')
-          .innerJoin('order_items as item', 'item.id', 'attempt.order_item_id').selectAll('delivery').where('item.order_id', '=', orderId).orderBy('delivery.id').execute()
-        expect(histories).toHaveLength(12)
-        const refund = await inject({ method: 'POST', url: `/api/v1/customer/orders/${orderId}/refunds`, headers: customerHeaders(customer),
-          payload: { idempotencyKey: randomUUID(), amount: '12.00', reason: 'phase55 historical delivery regression' } })
-        expect(refund.statusCode, refund.body).toBe(201)
-        const refundId = refund.json().data.refunds.items[0].id
-        const approved = await inject({ method: 'POST', url: `/api/v1/admin/orders/${orderId}/refunds/${refundId}/approve`, headers: adminHeaders(admin),
-          payload: { idempotencyKey: randomUUID() } })
-        expect(approved.statusCode, approved.body).toBe(200)
-        const fileItem = complete.json().data.order.items.find((item: { fulfillmentMethod: string }) => item.fulfillmentMethod === 'file')
-        const historicalDownload = await inject({ method: 'GET', url: fileItem.deliveries[0].downloadUrl, headers: { cookie: customer.cookie } })
-        expect(historicalDownload.statusCode, historicalDownload.body).toBe(200)
-        expect(historicalDownload.rawPayload).toEqual(Buffer.from('private mixed file'))
-        await runDigitalDeliveryRecoveryPass(db, config)
-        expect(await db.selectFrom('order_item_fulfillment_deliveries').selectAll().where('id', 'in', histories.map(row => row.id)).orderBy('id').execute()).toEqual(histories)
-        expect(await reconcileSkus(skuIds)).toEqual([])
-        if (inventoryMode === 'quantity') {
-          const switched = catalogs.get('fixed_content')!
-          const sku = await db.selectFrom('product_variants').select('inventory_revision').where('id', '=', switched.skuId).executeTakeFirstOrThrow()
-          const removed = await inject({ method: 'POST', url: `/api/v1/admin/products/${switched.productId}/variants/${switched.skuId}/inventory/adjustments`,
-            headers: adminHeaders(admin), payload: { operationId: randomUUID(), expectedInventoryRevision: sku.inventory_revision,
-              action: 'decrease', quantity: 3, reason: 'close remaining stock before switching to a code pool' } })
-          expect(removed.statusCode, removed.body).toBe(201)
-          await configurePool(switched, admin, 3)
-          expect(await reconcileSkus(skuIds)).toEqual([])
-          const historical = await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderId}`, headers: { cookie: customer.cookie } })
-          expect(historical.json().data.items.find((item: { skuId: string }) => item.skuId === switched.skuId))
-            .toMatchObject({ fulfillmentMethod: 'fixed_content', fulfilledQuantity: 2 })
-          expect(await db.selectFrom('order_item_fulfillment_deliveries').selectAll().where('id', 'in', histories.map(row => row.id)).orderBy('id').execute()).toEqual(histories)
-        }
-        expect(supplierFixture.stats()).toMatchObject({ executions: 2, createRequests: 2 })
-      } finally { await otherApp.close(); await otherDb.destroy() }
-    }, 30_000)
-  }
-
+describe('⑤-5 transactional rollback and safe recovery', () => {
   it('redacts private delivery plaintext and uses a fixed safe diagnostic code', async () => {
     const order = await paidApiOrder('manual')
     const secret = 'phase55-private-delivery-never-log-this'
@@ -1458,7 +1360,9 @@ describe('⑤-5 mixed digital orders and transactional rollback', () => {
     const catalog = await createCatalog('0.00', 'quantity', 0)
     await configurePool(catalog, admin, 3)
     const quoted = await quote(customer, catalog, 2)
-    const payload = { idempotencyKey: randomUUID(), quoteToken: quoted.json().data.quoteToken, items: [{ skuId: catalog.skuId, quantity: 2 }] }
+    const quoteData = quoted.json().data
+    const lineId = quoteData.items[0].lineId
+    const payload = { version: 2, idempotencyKey: randomUUID(), quoteToken: quoteData.quoteToken, items: [{ lineId, skuId: catalog.skuId, quantity: 2 }] }
     const reservationProcess = await startCrashProcess(config, 'code_reserved_uncommitted')
     const lost = fetch(`${reservationProcess.origin}/api/v1/checkout/orders`, { method: 'POST', headers: { ...customerHeaders(customer), 'content-type': 'application/json' }, body: JSON.stringify(payload) })
       .then(() => false, () => true)

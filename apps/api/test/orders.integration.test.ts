@@ -363,7 +363,18 @@ async function enableManual(catalog: Catalog, admin: Admin): Promise<void> {
   expect(response.json().data).toMatchObject({ skuId: catalog.skuId, productType: 'digital', enabled: true })
 }
 
-async function quote(items: Array<{ skuId: string; quantity: number }>, customer?: Customer, guestCookie?: string) {
+type CheckoutTestLine = {
+  lineId?: string
+  skuId: string
+  quantity: number
+  draftId?: string | null
+  draftRevision?: number | null
+}
+
+async function quote(items: CheckoutTestLine[], customer?: Customer, guestCookie?: string) {
+  for (const item of items) {
+    if (!item.lineId) item.lineId = randomUUID()
+  }
   const csrf = customer ? { token: customer.csrfToken, cookie: customer.csrfCookie } : await customerCsrf()
   return inject({
     method: 'POST', url: '/api/v1/checkout/quote',
@@ -372,7 +383,15 @@ async function quote(items: Array<{ skuId: string; quantity: number }>, customer
       cookie: [customer?.cookie, guestCookie, csrf.cookie].filter(Boolean).join('; '),
       'x-csrf-token': csrf.token,
     },
-    payload: { items },
+    payload: {
+      version: 2,
+      items: items.map(item => ({
+        lineId: item.lineId!,
+        skuId: item.skuId,
+        quantity: item.quantity,
+        ...(item.draftId !== undefined ? { draftId: item.draftId, draftRevision: item.draftRevision } : {}),
+      })),
+    },
   })
 }
 
@@ -391,12 +410,15 @@ async function newGuestSession() {
 }
 
 async function createOrder(
-  items: Array<{ skuId: string; quantity: number }>,
+  items: CheckoutTestLine[],
   quoteToken: string,
   owner: Customer | { cookie: string; csrfToken: string; csrfCookie: string },
   idempotencyKey = randomUUID(),
   extra: Record<string, unknown> = {},
 ) {
+  for (const item of items) {
+    if (!item.lineId) item.lineId = randomUUID()
+  }
   return inject({
     method: 'POST', url: '/api/v1/checkout/orders',
     headers: {
@@ -404,7 +426,18 @@ async function createOrder(
       cookie: [owner.cookie, owner.csrfCookie].filter(Boolean).join('; '),
       'x-csrf-token': owner.csrfToken,
     },
-    payload: { idempotencyKey, quoteToken, items, ...extra },
+    payload: {
+      version: 2,
+      idempotencyKey,
+      quoteToken,
+      items: items.map(item => ({
+        lineId: item.lineId!,
+        skuId: item.skuId,
+        quantity: item.quantity,
+        ...(item.draftId !== undefined ? { draftId: item.draftId, draftRevision: item.draftRevision } : {}),
+      })),
+      ...extra,
+    },
   })
 }
 
@@ -813,8 +846,9 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
 
     await db.updateTable('storefront_customer_policy').set({ guest_checkout_enabled: true }).execute()
     const guest = await newGuestSession()
-    const guestQuote = await quote([{ skuId: catalog.skuId, quantity: 1 }], undefined, guest.cookie)
-    const guestOrder = await createOrder([{ skuId: catalog.skuId, quantity: 1 }], guestQuote.json().data.quoteToken, guest)
+    const guestItems = [{ skuId: catalog.skuId, quantity: 1 }]
+    const guestQuote = await quote(guestItems, undefined, guest.cookie)
+    const guestOrder = await createOrder(guestItems, guestQuote.json().data.quoteToken, guest)
     expect(guestOrder.statusCode).toBe(201)
     const guestOrderId = guestOrder.json().data.order.id as string
     const guestSearch = await inject({
@@ -834,7 +868,7 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     await enableManual(catalog, admin)
     const items = [{ skuId: catalog.skuId, quantity: 1 }]
     const quoted = await quote(items, customer)
-    const body = { idempotencyKey: randomUUID(), quoteToken: quoted.json().data.quoteToken, items }
+    const body = { version: 2, idempotencyKey: randomUUID(), quoteToken: quoted.json().data.quoteToken, items }
     const created = await inject({ method: 'POST', url: '/api/v1/checkout/orders', headers: customerHeaders(customer), payload: body })
     expect(created.statusCode).toBe(201)
     const orderId = created.json().data.order.id
@@ -1791,27 +1825,31 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     for (const catalog of [priceSku, productSku, retiredSku, stockSku]) await enableManual(catalog, admin)
 
     const staleKeys = [randomUUID(), randomUUID(), randomUUID(), randomUUID()] as const
-    const priceQuote = await quote([{ skuId: priceSku.skuId, quantity: 1 }], customer)
+    const priceItems = [{ skuId: priceSku.skuId, quantity: 1 }]
+    const priceQuote = await quote(priceItems, customer)
     await db.updateTable('product_variants').set({ sale_price: '0.50' }).where('id', '=', priceSku.skuId).execute()
-    const changedPrice = await createOrder([{ skuId: priceSku.skuId, quantity: 1 }], priceQuote.json().data.quoteToken, customer, staleKeys[0])
+    const changedPrice = await createOrder(priceItems, priceQuote.json().data.quoteToken, customer, staleKeys[0])
     expect(changedPrice.statusCode).toBe(409)
     expect(changedPrice.json().error).toMatchObject({ code: 'CHECKOUT_QUOTE_CHANGED', currentQuote: { items: [{ unitPrice: '0.50' }] } })
 
-    const productQuote = await quote([{ skuId: productSku.skuId, quantity: 1 }], customer)
+    const productItems = [{ skuId: productSku.skuId, quantity: 1 }]
+    const productQuote = await quote(productItems, customer)
     await db.updateTable('products').set({ status: 'paused' }).where('id', '=', productSku.productId).execute()
-    const changedProduct = await createOrder([{ skuId: productSku.skuId, quantity: 1 }], productQuote.json().data.quoteToken, customer, staleKeys[1])
+    const changedProduct = await createOrder(productItems, productQuote.json().data.quoteToken, customer, staleKeys[1])
     expect(changedProduct.statusCode).toBe(409)
     expect(changedProduct.json().error.currentQuote.items[0]).toMatchObject({ productStatus: 'paused', reason: 'product_not_active' })
 
-    const skuQuote = await quote([{ skuId: retiredSku.skuId, quantity: 1 }], customer)
+    const skuItems = [{ skuId: retiredSku.skuId, quantity: 1 }]
+    const skuQuote = await quote(skuItems, customer)
     await db.updateTable('product_variants').set({ enabled: false, retired_at: new Date() }).where('id', '=', retiredSku.skuId).execute()
-    const changedSku = await createOrder([{ skuId: retiredSku.skuId, quantity: 1 }], skuQuote.json().data.quoteToken, customer, staleKeys[2])
+    const changedSku = await createOrder(skuItems, skuQuote.json().data.quoteToken, customer, staleKeys[2])
     expect(changedSku.statusCode).toBe(409)
     expect(changedSku.json().error.currentQuote.items[0]).toMatchObject({ reason: 'sku_retired' })
 
-    const stockQuote = await quote([{ skuId: stockSku.skuId, quantity: 1 }], customer)
+    const stockItems = [{ skuId: stockSku.skuId, quantity: 1 }]
+    const stockQuote = await quote(stockItems, customer)
     await db.updateTable('product_variant_quantity_inventory').set({ stocked: 3 }).where('product_variant_id', '=', stockSku.skuId).execute()
-    const changedStock = await createOrder([{ skuId: stockSku.skuId, quantity: 1 }], stockQuote.json().data.quoteToken, customer, staleKeys[3])
+    const changedStock = await createOrder(stockItems, stockQuote.json().data.quoteToken, customer, staleKeys[3])
     expect(changedStock.statusCode).toBe(409)
     expect(changedStock.json().error.currentQuote.items[0]).toMatchObject({ availableQuantity: 3, canPurchase: true })
     expect(await db.selectFrom('orders').select('id').where('idempotency_key', 'in', staleKeys).execute()).toHaveLength(0)
@@ -2276,8 +2314,9 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     const secondGuest = await newGuestSession()
     const csrfForGuest = { cookie: guest.cookie, csrfCookie: guest.csrfCookie, csrfToken: guest.csrfToken }
 
-    const paidQuote = await quote([{ skuId: paidSku.skuId, quantity: 1 }], undefined, guest.cookie)
-    const pending = await createOrder([{ skuId: paidSku.skuId, quantity: 1 }], paidQuote.json().data.quoteToken, csrfForGuest)
+    const paidItems = [{ skuId: paidSku.skuId, quantity: 1 }]
+    const paidQuote = await quote(paidItems, undefined, guest.cookie)
+    const pending = await createOrder(paidItems, paidQuote.json().data.quoteToken, csrfForGuest)
     expect(pending.statusCode).toBe(201)
     expect(pending.json().data.order).toMatchObject({ status: 'pending_payment', paymentStatus: 'unpaid' })
     const paidOrderId = pending.json().data.order.id as string
@@ -2296,9 +2335,10 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
     expect(guestCancel.statusCode).toBe(200)
     expect(guestCancel.json().data.status).toBe('closed')
 
-    const freeQuote = await quote([{ skuId: freeSku.skuId, quantity: 1 }], undefined, guest.cookie)
+    const freeItems = [{ skuId: freeSku.skuId, quantity: 1 }]
+    const freeQuote = await quote(freeItems, undefined, guest.cookie)
     expect(freeQuote.json().data.canContinue).toBe(true)
-    const freeOrder = await createOrder([{ skuId: freeSku.skuId, quantity: 1 }], freeQuote.json().data.quoteToken, csrfForGuest)
+    const freeOrder = await createOrder(freeItems, freeQuote.json().data.quoteToken, csrfForGuest)
     expect(freeOrder.statusCode).toBe(201)
     expect(freeOrder.json().data.order).toMatchObject({ status: 'processing', paymentStatus: 'not_required', totalAmount: '0.00' })
     const freeOrderId = freeOrder.json().data.order.id as string
@@ -2462,8 +2502,9 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
 
     const skipSku = await createCatalog({ price: '2.00', mode: 'quantity', stock: 2 })
     await enableManual(skipSku, admin)
-    const skipQuote = await quote([{ skuId: skipSku.skuId, quantity: 1 }], customer)
-    const skipOrder = await createOrder([{ skuId: skipSku.skuId, quantity: 1 }], skipQuote.json().data.quoteToken, customer)
+    const skipItems = [{ skuId: skipSku.skuId, quantity: 1 }]
+    const skipQuote = await quote(skipItems, customer)
+    const skipOrder = await createOrder(skipItems, skipQuote.json().data.quoteToken, customer)
     const skipId = skipOrder.json().data.order.id as string
     const dueAt = new Date(Date.now() + 20 * 60_000)
     let unlock!: () => void
@@ -2489,8 +2530,9 @@ describe('real order creation and lifecycle on PostgreSQL', () => {
 
     const recoverySku = await createCatalog({ price: '1.50', mode: 'quantity', stock: 2 })
     await enableManual(recoverySku, admin)
-    const recoveryQuote = await quote([{ skuId: recoverySku.skuId, quantity: 1 }], customer)
-    const recoveryOrder = await createOrder([{ skuId: recoverySku.skuId, quantity: 1 }], recoveryQuote.json().data.quoteToken, customer)
+    const recoveryItems = [{ skuId: recoverySku.skuId, quantity: 1 }]
+    const recoveryQuote = await quote(recoveryItems, customer)
+    const recoveryOrder = await createOrder(recoveryItems, recoveryQuote.json().data.quoteToken, customer)
     const recoveryId = recoveryOrder.json().data.order.id as string
     await sql`ALTER TABLE orders DISABLE TRIGGER orders_guard_update`.execute(db)
     try {
@@ -3135,7 +3177,8 @@ describe('versioned fixed-content and link delivery on PostgreSQL', () => {
     expect((await inject({ method: 'GET', url: `/api/v1/customer/orders/${orderIdV1}`, headers: { cookie: customer.cookie } }))
       .json().data.items[0].deliveries).toEqual([])
 
-    const staleQuote = await quote([{ skuId: catalog.skuId, quantity: 1 }], customer)
+    const staleItems = [{ skuId: catalog.skuId, quantity: 1 }]
+    const staleQuote = await quote(staleItems, customer)
     const secondText = '## Version two\n\nNew authorization instructions.'
     const savedV2 = await inject({
       method: 'POST', url: `${configUrl}/versions`, headers: adminHeaders(admin),
@@ -3164,7 +3207,7 @@ describe('versioned fixed-content and link delivery on PostgreSQL', () => {
     expect(copiedConfig.statusCode).toBe(200)
     expect(copiedConfig.json().data).toMatchObject({ method: null, automaticDeliveryReady: false, currentVersion: null })
 
-    const oldQuoteOrder = await createOrder([{ skuId: catalog.skuId, quantity: 1 }], staleQuote.json().data.quoteToken, customer)
+    const oldQuoteOrder = await createOrder(staleItems, staleQuote.json().data.quoteToken, customer)
     expect(oldQuoteOrder.statusCode).toBe(409)
     expect(oldQuoteOrder.json().error.code).toBe('CHECKOUT_QUOTE_CHANGED')
     const enabledV2 = await inject({
@@ -3172,10 +3215,11 @@ describe('versioned fixed-content and link delivery on PostgreSQL', () => {
       payload: { expectedRevision: savedV2.json().data.configurationRevision, enabled: true },
     })
     expect(enabledV2.statusCode).toBe(200)
-    const quoteV2 = await quote([{ skuId: catalog.skuId, quantity: 1 }], customer)
+    const v2Items = [{ skuId: catalog.skuId, quantity: 1 }]
+    const quoteV2 = await quote(v2Items, customer)
     expect(quoteV2.json().data.canContinue).toBe(true)
     expect(quoteV2.json().data.items[0].fulfillmentVersionId).toBe(savedV2.json().data.currentVersion.id)
-    const createdV2 = await createOrder([{ skuId: catalog.skuId, quantity: 1 }], quoteV2.json().data.quoteToken, customer)
+    const createdV2 = await createOrder(v2Items, quoteV2.json().data.quoteToken, customer)
     expect(createdV2.statusCode).toBe(201)
     const orderIdV2 = createdV2.json().data.order.id as string
     const itemIdV2 = createdV2.json().data.order.items[0].id as string
@@ -3527,10 +3571,11 @@ describe('purchase limit acceptance on PostgreSQL', () => {
     expect(unlimited.json().data.items[0].purchaseLimits.requiresLogin).toBe(false)
 
     await setSkuPurchaseLimits(catalog.skuId, { perOrder: 2 })
-    const withinLimit = await quote([{ skuId: catalog.skuId, quantity: 2 }], undefined, guest.cookie)
+    const withinLimitItems = [{ skuId: catalog.skuId, quantity: 2 }]
+    const withinLimit = await quote(withinLimitItems, undefined, guest.cookie)
     expect(withinLimit.json().data.canContinue).toBe(true)
     const guestOrder = await createOrder(
-      [{ skuId: catalog.skuId, quantity: 2 }], withinLimit.json().data.quoteToken, guest,
+      withinLimitItems, withinLimit.json().data.quoteToken, guest,
     )
     expect(guestOrder.statusCode).toBe(201)
     const overLimit = await quote([{ skuId: catalog.skuId, quantity: 3 }], undefined, guest.cookie)
@@ -3544,24 +3589,18 @@ describe('purchase limit acceptance on PostgreSQL', () => {
     expect(accountOnly.json().data.canContinue).toBe(false)
   })
 
-  it('combines product and SKU per-order rules across all selected SKUs', async () => {
+  it('combines product and SKU per-order rules on direct purchase', async () => {
     const admin = await createAdmin()
     const customer = await createCustomer()
     const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
     await enableManual(catalog, admin)
-    const secondSkuId = await addSiblingSku(catalog)
     await setProductPurchaseLimits(catalog.productId, { perOrder: 3 })
     await setSkuPurchaseLimits(catalog.skuId, { perOrder: 1 })
 
-    const bothRules = await quote([
-      { skuId: catalog.skuId, quantity: 2 },
-      { skuId: secondSkuId, quantity: 2 },
-    ], customer)
+    const bothRules = await quote([{ skuId: catalog.skuId, quantity: 4 }], customer)
     expect(bothRules.json().data.canContinue).toBe(false)
-    expect(bothRules.json().data.items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ skuId: catalog.skuId, purchaseLimits: expect.objectContaining({ product: expect.objectContaining({ exceeded: true }), sku: expect.objectContaining({ exceeded: true }) }) }),
-      expect.objectContaining({ skuId: secondSkuId, purchaseLimits: expect.objectContaining({ product: expect.objectContaining({ exceeded: true }), sku: expect.objectContaining({ exceeded: false }) }) }),
-    ]))
+    expect(bothRules.json().data.items[0].purchaseLimits.product.exceeded).toBe(true)
+    expect(bothRules.json().data.items[0].purchaseLimits.sku.exceeded).toBe(true)
 
     await setProductPurchaseLimits(catalog.productId, { perOrder: null })
     const skuOnly = await quote([{ skuId: catalog.skuId, quantity: 2 }], customer)
@@ -3769,51 +3808,6 @@ describe('purchase limit acceptance on PostgreSQL', () => {
     expect(await db.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()).toHaveLength(1)
     const remaining = await quote([{ skuId: catalog.skuId, quantity: 1 }], customer)
     expect(remaining.json().data.items[0].purchaseLimits.product).toMatchObject({ lifetimePurchased: 1, maxAvailable: 0 })
-  })
-
-  it('checks a multi-SKU order atomically against a concurrent single-SKU order', async () => {
-    const admin = await createAdmin()
-    const customer = await createCustomer()
-    const secondDevice = await loginCustomerSession(customer)
-    const catalog = await createCatalog({ price: '1.00', mode: 'unlimited' })
-    await enableManual(catalog, admin)
-    const otherSkuId = await addSiblingSku(catalog)
-    await setProductPurchaseLimits(catalog.productId, { lifetime: 2 })
-    const combinedItems = [{ skuId: catalog.skuId, quantity: 1 }, { skuId: otherSkuId, quantity: 1 }]
-    const singleItems = [{ skuId: catalog.skuId, quantity: 1 }]
-    const [combinedQuote, singleQuote] = await Promise.all([quote(combinedItems, customer), quote(singleItems, secondDevice)])
-    expect(combinedQuote.json().data.canContinue).toBe(true)
-    expect(singleQuote.json().data.canContinue).toBe(true)
-
-    let releaseOwner!: () => void
-    let signalLocked!: () => void
-    const gate = new Promise<void>(resolve => { releaseOwner = resolve })
-    const ownerLocked = new Promise<void>(resolve => { signalLocked = resolve })
-    const blocker = db.transaction().execute(async trx => {
-      await sql`SELECT id FROM customers WHERE id = ${customer.id}::uuid FOR UPDATE`.execute(trx)
-      signalLocked()
-      await gate
-    })
-    await ownerLocked
-    const combined = createOrder(combinedItems, combinedQuote.json().data.quoteToken, customer)
-    const single = createOrder(singleItems, singleQuote.json().data.quoteToken, secondDevice)
-    try {
-      await waitForLockWaitCount('aikayun-api', 2, 'customers')
-    } finally {
-      releaseOwner()
-    }
-    await blocker
-    const results = await Promise.all([combined, single])
-    expect(results.map(result => result.statusCode).sort()).toEqual([201, 409])
-    const orders = await db.selectFrom('orders').select('id').where('customer_id', '=', customer.id).execute()
-    expect(orders).toHaveLength(1)
-    const createdOrder = results.find(result => result.statusCode === 201)!.json().data.order
-    const expectedQuantity = createdOrder.items.reduce((total: number, item: { quantity: number }) => total + item.quantity, 0)
-    const purchased = await sql<{ quantity: string }>`
-      SELECT prior_purchase_quantity(${customer.id}::uuid, ${catalog.productId}::uuid, NULL, NULL, NULL)::text AS quantity
-    `.execute(db)
-    expect(purchased.rows[0]?.quantity).toBe(String(expectedQuantity))
-    expect([1, 2]).toContain(expectedQuantity)
   })
 
   it('rechecks stock and limit together and rolls back an ineligible order without a reservation', async () => {

@@ -351,7 +351,6 @@ test('D7 serves a real SSR catalog, visible category path, safe media details, s
   expect(detailBrowserRequests.some(url => /ProductRichContentEditor|@tiptap|prosemirror/iu.test(url))).toBe(false)
   page.off('request', recordDetailRequest)
   await expect(page.getByText(/商品、库存、填写模板和已配置的履约资格都会在结算事务中再次校验/u)).toBeVisible()
-  await expect(page.getByRole('button', { name: '加入购物车' })).toBeVisible()
   await expect(page.getByRole('button', { name: '立即购买' })).toBeVisible()
   await expect(page.locator('.product-rich-content')).toContainText('真实结构化商品说明')
   await expect(page.locator('img[fetchpriority="high"]')).toBeVisible()

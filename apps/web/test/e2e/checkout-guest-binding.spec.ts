@@ -40,7 +40,7 @@ async function pauseProduct(page: Page, productId: string): Promise<void> {
 }
 
 async function setupProduct(page: Page, cleanup: FixtureCleanup) {
-  await page.goto('/cart')
+  await page.goto('/')
   await page.context().addCookies([{
     name: 'aikayun_admin_session', value: createBrowserAdminSession(),
     url: new URL(page.url()).origin, httpOnly: true, sameSite: 'Lax',
@@ -123,7 +123,8 @@ test('concurrent initial v2 and legacy guest checkout bind lost-acknowledgment r
     const { product } = await setupProduct(page, cleanup)
     const checkoutUrl = await installSelection(page, product.variants[0]!.id)
     await page.goto(checkoutUrl)
-    await second.goto(`/checkout?items=${encodeURIComponent(JSON.stringify([{ skuId: product.variants[0]!.id, quantity: 2 }]))}`)
+    const secondCheckoutUrl = await installSelection(second, product.variants[0]!.id)
+    await second.goto(secondCheckoutUrl)
     await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
     await expect(second.getByRole('button', { name: '提交订单' })).toBeEnabled()
     expect((await context.cookies()).some(cookie => cookie.name === guestCookieName)).toBe(false)
@@ -206,9 +207,9 @@ test('concurrent initial v2 and legacy guest checkout bind lost-acknowledgment r
     expect(databaseState(pending[0]!.idempotencyKey)).toEqual(beforeReplay)
     await expect(second.getByRole('alert').filter({ hasText: '服务暂时无法处理此请求' })).toBeVisible()
     expect(legacyKeys).toHaveLength(1)
-    const binding = await second.evaluate(() => sessionStorage.getItem('aikayun-order-intent-guest-owners-v1'))
-    expect(JSON.parse(binding ?? '[]')).toEqual([{ idempotencyKey: legacyKeys[0], ownerId: `guest:${currentSessionId}` }])
-    // A newly created legacy key also retains its real owner after a network
+    const secondPending = JSON.parse(await second.evaluate(key => localStorage.getItem(key), intentKey) ?? '[]') as Array<{ ownerId: string; idempotencyKey: string }>
+    expect(secondPending.find(i => i.idempotencyKey === legacyKeys[0])?.ownerId).toBe(`guest:${currentSessionId}`)
+    // A newly created key also retains its real owner after a network
     // failure. A later genuine guest session cannot reuse that key as its own.
     await context.clearCookies({ name: guestCookieName })
     const changedSession = await page.request.post('/api/v1/guest/session', {
@@ -219,7 +220,6 @@ test('concurrent initial v2 and legacy guest checkout bind lost-acknowledgment r
     await second.getByRole('button', { name: '提交订单' }).click()
     await expect(second.getByRole('alert').filter({ hasText: '已有其他账户或游客会话的未确认订单' })).toBeVisible()
     expect(legacyKeys).toHaveLength(1)
-    expect(await second.evaluate(() => sessionStorage.getItem('aikayun-order-intent-guest-owners-v1'))).toBe(binding)
     expect(databaseState(legacyKeys[0]!)).toEqual({ orders: [], reservations: [] })
   } finally {
     aSessionRelease.open(); bSessionRelease.open(); orderProbeRelease.open()
@@ -252,7 +252,7 @@ test('a late real guest Set-Cookie cannot submit a pending request under a diffe
   const cleanup: FixtureCleanup = {}
   try {
     const { product } = await setupProduct(page, cleanup)
-    await second.goto('/cart')
+    await second.goto('/')
     const csrf = (await context.cookies()).find(cookie => cookie.name === 'aikayun_customer_csrf')
       ?? (await (await page.request.get('/api/v1/customer/auth/csrf')).json()).data.csrfToken
     const csrfValue = typeof csrf === 'string' ? csrf : csrf.value

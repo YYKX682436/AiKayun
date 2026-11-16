@@ -105,7 +105,7 @@ async function changePrice(page: Page, product: Product): Promise<void> {
 }
 
 async function storeSelection(page: Page, selectionId: string, line: Line): Promise<void> {
-  await page.goto('/cart')
+  await page.goto('/')
   await page.evaluate(({ selectionId, line }) => {
     sessionStorage.setItem('aikayun-checkout-selections-v2', JSON.stringify([{
       id: selectionId, fingerprint: JSON.stringify([line]), items: [line],
@@ -190,7 +190,7 @@ for (const confirmationLink of ['primary', 'alias', 'rejoined-pending', 'capacit
       let rejoinedKey: string | null = null
       // A user can leave the second checkout tab on another page. It must
       // still recover its original operation after returning to the old URL.
-      await other.goto('/cart')
+      await other.goto('/')
       await changePrice(page, prepared.product)
       allowBackend = true
       const rejected = confirmer.waitForResponse(response => response.url().endsWith('/api/v1/checkout/orders')
@@ -220,7 +220,7 @@ for (const confirmationLink of ['primary', 'alias', 'rejoined-pending', 'capacit
         const separatelyPending = (await intents(page)).find(intent => intent.state === 'pending')!
         expect(separatelyPending.selectionId).toBe(thirdId)
         rejoinedKey = separatelyPending.idempotencyKey
-        await thirdPage.goto('/cart')
+        await thirdPage.goto('/')
         allowBackend = true
       }
       if (confirmationLink === 'capacity') {
@@ -267,14 +267,17 @@ for (const confirmationLink of ['primary', 'alias', 'rejoined-pending', 'capacit
       expect(new Set(results.filter(result => result.orderId).map(result => result.key)).size).toBe(1)
       expect(orderCount(line.skuId)).toBe(beforeCount + 1)
 
-      // An explicit new selection from the cart remains a normal repurchase.
-      await other.goto('/cart')
-      await other.evaluate(line => localStorage.setItem('aikayun-guest-cart-v2', JSON.stringify({
-        version: 3, unclaimedItems: [line], pendingBatches: [],
-      })), line)
-      await other.reload()
-      await other.getByRole('link', { name: '查看结算报价' }).click()
+      // An explicit new selection remains a normal repurchase.
+      const repurchaseSelectionId = randomUUID()
+      const repurchaseLine = { lineId: randomUUID(), skuId: line.skuId, quantity: 1 }
+      await other.evaluate(({ selectionId, repurchaseLine }) => {
+        sessionStorage.setItem('aikayun-checkout-selections-v2', JSON.stringify([{
+          id: selectionId, fingerprint: JSON.stringify([repurchaseLine]), items: [repurchaseLine],
+        }]))
+      }, { selectionId: repurchaseSelectionId, repurchaseLine })
+      await other.goto(`/checkout?intent=${repurchaseSelectionId}`)
       const nextId = new URL(other.url()).searchParams.get('intent')
+      expect(nextId).toBe(repurchaseSelectionId)
       expect(nextId).not.toBe(primaryId)
       expect(nextId).not.toBe(aliasId)
       await expect(other.getByRole('button', { name: '提交订单' })).toBeEnabled()

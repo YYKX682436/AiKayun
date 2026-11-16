@@ -46,7 +46,7 @@ async function adminHeaders(page: Page) {
 }
 
 async function prepareProducts(page: Page, cleanup: Cleanup): Promise<[Product, Product]> {
-  await page.goto('/cart')
+  await page.goto('/')
   await page.context().addCookies([{
     name: 'aikayun_admin_session', value: createBrowserAdminSession(),
     url: new URL(page.url()).origin, httpOnly: true, sameSite: 'Lax',
@@ -167,7 +167,7 @@ async function installHistory(page: Page, selections: { s1: { selectionId: strin
   await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
   const marker = randomUUID()
   await page.evaluate(value => { (window as Window & { r2DocumentMarker?: string }).r2DocumentMarker = value }, marker)
-  await routeTo(page, '/cart')
+  await routeTo(page, '/')
   await routeTo(page, `/checkout?intent=${selections.s1.selectionId}`)
   await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
   await expect(page.getByRole('heading', { name: /R2上下文A-/u })).toBeVisible()
@@ -228,10 +228,10 @@ test('a lock-delayed S1 submit keeps its S1 link and leaves a same-SPA S2 select
   try {
     const [productA, productB] = await prepareProducts(page, cleanup)
     const selections = { s1: newSelection(productA.variants[0]!.id), s2: newSelection(productB.variants[0]!.id) }
-    await page.goto('/cart')
+    await page.goto('/')
     await installSelections(page, [selections.s1, selections.s2])
     const marker = await installHistory(page, selections)
-    await second.goto('/cart')
+    await second.goto('/')
     release = await holdSubmissionLock(second)
     await page.route('**/api/v1/checkout/orders', async (route) => {
       const body = route.request().postDataJSON() as { idempotencyKey: string; items: Array<{ skuId: string }> }
@@ -312,10 +312,10 @@ test('an aborted real order acknowledgment stays recoverable under S1 after a lo
   try {
     const [productA, productB] = await prepareProducts(page, cleanup)
     const selections = { s1: newSelection(productA.variants[0]!.id), s2: newSelection(productB.variants[0]!.id) }
-    await page.goto('/cart')
+    await page.goto('/')
     await installSelections(page, [selections.s1, selections.s2])
     const marker = await installHistory(page, selections)
-    await second.goto('/cart')
+    await second.goto('/')
     release = await holdSubmissionLock(second)
     await page.route('**/api/v1/checkout/orders', async (route) => {
       postStarted = true
@@ -409,11 +409,11 @@ test('a delayed real 409 from S1 cannot replace S2 quote, errors, or submit stat
   try {
     const [productA, productB] = await prepareProducts(page, cleanup)
     const selections = { s1: newSelection(productA.variants[0]!.id), s2: newSelection(productB.variants[0]!.id) }
-    await page.goto('/cart')
+    await page.goto('/')
     await installSelections(page, [selections.s1, selections.s2])
     await installHistory(page, selections)
 
-    await second.goto('/cart')
+    await second.goto('/')
     release = await holdSubmissionLock(second)
     await page.getByRole('button', { name: '提交订单' }).click()
     clicked = true
@@ -491,9 +491,8 @@ test('a successful S1 response after checkout unmount cannot navigate away from 
   try {
     const [productA, productB] = await prepareProducts(page, cleanup)
     const selections = { s1: newSelection(productA.variants[0]!.id), s2: newSelection(productB.variants[0]!.id) }
-    await page.goto('/cart')
+    await page.goto('/')
     await installSelections(page, [selections.s1, selections.s2])
-    await page.getByRole('heading', { name: '购物车', exact: true }).waitFor({ state: 'visible' })
     await page.waitForFunction(() => Boolean((document.getElementById('__nuxt') as (HTMLElement & {
       __vue_app__?: { config?: { globalProperties?: Record<string, unknown> } }
     }) | null)?.__vue_app__?.config?.globalProperties?.$router))
@@ -502,7 +501,7 @@ test('a successful S1 response after checkout unmount cannot navigate away from 
     await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
     const marker = randomUUID()
     await page.evaluate(value => { (window as Window & { r3DocumentMarker?: string }).r3DocumentMarker = value }, marker)
-    await second.goto('/cart')
+    await second.goto('/')
     releaseSubmission = await holdSubmissionLock(second)
 
     await page.route('**/api/v1/checkout/orders', async (route) => {
@@ -531,9 +530,8 @@ test('a successful S1 response after checkout unmount cannot navigate away from 
     await page.getByRole('button', { name: '提交订单' }).click()
     await waitForQueuedSubmission(page)
 
-    await page.getByRole('link', { name: '返回购物车调整' }).click()
-    await expect(page).toHaveURL(/\/cart$/u)
-    await expect(page.getByRole('heading', { name: '购物车', exact: true })).toBeVisible()
+    await page.getByRole('link', { name: '返回商品' }).click()
+    await expect(page).toHaveURL(new RegExp(`/products/${productA.id}`))
     expect(await page.evaluate(() => (window as Window & { r3DocumentMarker?: string }).r3DocumentMarker)).toBe(marker)
     await routeTo(page, `/checkout?intent=${selections.s2.selectionId}`)
     await expect(page.getByRole('heading', { name: new RegExp(productB.name) })).toBeVisible()
@@ -618,102 +616,3 @@ test('a successful S1 response after checkout unmount cannot navigate away from 
   }
 })
 
-test('a successful legacy V1 response after checkout unmount leaves the active cart page in place', async ({ page, context }) => {
-  test.setTimeout(120_000)
-  const cleanup: Cleanup = { productIds: [] }
-  const second = await context.newPage()
-  const apiCommitted = gate()
-  const releaseResponse = gate()
-  const responseDelivered = gate()
-  const routeFinished = gate()
-  let releaseSubmission: (() => Promise<void>) | undefined
-  let orderRouteStarted = false
-  let clicked = false
-  let submitted: { idempotencyKey: string; items: Array<{ skuId: string; quantity: number }>; quoteToken: string } | undefined
-  try {
-    const [product] = await prepareProducts(page, cleanup)
-    const skuId = product.variants[0]!.id
-    const items = [{ skuId, quantity: 1 }]
-    await page.goto('/cart')
-    await page.getByRole('heading', { name: '购物车', exact: true }).waitFor({ state: 'visible' })
-    await page.waitForFunction(() => Boolean((document.getElementById('__nuxt') as (HTMLElement & {
-      __vue_app__?: { config?: { globalProperties?: Record<string, unknown> } }
-    }) | null)?.__vue_app__?.config?.globalProperties?.$router))
-    await routeTo(page, `/checkout?items=${encodeURIComponent(JSON.stringify(items))}`)
-    await expect(page.getByRole('heading', { name: new RegExp(product.name) })).toBeVisible()
-    await expect(page.getByRole('button', { name: '提交订单' })).toBeEnabled()
-    const marker = randomUUID()
-    await page.evaluate(value => { (window as Window & { r3V1DocumentMarker?: string }).r3V1DocumentMarker = value }, marker)
-    await second.goto('/cart')
-    releaseSubmission = await holdSubmissionLock(second)
-    await page.route('**/api/v1/checkout/orders', async (route) => {
-      const body = route.request().postDataJSON() as typeof submitted
-      expect(body).toBeTruthy()
-      submitted = body!
-      expect(Object.keys(body!).sort()).toEqual(['idempotencyKey', 'items', 'quoteToken'])
-      expect(body!.items).toEqual(items)
-      const response = await route.fetch()
-      expect(response.status()).toBe(201)
-      orderRouteStarted = true
-      try {
-        apiCommitted.open()
-        await releaseResponse.promise
-        await route.fulfill({ response })
-        responseDelivered.open()
-      } finally {
-        routeFinished.open()
-      }
-    })
-
-    clicked = true
-    await page.getByRole('button', { name: '提交订单' }).click()
-    await waitForQueuedSubmission(page)
-    await page.getByRole('link', { name: '返回购物车调整' }).click()
-    await expect(page).toHaveURL(/\/cart$/u)
-    await expect(page.getByRole('heading', { name: '购物车', exact: true })).toBeVisible()
-    expect(await page.evaluate(() => (window as Window & { r3V1DocumentMarker?: string }).r3V1DocumentMarker)).toBe(marker)
-
-    const orderResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/checkout/orders')
-      && response.request().method() === 'POST')
-    await releaseSubmission()
-    releaseSubmission = undefined
-    await apiCommitted.promise
-    expect(submitted).toBeTruthy()
-    const rows = ordersBySku(skuId)
-    expect(rows).toEqual([{ id: expect.any(String), idempotency_key: submitted!.idempotencyKey }])
-    const state = orderState(submitted!.idempotencyKey)
-    expect(state.orders).toHaveLength(1)
-    expect(state.reservations).toHaveLength(1)
-    releaseResponse.open()
-    expect((await orderResponse).status()).toBe(201)
-    await responseDelivered.promise
-    await routeFinished.promise
-    await expect.poll(() => page.evaluate(async (lockNames: string[]) => {
-      const locks = await navigator.locks.query()
-      return [...(locks.held ?? []), ...(locks.pending ?? [])]
-        .filter(lock => typeof lock.name === 'string' && lockNames.includes(lock.name)).length
-    }, [submissionLock, identityLock])).toBe(0)
-    await page.evaluate(() => new Promise<void>(resolveFrames => requestAnimationFrame(() => requestAnimationFrame(() => resolveFrames()))))
-    await expect(page).toHaveURL(/\/cart$/u)
-    await expect(page.getByRole('heading', { name: '购物车', exact: true })).toBeVisible()
-    expect(await page.evaluate(() => (window as Window & { r3V1DocumentMarker?: string }).r3V1DocumentMarker)).toBe(marker)
-    expect(ordersBySku(skuId)).toEqual([{ id: rows[0]!.id, idempotency_key: submitted!.idempotencyKey }])
-    expect(orderState(submitted!.idempotencyKey)).toEqual(state)
-  } finally {
-    releaseResponse.open()
-    await releaseSubmission?.()
-    if (orderRouteStarted) await routeFinished.promise
-    try {
-      await cleanupFixture(page, cleanup)
-    } finally {
-      await second.close()
-      if (clicked) {
-        await expect.poll(() => page.evaluate(async (lockNames: string[]) => {
-          const locks = await navigator.locks.query()
-          return [...(locks.held ?? []), ...(locks.pending ?? [])]
-            .filter(lock => typeof lock.name === 'string' && lockNames.includes(lock.name)).length
-        }, [submissionLock, identityLock])).toBe(0).catch(() => {})
-      }
-    }
-  }
-})
