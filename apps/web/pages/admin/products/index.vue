@@ -76,19 +76,39 @@ const categoryItems = computed(() => [
   { label: '全部分类', value: allFilterValue },
   ...categories.value.map(category => ({ label: category.name, value: category.id })),
 ])
+
 const statusItems = [
   { label: '全部状态', value: allFilterValue },
-  { label: '草稿', value: 'draft' },
   { label: '销售中', value: 'active' },
+  { label: '草稿', value: 'draft' },
   { label: '已暂停', value: 'paused' },
   { label: '已归档', value: 'archived' },
 ]
+
+const quickStatusTabs = [
+  { label: '全部商品', value: allFilterValue, icon: 'i-lucide-boxes' },
+  { label: '销售中', value: 'active', icon: 'i-lucide-play-circle' },
+  { label: '草稿箱', value: 'draft', icon: 'i-lucide-file-edit' },
+  { label: '已暂停', value: 'paused', icon: 'i-lucide-pause-circle' },
+  { label: '已归档', value: 'archived', icon: 'i-lucide-archive' },
+]
+
+const currentStatusTab = computed(() => status.value || allFilterValue)
+
+function selectStatusTab(val: string) {
+  updateQuery({
+    status: val === allFilterValue ? '' : val,
+    page: 1,
+  })
+}
+
 const typeItems = [
   { label: '全部性质', value: allFilterValue },
-  { label: '实物商品', value: 'physical' },
   { label: '数字商品', value: 'digital' },
+  { label: '实物商品', value: 'physical' },
   { label: '服务', value: 'service' },
 ]
+
 const sortItems = [
   { label: '最近更新', value: 'updatedAt:desc' },
   { label: '最早更新', value: 'updatedAt:asc' },
@@ -97,6 +117,7 @@ const sortItems = [
   { label: '价格从高到低', value: 'price:desc' },
   { label: '价格从低到高', value: 'price:asc' },
 ]
+
 const sortValue = computed(() => `${sortBy.value}:${sortOrder.value}`)
 const isNonDefaultSort = computed(() => sortBy.value !== 'updatedAt' || sortOrder.value !== 'desc')
 const currentSortLabel = computed(() => sortItems.find(s => s.value === sortValue.value)?.label ?? '自定义排序')
@@ -219,6 +240,10 @@ function productTypeName(value: ProductListItem['productType']) {
   return value === 'physical' ? '实物商品' : value === 'digital' ? '数字商品' : '服务'
 }
 
+function productTypeBadgeColor(value: ProductListItem['productType']) {
+  return value === 'digital' ? 'info' : value === 'physical' ? 'primary' : 'neutral'
+}
+
 function statusName(value: ProductListItem['status']) {
   return value === 'draft' ? '草稿' : value === 'active' ? '销售中' : value === 'paused' ? '已暂停' : '已归档'
 }
@@ -238,7 +263,7 @@ function productTransitionIcon(status: ProductListItem['status']) {
 }
 
 function priceRange(product: ProductListItem) {
-  if (!product.priceRange) return '无有效价格'
+  if (!product.priceRange) return '未定价'
   if (product.priceRange.min === product.priceRange.max) return `¥${product.priceRange.min}`
   return `¥${product.priceRange.min} – ¥${product.priceRange.max}`
 }
@@ -248,9 +273,9 @@ function formatDate(value: string) {
 }
 
 function allowedTransition(current: ProductListItem['status']) {
-  if (current === 'draft') return [{ label: '发布', status: 'active' as const }, { label: '归档', status: 'archived' as const }]
-  if (current === 'active') return [{ label: '暂停销售', status: 'paused' as const }, { label: '归档', status: 'archived' as const }]
-  if (current === 'paused') return [{ label: '重新上架', status: 'active' as const }, { label: '归档', status: 'archived' as const }]
+  if (current === 'draft') return [{ label: '发布商品', status: 'active' as const }, { label: '归档商品', status: 'archived' as const }]
+  if (current === 'active') return [{ label: '暂停销售', status: 'paused' as const }, { label: '归档商品', status: 'archived' as const }]
+  if (current === 'paused') return [{ label: '重新上架', status: 'active' as const }, { label: '归档商品', status: 'archived' as const }]
   return [{ label: '恢复为草稿', status: 'draft' as const }]
 }
 
@@ -277,21 +302,21 @@ async function copyProductId(id: string) {
       title: '已复制商品 ID',
       description: id,
       color: 'success',
-      icon: 'i-lucide-copy-check',
+      icon: 'i-lucide-check',
     })
     setTimeout(() => {
       if (copiedProductId.value === id) copiedProductId.value = ''
     }, 2000)
   } catch {
     toast.add({
-      title: '复制失败，请手动复制',
+      title: '复制失败，请手动选择复制',
       color: 'error',
     })
   }
 }
 
 async function changeLifecycle(product: ProductListItem, next: ProductListItem['status']) {
-  const label = next === 'archived' ? '归档' : next === 'draft' ? '恢复为草稿' : next === 'active' ? '发布或重新上架' : '暂停销售'
+  const label = next === 'archived' ? '归档' : next === 'draft' ? '恢复为草稿' : next === 'active' ? '发布上架' : '暂停销售'
   if ((next === 'archived' || next === 'draft') && !window.confirm(`确认${label}“${product.name}”？`)) return
   busyId.value = product.id
   actionMessage.value = ''
@@ -338,41 +363,59 @@ async function copyProduct(product: ProductListItem) {
     </template>
 
     <template #body>
-      <main class="mx-auto w-full max-w-[90rem] min-w-0 px-4 py-5 sm:px-6 lg:px-8">
-        <header class="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <main class="mx-auto w-full max-w-[90rem] min-w-0 px-4 py-5 sm:px-6 lg:px-8 space-y-4">
+        <!-- 页面顶部标题与主要操作 -->
+        <header class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between pb-1">
           <div>
             <h1 class="text-xl sm:text-2xl font-bold tracking-tight text-highlighted">
               商品管理
             </h1>
             <p class="mt-0.5 text-xs sm:text-sm text-muted">
-              商品资料、规格、价格与销售生命周期
+              管理商品资料、规格型号、销售价格与库存交付
             </p>
           </div>
-          <UButton
-            to="/admin/products/new"
-            icon="i-lucide-plus"
-            color="primary"
-            size="md"
-            class="font-medium shrink-0 shadow-xs min-h-10 sm:min-h-9"
-          >
-            新建商品
-          </UButton>
+          <div class="flex items-center gap-2 shrink-0">
+            <UButton
+              color="neutral"
+              variant="outline"
+              size="md"
+              icon="i-lucide-refresh-cw"
+              :loading="loading"
+              class="hidden sm:inline-flex"
+              aria-label="刷新商品列表"
+              @click="reloadProducts"
+            >
+              刷新
+            </UButton>
+            <UButton
+              to="/admin/products/new"
+              icon="i-lucide-plus"
+              color="primary"
+              size="md"
+              class="font-medium shrink-0 shadow-xs min-h-10 sm:min-h-9"
+            >
+              新建商品
+            </UButton>
+          </div>
         </header>
 
+        <!-- 状态反馈提示 -->
         <UAlert
           v-if="actionMessage"
-          class="mb-4"
           color="info"
           variant="soft"
           :title="actionMessage"
+          icon="i-lucide-info"
           role="status"
+          :close="true"
+          @close="actionMessage = ''"
         />
         <UAlert
           v-if="errorMessage"
-          class="mb-4"
           color="error"
           variant="soft"
           :title="errorMessage"
+          icon="i-lucide-alert-circle"
           role="alert"
         >
           <template #actions>
@@ -388,10 +431,10 @@ async function copyProduct(product: ProductListItem) {
         </UAlert>
         <UAlert
           v-if="categoryError"
-          class="mb-4"
           color="error"
           variant="soft"
           :title="`分类筛选暂不可用：${categoryError}`"
+          icon="i-lucide-alert-circle"
           role="alert"
         >
           <template #actions>
@@ -406,11 +449,36 @@ async function copyProduct(product: ProductListItem) {
           </template>
         </UAlert>
 
+        <!-- 快捷状态切换胶囊栏 (HiUI 风格快速标签) -->
+        <nav
+          aria-label="快捷状态分类"
+          class="flex items-center gap-1.5 overflow-x-auto pb-1 no-scrollbar sm:pb-0"
+        >
+          <button
+            v-for="tab in quickStatusTabs"
+            :key="tab.value"
+            type="button"
+            class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-all shrink-0 cursor-pointer"
+            :class="currentStatusTab === tab.value
+              ? 'bg-primary text-white shadow-xs font-semibold'
+              : 'bg-elevated text-muted hover:text-highlighted border border-default hover:bg-muted/10'"
+            @click="selectStatusTab(tab.value)"
+          >
+            <UIcon
+              :name="tab.icon"
+              class="size-3.5 sm:size-4"
+            />
+            <span>{{ tab.label }}</span>
+          </button>
+        </nav>
+
+        <!-- 综合搜索与筛选控制面板 -->
         <section
           aria-label="商品筛选"
-          class="mb-4 rounded-xl border border-default bg-elevated p-3 sm:p-4 shadow-2xs space-y-3"
+          class="rounded-xl border border-default bg-elevated p-3.5 sm:p-4 shadow-2xs space-y-3"
         >
-          <div class="grid grid-cols-2 gap-2.5 sm:grid-cols-2 lg:grid-cols-12">
+          <div class="grid grid-cols-2 gap-2.5 sm:grid-cols-2 lg:grid-cols-12 items-center">
+            <!-- 搜索框 -->
             <div class="col-span-2 lg:col-span-4">
               <UInput
                 v-model="searchInput"
@@ -437,6 +505,8 @@ async function copyProduct(product: ProductListItem) {
                 </template>
               </UInput>
             </div>
+
+            <!-- 状态下拉 (保留原有 aria-label 兼容自动化) -->
             <div class="col-span-1 lg:col-span-2">
               <USelect
                 :model-value="status || allFilterValue"
@@ -447,6 +517,8 @@ async function copyProduct(product: ProductListItem) {
                 @update:model-value="value => updateQuery({ status: String(value) === allFilterValue ? '' : String(value), page: 1 })"
               />
             </div>
+
+            <!-- 分类下拉 -->
             <div class="col-span-1 lg:col-span-2">
               <USelect
                 :model-value="categoryId || allFilterValue"
@@ -457,6 +529,8 @@ async function copyProduct(product: ProductListItem) {
                 @update:model-value="value => updateQuery({ categoryId: String(value) === allFilterValue ? '' : String(value), page: 1 })"
               />
             </div>
+
+            <!-- 性质下拉 -->
             <div class="col-span-1 lg:col-span-2">
               <USelect
                 :model-value="productType || allFilterValue"
@@ -467,6 +541,8 @@ async function copyProduct(product: ProductListItem) {
                 @update:model-value="value => updateQuery({ productType: String(value) === allFilterValue ? '' : String(value), page: 1 })"
               />
             </div>
+
+            <!-- 排序下拉 -->
             <div class="col-span-1 lg:col-span-2">
               <USelect
                 :model-value="sortValue"
@@ -486,76 +562,98 @@ async function copyProduct(product: ProductListItem) {
             </div>
           </div>
 
+          <!-- 活跃筛选标签与一键清除 -->
           <div
             v-if="hasActiveFilters"
-            class="flex flex-wrap items-center gap-2 pt-2 border-t border-default/50 text-xs text-muted"
+            class="flex flex-wrap items-center gap-1.5 pt-2 border-t border-default/60 text-xs text-muted"
           >
-            <span class="font-medium text-default">活跃筛选：</span>
-            <UButton
+            <span class="font-medium text-default flex items-center gap-1">
+              <UIcon
+                name="i-lucide-filter"
+                class="size-3.5"
+              />
+              当前筛选：
+            </span>
+            <UBadge
               v-if="search"
               color="neutral"
               variant="subtle"
-              size="xs"
-              trailing-icon="i-lucide-x"
+              size="sm"
+              class="gap-1 font-normal cursor-pointer hover:bg-neutral-200 dark:hover:bg-neutral-800"
               :aria-label="`清除搜索筛选: ${search}`"
-              class="font-normal"
               @click="searchInput = ''; updateQuery({ search: '', page: 1 })"
             >
-              搜索: {{ search }}
-            </UButton>
-            <UButton
+              <span>搜索: {{ search }}</span>
+              <UIcon
+                name="i-lucide-x"
+                class="size-3"
+              />
+            </UBadge>
+            <UBadge
               v-if="status"
               color="neutral"
               variant="subtle"
-              size="xs"
-              trailing-icon="i-lucide-x"
+              size="sm"
+              class="gap-1 font-normal cursor-pointer hover:bg-neutral-200 dark:hover:bg-neutral-800"
               :aria-label="`清除状态筛选: ${statusItems.find(s => s.value === status)?.label}`"
-              class="font-normal"
               @click="updateQuery({ status: '', page: 1 })"
             >
-              状态: {{ statusItems.find(s => s.value === status)?.label }}
-            </UButton>
-            <UButton
+              <span>状态: {{ statusItems.find(s => s.value === status)?.label }}</span>
+              <UIcon
+                name="i-lucide-x"
+                class="size-3"
+              />
+            </UBadge>
+            <UBadge
               v-if="categoryId"
               color="neutral"
               variant="subtle"
-              size="xs"
-              trailing-icon="i-lucide-x"
+              size="sm"
+              class="gap-1 font-normal cursor-pointer hover:bg-neutral-200 dark:hover:bg-neutral-800"
               :aria-label="`清除分类筛选: ${categoryItems.find(c => c.value === categoryId)?.label}`"
-              class="font-normal"
               @click="updateQuery({ categoryId: '', page: 1 })"
             >
-              分类: {{ categoryItems.find(c => c.value === categoryId)?.label }}
-            </UButton>
-            <UButton
+              <span>分类: {{ categoryItems.find(c => c.value === categoryId)?.label }}</span>
+              <UIcon
+                name="i-lucide-x"
+                class="size-3"
+              />
+            </UBadge>
+            <UBadge
               v-if="productType"
               color="neutral"
               variant="subtle"
-              size="xs"
-              trailing-icon="i-lucide-x"
+              size="sm"
+              class="gap-1 font-normal cursor-pointer hover:bg-neutral-200 dark:hover:bg-neutral-800"
               :aria-label="`清除性质筛选: ${typeItems.find(t => t.value === productType)?.label}`"
-              class="font-normal"
               @click="updateQuery({ productType: '', page: 1 })"
             >
-              性质: {{ typeItems.find(t => t.value === productType)?.label }}
-            </UButton>
-            <UButton
+              <span>性质: {{ typeItems.find(t => t.value === productType)?.label }}</span>
+              <UIcon
+                name="i-lucide-x"
+                class="size-3"
+              />
+            </UBadge>
+            <UBadge
               v-if="isNonDefaultSort"
               color="neutral"
               variant="subtle"
-              size="xs"
-              trailing-icon="i-lucide-x"
+              size="sm"
+              class="gap-1 font-normal cursor-pointer hover:bg-neutral-200 dark:hover:bg-neutral-800"
               :aria-label="`恢复默认排序: ${currentSortLabel}`"
-              class="font-normal"
               @click="updateQuery({ sortBy: undefined, sortOrder: undefined, page: 1 })"
             >
-              排序: {{ currentSortLabel }}
-            </UButton>
+              <span>排序: {{ currentSortLabel }}</span>
+              <UIcon
+                name="i-lucide-x"
+                class="size-3"
+              />
+            </UBadge>
             <UButton
               size="xs"
               color="neutral"
               variant="ghost"
-              class="text-xs text-muted hover:text-highlighted font-normal"
+              class="text-xs text-muted hover:text-highlighted font-normal ml-auto"
               @click="resetAllFilters"
             >
               清空全部筛选
@@ -563,43 +661,65 @@ async function copyProduct(product: ProductListItem) {
           </div>
         </section>
 
-        <div class="mb-3 flex min-h-7 items-center justify-between gap-3 text-xs sm:text-sm text-muted">
-          <p aria-live="polite">
-            {{ loading ? '正在加载商品…' : `共 ${total} 件商品` }}
+        <!-- 列表统计与分页设置栏 -->
+        <div class="flex min-h-7 items-center justify-between gap-3 text-xs sm:text-sm text-muted px-0.5">
+          <p
+            aria-live="polite"
+            class="flex items-center gap-1.5 font-medium"
+          >
+            <span
+              v-if="loading"
+              class="size-2 rounded-full bg-primary animate-pulse"
+            />
+            <span>{{ loading ? '正在载入商品数据…' : `共 ${total} 件商品` }}</span>
           </p>
-          <label class="flex min-h-10 items-center gap-2">
-            <span>每页</span>
+          <label class="flex min-h-8 items-center gap-2">
+            <span>每页显示</span>
             <USelect
               :model-value="String(pageSize)"
-              :items="[{ label: '20', value: '20' }, { label: '50', value: '50' }, { label: '100', value: '100' }]"
+              :items="[{ label: '20 条', value: '20' }, { label: '50 条', value: '50' }, { label: '100 条', value: '100' }]"
               aria-label="每页商品数"
-              class="w-20"
+              class="w-24"
               size="xs"
               @update:model-value="value => updateQuery({ pageSize: Number(value), page: 1 })"
             />
           </label>
         </div>
 
+        <!-- 空数据状态 -->
         <UCard
           v-if="!errorMessage && !loading && items.length === 0"
-          class="border-default bg-elevated"
+          class="border-default bg-elevated py-12"
         >
           <UEmpty
             icon="i-lucide-package-search"
-            title="没有找到商品"
-            :description="search || status || productType || categoryId ? '调整筛选条件，或创建一个新商品。' : '商品创建后会显示在这里。'"
+            title="没有找到匹配的商品"
+            :description="hasActiveFilters ? '当前筛选条件下暂无商品，可调整筛选或清空后重新查看。' : '还没有添加任何商品，现在就去创建第一件商品吧。'"
           >
             <template #actions>
-              <UButton
-                to="/admin/products/new"
-                icon="i-lucide-plus"
-              >
-                新建商品
-              </UButton>
+              <div class="flex items-center gap-2.5">
+                <UButton
+                  v-if="hasActiveFilters"
+                  color="neutral"
+                  variant="outline"
+                  icon="i-lucide-filter-x"
+                  @click="resetAllFilters"
+                >
+                  清空筛选
+                </UButton>
+                <UButton
+                  to="/admin/products/new"
+                  icon="i-lucide-plus"
+                  color="primary"
+                >
+                  新建商品
+                </UButton>
+              </div>
             </template>
           </UEmpty>
         </UCard>
 
+        <!-- 桌面端表格视图 -->
         <div
           v-else
           class="hidden overflow-x-auto rounded-xl border border-default bg-elevated shadow-2xs lg:block"
@@ -610,15 +730,16 @@ async function copyProduct(product: ProductListItem) {
             :loading="loading"
             class="w-full"
             :ui="{
-              th: 'px-3 py-2.5 text-xs font-semibold text-muted bg-muted/20 whitespace-nowrap',
-              td: 'px-3 py-2.5 text-sm',
+              th: 'px-4 py-3 text-xs font-semibold text-muted bg-muted/15 whitespace-nowrap border-b border-default',
+              td: 'px-4 py-3 text-sm border-b border-default/50',
             }"
           >
+            <!-- 封面缩略图 -->
             <template #coverImage-header>
-              <span class="w-10 block text-center">封面</span>
+              <span class="w-11 block text-center">封面</span>
             </template>
             <template #coverImage-cell="{ row }">
-              <div class="relative size-10 overflow-hidden rounded-lg border border-default/60 bg-muted/20 shrink-0">
+              <div class="relative size-11 overflow-hidden rounded-lg border border-default/70 bg-muted/20 shrink-0 shadow-2xs">
                 <img
                   v-if="row.original.coverImage"
                   :src="row.original.coverImage.thumbnailUrl"
@@ -638,17 +759,19 @@ async function copyProduct(product: ProductListItem) {
               </div>
             </template>
 
+            <!-- 商品名称与标识 -->
             <template #name-cell="{ row }">
-              <div class="min-w-0 max-w-xs">
-                <div class="flex items-center gap-1.5 min-w-0">
+              <div class="min-w-0 max-w-sm py-0.5">
+                <div class="flex items-center gap-2 min-w-0">
                   <NuxtLink
                     :to="`/admin/products/${row.original.id}`"
-                    class="truncate font-semibold text-highlighted hover:text-primary transition-colors focus-visible:outline-2 focus-visible:outline-primary"
+                    class="truncate font-semibold text-highlighted hover:text-primary transition-colors text-sm focus-visible:outline-2 focus-visible:outline-primary"
+                    :title="row.original.name"
                   >
                     {{ row.original.name }}
                   </NuxtLink>
                   <UBadge
-                    color="neutral"
+                    :color="productTypeBadgeColor(row.original.productType)"
                     variant="subtle"
                     size="xs"
                     class="shrink-0 font-normal"
@@ -656,76 +779,98 @@ async function copyProduct(product: ProductListItem) {
                     {{ productTypeName(row.original.productType) }}
                   </UBadge>
                 </div>
-                <div class="mt-0.5 flex items-center gap-1.5 text-xs text-dimmed font-mono">
-                  <span class="truncate">{{ row.original.id }}</span>
-                  <UButton
-                    :icon="copiedProductId === row.original.id ? 'i-lucide-check' : 'i-lucide-copy'"
-                    size="xs"
-                    color="neutral"
-                    variant="ghost"
-                    :aria-label="`复制商品 ID ${row.original.id}`"
-                    class="size-5 p-0 text-muted hover:text-highlighted shrink-0"
-                    @click.stop="copyProductId(row.original.id)"
-                  />
+                <div class="mt-1 flex items-center gap-1.5 text-xs text-dimmed font-mono">
+                  <span class="truncate max-w-[13rem]">{{ row.original.id }}</span>
+                  <UTooltip text="复制商品 ID">
+                    <UButton
+                      :icon="copiedProductId === row.original.id ? 'i-lucide-check' : 'i-lucide-copy'"
+                      size="xs"
+                      color="neutral"
+                      variant="ghost"
+                      :aria-label="`复制商品 ID ${row.original.id}`"
+                      class="size-5 p-0 text-muted hover:text-highlighted shrink-0"
+                      @click.stop="copyProductId(row.original.id)"
+                    />
+                  </UTooltip>
                 </div>
               </div>
             </template>
 
+            <!-- 销售状态 -->
             <template #status-cell="{ row }">
               <UBadge
                 :color="productStatusColor(row.original.status)"
                 variant="subtle"
                 size="sm"
-                class="font-medium whitespace-nowrap"
+                class="font-medium whitespace-nowrap gap-1 px-2.5 py-0.5"
               >
-                {{ statusName(row.original.status) }}
+                <span
+                  class="size-1.5 rounded-full"
+                  :class="{
+                    'bg-success': row.original.status === 'active',
+                    'bg-warning': row.original.status === 'paused',
+                    'bg-info': row.original.status === 'draft',
+                    'bg-neutral-400': row.original.status === 'archived',
+                  }"
+                />
+                <span>{{ statusName(row.original.status) }}</span>
               </UBadge>
             </template>
 
+            <!-- 有效售价 -->
             <template #priceRange-cell="{ row }">
               <span
                 class="tabular-nums whitespace-nowrap"
-                :class="row.original.priceRange ? 'font-semibold text-highlighted' : 'text-xs text-muted'"
+                :class="row.original.priceRange ? 'font-bold text-highlighted text-base' : 'text-xs text-muted'"
               >
                 {{ priceRange(row.original) }}
               </span>
             </template>
 
+            <!-- SKU 数量 -->
             <template #skuCount-cell="{ row }">
-              <span class="text-xs text-muted tabular-nums whitespace-nowrap">
-                {{ row.original.skuCount }} 个
+              <span class="text-xs text-muted tabular-nums whitespace-nowrap bg-muted/20 px-2 py-0.5 rounded">
+                {{ row.original.skuCount }} 规格
               </span>
             </template>
 
+            <!-- 所属分类 -->
             <template #categories-cell="{ row }">
-              <span class="text-xs text-default truncate max-w-[7rem] block whitespace-nowrap">
+              <span class="text-xs text-default truncate max-w-[8rem] block whitespace-nowrap">
                 {{ categoryName(row.original) }}
               </span>
             </template>
 
+            <!-- 时间戳 -->
             <template #timestamps-cell="{ row }">
               <div class="flex flex-col text-xs text-muted leading-tight whitespace-nowrap">
                 <time
                   :datetime="row.original.updatedAt"
                   class="text-highlighted font-medium"
-                >{{ formatDate(row.original.updatedAt) }}</time>
+                >
+                  {{ formatDate(row.original.updatedAt) }}
+                </time>
                 <time
                   :datetime="row.original.createdAt"
                   class="text-dimmed text-[11px] mt-0.5"
-                >创建 {{ formatDate(row.original.createdAt) }}</time>
+                >
+                  建于 {{ formatDate(row.original.createdAt) }}
+                </time>
               </div>
             </template>
 
+            <!-- 操作按钮 -->
             <template #actions-header>
-              <span class="w-20 block text-right">操作</span>
+              <span class="w-24 block text-right">操作</span>
             </template>
             <template #actions-cell="{ row }">
-              <div class="flex items-center justify-end gap-1 whitespace-nowrap">
+              <div class="flex items-center justify-end gap-1.5 whitespace-nowrap">
                 <UButton
                   :to="`/admin/products/${row.original.id}`"
                   size="xs"
                   color="primary"
-                  variant="outline"
+                  variant="subtle"
+                  class="font-medium"
                 >
                   编辑
                 </UButton>
@@ -744,18 +889,20 @@ async function copyProduct(product: ProductListItem) {
           </UTable>
         </div>
 
+        <!-- 移动端骨架加载 -->
         <section
           v-if="loading && items.length === 0"
           class="grid gap-3 lg:hidden"
           aria-label="正在加载商品"
         >
           <USkeleton
-            v-for="index in 3"
+            v-for="index in 4"
             :key="index"
-            class="h-28 rounded-xl"
+            class="h-36 rounded-xl"
           />
         </section>
 
+        <!-- 移动端触屏卡片列表 -->
         <section
           v-else-if="items.length > 0"
           class="grid gap-3 lg:hidden"
@@ -764,10 +911,11 @@ async function copyProduct(product: ProductListItem) {
           <article
             v-for="product in items"
             :key="product.id"
-            class="min-w-0 rounded-xl border border-default bg-elevated p-3.5 space-y-3 shadow-2xs"
+            class="min-w-0 rounded-xl border border-default bg-elevated p-3.5 space-y-3 shadow-2xs transition-shadow hover:shadow-xs"
           >
+            <!-- 头部：封面、标题与状态 -->
             <div class="flex min-w-0 gap-3">
-              <div class="relative size-14 shrink-0 overflow-hidden rounded-lg border border-default/60 bg-muted/20">
+              <div class="relative size-14 shrink-0 overflow-hidden rounded-lg border border-default/70 bg-muted/20">
                 <img
                   v-if="product.coverImage"
                   :src="product.coverImage.cardUrl"
@@ -789,7 +937,7 @@ async function copyProduct(product: ProductListItem) {
                 <div class="flex items-start justify-between gap-2">
                   <NuxtLink
                     :to="`/admin/products/${product.id}`"
-                    class="block truncate font-semibold text-highlighted hover:text-primary transition-colors"
+                    class="block truncate font-semibold text-highlighted hover:text-primary transition-colors text-base"
                   >
                     {{ product.name }}
                   </NuxtLink>
@@ -797,38 +945,66 @@ async function copyProduct(product: ProductListItem) {
                     :color="productStatusColor(product.status)"
                     variant="subtle"
                     size="xs"
-                    class="shrink-0 font-medium whitespace-nowrap"
+                    class="shrink-0 font-medium whitespace-nowrap gap-1"
                   >
-                    {{ statusName(product.status) }}
+                    <span
+                      class="size-1.5 rounded-full"
+                      :class="{
+                        'bg-success': product.status === 'active',
+                        'bg-warning': product.status === 'paused',
+                        'bg-info': product.status === 'draft',
+                        'bg-neutral-400': product.status === 'archived',
+                      }"
+                    />
+                    <span>{{ statusName(product.status) }}</span>
                   </UBadge>
                 </div>
-                <p class="mt-0.5 truncate font-mono text-xs text-dimmed">
-                  {{ product.id }}
-                </p>
-                <div class="mt-1.5 flex items-center justify-between text-xs">
-                  <span class="font-semibold tabular-nums text-highlighted text-sm">
-                    {{ priceRange(product) }}
-                  </span>
-                  <span class="text-muted">
-                    {{ categoryName(product) }} · {{ product.skuCount }} SKU
-                  </span>
+                <div class="mt-1 flex items-center gap-1.5">
+                  <UBadge
+                    :color="productTypeBadgeColor(product.productType)"
+                    variant="subtle"
+                    size="xs"
+                    class="font-normal shrink-0"
+                  >
+                    {{ productTypeName(product.productType) }}
+                  </UBadge>
+                  <span class="truncate font-mono text-xs text-dimmed">{{ product.id }}</span>
                 </div>
               </div>
             </div>
 
-            <div class="flex flex-wrap items-center justify-between gap-2 border-t border-default/60 pt-2.5 text-xs text-muted">
-              <div class="grid gap-0.5">
-                <time :datetime="product.createdAt">创建 {{ formatDate(product.createdAt) }}</time>
-                <time :datetime="product.updatedAt">更新 {{ formatDate(product.updatedAt) }}</time>
+            <!-- 价格与属性概要 -->
+            <div class="flex items-center justify-between rounded-lg bg-muted/15 px-3 py-2 text-xs">
+              <div class="flex items-baseline gap-1">
+                <span class="text-xs text-muted">售价</span>
+                <span class="font-bold tabular-nums text-highlighted text-base">
+                  {{ priceRange(product) }}
+                </span>
               </div>
+              <div class="flex items-center gap-2 text-muted">
+                <span>{{ categoryName(product) }}</span>
+                <span>·</span>
+                <span>{{ product.skuCount }} 规格</span>
+              </div>
+            </div>
+
+            <!-- 底部操作与更新时间 -->
+            <div class="flex items-center justify-between gap-2 border-t border-default/60 pt-2.5 text-xs text-muted">
+              <time
+                :datetime="product.updatedAt"
+                class="text-xs text-dimmed"
+              >
+                {{ formatDate(product.updatedAt) }}
+              </time>
               <div class="flex items-center gap-2">
                 <UButton
                   :to="`/admin/products/${product.id}`"
                   size="sm"
-                  color="neutral"
-                  variant="outline"
+                  color="primary"
+                  variant="subtle"
+                  class="font-medium min-h-8"
                 >
-                  编辑
+                  编辑商品
                 </UButton>
                 <UDropdownMenu :items="productMenuItems(product)">
                   <UButton
@@ -836,6 +1012,7 @@ async function copyProduct(product: ProductListItem) {
                     color="neutral"
                     variant="outline"
                     size="sm"
+                    class="min-h-8 min-w-8"
                     :loading="busyId === product.id"
                     :aria-label="`更多操作：${product.name}`"
                   />
@@ -845,9 +1022,10 @@ async function copyProduct(product: ProductListItem) {
           </article>
         </section>
 
+        <!-- 分页控制 -->
         <div
           v-if="!loading && totalPages > 1"
-          class="mt-5 flex justify-center"
+          class="mt-6 flex justify-center pb-4"
         >
           <UPagination
             :page="page"

@@ -20,9 +20,9 @@ const errorMessage = ref('')
 const restored = ref(false)
 
 const productTypeItems = [
-  { label: '数字商品', value: 'digital' },
-  { label: '实物商品', value: 'physical' },
-  { label: '服务', value: 'service' },
+  { label: '数字商品', value: 'digital', description: '虚拟卡密、软件许可、数字资源，支持自动发货', icon: 'i-lucide-key-round' },
+  { label: '实物商品', value: 'physical', description: '实体快递货物，支持实物库存扣减与物流履约', icon: 'i-lucide-package' },
+  { label: '服务', value: 'service', description: '在线咨询、人工履约、定制服务，无需物流卡密', icon: 'i-lucide-headset' },
 ]
 
 onMounted(async () => {
@@ -73,7 +73,7 @@ async function openCreatedProduct() {
     await navigateTo(`/admin/products/${productId.value}`)
     if (route.path === `/admin/products/${productId.value}`) sessionStorage.removeItem(storageKey)
   } catch {
-    errorMessage.value = '商品已创建。页面跳转失败，请使用下方按钮继续编辑。'
+    errorMessage.value = '商品已创建成功。页面自动跳转失败，请点击下方按钮进入编辑。'
   }
 }
 
@@ -102,14 +102,14 @@ async function createProduct() {
       await navigateTo(`/admin/products/${result.id}`)
       if (route.path === `/admin/products/${result.id}`) sessionStorage.removeItem(storageKey)
     } catch {
-      errorMessage.value = '商品已创建。页面跳转失败，请使用下方按钮继续编辑。'
+      errorMessage.value = '商品已创建成功。页面自动跳转失败，请点击下方按钮进入编辑。'
     }
   } catch (error) {
     const status = Number((error as { status?: number })?.status ?? 0)
     requestUncertain.value = status === 0 || status >= 500
     requestSubmitted.value = requestUncertain.value
     if (!requestUncertain.value) idempotencyKey.value = crypto.randomUUID()
-    errorMessage.value = error instanceof Error ? error.message : '创建商品失败。'
+    errorMessage.value = error instanceof Error ? error.message : '创建商品失败，请稍后重试。'
     persist()
   } finally {
     busy.value = false
@@ -117,7 +117,7 @@ async function createProduct() {
 }
 
 function startFresh() {
-  if (!window.confirm('清除当前尚未创建的商品资料？')) return
+  if (!window.confirm('确认放弃当前未保存的草稿并重新填写？')) return
   sessionStorage.removeItem(storageKey)
   name.value = ''
   productType.value = 'digital'
@@ -143,134 +143,260 @@ function startFresh() {
     </template>
 
     <template #body>
-      <main class="mx-auto w-full max-w-3xl min-w-0 px-4 py-5 sm:px-6 lg:py-8">
+      <main class="mx-auto w-full max-w-3xl min-w-0 px-4 py-6 sm:px-6 lg:py-8 space-y-6">
+        <!-- 面包屑导航 -->
         <nav
           aria-label="面包屑"
-          class="mb-4 text-sm text-muted"
+          class="flex items-center gap-2 text-xs sm:text-sm text-muted"
         >
           <NuxtLink
             to="/admin/products"
-            class="rounded-sm hover:text-primary focus-visible:outline-2 focus-visible:outline-primary"
+            class="flex items-center gap-1 hover:text-primary transition-colors focus-visible:outline-2 focus-visible:outline-primary rounded-sm"
           >
-            商品管理
+            <UIcon
+              name="i-lucide-arrow-left"
+              class="size-3.5"
+            />
+            <span>商品管理</span>
           </NuxtLink>
           <span
             aria-hidden="true"
-            class="px-2"
+            class="text-dimmed"
           >/</span>
-          <span class="text-highlighted">新建商品</span>
+          <span class="text-highlighted font-medium">新建商品草稿</span>
         </nav>
-        <header class="mb-6">
-          <p class="text-sm font-medium text-primary">
-            草稿
-          </p>
-          <h1 class="mt-1 text-2xl font-semibold tracking-tight text-highlighted sm:text-3xl">
-            创建商品
-          </h1>
-          <p class="mt-2 max-w-2xl text-sm leading-6 text-muted">
-            先填写必要信息创建草稿，之后可在同一编辑页配置分类、图片、规格、价格和库存。
-          </p>
+
+        <!-- 页面标题与步骤指引 -->
+        <header class="space-y-4">
+          <div class="flex items-start justify-between gap-4">
+            <div>
+              <div class="flex items-center gap-2">
+                <UBadge
+                  color="info"
+                  variant="subtle"
+                  size="sm"
+                  class="font-medium"
+                >
+                  草稿第一步
+                </UBadge>
+                <span class="text-xs text-muted">先建基础，后配详情</span>
+              </div>
+              <h1 class="mt-2 text-2xl font-bold tracking-tight text-highlighted sm:text-3xl">
+                创建新商品
+              </h1>
+              <p class="mt-1.5 text-xs sm:text-sm text-muted leading-relaxed max-w-xl">
+                填写商品名称、商品性质与初始售价快速建立草稿。创建后会自动进入编辑页，配置分类、图片、多规格、库存和自动发货规则。
+              </p>
+            </div>
+            <div class="hidden sm:grid size-12 shrink-0 place-items-center rounded-2xl bg-primary/10 text-primary">
+              <UIcon
+                name="i-lucide-sparkles"
+                class="size-6"
+              />
+            </div>
+          </div>
+
+          <!-- 3步流程导航条 (商业 SaaS 引导体验) -->
+          <div class="grid grid-cols-3 gap-2 rounded-xl bg-muted/15 p-2 text-xs">
+            <div class="flex items-center gap-2 rounded-lg bg-elevated px-3 py-2 text-primary shadow-2xs font-medium border border-primary/20">
+              <span class="grid size-5 place-items-center rounded-full bg-primary text-white text-[11px] font-bold">1</span>
+              <span class="truncate">基本信息</span>
+            </div>
+            <div class="flex items-center gap-2 px-3 py-2 text-muted">
+              <span class="grid size-5 place-items-center rounded-full bg-muted/30 text-dimmed text-[11px] font-bold">2</span>
+              <span class="truncate">规格与定价</span>
+            </div>
+            <div class="flex items-center gap-2 px-3 py-2 text-muted">
+              <span class="grid size-5 place-items-center rounded-full bg-muted/30 text-dimmed text-[11px] font-bold">3</span>
+              <span class="truncate">库存与发布</span>
+            </div>
+          </div>
         </header>
 
+        <!-- 状态提醒 -->
         <UAlert
           v-if="restored && !productId"
-          class="mb-4"
           color="info"
           variant="soft"
-          title="已恢复本次会话中未完成的商品资料。"
-        />
-        <UAlert
-          v-if="productId"
-          class="mb-4"
-          color="success"
-          variant="soft"
-          title="商品已创建，草稿保存在后台。"
+          icon="i-lucide-history"
+          title="已自动恢复你上次未完成填写的商品资料"
+          :close="true"
+          @close="restored = false"
         >
           <template #actions>
             <UButton
-              :to="`/admin/products/${productId}`"
-              icon="i-lucide-arrow-right"
+              size="xs"
+              color="neutral"
+              variant="ghost"
+              @click="startFresh"
             >
-              继续编辑商品
+              重新填写
             </UButton>
           </template>
         </UAlert>
+
+        <!-- 创建成功提示与继续编辑入口 -->
+        <UAlert
+          v-if="productId"
+          color="success"
+          variant="soft"
+          icon="i-lucide-check-circle-2"
+          title="商品草稿创建成功！"
+          description="草稿已安全保存在后台，你可以随时继续完善配置并发布上架。"
+        >
+          <template #actions>
+            <div class="flex items-center gap-2">
+              <UButton
+                :to="`/admin/products/${productId}`"
+                color="success"
+                icon="i-lucide-arrow-right"
+                class="font-medium"
+              >
+                继续编辑商品
+              </UButton>
+            </div>
+          </template>
+        </UAlert>
+
         <UAlert
           v-if="requestUncertain && !productId"
-          class="mb-4"
           color="warning"
           variant="soft"
-          title="创建结果暂时无法确认。"
+          icon="i-lucide-alert-triangle"
+          title="创建请求结果暂时无法确认"
+          description="网络响应超时或波动，请点击下方重试。系统具备幂等校验保护，不会产生重复商品。"
         >
-          <p class="mt-1 text-sm">
-            请用相同内容重试。服务器会核验本次请求键，避免重复创建商品。
-          </p>
+          <template #actions>
+            <UButton
+              size="xs"
+              color="warning"
+              variant="outline"
+              @click="startFresh"
+            >
+              放弃本次并重开
+            </UButton>
+          </template>
         </UAlert>
+
         <UAlert
           v-if="errorMessage"
-          class="mb-4"
           color="error"
           variant="soft"
+          icon="i-lucide-alert-circle"
           :title="errorMessage"
           role="alert"
         />
 
-        <UCard class="border-default bg-elevated">
+        <!-- 主表单卡片 -->
+        <UCard class="border-default bg-elevated shadow-xs rounded-2xl">
           <form
-            class="grid gap-5"
+            class="space-y-6"
             @submit.prevent="productId ? openCreatedProduct() : createProduct()"
           >
+            <!-- 商品名称 -->
             <UFormField
               label="商品名称"
               name="name"
               required
-              hint="最多 200 个字符"
+              hint="最多 200 个字"
+              help="输入吸引顾客且表达清晰的商品标题，后续可随时修改。"
             >
               <UInput
                 v-model="name"
                 class="w-full"
                 size="lg"
                 maxlength="200"
-                placeholder="例如：年度会员服务"
-                :disabled="restoring || busy || Boolean(productId) || requestUncertain"
-                required
-              />
-            </UFormField>
-            <UFormField
-              label="商品性质"
-              name="productType"
-              required
-            >
-              <USelect
-                v-model="productType"
-                :items="productTypeItems"
-                size="lg"
-                class="w-full"
-                :disabled="restoring || busy || Boolean(productId) || requestUncertain"
-              />
-              <template #description>
-                <span>性质会影响后续库存配置限制。</span>
-              </template>
-            </UFormField>
-            <UFormField
-              label="默认 SKU 销售价（人民币）"
-              name="salePrice"
-              required
-              hint="最多两位小数；金额按字符串提交。"
-            >
-              <UInput
-                v-model="salePrice"
-                class="w-full sm:max-w-xs"
-                size="lg"
-                inputmode="decimal"
-                placeholder="例如：29.90"
+                placeholder="例如：ChatGPT Plus 独享包月账号"
                 :disabled="restoring || busy || Boolean(productId) || requestUncertain"
                 required
               />
             </UFormField>
 
-            <div class="flex flex-col-reverse gap-3 border-t border-default pt-4 sm:flex-row sm:items-center sm:justify-between">
-              <div class="flex gap-2">
+            <!-- 商品性质（提供直观卡片选择与下拉联动，保证无障碍与兼容性） -->
+            <UFormField
+              label="商品性质"
+              name="productType"
+              required
+              help="商品性质决定了后续的库存交付模式（如卡密自动发货、文件下载或物流发货）。"
+            >
+              <!-- 交互式性质卡片 -->
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-2">
+                <button
+                  v-for="item in productTypeItems"
+                  :key="item.value"
+                  type="button"
+                  class="flex flex-col text-left p-3.5 rounded-xl border transition-all text-xs cursor-pointer"
+                  :class="productType === item.value
+                    ? 'border-primary bg-primary/5 ring-1 ring-primary shadow-2xs'
+                    : 'border-default bg-elevated hover:bg-muted/10 opacity-80'"
+                  :disabled="restoring || busy || Boolean(productId) || requestUncertain"
+                  @click="productType = item.value as any"
+                >
+                  <div class="flex items-center justify-between w-full mb-1.5">
+                    <div class="flex items-center gap-2">
+                      <UIcon
+                        :name="item.icon"
+                        class="size-4"
+                        :class="productType === item.value ? 'text-primary' : 'text-muted'"
+                      />
+                      <span
+                        class="font-semibold text-sm"
+                        :class="productType === item.value ? 'text-primary' : 'text-highlighted'"
+                      >
+                        {{ item.label }}
+                      </span>
+                    </div>
+                    <UIcon
+                      :name="productType === item.value ? 'i-lucide-check-circle-2' : 'i-lucide-circle'"
+                      class="size-4"
+                      :class="productType === item.value ? 'text-primary' : 'text-dimmed'"
+                    />
+                  </div>
+                  <p class="text-xs text-muted leading-relaxed">
+                    {{ item.description }}
+                  </p>
+                </button>
+              </div>
+
+              <!-- 原生下拉选择（支持自动化测试与无障碍定位） -->
+              <USelect
+                v-model="productType"
+                :items="productTypeItems"
+                size="md"
+                class="w-full sm:w-60"
+                aria-label="商品性质"
+                :disabled="restoring || busy || Boolean(productId) || requestUncertain"
+              />
+            </UFormField>
+
+            <!-- 默认 SKU 销售价 -->
+            <UFormField
+              label="默认 SKU 销售价（人民币）"
+              name="salePrice"
+              required
+              hint="元（保留最多两位小数）"
+              help="创建商品的初始默认销售价格。如需设置多规格不同价格，创建后可在编辑页分别指定。"
+            >
+              <div class="relative w-full sm:max-w-xs">
+                <UInput
+                  v-model="salePrice"
+                  class="w-full pl-6"
+                  size="lg"
+                  inputmode="decimal"
+                  placeholder="29.90"
+                  :disabled="restoring || busy || Boolean(productId) || requestUncertain"
+                  required
+                >
+                  <template #leading>
+                    <span class="text-sm font-semibold text-muted">¥</span>
+                  </template>
+                </UInput>
+              </div>
+            </UFormField>
+
+            <!-- 底部操作按钮 -->
+            <div class="flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3 border-t border-default pt-5">
+              <div class="flex items-center gap-2">
                 <UButton
                   to="/admin/products"
                   color="neutral"
@@ -278,7 +404,7 @@ function startFresh() {
                   size="lg"
                   :disabled="busy"
                 >
-                  取消
+                  返回列表
                 </UButton>
                 <UButton
                   v-if="requestUncertain && !productId"
@@ -291,14 +417,19 @@ function startFresh() {
                   放弃本次创建
                 </UButton>
               </div>
-              <UButton
-                type="submit"
-                size="lg"
-                :loading="busy"
-                :disabled="restoring || busy || (!productId && (!name.trim() || !salePrice.trim()))"
-              >
-                {{ productId ? '继续编辑商品' : requestUncertain ? '核验并重试创建' : '保存为草稿' }}
-              </UButton>
+
+              <div class="flex items-center gap-2">
+                <UButton
+                  type="submit"
+                  size="lg"
+                  color="primary"
+                  class="font-medium min-w-32 justify-center shadow-xs"
+                  :loading="busy"
+                  :disabled="restoring || busy || (!productId && (!name.trim() || !salePrice.trim()))"
+                >
+                  {{ productId ? '继续编辑商品' : requestUncertain ? '核验并重试创建' : '保存为草稿' }}
+                </UButton>
+              </div>
             </div>
           </form>
         </UCard>

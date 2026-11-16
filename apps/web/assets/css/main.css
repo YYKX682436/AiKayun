@@ -101,6 +101,7 @@ input {
 [data-aikayun-area="admin"] {
   --ui-radius: 0.5rem;
   --ui-header-height: 3.5rem;
+  scroll-behavior: smooth;
 }
 
 [data-aikayun-area="admin"] ::-webkit-scrollbar {
@@ -119,6 +120,18 @@ input {
 
 .dark[data-aikayun-area="admin"] ::-webkit-scrollbar-thumb {
   background: var(--ui-color-neutral-700);
+}
+
+[data-aikayun-area="admin"] table tbody tr {
+  transition: background-color 0.15s ease;
+}
+
+[data-aikayun-area="admin"] table tbody tr:hover {
+  background-color: rgba(14, 165, 233, 0.03);
+}
+
+.dark[data-aikayun-area="admin"] table tbody tr:hover {
+  background-color: rgba(255, 255, 255, 0.03);
 }
 
 /* Storefront Apple-inspired aesthetic tokens and refinements */

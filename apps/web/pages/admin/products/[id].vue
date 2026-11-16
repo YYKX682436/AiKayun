@@ -48,6 +48,7 @@ const rootCategoryValue = '__root_category__'
 const route = useRoute()
 const router = useRouter()
 const { request, upload } = useAdminApi()
+const toast = useToast()
 const productId = computed(() => String(route.params.id))
 const product = shallowRef<ProductDetail | null>(null)
 const categories = ref<AdminProductCategory[]>([])
@@ -1927,6 +1928,64 @@ const navSections = computed(() => [
   { id: 'advanced', label: '高级操作', icon: 'i-lucide-settings', dirty: false, saving: saving.value === 'lifecycle' || saving.value === 'copy' || saving.value === 'delete', error: Boolean(sectionErrors.lifecycle || sectionErrors.advanced) },
 ])
 
+const groupedNavSections = computed(() => [
+  {
+    group: '基础展示',
+    icon: 'i-lucide-file-text',
+    items: [
+      navSections.value.find(s => s.id === 'basic')!,
+      navSections.value.find(s => s.id === 'categories')!,
+      navSections.value.find(s => s.id === 'gallery')!,
+      navSections.value.find(s => s.id === 'rich-content')!,
+    ].filter(Boolean),
+  },
+  {
+    group: '规格定价',
+    icon: 'i-lucide-tag',
+    items: [
+      navSections.value.find(s => s.id === 'variants')!,
+      navSections.value.find(s => s.id === 'prices')!,
+      navSections.value.find(s => s.id === 'purchase-limits')!,
+    ].filter(Boolean),
+  },
+  {
+    group: '库存交付',
+    icon: 'i-lucide-boxes',
+    items: [
+      navSections.value.find(s => s.id === 'inventory')!,
+    ].filter(Boolean),
+  },
+  {
+    group: '高级管理',
+    icon: 'i-lucide-settings-2',
+    items: [
+      navSections.value.find(s => s.id === 'attributes')!,
+      navSections.value.find(s => s.id === 'advanced')!,
+    ].filter(Boolean),
+  },
+])
+
+const dirtySectionCount = computed(() => {
+  return navSections.value.filter(s => s.dirty).length
+})
+
+async function copyProductId(id: string) {
+  try {
+    await navigator.clipboard.writeText(id)
+    toast.add({
+      title: '已复制商品 ID',
+      description: id,
+      color: 'success',
+      icon: 'i-lucide-check',
+    })
+  } catch {
+    toast.add({
+      title: '复制失败，请手动选择复制',
+      color: 'error',
+    })
+  }
+}
+
 const skuStatusCounts = computed(() => {
   const variants = product.value?.variants ?? []
   let active = 0
@@ -2074,16 +2133,16 @@ onUnmounted(() => {
         <template v-else-if="product">
           <nav
             aria-label="面包屑"
-            class="mb-4 flex items-center justify-between text-sm text-muted"
+            class="mb-3 flex items-center justify-between text-xs sm:text-sm text-muted"
           >
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-1.5">
               <NuxtLink
                 to="/admin/products"
                 class="inline-flex items-center gap-1 rounded-sm text-muted hover:text-primary focus-visible:outline-2 focus-visible:outline-primary transition-colors"
               >
                 <UIcon
                   name="i-lucide-arrow-left"
-                  class="size-4"
+                  class="size-3.5"
                 />
                 商品管理
               </NuxtLink>
@@ -2098,24 +2157,33 @@ onUnmounted(() => {
                 v-if="hasUnsavedChanges"
                 color="warning"
                 variant="subtle"
-                class="hidden sm:inline-flex items-center gap-1 text-xs"
+                class="inline-flex items-center gap-1 text-xs"
               >
                 <span class="size-1.5 rounded-full bg-warning animate-pulse" />
-                有未保存修改
+                有 {{ dirtySectionCount }} 处未保存修改
               </UBadge>
             </div>
           </nav>
 
-          <header class="mb-6 rounded-2xl border border-default bg-elevated/70 p-5 backdrop-blur-sm sm:p-6 shadow-xs">
+          <header class="mb-6 rounded-2xl border border-default bg-elevated p-5 sm:p-6 shadow-xs">
             <div class="flex min-w-0 flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
               <div class="min-w-0 flex-1">
                 <div class="flex flex-wrap items-center gap-2">
                   <UBadge
                     :color="product.status === 'active' ? 'success' : product.status === 'archived' ? 'neutral' : product.status === 'paused' ? 'warning' : 'info'"
                     variant="subtle"
-                    class="font-medium"
+                    class="font-medium gap-1 px-2.5"
                   >
-                    {{ statusName }}
+                    <span
+                      class="size-1.5 rounded-full"
+                      :class="{
+                        'bg-success': product.status === 'active',
+                        'bg-warning': product.status === 'paused',
+                        'bg-info': product.status === 'draft',
+                        'bg-neutral-400': product.status === 'archived',
+                      }"
+                    />
+                    <span>{{ statusName }}</span>
                   </UBadge>
                   <UBadge
                     color="neutral"
@@ -2130,7 +2198,20 @@ onUnmounted(() => {
                   >
                     修订 {{ product.revision }}
                   </UBadge>
-                  <span class="font-mono text-xs text-dimmed select-all">{{ product.id }}</span>
+                  <div class="flex items-center gap-1 font-mono text-xs text-dimmed bg-muted/20 px-2 py-0.5 rounded">
+                    <span class="truncate max-w-[12rem]">{{ product.id }}</span>
+                    <button
+                      type="button"
+                      class="text-muted hover:text-highlighted cursor-pointer"
+                      title="复制商品 ID"
+                      @click="copyProductId(product.id)"
+                    >
+                      <UIcon
+                        name="i-lucide-copy"
+                        class="size-3"
+                      />
+                    </button>
+                  </div>
                 </div>
                 <h1 class="mt-2.5 break-words text-2xl font-bold tracking-tight text-highlighted sm:text-3xl">
                   {{ product.name }}
@@ -2141,7 +2222,7 @@ onUnmounted(() => {
                       name="i-lucide-layers"
                       class="size-3.5 text-dimmed"
                     />
-                    {{ product.variants.length }} 个 SKU
+                    {{ product?.variants?.length ?? 0 }} 个 SKU 规格
                   </span>
                   <span
                     v-if="totalStockStats"
@@ -2205,6 +2286,7 @@ onUnmounted(() => {
                 <UButton
                   icon="i-lucide-save"
                   size="md"
+                  color="primary"
                   :loading="saving === 'basic'"
                   :disabled="isArchived || saving !== '' || !dirty.basic"
                   @click="saveBasic"
@@ -2354,7 +2436,7 @@ onUnmounted(() => {
               <section
                 id="basic"
                 aria-labelledby="basic-title"
-                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
+                class="scroll-mt-20 rounded-2xl border border-default bg-elevated p-5 sm:p-6 shadow-xs"
               >
                 <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
                   <div class="flex items-center gap-2.5">
@@ -2476,7 +2558,7 @@ onUnmounted(() => {
               <section
                 id="purchase-limits"
                 aria-labelledby="purchase-limits-title"
-                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
+                class="scroll-mt-20 rounded-2xl border border-default bg-elevated p-5 sm:p-6 shadow-xs"
               >
                 <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
                   <div class="flex items-center gap-2.5">
@@ -2605,7 +2687,7 @@ onUnmounted(() => {
               <section
                 id="categories"
                 aria-labelledby="categories-title"
-                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
+                class="scroll-mt-20 rounded-2xl border border-default bg-elevated p-5 sm:p-6 shadow-xs"
               >
                 <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
                   <div class="flex items-center gap-2.5">
@@ -2741,7 +2823,7 @@ onUnmounted(() => {
               <section
                 id="gallery"
                 aria-labelledby="gallery-title"
-                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
+                class="scroll-mt-20 rounded-2xl border border-default bg-elevated p-5 sm:p-6 shadow-xs"
               >
                 <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
                   <div class="flex items-center gap-2.5">
@@ -2919,7 +3001,7 @@ onUnmounted(() => {
               <section
                 id="rich-content"
                 aria-labelledby="rich-title"
-                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
+                class="scroll-mt-20 rounded-2xl border border-default bg-elevated p-5 sm:p-6 shadow-xs"
               >
                 <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
                   <div class="flex items-center gap-2.5">
@@ -3010,7 +3092,7 @@ onUnmounted(() => {
               <section
                 id="variants"
                 aria-labelledby="variants-title"
-                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs space-y-6"
+                class="scroll-mt-20 rounded-2xl border border-default bg-elevated p-5 sm:p-6 shadow-xs space-y-6"
               >
                 <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
                   <div class="flex items-center gap-2.5">
@@ -3684,7 +3766,7 @@ onUnmounted(() => {
               <section
                 id="prices"
                 aria-labelledby="prices-title"
-                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs space-y-5"
+                class="scroll-mt-20 rounded-2xl border border-default bg-elevated p-5 sm:p-6 shadow-xs space-y-5"
               >
                 <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
                   <div class="flex items-center gap-2.5">
@@ -3902,7 +3984,7 @@ onUnmounted(() => {
               <section
                 id="inventory"
                 aria-labelledby="inventory-title"
-                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs space-y-6"
+                class="scroll-mt-20 rounded-2xl border border-default bg-elevated p-5 sm:p-6 shadow-xs space-y-6"
               >
                 <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
                   <div class="flex items-center gap-2.5">
@@ -5108,7 +5190,7 @@ onUnmounted(() => {
               <section
                 id="attributes"
                 aria-labelledby="attributes-title"
-                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
+                class="scroll-mt-20 rounded-2xl border border-default bg-elevated p-5 sm:p-6 shadow-xs"
               >
                 <header class="mb-5 flex flex-wrap items-start justify-between gap-3 border-b border-default pb-4">
                   <div class="flex items-center gap-2.5">
@@ -5221,7 +5303,7 @@ onUnmounted(() => {
               <section
                 id="advanced"
                 aria-labelledby="advanced-title"
-                class="scroll-mt-16 rounded-2xl border border-default bg-elevated/40 p-5 sm:p-6 shadow-xs"
+                class="scroll-mt-20 rounded-2xl border border-default bg-elevated p-5 sm:p-6 shadow-xs"
               >
                 <div class="mb-5 flex items-center gap-2.5 border-b border-default pb-4">
                   <div class="rounded-lg bg-primary/10 p-2 text-primary">
@@ -5337,7 +5419,7 @@ onUnmounted(() => {
             </div>
 
             <aside class="min-w-0 lg:sticky lg:top-4 lg:self-start space-y-4">
-              <div class="rounded-2xl border border-default bg-elevated/80 p-4 backdrop-blur-sm shadow-xs">
+              <div class="rounded-2xl border border-default bg-elevated p-4 shadow-xs space-y-3.5">
                 <div class="flex items-center justify-between pb-3 border-b border-default">
                   <div class="flex items-center gap-2">
                     <UIcon
@@ -5353,77 +5435,129 @@ onUnmounted(() => {
                     color="warning"
                     variant="subtle"
                     size="xs"
+                    class="gap-1 font-medium"
                   >
-                    有未保存
+                    <span class="size-1.5 rounded-full bg-warning animate-pulse" />
+                    <span>{{ dirtySectionCount }} 项未保存</span>
                   </UBadge>
                   <UBadge
                     v-else
                     color="success"
                     variant="subtle"
                     size="xs"
+                    class="gap-1 font-medium"
                   >
-                    已全部保存
+                    <UIcon
+                      name="i-lucide-check"
+                      class="size-3"
+                    />
+                    <span>全部已保存</span>
                   </UBadge>
                 </div>
 
                 <nav
                   aria-label="页面内导航"
-                  class="mt-3 space-y-1"
+                  class="space-y-3"
                 >
-                  <button
-                    v-for="item in navSections"
-                    :key="item.id"
-                    type="button"
-                    class="group flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-xs transition-all text-left"
-                    :class="activeSection === item.id ? 'bg-primary/10 text-primary font-medium' : 'text-muted hover:bg-muted/50 hover:text-highlighted'"
-                    @click="scrollToSection(item.id)"
+                  <div
+                    v-for="g in groupedNavSections"
+                    :key="g.group"
+                    class="space-y-1"
                   >
-                    <span class="flex items-center gap-2 truncate">
+                    <div class="text-[11px] font-semibold text-dimmed px-2 py-0.5 uppercase tracking-wider flex items-center gap-1.5">
                       <UIcon
-                        :name="item.icon"
-                        class="size-3.5 shrink-0 transition-colors"
-                        :class="activeSection === item.id ? 'text-primary' : 'text-dimmed group-hover:text-muted'"
+                        :name="g.icon"
+                        class="size-3"
                       />
-                      <span class="truncate">{{ item.label }}</span>
-                    </span>
-                    <span class="shrink-0 ml-2">
-                      <span
-                        v-if="item.saving"
-                        class="inline-flex items-center gap-1 font-normal text-[11px] text-primary"
-                      >
+                      <span>{{ g.group }}</span>
+                    </div>
+                    <button
+                      v-for="item in g.items"
+                      :key="item.id"
+                      type="button"
+                      class="group flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-xs transition-all text-left cursor-pointer"
+                      :class="activeSection === item.id ? 'bg-primary/10 text-primary font-medium' : 'text-muted hover:bg-muted/40 hover:text-highlighted'"
+                      @click="scrollToSection(item.id)"
+                    >
+                      <span class="flex items-center gap-2 truncate">
                         <UIcon
-                          name="i-lucide-loader-2"
-                          class="size-3 animate-spin"
+                          :name="item.icon"
+                          class="size-3.5 shrink-0 transition-colors"
+                          :class="activeSection === item.id ? 'text-primary' : 'text-dimmed group-hover:text-muted'"
                         />
-                        保存中
+                        <span class="truncate">{{ item.label }}</span>
                       </span>
-                      <UBadge
-                        v-else-if="item.error"
-                        color="error"
-                        variant="subtle"
-                        size="xs"
-                      >
-                        错误
-                      </UBadge>
-                      <UBadge
-                        v-else-if="item.dirty"
-                        color="warning"
-                        variant="subtle"
-                        size="xs"
-                      >
-                        未保存
-                      </UBadge>
-                      <UIcon
-                        v-else
-                        name="i-lucide-check"
-                        class="size-3.5 text-success/60"
-                      />
-                    </span>
-                  </button>
+                      <span class="shrink-0 ml-2">
+                        <span
+                          v-if="item.saving"
+                          class="inline-flex items-center gap-1 font-normal text-[11px] text-primary"
+                        >
+                          <UIcon
+                            name="i-lucide-loader-2"
+                            class="size-3 animate-spin"
+                          />
+                          保存中
+                        </span>
+                        <UBadge
+                          v-else-if="item.error"
+                          color="error"
+                          variant="subtle"
+                          size="xs"
+                        >
+                          错误
+                        </UBadge>
+                        <UBadge
+                          v-else-if="item.dirty"
+                          color="warning"
+                          variant="subtle"
+                          size="xs"
+                          class="font-normal"
+                        >
+                          未保存
+                        </UBadge>
+                        <UIcon
+                          v-else
+                          name="i-lucide-check"
+                          class="size-3.5 text-success/50"
+                        />
+                      </span>
+                    </button>
+                  </div>
                 </nav>
+
+                <!-- 常用快捷入口 -->
+                <div class="pt-3 border-t border-default space-y-1.5">
+                  <div class="text-[11px] font-semibold text-dimmed px-1 uppercase tracking-wider">
+                    常用配置定位
+                  </div>
+                  <div class="grid grid-cols-2 gap-1.5 text-xs">
+                    <button
+                      type="button"
+                      class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-default bg-elevated hover:bg-muted/30 text-muted hover:text-highlighted text-xs transition-colors cursor-pointer"
+                      @click="scrollToSection('prices')"
+                    >
+                      <UIcon
+                        name="i-lucide-tag"
+                        class="size-3.5 text-primary"
+                      />
+                      <span>修改售价</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-default bg-elevated hover:bg-muted/30 text-muted hover:text-highlighted text-xs transition-colors cursor-pointer"
+                      @click="scrollToSection('inventory')"
+                    >
+                      <UIcon
+                        name="i-lucide-boxes"
+                        class="size-3.5 text-primary"
+                      />
+                      <span>管理库存</span>
+                    </button>
+                  </div>
+                </div>
               </div>
 
-              <div class="rounded-2xl border border-default bg-elevated/80 p-4 backdrop-blur-sm shadow-xs">
+              <div class="rounded-2xl border border-default bg-elevated p-4 shadow-xs">
                 <h3 class="font-semibold text-xs text-muted uppercase tracking-wider">
                   商品概况
                 </h3>
